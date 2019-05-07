@@ -16,12 +16,16 @@
 
 package com.netflix.spinnaker.clouddriver.artifacts.s3;
 
+import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.AWSStaticCredentialsProvider;
 import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.auth.STSAssumeRoleSessionCredentialsProvider;
 import com.amazonaws.client.builder.AwsClientBuilder;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.amazonaws.services.s3.model.S3Object;
+import com.amazonaws.services.securitytoken.AWSSecurityTokenService;
+import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder;
 import com.netflix.spinnaker.clouddriver.artifacts.config.ArtifactCredentials;
 import com.netflix.spinnaker.kork.artifacts.model.Artifact;
 import groovy.util.logging.Slf4j;
@@ -31,9 +35,11 @@ import org.apache.commons.lang3.StringUtils;
 import java.io.InputStream;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 
 @Slf4j
 public class S3ArtifactCredentials implements ArtifactCredentials {
+  private final static String DEFAULT_STS_SESSION_NAME = "Clouddriver";
   @Getter
   private final String name;
   @Getter
@@ -44,6 +50,8 @@ public class S3ArtifactCredentials implements ArtifactCredentials {
   private final String region;
   private final String awsAccessKeyId;
   private final String awsSecretAccessKey;
+  private final String assumeRole;
+  private final String assumeRoleAccountId;
 
   S3ArtifactCredentials(S3ArtifactAccount account) throws IllegalArgumentException {
     name = account.getName();
@@ -52,6 +60,8 @@ public class S3ArtifactCredentials implements ArtifactCredentials {
     region = account.getRegion();
     awsAccessKeyId = account.getAwsAccessKeyId();
     awsSecretAccessKey = account.getAwsSecretAccessKey();
+    assumeRole = account.getAssumeRole();
+    assumeRoleAccountId = account.getAssumeRoleAccountId();
   }
 
   private AmazonS3 getS3Client() {
@@ -65,13 +75,40 @@ public class S3ArtifactCredentials implements ArtifactCredentials {
       builder.setRegion(region);
     }
 
-    if (!StringUtils.isEmpty(awsAccessKeyId) && !StringUtils.isEmpty(awsSecretAccessKey)) {
-      BasicAWSCredentials awsStaticCreds = new BasicAWSCredentials(awsAccessKeyId, awsSecretAccessKey);
-      builder.withCredentials(new AWSStaticCredentialsProvider(awsStaticCreds));
+    AWSCredentialsProvider credentialsProvider = getAWSCredentialsProvider();
+    if (credentialsProvider != null) {
+      builder.withCredentials(credentialsProvider);
     }
-
     return builder.build();
   }
+
+  private AWSCredentialsProvider getAWSCredentialsProvider() {
+    AWSCredentialsProvider staticCredProvider = null;
+    if (!StringUtils.isEmpty(awsAccessKeyId) && !StringUtils.isEmpty(awsSecretAccessKey)) {
+      BasicAWSCredentials awsStaticCreds = new BasicAWSCredentials(awsAccessKeyId, awsSecretAccessKey);
+      staticCredProvider = new AWSStaticCredentialsProvider(awsStaticCreds);
+    }
+
+    if (!StringUtils.isEmpty(assumeRole)) {
+      AWSSecurityTokenServiceClientBuilder builder = AWSSecurityTokenServiceClientBuilder.standard();
+      if (staticCredProvider != null) {
+        builder.withCredentials(staticCredProvider);
+      }
+      AWSSecurityTokenService sts = builder.build();
+      return new STSAssumeRoleSessionCredentialsProvider.Builder(awsAssumeRoleArn(), DEFAULT_STS_SESSION_NAME)
+        .withStsClient(sts)
+        .build();
+    }
+    return staticCredProvider;
+  }
+
+  protected String awsAssumeRoleArn() {
+    if (assumeRole.startsWith("arn:")) {
+      return assumeRole;
+    }
+    return String.format("arn:aws:iam::%s:%s", Objects.requireNonNull(assumeRoleAccountId, "accountId"), assumeRole);
+  }
+
 
   @Override
   public InputStream download(Artifact artifact) throws IllegalArgumentException {

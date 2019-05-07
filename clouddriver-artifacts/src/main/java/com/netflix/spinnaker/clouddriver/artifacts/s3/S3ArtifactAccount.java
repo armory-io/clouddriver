@@ -27,4 +27,6 @@ public class S3ArtifactAccount implements ArtifactAccount {
   private String region;
   private String awsAccessKeyId;
   private String awsSecretAccessKey;
+  private String assumeRole;
+  private String assumeRoleAccountId;
 }
