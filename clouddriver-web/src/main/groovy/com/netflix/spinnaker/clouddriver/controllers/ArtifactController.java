@@ -20,6 +20,7 @@ package com.netflix.spinnaker.clouddriver.controllers;
 import com.netflix.spinnaker.clouddriver.artifacts.ArtifactCredentialsRepository;
 import com.netflix.spinnaker.clouddriver.artifacts.ArtifactDownloader;
 import com.netflix.spinnaker.clouddriver.artifacts.config.ArtifactCredentials;
+import com.netflix.spinnaker.clouddriver.artifacts.github.GitHubArtifactKustomize;
 import com.netflix.spinnaker.kork.artifacts.model.Artifact;
 import java.util.Collections;
 import java.util.List;
@@ -36,13 +37,16 @@ import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBo
 public class ArtifactController {
   private ArtifactCredentialsRepository artifactCredentialsRepository;
   private ArtifactDownloader artifactDownloader;
+  private GitHubArtifactKustomize gitHubArtifactKustomize;
 
   @Autowired
   public ArtifactController(
       Optional<ArtifactCredentialsRepository> artifactCredentialsRepository,
-      Optional<ArtifactDownloader> artifactDownloader) {
+      Optional<ArtifactDownloader> artifactDownloader,
+      Optional<GitHubArtifactKustomize> gitHubArtifactKustomize) {
     this.artifactCredentialsRepository = artifactCredentialsRepository.orElse(null);
     this.artifactDownloader = artifactDownloader.orElse(null);
+    this.gitHubArtifactKustomize = gitHubArtifactKustomize.orElse(null);
   }
 
   @RequestMapping(method = RequestMethod.GET, value = "/credentials")
@@ -63,6 +67,11 @@ public class ArtifactController {
     }
 
     return outputStream -> IOUtils.copy(artifactDownloader.download(artifact), outputStream);
+  }
+
+  @RequestMapping(method = RequestMethod.PUT, value = "/github/kustomize")
+  List<Artifact> getFromGithub(@RequestBody Artifact artifact){
+    return gitHubArtifactKustomize.getArtifacts(artifact);
   }
 
   @RequestMapping(method = RequestMethod.GET, value = "/account/{accountName}/names")
