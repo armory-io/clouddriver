@@ -33,6 +33,7 @@ import com.netflix.spinnaker.clouddriver.security.AccountCredentials;
 import com.netflix.spinnaker.clouddriver.security.AccountCredentialsRepository;
 import com.netflix.spinnaker.clouddriver.security.ProviderVersion;
 import com.netflix.spinnaker.fiat.model.resources.Permissions;
+import com.netflix.spinnaker.kork.configserver.CloudConfigResourceService;
 import com.netflix.spinnaker.kork.configserver.ConfigFileService;
 import java.util.*;
 import lombok.EqualsAndHashCode;
@@ -140,6 +141,7 @@ public class KubernetesNamedAccountCredentials<C extends KubernetesCredentials>
     private final AccountCredentialsRepository accountCredentialsRepository;
     private final KubectlJobExecutor jobExecutor;
     private final ConfigFileService configFileService;
+    private final CloudConfigResourceService cloudConfigResourceService;
     private final AccountResourcePropertyRegistry.Factory resourcePropertyRegistryFactory;
     private final KubernetesKindRegistry.Factory kindRegistryFactory;
 
@@ -171,6 +173,8 @@ public class KubernetesNamedAccountCredentials<C extends KubernetesCredentials>
           .setNamer(
               KubernetesManifest.class,
               namerRegistry.getNamingStrategy(managedAccount.getNamingStrategy()));
+      //
+      // managedAccount.setKubeconfigFile("/Users/nicolas/.hal/default/staging/dependencies/1616888589-1479512435-kubecfg-nc5-3");
       return new KubernetesV2Credentials(
           spectatorRegistry,
           jobExecutor,
@@ -200,6 +204,9 @@ public class KubernetesNamedAccountCredentials<C extends KubernetesCredentials>
     private String getKubeconfigFile(
         KubernetesConfigurationProperties.ManagedAccount managedAccount) {
       if (StringUtils.isNotEmpty(managedAccount.getKubeconfigFile())) {
+        if (CloudConfigResourceService.isCloudConfigResource(managedAccount.getKubeconfigFile())) {
+          return cloudConfigResourceService.getLocalPath(managedAccount.getKubeconfigFile());
+        }
         return configFileService.getLocalPath(managedAccount.getKubeconfigFile());
       }
 

@@ -19,7 +19,6 @@ package com.netflix.spinnaker.clouddriver.kubernetes.v2.caching;
 
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.module.CatsModule;
-import com.netflix.spinnaker.cats.thread.NamedThreadFactory;
 import com.netflix.spinnaker.clouddriver.kubernetes.KubernetesCloudProvider;
 import com.netflix.spinnaker.clouddriver.kubernetes.config.KubernetesConfigurationProperties;
 import com.netflix.spinnaker.clouddriver.kubernetes.security.KubernetesNamedAccountCredentials;
@@ -28,12 +27,7 @@ import com.netflix.spinnaker.clouddriver.kubernetes.v2.description.KubernetesRes
 import com.netflix.spinnaker.clouddriver.kubernetes.v2.description.KubernetesSpinnakerKindMap;
 import com.netflix.spinnaker.clouddriver.kubernetes.v2.security.KubernetesV2Credentials;
 import com.netflix.spinnaker.clouddriver.security.*;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.*;
 import java.util.stream.Collectors;
 import javax.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -64,10 +58,6 @@ public class KubernetesV2ProviderSynchronizable implements CredentialsInitialize
     this.credentialFactory = credentialFactory;
     this.kubernetesSpinnakerKindMap = kubernetesSpinnakerKindMap;
     this.catsModule = catsModule;
-
-    ScheduledExecutorService poller =
-        Executors.newSingleThreadScheduledExecutor(
-            new NamedThreadFactory(KubernetesV2ProviderSynchronizable.class.getSimpleName()));
   }
 
   @Override

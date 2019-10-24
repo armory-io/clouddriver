@@ -31,6 +31,7 @@ import com.netflix.spinnaker.clouddriver.names.NamerRegistry
 import com.netflix.spinnaker.clouddriver.security.AccountCredentials
 import com.netflix.spinnaker.clouddriver.security.AccountCredentialsRepository
 import com.netflix.spinnaker.clouddriver.security.ProviderVersion
+import com.netflix.spinnaker.kork.configserver.CloudConfigResourceService
 import com.netflix.spinnaker.kork.configserver.ConfigFileService
 import spock.lang.Specification
 
@@ -40,6 +41,7 @@ class KubernetesV2ProviderSynchronizableSpec extends Specification {
   AccountCredentialsRepository accountCredentialsRepository = Mock(AccountCredentialsRepository)
   NamerRegistry namerRegistry = Mock(NamerRegistry)
   ConfigFileService configFileService = Mock(ConfigFileService)
+  CloudConfigResourceService cloudConfigResourceService = Mock(CloudConfigResourceService)
   KubernetesV2Provider kubernetesV2Provider = new KubernetesV2Provider()
   KubernetesV2CachingAgentDispatcher agentDispatcher = Mock(KubernetesV2CachingAgentDispatcher)
   AccountResourcePropertyRegistry.Factory resourcePropertyRegistryFactory = Mock(AccountResourcePropertyRegistry.Factory)
@@ -53,7 +55,8 @@ class KubernetesV2ProviderSynchronizableSpec extends Specification {
     Mock(KubectlJobExecutor),
     configFileService,
     resourcePropertyRegistryFactory,
-    kindRegistryFactory
+    kindRegistryFactory,
+    cloudConfigResourceService
   )
 
   def synchronizeAccounts(KubernetesConfigurationProperties configurationProperties) {
