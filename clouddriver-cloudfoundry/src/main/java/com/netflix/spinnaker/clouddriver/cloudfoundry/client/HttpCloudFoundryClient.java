@@ -21,17 +21,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.PropertyNamingStrategy;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.ApplicationService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.AuthenticationService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.ConfigService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.DomainService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.DopplerService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.OrganizationService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.RouteService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.ServiceInstanceService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.ServiceKeyService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.SpaceService;
-import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.TaskService;
+import com.netflix.spinnaker.clouddriver.cloudfoundry.client.api.*;
 import com.netflix.spinnaker.clouddriver.cloudfoundry.client.model.Token;
 import com.squareup.okhttp.Interceptor;
 import com.squareup.okhttp.OkHttpClient;
@@ -51,7 +41,7 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -63,6 +53,8 @@ import okio.Buffer;
 import okio.BufferedSource;
 import org.apache.commons.fileupload.MultipartStream;
 import org.cloudfoundry.dropsonde.events.EventFactory.Envelope;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import retrofit.RequestInterceptor;
 import retrofit.RestAdapter;
 import retrofit.client.OkClient;
@@ -82,10 +74,12 @@ public class HttpCloudFoundryClient implements CloudFoundryClient {
   private final String user;
   private final String password;
   private final OkHttpClient okHttpClient;
+  private Logger logger = LoggerFactory.getLogger(HttpCloudFoundryClient.class);
 
   private AuthenticationService uaaService;
-  private AtomicLong tokenExpirationNs = new AtomicLong(System.nanoTime());
-  private volatile Token token;
+  private long tokenExpiration = System.currentTimeMillis();
+  private Token token;
+  private final Object tokenLock = new Object();
 
   private JacksonConverter jacksonConverter;
 
@@ -100,17 +94,11 @@ public class HttpCloudFoundryClient implements CloudFoundryClient {
   private Logs logs;
 
   private final RequestInterceptor oauthInterceptor =
-      new RequestInterceptor() {
-        @Override
-        public void intercept(RequestFacade request) {
-          refreshTokenIfNecessary();
-          request.addHeader("Authorization", "bearer " + token.getAccessToken());
-        }
-      };
+      request -> request.addHeader("Authorization", "bearer " + getToken(false).getAccessToken());
 
   private static class RetryableApiException extends RuntimeException {
-    RetryableApiException() {
-      super();
+    RetryableApiException(String message) {
+      super(message);
     }
 
     RetryableApiException(String message, Throwable cause) {
@@ -127,7 +115,7 @@ public class HttpCloudFoundryClient implements CloudFoundryClient {
                 .intervalFunction(IntervalFunction.ofExponentialBackoff(Duration.ofSeconds(10), 3))
                 .retryExceptions(RetryableApiException.class)
                 .build());
-
+    logger.trace("cf request: " + chain.request().urlString());
     AtomicReference<Response> lastResponse = new AtomicReference<>();
     try {
       return retry.executeCallable(
@@ -142,13 +130,12 @@ public class HttpCloudFoundryClient implements CloudFoundryClient {
                 Buffer buffer = source.buffer();
                 String body = buffer.clone().readString(Charset.forName("UTF-8"));
                 if (!body.contains("Bad credentials")) {
-                  refreshToken();
                   response =
                       chain.proceed(
                           chain
                               .request()
                               .newBuilder()
-                              .header("Authorization", "bearer " + token.getAccessToken())
+                              .header("Authorization", "bearer " + getToken(true).getAccessToken())
                               .build());
                   lastResponse.set(response);
                 }
@@ -158,13 +145,19 @@ public class HttpCloudFoundryClient implements CloudFoundryClient {
               case 504:
                 // after retries fail, the response body for these status codes will get wrapped up
                 // into a CloudFoundryApiException
-                throw new RetryableApiException();
+                throw new RetryableApiException(
+                    "Response Code "
+                        + response.code()
+                        + ": "
+                        + chain.request().httpUrl()
+                        + " attempting retry");
             }
 
             return response;
           });
     } catch (SocketTimeoutException e) {
-      throw new RetryableApiException("Timeout " + callName, e);
+      throw new RetryableApiException(
+          "Timeout " + callName + " " + chain.request().httpUrl() + ",  attempting retry", e);
     } catch (Exception e) {
       final Response response = lastResponse.get();
       if (response == null) {
@@ -181,12 +174,15 @@ public class HttpCloudFoundryClient implements CloudFoundryClient {
       String apiHost,
       String user,
       String password,
-      boolean skipSslValidation) {
+      boolean skipSslValidation,
+      Integer resultsPerPage,
+      int maxCapiConnectionsForCache) {
     this.apiHost = apiHost;
     this.user = user;
     this.password = password;
 
     this.okHttpClient = createHttpClient(skipSslValidation);
+    this.okHttpClient.setReadTimeout(20, TimeUnit.SECONDS);
 
     okHttpClient.interceptors().add(this::createRetryInterceptor);
 
@@ -210,7 +206,13 @@ public class HttpCloudFoundryClient implements CloudFoundryClient {
     this.spaces = new Spaces(createService(SpaceService.class), organizations);
     this.applications =
         new Applications(
-            account, appsManagerUri, metricsUri, createService(ApplicationService.class), spaces);
+            account,
+            appsManagerUri,
+            metricsUri,
+            createService(ApplicationService.class),
+            spaces,
+            resultsPerPage,
+            maxCapiConnectionsForCache);
     this.domains = new Domains(createService(DomainService.class), organizations);
     this.serviceInstances =
         new ServiceInstances(
@@ -219,7 +221,14 @@ public class HttpCloudFoundryClient implements CloudFoundryClient {
             organizations,
             spaces);
     this.routes =
-        new Routes(account, createService(RouteService.class), applications, domains, spaces);
+        new Routes(
+            account,
+            createService(RouteService.class),
+            applications,
+            domains,
+            spaces,
+            resultsPerPage,
+            maxCapiConnectionsForCache);
     this.serviceKeys = new ServiceKeys(createService(ServiceKeyService.class), spaces);
     this.tasks = new Tasks(createService(TaskService.class));
 
@@ -270,23 +279,19 @@ public class HttpCloudFoundryClient implements CloudFoundryClient {
     return client;
   }
 
-  private void refreshTokenIfNecessary() {
-    long currentExpiration = tokenExpirationNs.get();
-    long now = System.nanoTime();
-    long comp = Math.min(currentExpiration, now);
-    if (tokenExpirationNs.compareAndSet(comp, now)) {
-      this.refreshToken();
+  private Token getToken(boolean forceRefresh) {
+    synchronized (tokenLock) {
+      if (forceRefresh || (token == null || System.currentTimeMillis() >= tokenExpiration)) {
+        try {
+          token = uaaService.passwordToken("password", user, password, "cf", "");
+        } catch (Exception e) {
+          log.warn("Failed to obtain a token", e);
+          throw e;
+        }
+        tokenExpiration = System.currentTimeMillis() + ((token.getExpiresIn() - 120) * 1000);
+      }
+      return token;
     }
-  }
-
-  private void refreshToken() {
-    try {
-      token = uaaService.passwordToken("password", user, password, "cf", "");
-    } catch (Exception e) {
-      log.warn("Failed to obtain a token", e);
-      throw e;
-    }
-    tokenExpirationNs.addAndGet(Duration.ofSeconds(token.getExpiresIn()).toNanos());
   }
 
   private <S> S createService(Class<S> serviceClass) {

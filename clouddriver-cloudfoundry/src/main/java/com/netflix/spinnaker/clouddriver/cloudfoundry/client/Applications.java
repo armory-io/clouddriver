@@ -42,11 +42,10 @@ import java.io.InputStream;
 import java.nio.charset.Charset;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ForkJoinPool;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -55,7 +54,6 @@ import retrofit.client.Response;
 import retrofit.mime.TypedFile;
 import retrofit.mime.TypedInput;
 
-@RequiredArgsConstructor
 @Slf4j
 public class Applications {
   private final String account;
@@ -63,20 +61,40 @@ public class Applications {
   private final String metricsUri;
   private final ApplicationService api;
   private final Spaces spaces;
+  private final Integer resultsPerPage;
 
-  private final LoadingCache<String, CloudFoundryServerGroup> serverGroupCache =
-      CacheBuilder.newBuilder()
-          .expireAfterWrite(5, TimeUnit.MINUTES)
-          .build(
-              new CacheLoader<String, CloudFoundryServerGroup>() {
-                @Override
-                public CloudFoundryServerGroup load(@Nonnull String guid)
-                    throws ResourceNotFoundException {
-                  return safelyCall(() -> api.findById(guid))
-                      .map(Applications.this::map)
-                      .orElseThrow(ResourceNotFoundException::new);
-                }
-              });
+  private final ForkJoinPool forkJoinPool;
+  private final LoadingCache<String, CloudFoundryServerGroup> serverGroupCache;
+
+  public Applications(
+      String account,
+      String appsManagerUri,
+      String metricsUri,
+      ApplicationService api,
+      Spaces spaces,
+      Integer resultsPerPage,
+      int maxConnections) {
+    this.account = account;
+    this.appsManagerUri = appsManagerUri;
+    this.metricsUri = metricsUri;
+    this.api = api;
+    this.spaces = spaces;
+    this.resultsPerPage = resultsPerPage;
+
+    this.forkJoinPool = new ForkJoinPool(maxConnections);
+    this.serverGroupCache =
+        CacheBuilder.newBuilder()
+            .build(
+                new CacheLoader<String, CloudFoundryServerGroup>() {
+                  @Override
+                  public CloudFoundryServerGroup load(@Nonnull String guid)
+                      throws ResourceNotFoundException {
+                    return safelyCall(() -> api.findById(guid))
+                        .map(Applications.this::map)
+                        .orElseThrow(ResourceNotFoundException::new);
+                  }
+                });
+  }
 
   @Nullable
   public CloudFoundryServerGroup findById(String guid) {
@@ -96,48 +114,93 @@ public class Applications {
   }
 
   public List<CloudFoundryApplication> all() {
-    List<Application> newCloudFoundryAppList =
-        collectPages("applications", page -> api.all(page, 5000, null, null));
+    log.debug("Listing all applications from account {}", this.account);
 
-    // Evict Records from `cache` that are no longer in the foundation
+    List<Application> newCloudFoundryAppList =
+        collectPages("applications", page -> api.all(page, resultsPerPage, null, null));
+
+    log.debug(
+        "Fetched {} total apps from foundation account {}",
+        newCloudFoundryAppList.size(),
+        this.account);
+
     List<String> availableAppIds =
         newCloudFoundryAppList.stream().map(Application::getGuid).collect(toList());
-    serverGroupCache.asMap().keySet().stream()
-        .forEach(
-            key -> {
-              if (!availableAppIds.contains(key)) {
-                log.debug("Evicting the following SG with id '" + key + "'");
-                serverGroupCache.invalidate(key);
-              }
-            });
+
+    long invalidatedServerGroups =
+        serverGroupCache
+            .asMap()
+            .keySet()
+            .parallelStream()
+            .filter(appGuid -> !availableAppIds.contains(appGuid))
+            .peek(appGuid -> log.trace("Evicting the following SG with id '{}'", appGuid))
+            .peek(serverGroupCache::invalidate)
+            .count();
+
+    log.debug(
+        "Evicted {} serverGroups from the cache that aren't on the '{}' foundation anymore",
+        invalidatedServerGroups,
+        this.account);
 
     // if the update time doesn't match then we need to update the cache
     // if the app is not found in the cache we need to process with `map` and update the cache
-    List<Application> appsToBeUpdated =
-        newCloudFoundryAppList.stream()
-            .filter(
-                a ->
-                    Optional.ofNullable(findById(a.getGuid()))
-                        .map(
-                            r ->
-                                !r.getUpdatedTime()
-                                    .equals(a.getUpdatedAt().toInstant().toEpochMilli()))
-                        .orElse(true))
-            .collect(Collectors.toList());
+    try {
+      forkJoinPool.submit(
+          () ->
+              newCloudFoundryAppList
+                  .parallelStream()
+                  .filter(
+                      app -> {
+                        CloudFoundryServerGroup cachedApp = findById(app.getGuid());
+                        if (cachedApp != null) {
+                          if (!cachedApp
+                              .getUpdatedTime()
+                              .equals(app.getUpdatedAt().toInstant().toEpochMilli())) {
+                            log.trace(
+                                "App '{}' cached version is out of date on foundation '{}'",
+                                app.getName(),
+                                this.account);
+                            return true;
+                          } else {
+                            return false;
+                          }
+                        } else {
+                          log.trace(
+                              "App '{}' not found in cache for foundation '{}'",
+                              app.getName(),
+                              this.account);
+                          return true;
+                        }
+                      })
+                  .map(this::map)
+                  .forEach(sg -> serverGroupCache.put(sg.getId(), sg)));
 
-    List<CloudFoundryServerGroup> serverGroups =
-        appsToBeUpdated.stream().map(this::map).collect(toList());
-    serverGroups.forEach(sg -> serverGroupCache.put(sg.getId(), sg));
-
-    // execute health check on instances, set number of available instances and health status
-    newCloudFoundryAppList.forEach(
-        a -> serverGroupCache.put(a.getGuid(), checkHealthStatus(findById(a.getGuid()), a)));
+      forkJoinPool.submit(
+          () ->
+              // execute health check on instances, set number of available instances and health
+              // status
+              newCloudFoundryAppList
+                  .parallelStream()
+                  .forEach(
+                      a ->
+                          serverGroupCache.put(
+                              a.getGuid(), checkHealthStatus(findById(a.getGuid()), a))));
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
 
     Map<String, Set<CloudFoundryServerGroup>> serverGroupsByClusters = new HashMap<>();
     Map<String, Set<String>> clustersByApps = new HashMap<>();
 
     for (CloudFoundryServerGroup serverGroup : serverGroupCache.asMap().values()) {
       Names names = Names.parseName(serverGroup.getName());
+      if (names.getCluster() == null) {
+        log.debug(
+            "Skipping app '{}' from foundation '{}' because the name isn't following the frigga naming schema.",
+            serverGroup.getName(),
+            this.account);
+        continue;
+      }
       serverGroupsByClusters
           .computeIfAbsent(names.getCluster(), clusterName -> new HashSet<>())
           .add(serverGroup);
@@ -168,7 +231,7 @@ public class Applications {
   @Nullable
   public CloudFoundryServerGroup findServerGroupByNameAndSpaceId(String name, String spaceId) {
     return Optional.ofNullable(findServerGroupId(name, spaceId))
-        .map(serverGroupId -> Optional.ofNullable(findById(serverGroupId)).orElse(null))
+        .flatMap(serverGroupId -> Optional.ofNullable(findById(serverGroupId)))
         .orElse(null);
   }
 
@@ -214,7 +277,7 @@ public class Applications {
     try {
       CloudFoundryPackage cfPackage =
           safelyCall(() -> api.findPackagesByAppId(appId))
-              .map(
+              .flatMap(
                   packages ->
                       packages.getResources().stream()
                           .findFirst()
@@ -233,8 +296,7 @@ public class Applications {
                                           pkg.getData().getChecksum() == null
                                               ? null
                                               : pkg.getData().getChecksum().getValue())
-                                      .build())
-                          .orElse(null))
+                                      .build()))
               .orElse(null);
 
       droplet =
@@ -304,13 +366,17 @@ public class Applications {
     String serverGroupAppManagerUri = appsManagerUri;
     if (StringUtils.isNotEmpty(appsManagerUri)) {
       serverGroupAppManagerUri =
-          appsManagerUri
-              + "/organizations/"
-              + space.getOrganization().getId()
-              + "/spaces/"
-              + space.getId()
-              + "/applications/"
-              + appId;
+          Optional.ofNullable(space)
+              .map(
+                  s ->
+                      appsManagerUri
+                          + "/organizations/"
+                          + s.getOrganization().getId()
+                          + "/spaces/"
+                          + s.getId()
+                          + "/applications/"
+                          + appId)
+              .orElse("");
     }
 
     String serverGroupMetricsUri = metricsUri;
@@ -383,7 +449,7 @@ public class Applications {
                       })
                   .collect(toSet());
 
-          log.debug(
+          log.trace(
               "Successfully retrieved "
                   + instances.size()
                   + " instances for application '"
@@ -504,7 +570,7 @@ public class Applications {
       throws CloudFoundryApiException {
     final Process.HealthCheck healthCheck =
         healthCheckType != null ? new Process.HealthCheck().setType(healthCheckType) : null;
-    if (healthCheckEndpoint != null && !healthCheckEndpoint.isEmpty()) {
+    if (healthCheckEndpoint != null && !healthCheckEndpoint.isEmpty() && healthCheck != null) {
       healthCheck.setData(new Process.HealthCheckData().setEndpoint(healthCheckEndpoint));
     }
     safelyCall(() -> api.updateProcess(guid, new UpdateProcess(command, healthCheck)));
@@ -539,9 +605,9 @@ public class Applications {
     }
   }
 
-  public String uploadPackageBits(String packageGuid, File file) throws CloudFoundryApiException {
+  public void uploadPackageBits(String packageGuid, File file) throws CloudFoundryApiException {
     TypedFile uploadFile = new TypedFile("multipart/form-data", file);
-    return safelyCall(() -> api.uploadPackageBits(packageGuid, uploadFile))
+    safelyCall(() -> api.uploadPackageBits(packageGuid, uploadFile))
         .map(Package::getGuid)
         .orElseThrow(
             () ->
