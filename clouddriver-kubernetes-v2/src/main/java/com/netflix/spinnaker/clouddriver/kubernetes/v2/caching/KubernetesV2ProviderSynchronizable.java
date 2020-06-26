@@ -25,11 +25,7 @@ import com.netflix.spinnaker.clouddriver.kubernetes.security.KubernetesNamedAcco
 import com.netflix.spinnaker.clouddriver.kubernetes.v2.caching.agent.KubernetesV2CachingAgentDispatcher;
 import com.netflix.spinnaker.clouddriver.kubernetes.v2.security.KubernetesV2Credentials;
 import com.netflix.spinnaker.clouddriver.security.*;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 import javax.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -75,35 +71,32 @@ public class KubernetesV2ProviderSynchronizable implements CredentialsInitialize
 
   @Override
   public void synchronize() {
-    Set<String> newAndChangedAccounts = synchronizeAccountCredentials();
+    Set<String> newAndChangedAccountNames = synchronizeAccountCredentials();
 
     // we only want to initialize caching agents for new or updated accounts
-    Set<KubernetesNamedAccountCredentials<KubernetesV2Credentials>> allAccounts =
+    Set<KubernetesNamedAccountCredentials<KubernetesV2Credentials>> newAndChangedAccounts =
         ProviderUtils.buildThreadSafeSetOfAccounts(
                 accountCredentialsRepository,
                 KubernetesNamedAccountCredentials.class,
                 ProviderVersion.v2)
             .stream()
             .map(c -> (KubernetesNamedAccountCredentials<KubernetesV2Credentials>) c)
-            .filter(account -> newAndChangedAccounts.contains(account.getName()))
+            .filter(account -> newAndChangedAccountNames.contains(account.getName()))
             .collect(Collectors.toSet());
 
-    if (allAccounts.size() < 1) {
-      log.info(
-          "No changes detected to V2 Kubernetes accounts. Skipping caching agent synchronization.");
+    if (newAndChangedAccounts.size() < 1) {
+      log.info("No new or changed V2 Kubernetes accounts. Skipping caching agent synchronization.");
       return;
     }
 
-    log.info("Synchronizing {} caching agents for V2 Kubernetes accounts.", allAccounts.size());
-    synchronizeKubernetesV2Provider(allAccounts);
+    synchronizeKubernetesV2Provider(newAndChangedAccounts);
   }
 
   private Set<String> synchronizeAccountCredentials() {
     List<String> deletedAccounts = getDeletedAccountNames();
-    List<String> changedAccounts = new ArrayList<>();
     Set<String> newAndChangedAccounts = new HashSet<>();
 
-    deletedAccounts.forEach(accountCredentialsRepository::delete);
+    deleteAccounts(deletedAccounts);
 
     kubernetesConfigurationProperties.getAccounts().stream()
         .filter(a -> ProviderVersion.v2.equals(a.getProviderVersion()))
@@ -115,12 +108,8 @@ public class KubernetesV2ProviderSynchronizable implements CredentialsInitialize
               AccountCredentials existingCredentials =
                   accountCredentialsRepository.getOne(managedAccount.getName());
 
-              if (existingCredentials == null) {
-                // account didn't previously exist
-                newAndChangedAccounts.add(managedAccount.getName());
-              } else if (!existingCredentials.equals(credentials)) {
-                // account exists but has changed
-                changedAccounts.add(managedAccount.getName());
+              if (existingCredentials == null || !existingCredentials.equals(credentials)) {
+                // account didn't previously exist or exists but has changed
                 newAndChangedAccounts.add(managedAccount.getName());
               } else {
                 // Current credentials may contain memoized namespaces, we should keep if the
@@ -132,10 +121,19 @@ public class KubernetesV2ProviderSynchronizable implements CredentialsInitialize
         .filter(Objects::nonNull)
         .forEach(a -> saveToCredentialsRepository(a));
 
-    ProviderUtils.unscheduleAndDeregisterAgents(deletedAccounts, catsModule);
-    ProviderUtils.unscheduleAndDeregisterAgents(changedAccounts, catsModule);
-
     return newAndChangedAccounts;
+  }
+
+  private void deleteAccounts(List<String> deletedAccounts) {
+    if (deletedAccounts.isEmpty()) {
+      return;
+    }
+    log.info(
+        "Deleted {} accounts, removing from repository and caching agents", deletedAccounts.size());
+    deletedAccounts.forEach(
+        accountCredentialsRepository::delete); // delete from endpoint /credentials
+    ProviderUtils.unscheduleAndDeregisterAgents(
+        deletedAccounts, catsModule); // delete caching agents
   }
 
   /**
@@ -174,10 +172,18 @@ public class KubernetesV2ProviderSynchronizable implements CredentialsInitialize
   }
 
   private void synchronizeKubernetesV2Provider(
-      Set<KubernetesNamedAccountCredentials<KubernetesV2Credentials>> allAccounts) {
+      Set<KubernetesNamedAccountCredentials<KubernetesV2Credentials>> newAndChangedAccounts) {
+
+    log.info(
+        "Synchronizing caching agents for {} new or changed V2 Kubernetes accounts.",
+        newAndChangedAccounts.size());
+
+    Set<String> accountNames = new HashSet<>();
 
     try {
-      for (KubernetesNamedAccountCredentials<KubernetesV2Credentials> credentials : allAccounts) {
+      for (KubernetesNamedAccountCredentials<KubernetesV2Credentials> credentials :
+          newAndChangedAccounts) {
+        accountNames.add(credentials.getName());
         List<Agent> newlyAddedAgents =
             kubernetesV2CachingAgentDispatcher.buildAllCachingAgents(credentials).stream()
                 .map(c -> (Agent) c)
@@ -185,12 +191,15 @@ public class KubernetesV2ProviderSynchronizable implements CredentialsInitialize
 
         log.info("Adding {} agents for account {}", newlyAddedAgents.size(), credentials.getName());
 
-        kubernetesV2Provider.addAllAgents(newlyAddedAgents);
+        kubernetesV2Provider.stageAllAgents(newlyAddedAgents);
       }
     } catch (Exception e) {
       log.warn("Error encountered scheduling new agents -- using old agent set instead", e);
-      kubernetesV2Provider.clearNewAgentSet();
+      kubernetesV2Provider.clearStagedAgents();
     }
+
+    // Remove existing agents belonging to changed accounts
+    ProviderUtils.unscheduleAndDeregisterAgents(accountNames, catsModule);
 
     // If there is an agent scheduler, then this provider has been through the AgentController in
     // the past.
@@ -201,6 +210,6 @@ public class KubernetesV2ProviderSynchronizable implements CredentialsInitialize
           kubernetesV2Provider, new ArrayList<>(kubernetesV2Provider.getNextAgentSet()));
     }
 
-    kubernetesV2Provider.switchToNewAgents();
+    kubernetesV2Provider.addStagedAgents();
   }
 }
