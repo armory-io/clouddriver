@@ -12,6 +12,8 @@ jobs:
   branch-build:
     # Only run this on repositories in the 'armory-io' org
     if: startsWith(github.repository, 'armory-io/')
+    env:
+      GRADLE_ARGS: -Partifactory_user=${{secrets.ARTIFACTORY_USER}} -Partifactory_password=${{secrets.ARTIFACTORY_PASSWORD}}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
@@ -29,5 +31,12 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
+      - name: Determine version
+        id: build-info
+        run: |
+          version=$(echo "$(git rev-parse --abbrev-ref HEAD)" | sed 's|release-||' | sed 's|_hotfixes||'))-hotfixes-$(echo ${GITHUB_SHA} | cut -c1-8)
+          echo "##[set-output name=version;]$version"
       - name: Build
-        run: ./gradlew -PenableCrossCompilerPlugin=true build --stacktrace
+        run: ./gradlew -Pversion=${{ steps.build-info.outputs.version }} -PenableCrossCompilerPlugin=true build --stacktrace
+#      - name: Publish to Artifactory
+#        run: ./gradlew $GRADLE_ARGS -Pversion=${{ steps.build-info.outputs.version }} artifactPublish

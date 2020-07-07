@@ -34,3 +34,15 @@ dependencies {
       .each { api(project(it.path)) }
   }
 }
+
+publishing {
+  publications {
+    javaPlatform(MavenPublication) {
+      from components.javaPlatform
+    }
+  }
+}
+
+artifactoryPublish {
+  publications(publishing.publications.javaPlatform)
+}
