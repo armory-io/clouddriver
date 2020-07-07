@@ -38,5 +38,5 @@ jobs:
           echo "##[set-output name=version;]$version"
       - name: Build
         run: ./gradlew -Pversion=${{ steps.build-info.outputs.version }} -PenableCrossCompilerPlugin=true build --stacktrace
-#      - name: Publish to Artifactory
-#        run: ./gradlew $GRADLE_ARGS -Pversion=${{ steps.build-info.outputs.version }} artifactPublish
+      - name: Publish to Artifactory
+        run: ./gradlew $GRADLE_ARGS -Pversion=${{ steps.build-info.outputs.version }} artifactPublish -x test
