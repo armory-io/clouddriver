@@ -63,4 +63,5 @@ jobs:
           git config user.email "githubactions@fake.com"
           git config user.name "Github Actions"
           git commit -m "chore(dependencies): Autobump oss clouddriver version"
+          git pull
           git push
