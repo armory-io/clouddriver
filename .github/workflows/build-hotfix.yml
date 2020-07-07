@@ -34,7 +34,7 @@ jobs:
       - name: Determine version
         id: build-info
         run: |
-          version=$(echo "$(git rev-parse --abbrev-ref HEAD)" | sed 's|release-||' | sed 's|_hotfixes||'))-hotfixes-$(echo ${GITHUB_SHA} | cut -c1-8)
+          version=$(echo "$(git rev-parse --abbrev-ref HEAD)" | sed 's|release-||' | sed 's|_hotfixes||')-hotfixes-$(echo ${GITHUB_SHA} | cut -c1-8)
           echo "##[set-output name=version;]$version"
       - name: Build
         run: ./gradlew -Pversion=${{ steps.build-info.outputs.version }} -PenableCrossCompilerPlugin=true build --stacktrace
