@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: clouddriver
+  test:
+    database:
+      replace: none
+
+services:
+  fiat:
+    enabled: false
+    baseUrl: http://localhost:7003
+  front50:
+    enabled: true
+    baseUrl: http://localhost:8080
+
+redis:
+  enabled: false
