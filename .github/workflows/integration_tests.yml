@@ -29,9 +29,9 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-gradle-
     - name: Dump GitHub context
-        env:
-          GITHUB_CONTEXT: ${{ toJson(github) }}
-        run: echo "$GITHUB_CONTEXT"
+      env:
+        GITHUB_CONTEXT: ${{ toJson(github) }}
+      run: echo "$GITHUB_CONTEXT"
     - name: Cache build output
       uses: actions/cache@v2
       with:
