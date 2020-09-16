@@ -35,7 +35,7 @@ jobs:
     - name: Cache build output
       uses: actions/cache@v2
       with:
-        path: **/build
+        path: '**/build'
         # Saves build outputs for the next commit to use
         key: ${{ runner.os }}-cd-build-${{ github.sha }}
         # Restore build outputs from the previous commit
