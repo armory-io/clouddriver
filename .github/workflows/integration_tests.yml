@@ -3,7 +3,7 @@ name: Integration Tests
 on:
   push:
     branches:
-      - master
+      - gha-tests
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Xmx6g -Xms6g
