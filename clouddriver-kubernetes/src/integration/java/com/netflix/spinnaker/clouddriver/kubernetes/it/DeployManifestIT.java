@@ -744,7 +744,7 @@ public class DeployManifestIT extends BaseTest {
 
     // ------------------------- then --------------------------
     String cm = kubeCluster.execKubectl("-n " + ns + " get secret " + secretName);
-    assertFalse(cm.contains("v000"), "Expected secret with name " + secretName);
+    assertFalse(cm.contains("v001"), "Expected secret with name " + secretName);
   }
 
   // ------------------------------------------------------------------------------------------------------
