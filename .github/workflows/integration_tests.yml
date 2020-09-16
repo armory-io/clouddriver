@@ -28,8 +28,6 @@ jobs:
         # Restore build outputs from the previous commit, if current commit hasn't run successfully yet
         restore-keys: |
           ${{ runner.os }}-cd-build-${{ github.event.before }}
-    - name: Build
-      run: ./gradlew -PenableCrossCompilerPlugin=true --build-cache build
-    # Separating integration tests by provider allows separate logging
-    - name: Kubernetes Integration Tests
+    # Separating integration tests by provider allows to have separate, shorter logs
+    - name: Kubernetes Provider Integration Tests
       run: ./gradlew --build-cache :clouddriver-kubernetes:integrationTest
