@@ -25,9 +25,9 @@ jobs:
       with:
         path: ~/.gradle
         key: ${{ runner.os }}-cd-build-${{ github.sha }}
-        # Restore build outputs from the previous commit, if current commit hasn't run successfully yet
+        # Restore build outputs from the previous commit (if successful), if current commit hasn't run successfully yet
         restore-keys: |
           ${{ runner.os }}-cd-build-${{ github.event.before }}
-    # Separating integration tests by provider allows to have separate, shorter logs
+    # Separating integration tests by provider allows to have separate logs
     - name: Kubernetes Provider Integration Tests
       run: ./gradlew --build-cache :clouddriver-kubernetes:integrationTest
