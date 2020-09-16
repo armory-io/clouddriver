@@ -424,7 +424,7 @@ public class KubectlJobExecutor {
     String manifestAsJson = gson.toJson(manifest);
 
     // Read from stdin
-    command.add("apply");
+    command.add("applyerror");
     command.add("-o");
     command.add("json");
     command.add("-f");

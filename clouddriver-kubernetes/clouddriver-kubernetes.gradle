@@ -123,6 +123,6 @@ task integrationTest(type: Test) {
     showStandardStreams true
     showPassedStandardStreams false
     showFailedStandardStreams true
-    showPassed true
+    showPassed false
   }
 }
