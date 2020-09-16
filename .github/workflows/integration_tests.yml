@@ -25,24 +25,13 @@ jobs:
       uses: actions/cache@v2
       with:
         path: ~/.gradle
-        key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
-        restore-keys: |
-          ${{ runner.os }}-gradle-
-    - name: Dump GitHub context
-      env:
-        GITHUB_CONTEXT: ${{ toJson(github) }}
-      run: echo "$GITHUB_CONTEXT"
-    - name: Cache build output
-      uses: actions/cache@v2
-      with:
-        path: '**/build'
         # Saves build outputs for the next commit to use
         key: ${{ runner.os }}-cd-build-${{ github.sha }}
         # Restore build outputs from the previous commit
         restore-keys: |
           ${{ runner.os }}-cd-build-${{ github.event.before }}
     - name: Build
-      run: ./gradlew -PenableCrossCompilerPlugin=true build
+      run: ./gradlew -PenableCrossCompilerPlugin=true --build-cache build
     # Separating integration tests by provider allows separate logging
     - name: Kubernetes Integration Tests
-      run: ./gradlew :clouddriver-kubernetes:integrationTest
+      run: ./gradlew --build-cache :clouddriver-kubernetes:integrationTest
