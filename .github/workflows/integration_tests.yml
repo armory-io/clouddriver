@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - gha-tests
+  pull_request:
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Xmx6g -Xms6g
@@ -21,10 +22,21 @@ jobs:
     - uses: actions/setup-java@v1
       with:
         java-version: 11
-    - uses: actions/cache@v2
+    - name: Cache on push
+      if: github.event_name == 'push'
+      uses: actions/cache@v2
       with:
         path: ~/.gradle
         key: ${{ runner.os }}-cd-build-${{ github.sha }}
+        # Restore build outputs from the previous commit (if successful), if current commit hasn't run successfully yet
+        restore-keys: |
+          ${{ runner.os }}-cd-build-${{ github.event.before }}
+    - name: Cache on pull_request
+      if: github.event_name == 'pull_request'
+      uses: actions/cache@v2
+      with:
+        path: ~/.gradle
+        key: ${{ runner.os }}-cd-build-${{ github.event.pull_request.head.sha }}
         # Restore build outputs from the previous commit (if successful), if current commit hasn't run successfully yet
         restore-keys: |
           ${{ runner.os }}-cd-build-${{ github.event.before }}
