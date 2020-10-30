@@ -35,11 +35,14 @@ plugins {
   id "nebula.kotlin" version "$kotlinVersion" apply false
   id "org.jetbrains.kotlin.plugin.allopen" version "$kotlinVersion" apply false
   id "com.google.protobuf" version "0.8.12" apply false
+  id "com.jfrog.artifactory" version "4.13.0"
 }
 
 subprojects {
   group = "com.netflix.spinnaker.clouddriver"
   apply plugin: 'io.spinnaker.project'
+  apply plugin: 'maven-publish'
+  apply plugin: 'com.jfrog.artifactory'
 
   if (name != "clouddriver-bom") {
     apply plugin: 'java-library'
@@ -82,6 +85,14 @@ subprojects {
         maxHeapSize = "512m"
       }
     }
+
+    publishing {
+      publications {
+        mavenJava(MavenPublication) {
+          from components.java
+        }
+      }
+    }
   }
 
   if ([korkVersion, fiatVersion].any { it.endsWith("-SNAPSHOT") }) {
@@ -96,6 +107,25 @@ subprojects {
       jvmArgs '-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=7102'
     }
   }
+
+  artifactory {
+    contextUrl = "https://armory.jfrog.io/armory"
+    //The base Artifactory URL if not overridden by the publisher/resolver
+    publish {
+      repository {
+        repoKey = "gradle-dev"
+        username = "${artifactory_user}"
+        password = "${artifactory_password}"
+        maven = true
+      }
+      defaults {
+        publications('mavenJava')
+        publishArtifacts = true
+        publishPom = true
+      }
+    }
+  }
+
 }
 
 defaultTasks ':clouddriver-web:run'
