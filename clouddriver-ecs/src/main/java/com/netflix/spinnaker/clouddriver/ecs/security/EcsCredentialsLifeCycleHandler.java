@@ -66,12 +66,12 @@ public class EcsCredentialsLifeCycleHandler
 
   @Override
   public void credentialsAdded(@NotNull NetflixECSCredentials credentials) {
-    log.info("ECS account, {}, was added. Scheduling caching agents", credentials.getName());
     if (credentials instanceof NetflixAssumeRoleEcsCredentials) {
-      ecsAccountMapper.addMapEntry(((NetflixAssumeRoleEcsCredentials) credentials));
+      ecsAccountMapper.addaddMapEntry(
+          ((NetflixAssumeRoleEcsCredentials) credentials).getAwsAccount());
     }
-    scheduleAgents(credentials);
     log.debug("Caching agents scheduled for ECS account {}", credentials.getName());
+    scheduleAgents(credentials);
   }
 
   @Override
@@ -89,6 +89,7 @@ public class EcsCredentialsLifeCycleHandler
     ecsAccountMapper.removeMapEntry(credentials.getName());
     ecsProvider.synchronizeHealthAgents();
     log.debug("Caching agents removed for ECS account {}", credentials.getName());
+    ecsProvider.synchronizeHealthAgents();
   }
 
   private void scheduleAgents(NetflixECSCredentials credentials) {

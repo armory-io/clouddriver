@@ -20,22 +20,25 @@ import com.netflix.spinnaker.clouddriver.aws.security.NetflixAmazonCredentials;
 import com.netflix.spinnaker.clouddriver.aws.security.NetflixAssumeRoleAmazonCredentials;
 import com.netflix.spinnaker.clouddriver.aws.security.config.CredentialsConfig;
 import com.netflix.spinnaker.clouddriver.ecs.provider.EcsProvider;
+import com.netflix.spinnaker.clouddriver.ecs.provider.view.EcsAccountMapper;
 import com.netflix.spinnaker.clouddriver.security.AccountCredentials;
 import com.netflix.spinnaker.credentials.CompositeCredentialsRepository;
 import com.netflix.spinnaker.credentials.definition.CredentialsParser;
 import lombok.AllArgsConstructor;
 import org.jetbrains.annotations.NotNull;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Lazy;
 
 @AllArgsConstructor
 public class EcsCredentialsParser<T extends NetflixECSCredentials>
     implements CredentialsParser<ECSCredentialsConfig.Account, NetflixECSCredentials> {
 
   private final CompositeCredentialsRepository<AccountCredentials> compositeCredentialsRepository;
+  @Lazy private final EcsAccountMapper ecsAccountMapper;
 
   @Qualifier("amazonCredentialsParser")
   private final CredentialsParser<CredentialsConfig.Account, NetflixAmazonCredentials>
-      amazonCredentialsParser;
+      AmazonCredentialsParser;
 
   @Override
   public NetflixECSCredentials parse(ECSCredentialsConfig.@NotNull Account accountDefinition) {
@@ -49,8 +52,10 @@ public class EcsCredentialsParser<T extends NetflixECSCredentials>
             netflixAmazonCredentials, accountDefinition.getName(), EcsProvider.NAME);
     NetflixECSCredentials netflixECSCredentials =
         new NetflixAssumeRoleEcsCredentials(
-            (NetflixAssumeRoleAmazonCredentials) amazonCredentialsParser.parse(account),
+            (NetflixAssumeRoleAmazonCredentials) AmazonCredentialsParser.parse(account),
             accountDefinition.getAwsAccount());
+    //    ecsAccountMapper.addMapEntry(accountDefinition); To be implemented once
+    // CredentialsRepository is implemented.
     return netflixECSCredentials;
   }
 }
