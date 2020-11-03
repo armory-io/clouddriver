@@ -36,6 +36,7 @@ import com.netflix.spinnaker.clouddriver.security.MapBackedAccountCredentialsRep
 import io.vavr.collection.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ForkJoinPool;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.stubbing.Answer;
@@ -63,7 +64,8 @@ class ScaleCloudFoundryServerGroupAtomicOperationConverterTest {
   }
 
   private final CloudFoundryCredentials cloudFoundryCredentials =
-      new CloudFoundryCredentials("test", "", "", "", "", "", "", false, 500, 16, cacheRepository) {
+      new CloudFoundryCredentials(
+          "test", "", "", "", "", "", "", false, 500, cacheRepository, ForkJoinPool.commonPool()) {
         public CloudFoundryClient getClient() {
           return cloudFoundryClient;
         }

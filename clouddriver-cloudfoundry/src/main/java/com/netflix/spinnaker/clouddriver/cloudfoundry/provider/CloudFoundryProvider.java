@@ -29,6 +29,7 @@ import com.netflix.spinnaker.clouddriver.cloudfoundry.cache.Keys;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ForkJoinPool;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
 import lombok.Getter;
@@ -37,6 +38,7 @@ import lombok.RequiredArgsConstructor;
 @RequiredArgsConstructor
 @Getter
 public class CloudFoundryProvider extends AgentSchedulerAware implements SearchableProvider {
+  private final ForkJoinPool forkJoinPool;
   private final Set<String> defaultCaches =
       Stream.of(
               APPLICATIONS.getNs(),
