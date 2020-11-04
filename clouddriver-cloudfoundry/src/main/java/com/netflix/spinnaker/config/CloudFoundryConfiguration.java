@@ -26,6 +26,7 @@ import com.netflix.spinnaker.clouddriver.helpers.OperationPoller;
 import com.netflix.spinnaker.clouddriver.security.AccountCredentialsRepository;
 import java.util.Collections;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ForkJoinPool;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
@@ -48,6 +49,12 @@ public class CloudFoundryConfiguration {
   }
 
   @Bean
+  public ForkJoinPool cloudFoundryThreadPool(
+      CloudFoundryConfigurationProperties cloudFoundryConfigurationProperties) {
+    return new ForkJoinPool(cloudFoundryConfigurationProperties.getApiRequestParallelism());
+  }
+
+  @Bean
   CloudFoundryCredentialsSynchronizer cloudFoundryCredentialsSynchronizer(
       CloudFoundryProvider cloudFoundryProvider,
       CloudFoundryConfigurationProperties cloudFoundryConfigurationProperties,
@@ -65,8 +72,9 @@ public class CloudFoundryConfiguration {
   }
 
   @Bean
-  CloudFoundryProvider cloudFoundryProvider() {
-    return new CloudFoundryProvider(Collections.newSetFromMap(new ConcurrentHashMap<>()));
+  CloudFoundryProvider cloudFoundryProvider(ForkJoinPool cloudFoundryThreadPool) {
+    return new CloudFoundryProvider(
+        cloudFoundryThreadPool, Collections.newSetFromMap(new ConcurrentHashMap<>()));
   }
 
   @Bean

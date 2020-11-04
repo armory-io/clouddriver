@@ -27,6 +27,7 @@ import com.netflix.spinnaker.clouddriver.security.ProviderUtils;
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ForkJoinPool;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.DependsOn;
@@ -37,9 +38,12 @@ public class CloudFoundryProviderConfig {
   @Bean
   @DependsOn("cloudFoundryAccountCredentials")
   public CloudFoundryProvider cloudFoundryProvider(
-      AccountCredentialsRepository accountCredentialsRepository, Registry registry) {
+      ForkJoinPool cloudFoundryThreadPool,
+      AccountCredentialsRepository accountCredentialsRepository,
+      Registry registry) {
     CloudFoundryProvider provider =
-        new CloudFoundryProvider(Collections.newSetFromMap(new ConcurrentHashMap<>()));
+        new CloudFoundryProvider(
+            cloudFoundryThreadPool, Collections.newSetFromMap(new ConcurrentHashMap<>()));
     synchronizeCloudFoundryProvider(provider, accountCredentialsRepository, registry);
     return provider;
   }

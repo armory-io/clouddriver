@@ -30,6 +30,7 @@ import com.netflix.spinnaker.clouddriver.cloudfoundry.client.HttpCloudFoundryCli
 import com.netflix.spinnaker.clouddriver.cloudfoundry.model.CloudFoundrySpace;
 import com.netflix.spinnaker.clouddriver.security.AccountCredentials;
 import java.util.*;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
@@ -67,14 +68,14 @@ public class CloudFoundryCredentials implements AccountCredentials<CloudFoundryC
 
   @Nullable private final Integer resultsPerPage;
 
-  private final int maxCapiConnectionsForCache;
-
   private final Supplier<List<CloudFoundrySpace>> spaceSupplier =
       Memoizer.memoizeWithExpiration(this::spaceSupplier, SPACE_EXPIRY_SECONDS, TimeUnit.SECONDS);
 
   private CloudFoundryClient credentials;
 
   private CacheRepository cacheRepository;
+
+  private final ForkJoinPool forkJoinPool;
 
   public CloudFoundryCredentials(
       String name,
@@ -86,8 +87,8 @@ public class CloudFoundryCredentials implements AccountCredentials<CloudFoundryC
       String environment,
       boolean skipSslValidation,
       Integer resultsPerPage,
-      Integer maxCapiConnectionsForCache,
-      CacheRepository cacheRepository) {
+      CacheRepository cacheRepository,
+      ForkJoinPool forkJoinPool) {
     this.name = name;
     this.appsManagerUri = appsManagerUri;
     this.metricsUri = metricsUri;
@@ -97,8 +98,8 @@ public class CloudFoundryCredentials implements AccountCredentials<CloudFoundryC
     this.environment = Optional.ofNullable(environment).orElse("dev");
     this.skipSslValidation = skipSslValidation;
     this.resultsPerPage = Optional.ofNullable(resultsPerPage).orElse(100);
-    this.maxCapiConnectionsForCache = Optional.ofNullable(maxCapiConnectionsForCache).orElse(16);
     this.cacheRepository = cacheRepository;
+    this.forkJoinPool = forkJoinPool;
   }
 
   public CloudFoundryClient getCredentials() {
@@ -113,7 +114,7 @@ public class CloudFoundryCredentials implements AccountCredentials<CloudFoundryC
               password,
               skipSslValidation,
               resultsPerPage,
-              maxCapiConnectionsForCache);
+              forkJoinPool);
     }
     return credentials;
   }

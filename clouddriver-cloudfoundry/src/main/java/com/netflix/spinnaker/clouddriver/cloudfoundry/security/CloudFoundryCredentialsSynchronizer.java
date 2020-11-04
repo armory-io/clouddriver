@@ -93,8 +93,8 @@ public class CloudFoundryCredentialsSynchronizer implements CredentialsInitializ
                   managedAccount.getEnvironment(),
                   managedAccount.isSkipSslValidation(),
                   managedAccount.getResultsPerPage(),
-                  managedAccount.getMaxCapiConnectionsForCache(),
-                  cacheRepository);
+                  cacheRepository,
+                  cloudFoundryProvider.getForkJoinPool());
 
           AccountCredentials existingCredentials =
               accountCredentialsRepository.getOne(credentials.getName());

@@ -37,6 +37,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ForkJoinPool;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -49,7 +50,8 @@ class CloudFoundryCredentialsSynchronizerTest {
   private final AccountCredentialsRepository repository =
       new MapBackedAccountCredentialsRepository();
 
-  private final CloudFoundryProvider provider = new CloudFoundryProvider(new ArrayList<>());
+  private final CloudFoundryProvider provider =
+      new CloudFoundryProvider(ForkJoinPool.commonPool(), new ArrayList<>());
   private final TestAgentScheduler scheduler = new TestAgentScheduler();
 
   private final CatsModule catsModule = mock(CatsModule.class);
@@ -161,8 +163,8 @@ class CloudFoundryCredentialsSynchronizerTest {
         null,
         false,
         null,
-        16,
-        cacheRepository);
+        cacheRepository,
+        ForkJoinPool.commonPool());
   }
 
   private void loadProviderFromRepository() {
