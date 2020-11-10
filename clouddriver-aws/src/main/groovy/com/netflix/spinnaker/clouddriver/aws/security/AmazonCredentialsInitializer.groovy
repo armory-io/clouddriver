@@ -110,54 +110,6 @@ class AmazonCredentialsInitializer {
   @Bean
   @ConditionalOnMissingBean(
     name = "amazonCredentialsInitializerSynchronizable"
-    value = [Account.class, NetflixAmazonCredentials.class],
-    parameterizedContainer = CredentialsRepository.class
-  )
-  CredentialsParser<Account, NetflixAmazonCredentials> amazonCredentialsParser(
-    AWSCredentialsProvider awsCredentialsProvider,
-    AmazonClientProvider amazonClientProvider,
-    Class<? extends NetflixAmazonCredentials> credentialsType, CredentialsConfig credentialsConfig
-  ) {
-    new AmazonCredentialsParser<>(awsCredentialsProvider, amazonClientProvider, credentialsType, credentialsConfig)
-  }
-
-  @Bean
-  @Primary
-  @ConditionalOnMissingBean(
-    name = "amazonCredentialsRepository"
-  )
-  CredentialsRepository<NetflixAmazonCredentials> amazonCredentialsRepository(
-    @Lazy CredentialsLifecycleHandler<NetflixAmazonCredentials> eventHandler
-  ) {
-    return new MapBackedCredentialsRepository<NetflixAmazonCredentials>(AmazonCloudProvider.ID, eventHandler)
-  }
-
-  @Bean
-  @ConditionalOnMissingBean(
-    name = "amazonCredentialsLoader"
-  )
-  AbstractCredentialsLoader<? extends NetflixAmazonCredentials> amazonCredentialsLoader(
-    CredentialsParser<Account, NetflixAmazonCredentials>  amazonCredentialsParser,
-    @Nullable CredentialsDefinitionSource<Account> amazonCredentialsSource,
-    CredentialsConfig credentialsConfig,
-    CredentialsRepository<NetflixAmazonCredentials> repository,
-    DefaultAccountConfigurationProperties defaultAccountConfigurationProperties
-  ) {
-    if (amazonCredentialsSource == null) {
-      amazonCredentialsSource = { -> credentialsConfig.getAccounts() } as CredentialsDefinitionSource
-    }
-    return new AmazonBasicCredentialsLoader<Account, NetflixAmazonCredentials>(
-      amazonCredentialsSource,
-      amazonCredentialsParser,
-      repository,
-      credentialsConfig,
-      defaultAccountConfigurationProperties
-    )
-  }
-
-  @Bean
-  @ConditionalOnMissingBean(
-    name = "amazonCredentialsInitializerSynchronizable"
   )
   CredentialsInitializerSynchronizable amazonCredentialsInitializerSynchronizable(
     AbstractCredentialsLoader<? extends NetflixAmazonCredentials> amazonCredentialsLoader

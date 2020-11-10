@@ -26,14 +26,12 @@ import com.netflix.spinnaker.credentials.definition.CredentialsParser;
 import lombok.AllArgsConstructor;
 import org.jetbrains.annotations.NotNull;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.annotation.Lazy;
 
 @AllArgsConstructor
 public class EcsCredentialsParser<T extends NetflixECSCredentials>
     implements CredentialsParser<ECSCredentialsConfig.Account, NetflixECSCredentials> {
 
   private final CompositeCredentialsRepository<AccountCredentials> compositeCredentialsRepository;
-  @Lazy private final EcsAccountMapper ecsAccountMapper;
 
   @Qualifier("amazonCredentialsParser")
   private final CredentialsParser<CredentialsConfig.Account, NetflixAmazonCredentials>

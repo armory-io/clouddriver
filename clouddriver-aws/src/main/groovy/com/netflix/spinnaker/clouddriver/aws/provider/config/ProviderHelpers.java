@@ -31,6 +31,7 @@ import com.netflix.spinnaker.clouddriver.aws.provider.AwsCleanupProvider;
 import com.netflix.spinnaker.clouddriver.aws.provider.AwsInfrastructureProvider;
 import com.netflix.spinnaker.clouddriver.aws.provider.AwsProvider;
 import com.netflix.spinnaker.clouddriver.aws.provider.agent.AmazonApplicationLoadBalancerCachingAgent;
+import com.netflix.spinnaker.clouddriver.aws.provider.agent.AmazonCachingAgentFilterConfiguration;
 import com.netflix.spinnaker.clouddriver.aws.provider.agent.AmazonCertificateCachingAgent;
 import com.netflix.spinnaker.clouddriver.aws.provider.agent.AmazonCloudFormationCachingAgent;
 import com.netflix.spinnaker.clouddriver.aws.provider.agent.AmazonElasticIpCachingAgent;
@@ -122,6 +123,7 @@ public class ProviderHelpers {
       ObjectMapper objectMapper,
       Registry registry,
       EddaTimeoutConfig eddaTimeoutConfig,
+      AmazonCachingAgentFilterConfiguration amazonCachingAgentFilterConfiguration,
       AwsProvider awsProvider,
       AmazonCloudProvider amazonCloudProvider,
       DynamicConfigService dynamicConfigService,
@@ -143,15 +145,13 @@ public class ProviderHelpers {
                 region.getName(),
                 objectMapper,
                 registry,
-                eddaTimeoutConfig));
+                eddaTimeoutConfig,
+                amazonCachingAgentFilterConfiguration));
         newlyAddedAgents.add(
             new LaunchConfigCachingAgent(
                 amazonClientProvider, credentials, region.getName(), objectMapper, registry));
-        boolean publicImages = false;
-        if (!publicRegions.contains(region.getName())) {
-          publicImages = true;
-          publicRegions.add(region.getName());
-        }
+
+        // always index private images per account/region
         newlyAddedAgents.add(
             new ImageCachingAgent(
                 amazonClientProvider,
@@ -159,8 +159,23 @@ public class ProviderHelpers {
                 region.getName(),
                 objectMapper,
                 registry,
-                publicImages,
+                false,
                 dynamicConfigService));
+
+        if (!publicRegions.contains(region.getName())) {
+          // only index public images once per region (regardless of account)
+          publicRegions.add(region.getName());
+          newlyAddedAgents.add(
+              new ImageCachingAgent(
+                  amazonClientProvider,
+                  credentials,
+                  region.getName(),
+                  objectMapper,
+                  registry,
+                  true,
+                  dynamicConfigService));
+        }
+
         newlyAddedAgents.add(
             new InstanceCachingAgent(
                 amazonClientProvider, credentials, region.getName(), objectMapper, registry));
