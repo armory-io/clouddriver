@@ -1,9 +1,9 @@
-name: JPMC test Build
+name: Test Fixes Build
 
 on:
   push:
     branches:
-      - release-*_jpmc
+      - release-*_testfixes
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Xmx6g -Xms6g
@@ -35,10 +35,10 @@ jobs:
         id: build-info
         run: |
           branch=$(git rev-parse --abbrev-ref HEAD)
-          semVersion=$(echo "$branch" | sed 's|release-||' | sed 's|_jpmc||')
+          semVersion=$(echo "$branch" | sed 's|release-||' | sed 's|_testfixes||')
           read -r major minor patch <<< "${semVersion//./ }"
-          armoryBranch=release-2.${minor}.x_jpmc
-          version=${semVersion}-jpmc-$(echo ${GITHUB_SHA} | cut -c1-7)
+          armoryBranch=release-2.${minor}.x_testfixes
+          version=${semVersion}-testfixes-$(echo ${GITHUB_SHA} | cut -c1-7)
           echo "Building version: $version"
           echo "##[set-output name=version;]$version"
           echo "##[set-output name=armoryBranch;]$armoryBranch"
