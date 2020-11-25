@@ -13,6 +13,7 @@ jobs:
     # Only run this on repositories in the 'armory-io' org
     if: startsWith(github.repository, 'armory-io/')
     env:
+      BASE_PROJECT: clouddriver
       GRADLE_ARGS: -Partifactory_user=${{secrets.ARTIFACTORY_USER}} -Partifactory_password=${{secrets.ARTIFACTORY_PASSWORD}}
     runs-on: ubuntu-latest
     steps:
@@ -65,3 +66,20 @@ jobs:
           git commit -m "chore(dependencies): Autobump oss clouddriver version"
           git pull
           git push
+      # Adding OSS docker build for SNAP
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/heads/release-')
+        run: |
+          ./gradlew final test docker dockerPush $GRADLE_ARGS
+          echo "BUILD_NUMBER=$(./gradlew -Prelease.useLastTag=true $GRADLE_ARGS  printVersion|grep VERSION|awk -F: '{print $2}')" >> $GITHUB_ENV
+      - name: Login to Docker Hub
+        if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release-')
+        run: docker login -u ${{ secrets.DOCKER_HUB_USER }} -p '${{ secrets.DOCKER_HUB_PASS }}'
+      - name: Publish Release to Docker Hub
+        if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release-')
+        run: |
+          RELEASE=$(./gradlew -Prelease.useLastTag=true $GRADLE_ARGS  printVersion|grep VERSION|awk -F: '{print $2}')
+          echo "Tagging armory-docker-all.jfrog.io/armory/$BASE_PROJECT$RELEASE to armory/$BASE_PROJECT:$RELEASE"
+          docker image tag armory-docker-local.jfrog.io/armory/$BASE_PROJECT:$RELEASE armory/$BASE_PROJECT:$RELEASE
+          echo "Pushing image..."
+          docker push armory/$BASE_PROJECT:$RELEASE
