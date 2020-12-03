@@ -68,15 +68,15 @@ jobs:
           git push
       # Adding OSS docker build
       - name: Publish Release
-        if: startsWith(github.ref, 'refs/heads/release-*_hotfixes')
+        if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
         run: |
           ./gradlew final test docker dockerPush $GRADLE_ARGS
           echo "BUILD_NUMBER=$(./gradlew -Prelease.useLastTag=true $GRADLE_ARGS  printVersion|grep VERSION|awk -F: '{print $2}')" >> $GITHUB_ENV
       - name: Login to Docker Hub
-        if: startsWith(github.ref, 'refs/heads/release-*_hotfixes')
+        if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
         run: docker login -u ${{ secrets.DOCKER_HUB_USER }} -p '${{ secrets.DOCKER_HUB_PASS }}'
       - name: Publish Release to Docker Hub
-        if: startsWith(github.ref, 'refs/heads/release-*_hotfixes')
+        if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
         run: |
           RELEASE=$(./gradlew -Prelease.useLastTag=true $GRADLE_ARGS  printVersion|grep VERSION|awk -F: '{print $2}')
           echo "Tagging armory-docker-all.jfrog.io/armory/$BASE_PROJECT$RELEASE to armory/$BASE_PROJECT:$RELEASE"
