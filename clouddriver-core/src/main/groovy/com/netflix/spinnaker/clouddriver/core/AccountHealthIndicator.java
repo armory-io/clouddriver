@@ -19,10 +19,15 @@ package com.netflix.spinnaker.clouddriver.core;
 import com.google.common.collect.ImmutableMap;
 import com.netflix.spectator.api.Registry;
 import com.netflix.spectator.api.patterns.PolledMeter;
+import com.netflix.spinnaker.clouddriver.config.ThreadConfigurationProperties;
 import com.netflix.spinnaker.clouddriver.security.AccountCredentials;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.annotation.Nonnull;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.actuate.health.Health;
 import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -45,6 +50,10 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
   @Nonnull private Health health = new Health.Builder().up().build();
   @Nonnull private final AtomicLong unhealthyAccounts = new AtomicLong(0);
 
+  @Autowired private ThreadConfigurationProperties threadConfigurationProperties;
+
+  private ExecutorService executorService;
+
   /**
    * Create an {@code AccountHealthIndicator} reporting metrics to the supplied registry, using the
    * supplied id.
@@ -65,17 +74,68 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
     return health;
   }
 
+  class AccountHealth implements Callable<Optional<String>> {
+    T account;
+
+    public AccountHealth(T account) {
+      this.account = account;
+    }
+
+    public Optional<String> call() throws Exception {
+      return accountHealth(account);
+    }
+  }
+
   @Scheduled(fixedDelay = 300000L)
   public void checkHealth() {
     long errors = 0;
     ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
-    for (T account : getAccounts()) {
-      Optional<String> error = accountHealth(account);
-      if (error.isPresent()) {
-        errors++;
-        builder.put(account.getName(), error.get());
+
+    if (threadConfigurationProperties.getAccountThreads() == null
+      || threadConfigurationProperties.getAccountThreads() < 2) {
+      for (T account : getAccounts()) {
+        Optional<String> error = accountHealth(account);
+        if (error.isPresent()) {
+          errors++;
+          builder.put(account.getName(), error.get());
+        }
+      }
+    } else {
+      if (executorService == null) {
+        executorService =
+          Executors.newFixedThreadPool(threadConfigurationProperties.getAccountThreads());
+      }
+
+      List<Callable<Optional<String>>> callableTasks = new ArrayList<>();
+      for (T account : getAccounts()) {
+        callableTasks.add(new AccountHealth(account));
+      }
+
+      List<Future<Optional<String>>> futures = null;
+      try {
+        futures = executorService.invokeAll(callableTasks);
+      } catch (InterruptedException e) {
+        return;
+      }
+
+      int i = 0;
+      for (T account : getAccounts()) {
+        Future<Optional<String>> future = futures.get(i);
+        Optional<String> error = null;
+        try {
+          error = future.get();
+          // By using invokeAll all tasks will have finished at this point.
+        } catch (ExecutionException | InterruptedException e) {
+          return;
+        }
+        if (error.isPresent()) {
+          errors++;
+          builder.put(account.getName(), error.get());
+        }
+        i++;
       }
     }
+
     unhealthyAccounts.set(errors);
     health = new Health.Builder().up().withDetails(builder.build()).build();
   }
