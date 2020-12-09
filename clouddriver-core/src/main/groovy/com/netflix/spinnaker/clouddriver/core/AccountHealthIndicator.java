@@ -92,7 +92,7 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
     ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
 
     if (threadConfigurationProperties.getAccountThreads() == null
-      || threadConfigurationProperties.getAccountThreads() < 2) {
+        || threadConfigurationProperties.getAccountThreads() < 2) {
       for (T account : getAccounts()) {
         Optional<String> error = accountHealth(account);
         if (error.isPresent()) {
@@ -103,7 +103,7 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
     } else {
       if (executorService == null) {
         executorService =
-          Executors.newFixedThreadPool(threadConfigurationProperties.getAccountThreads());
+            Executors.newFixedThreadPool(threadConfigurationProperties.getAccountThreads());
       }
 
       List<Callable<Optional<String>>> callableTasks = new ArrayList<>();
