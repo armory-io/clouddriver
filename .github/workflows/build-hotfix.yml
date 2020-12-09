@@ -13,6 +13,7 @@ jobs:
     # Only run this on repositories in the 'armory-io' org
     if: startsWith(github.repository, 'armory-io/')
     env:
+      BASE_PROJECT: clouddriver
       GRADLE_ARGS: -Partifactory_user=${{secrets.ARTIFACTORY_USER}} -Partifactory_password=${{secrets.ARTIFACTORY_PASSWORD}}
     runs-on: ubuntu-latest
     steps:
@@ -65,3 +66,20 @@ jobs:
           git commit -m "chore(dependencies): Autobump oss clouddriver version"
           git pull
           git push
+
+      # Adding OSS docker build
+      - name: Login to Docker Hub
+        if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
+        run: docker login -u ${{ secrets.DOCKER_HUB_USER }} -p '${{ secrets.DOCKER_HUB_PASS }}'
+
+      - name: Build Hotfix Release
+        if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
+        run: |
+          echo "Building Hotfix Image"
+          docker build -t compile -f Dockerfile.compile . && docker build -t armory/$BASE_PROJECT:${{ steps.build-info.outputs.version }} -f Dockerfile.slim
+
+      - name: Publish Release to Docker Hub
+        if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
+        run: |
+          echo "Pushing Hotfix Image"
+          docker push armory/$BASE_PROJECT:${{ steps.build-info.outputs.version }}
