@@ -91,7 +91,8 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
     long errors = 0;
     ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
 
-    if (threadConfigurationProperties.getAccountThreads() == null
+    if (threadConfigurationProperties == null
+        || threadConfigurationProperties.getAccountThreads() == null
         || threadConfigurationProperties.getAccountThreads() < 2) {
       for (T account : getAccounts()) {
         Optional<String> error = accountHealth(account);
