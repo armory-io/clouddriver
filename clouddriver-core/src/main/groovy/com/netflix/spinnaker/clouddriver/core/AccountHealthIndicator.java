@@ -20,14 +20,12 @@ import com.google.common.collect.ImmutableMap;
 import com.netflix.spectator.api.Registry;
 import com.netflix.spectator.api.patterns.PolledMeter;
 import com.netflix.spinnaker.clouddriver.security.AccountCredentials;
-
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.StreamSupport;
 import javax.annotation.Nonnull;
-
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.actuate.health.Health;
 import org.springframework.boot.actuate.health.HealthIndicator;
@@ -47,11 +45,12 @@ import org.springframework.scheduling.annotation.Scheduled;
  * @param <T> The type of account credentials this health indicator supports
  */
 public abstract class AccountHealthIndicator<T extends AccountCredentials>
-  implements HealthIndicator {
+    implements HealthIndicator {
   @Nonnull private Health health = new Health.Builder().up().build();
   @Nonnull private final AtomicLong unhealthyAccounts = new AtomicLong(0);
 
-  @Value("${clouddriver.account-threads:-1}") private int threads;
+  @Value("${clouddriver.account-threads:-1}")
+  private int threads;
 
   private ForkJoinPool customThreadPool;
 
@@ -87,12 +86,13 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
     }
   }
 
-  private Runnable getRunnable(ImmutableMap.Builder<String, String> builder, boolean isParallel){
-    return () -> StreamSupport.stream(getAccounts().spliterator(), isParallel)
-      .map(a -> Map.entry(a.getName(), accountHealth(a)))
-      .filter(entry -> entry.getValue().isPresent())
-      .map(entry -> Map.entry(entry.getKey(), entry.getValue().get()))
-      .forEach(builder::put);
+  private Runnable getRunnable(ImmutableMap.Builder<String, String> builder, boolean isParallel) {
+    return () ->
+        StreamSupport.stream(getAccounts().spliterator(), isParallel)
+            .map(a -> Map.entry(a.getName(), accountHealth(a)))
+            .filter(entry -> entry.getValue().isPresent())
+            .map(entry -> Map.entry(entry.getKey(), entry.getValue().get()))
+            .forEach(builder::put);
   }
 
   @Scheduled(fixedDelay = 30000L)
@@ -102,7 +102,7 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
     boolean isParallel = threads > 1;
     Runnable runnable = getRunnable(builder, isParallel);
     if (isParallel) {
-      if(customThreadPool == null) {
+      if (customThreadPool == null) {
         customThreadPool = new ForkJoinPool(threads);
       }
       try {
