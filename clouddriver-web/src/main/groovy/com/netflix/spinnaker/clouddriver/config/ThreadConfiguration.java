@@ -17,24 +17,23 @@
 
 package com.netflix.spinnaker.clouddriver.config;
 
-import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 
 @Configuration
-@EnableConfigurationProperties(ThreadConfigurationProperties.class)
 public class ThreadConfiguration {
 
-  @Autowired private ThreadConfigurationProperties threadConfigurationProperties;
+  @Value("${clouddriver.startup-threads:-1}")
+  private int threads;
 
   @Bean
   @ConditionalOnProperty("clouddriver.startup-threads")
   public ThreadPoolTaskScheduler threadPoolTaskScheduler() {
     ThreadPoolTaskScheduler threadPoolTaskScheduler = new ThreadPoolTaskScheduler();
-    threadPoolTaskScheduler.setPoolSize(threadConfigurationProperties.getStartupThreads());
+    threadPoolTaskScheduler.setPoolSize(threads);
     threadPoolTaskScheduler.setThreadNamePrefix("ThreadPoolTaskScheduler");
     return threadPoolTaskScheduler;
   }
