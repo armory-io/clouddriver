@@ -21,11 +21,11 @@ import com.netflix.spectator.api.Registry;
 import com.netflix.spectator.api.patterns.PolledMeter;
 import com.netflix.spinnaker.clouddriver.config.ThreadConfigurationProperties;
 import com.netflix.spinnaker.clouddriver.security.AccountCredentials;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.StreamSupport;
 import javax.annotation.Nonnull;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.actuate.health.Health;
@@ -52,7 +52,7 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
 
   @Autowired private ThreadConfigurationProperties threadConfigurationProperties;
 
-  private ExecutorService executorService;
+  private ForkJoinPool customThreadPool;
 
   /**
    * Create an {@code AccountHealthIndicator} reporting metrics to the supplied registry, using the
@@ -86,9 +86,8 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
     }
   }
 
-  @Scheduled(fixedDelay = 300000L)
+  @Scheduled(fixedDelay = 30000L)
   public void checkHealth() {
-    long errors = 0;
     ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
 
     if (threadConfigurationProperties == null
@@ -97,48 +96,32 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
       for (T account : getAccounts()) {
         Optional<String> error = accountHealth(account);
         if (error.isPresent()) {
-          errors++;
           builder.put(account.getName(), error.get());
         }
       }
     } else {
-      if (executorService == null) {
-        executorService =
-            Executors.newFixedThreadPool(threadConfigurationProperties.getAccountThreads());
+      if (customThreadPool == null) {
+        customThreadPool = new ForkJoinPool(threadConfigurationProperties.getAccountThreads());
       }
 
-      List<Callable<Optional<String>>> callableTasks = new ArrayList<>();
-      for (T account : getAccounts()) {
-        callableTasks.add(new AccountHealth(account));
-      }
-
-      List<Future<Optional<String>>> futures = null;
       try {
-        futures = executorService.invokeAll(callableTasks);
-      } catch (InterruptedException e) {
+        customThreadPool
+            .submit(
+                () ->
+                    StreamSupport.stream(getAccounts().spliterator(), true)
+                        .map(a -> Map.entry(a.getName(), accountHealth(a)))
+                        .filter(entry -> entry.getValue().isPresent())
+                        .map(entry -> Map.entry(entry.getKey(), entry.getValue().get()))
+                        .forEach(builder::put))
+            .get();
+      } catch (InterruptedException | ExecutionException e) {
         return;
-      }
-
-      int i = 0;
-      for (T account : getAccounts()) {
-        Future<Optional<String>> future = futures.get(i);
-        Optional<String> error = null;
-        try {
-          error = future.get();
-          // By using invokeAll all tasks will have finished at this point.
-        } catch (ExecutionException | InterruptedException e) {
-          return;
-        }
-        if (error.isPresent()) {
-          errors++;
-          builder.put(account.getName(), error.get());
-        }
-        i++;
       }
     }
 
-    unhealthyAccounts.set(errors);
-    health = new Health.Builder().up().withDetails(builder.build()).build();
+    ImmutableMap failingAccounts = builder.build();
+    unhealthyAccounts.set(failingAccounts.size());
+    health = new Health.Builder().up().withDetails(failingAccounts).build();
   }
 
   /**
