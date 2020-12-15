@@ -74,18 +74,6 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
     return health;
   }
 
-  class AccountHealth implements Callable<Optional<String>> {
-    T account;
-
-    public AccountHealth(T account) {
-      this.account = account;
-    }
-
-    public Optional<String> call() throws Exception {
-      return accountHealth(account);
-    }
-  }
-
   private Runnable getRunnable(ImmutableMap.Builder<String, String> builder, boolean isParallel) {
     return () ->
         StreamSupport.stream(getAccounts().spliterator(), isParallel)
