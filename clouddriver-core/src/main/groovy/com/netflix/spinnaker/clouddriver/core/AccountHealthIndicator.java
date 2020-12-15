@@ -95,7 +95,7 @@ public abstract class AccountHealthIndicator<T extends AccountCredentials>
             .forEach(builder::put);
   }
 
-  @Scheduled(fixedDelay = 30000L)
+  @Scheduled(fixedDelay = 300000L)
   public void checkHealth() {
     ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
 
