@@ -51,7 +51,7 @@ jobs:
           path: 'external/clouddriver-armory'
           token: ${{ secrets.EXTENDED_TOKEN_GITHUB }}
       - name: Build
-        run: ./gradlew -Pversion=${{ steps.build-info.outputs.version }} -PenableCrossCompilerPlugin=true build --stacktrace
+        run: ./gradlew -Pversion=${{ steps.build-info.outputs.version }} -PenableCrossCompilerPlugin=true build installDist --stacktrace
       - name: Publish to Artifactory
         run: ./gradlew $GRADLE_ARGS -Pversion=${{ steps.build-info.outputs.version }} artifactPublish -x test
       - name: Update armory-io/clouddriver-armory
@@ -78,7 +78,8 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
         run: |
           echo "Building Hotfix Image"
-          docker build -t compile -f Dockerfile.compile . && docker build -t armory/$BASE_PROJECT:${{ steps.build-info.outputs.version }} -f Dockerfile.slim .
+          # docker build -t compile -f Dockerfile.compile . && docker build -t armory/$BASE_PROJECT:${{ steps.build-info.outputs.version }} -f Dockerfile.slim .
+          docker build -t armory/$BASE_PROJECT:${{ steps.build-info.outputs.version }} -f Dockerfile.slim .
 
       - name: Publish Release to Docker Hub
         if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
