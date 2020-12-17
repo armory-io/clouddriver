@@ -78,7 +78,7 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
         run: |
           echo "Building Hotfix Image"
-          docker build -t compile -f Dockerfile.compile . && docker build -t armory/$BASE_PROJECT:${{ steps.build-info.outputs.version }} -f Dockerfile.slim
+          docker build -t compile -f Dockerfile.compile . && docker build -t armory/$BASE_PROJECT:${{ steps.build-info.outputs.version }} -f Dockerfile.slim .
 
       - name: Publish Release to Docker Hub
         if: startsWith(github.ref, 'refs/heads/release-') && endsWith(github.ref, '_hotfixes')
