@@ -1,15 +1,8 @@
 package com.netflix.spinnaker.cats.sql
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.netflix.spinnaker.cats.cache.Cache
 import com.netflix.spinnaker.cats.cache.RelationshipCacheFilter
 import com.netflix.spinnaker.cats.cache.WriteableCacheSpec
 import com.netflix.spinnaker.cats.sql.cache.SqlCache
-import com.netflix.spinnaker.cats.sql.cache.SqlCacheMetrics
-import com.netflix.spinnaker.config.SqlConstraints
-import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService
-import com.netflix.spinnaker.kork.sql.config.RetryProperties
-import com.netflix.spinnaker.kork.sql.config.SqlRetryProperties
 import com.netflix.spinnaker.kork.sql.test.SqlTestUtil
 import com.zaxxer.hikari.HikariDataSource
 import org.jooq.DSLContext
@@ -18,11 +11,7 @@ import spock.lang.AutoCleanup
 import spock.lang.Shared
 import spock.lang.Unroll
 
-import java.time.Clock
-import java.time.Instant
-import java.time.ZoneId
-
-class SqlCacheSpec extends WriteableCacheSpec {
+abstract class SqlCacheSpec extends WriteableCacheSpec {
 
   @Shared
   DSLContext context
@@ -95,35 +84,6 @@ class SqlCacheSpec extends WriteableCacheSpec {
     null                                                   || DSL.field("meowdy").eq("partner") || "meowdy = 'partner'"
     RelationshipCacheFilter.include("instances", "images") || null                              || "(\n  rel_type like 'instances%'\n  or rel_type like 'images%'\n)"
     RelationshipCacheFilter.include("images")              || DSL.field("meowdy").eq("partner") || "(\n  meowdy = 'partner'\n  and rel_type like 'images%'\n)"
-    null                                                   || null                              || "1 = 1"
+    null                                                   || null                              || "true"
   }
-
-  @Override
-  Cache getSubject() {
-    def mapper = new ObjectMapper()
-    def clock = new Clock.FixedClock(Instant.EPOCH, ZoneId.of("UTC"))
-    def sqlRetryProperties = new SqlRetryProperties(new RetryProperties(1, 10), new RetryProperties(1, 10))
-
-    def dynamicConfigService = Mock(DynamicConfigService) {
-      getConfig(_ as Class, _ as String, _) >> 2
-    }
-
-    SqlTestUtil.TestDatabase testDatabase = SqlTestUtil.initTcMysqlDatabase()
-    context = testDatabase.context
-    dataSource = testDatabase.dataSource
-
-    return new SqlCache(
-      "test",
-      context,
-      mapper,
-      null,
-      clock,
-      sqlRetryProperties,
-      "test",
-      Mock(SqlCacheMetrics),
-      dynamicConfigService,
-      new SqlConstraints()
-    )
-  }
-
 }
