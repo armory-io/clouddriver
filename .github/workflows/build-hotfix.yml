@@ -60,12 +60,14 @@ jobs:
           sed 's|spinnakerRelease=.*|spinnakerRelease=${{ steps.build-info.outputs.version }}|' gradle.properties > gradle.properties.new
           mv gradle.properties.new gradle.properties
           git add gradle.properties
+          if [[ "x$(git status --porcelain)" != "x" ]] ; then
+            git config user.email "githubactions@fake.com"
+            git config user.name "Github Actions"
+            git commit -m "chore(dependencies): Autobump oss clouddriver version"
+            git pull
+            git push
+          fi
           git status
-          git config user.email "githubactions@fake.com"
-          git config user.name "Github Actions"
-          git commit -m "chore(dependencies): Autobump oss clouddriver version"
-          git pull
-          git push
 
       # Adding OSS docker build
       - name: Login to Docker Hub
