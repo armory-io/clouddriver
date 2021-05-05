@@ -161,11 +161,11 @@ public class OperationsService {
                           DescriptionValidationErrors errors =
                               new DescriptionValidationErrors(description);
 
-                          DescriptionValidator validator =
+                          List<DescriptionValidator> validators =
                               atomicOperationsRegistry.getAtomicOperationDescriptionValidator(
                                   DescriptionValidator.getValidatorName(descriptionName), provider);
 
-                          if (validator == null) {
+                          if (validators == null) {
                             String operationName =
                                 Optional.ofNullable(description)
                                     .map(it -> it.getClass().getSimpleName())
@@ -176,7 +176,9 @@ public class OperationsService {
                                 provider);
                           } else {
                             // TODO(rz): Assert description is T
-                            validator.validate(descriptions, description, errors);
+                            for (DescriptionValidator dv : validators) {
+                              dv.validate(descriptions, description, errors);
+                            }
                           }
 
                           allowedAccountValidators.forEach(

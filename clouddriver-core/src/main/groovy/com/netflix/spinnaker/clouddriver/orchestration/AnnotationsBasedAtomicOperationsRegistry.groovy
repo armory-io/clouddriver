@@ -84,7 +84,7 @@ class AnnotationsBasedAtomicOperationsRegistry extends ApplicationContextAtomicO
   }
 
   @Override
-  DescriptionValidator getAtomicOperationDescriptionValidator(String validator, String cloudProvider) {
+  List<DescriptionValidator> getAtomicOperationDescriptionValidator(String validator, String cloudProvider) {
     // Legacy naming convention which is not generic and validator name is specific to cloud provider
     try {
       DescriptionValidator descriptionValidator = super.getAtomicOperationDescriptionValidator(validator, cloudProvider)
@@ -98,11 +98,12 @@ class AnnotationsBasedAtomicOperationsRegistry extends ApplicationContextAtomicO
     Class<? extends Annotation> providerAnnotationType = getCloudProviderAnnotation(cloudProvider)
 
     List validators = applicationContext.getBeansWithAnnotation(providerAnnotationType).findAll { key, value ->
-      DescriptionValidator.getValidatorName(value.getClass().getAnnotation(providerAnnotationType).value()) == validator &&
+      String validatorName = DescriptionValidator.getValidatorName(value.getClass().getAnnotation(providerAnnotationType).value())
+      (validatorName == validator || validatorName == "pluginValidator" ) &&
         value instanceof DescriptionValidator
     }.values().toList()
 
-    return validators ? (DescriptionValidator) validators[0] : null
+    return validators ? validators : null
   }
 
   protected Class<? extends Annotation> getCloudProviderAnnotation(String cloudProvider) {

@@ -36,7 +36,7 @@ class ApplicationContextAtomicOperationsRegistry implements AtomicOperationsRegi
   }
 
   @Override
-  DescriptionValidator getAtomicOperationDescriptionValidator(String validator, String cloudProvider) {
+  List<DescriptionValidator> getAtomicOperationDescriptionValidator(String validator, String cloudProvider) {
     return (DescriptionValidator) applicationContext.getBean(validator)
   }
 }

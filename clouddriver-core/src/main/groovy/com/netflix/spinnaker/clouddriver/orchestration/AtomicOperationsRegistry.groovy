@@ -41,5 +41,5 @@ interface AtomicOperationsRegistry {
    * @param cloudProvider
    * @return
    */
-  @Nullable DescriptionValidator getAtomicOperationDescriptionValidator(String validator, String cloudProvider)
+  @Nullable List<DescriptionValidator> getAtomicOperationDescriptionValidator(String validator, String cloudProvider)
 }

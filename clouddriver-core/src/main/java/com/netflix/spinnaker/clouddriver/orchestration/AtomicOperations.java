@@ -120,4 +120,6 @@ public final class AtomicOperations {
 
   // AppEngine Config operations
   public static final String DEPLOY_APPENGINE_CONFIG = "deployAppengineConfiguration";
+
+  public static final String GLOBAL = "plugin";
 }
