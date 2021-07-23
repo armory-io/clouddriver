@@ -35,6 +35,8 @@ plugins {
   id 'org.jetbrains.kotlin.jvm' version "$kotlinVersion"
   id 'org.jetbrains.kotlin.plugin.allopen' version "$kotlinVersion" apply false
   id "com.google.protobuf" version "0.8.12" apply false
+  id "com.jfrog.artifactory" version "4.13.0"
+
 }
 
 allprojects {
@@ -46,6 +48,8 @@ allprojects {
 subprojects {
   group = "com.netflix.spinnaker.clouddriver"
   apply plugin: 'io.spinnaker.project'
+    apply plugin: 'maven-publish'
+    apply plugin: 'com.jfrog.artifactory'
 
   if (name != "clouddriver-bom" && name != "clouddriver-api") {
     apply plugin: 'java-library'
@@ -67,6 +71,23 @@ subprojects {
       testAnnotationProcessor "org.projectlombok:lombok"
       testRuntimeOnly "org.junit.vintage:junit-vintage-engine" // Required for Spock tests to execute along with Junit5 tests.
     }
+  artifactory {
+    contextUrl = "https://armory.jfrog.io/armory"
+    //The base Artifactory URL if not overridden by the publisher/resolver
+    publish {
+      repository {
+        repoKey = "gradle-dev"
+        username = "${artifactory_user}"
+        password = "${artifactory_password}"
+        maven = true
+      }
+      defaults {
+        publications('mavenJava')
+        publishArtifacts = true
+        publishPom = true
+      }
+    }
+  }
 
     test {
       useJUnitPlatform()
@@ -92,6 +113,15 @@ subprojects {
         enabled = project.hasProperty('testCoverage')
       }
     }
+    publishing {
+      publications {
+        mavenJava(MavenPublication) {
+          from components.java
+        }
+      }
+    }
+
+
 
     // The test report requires tests to have run first
     jacocoTestReport {
@@ -111,6 +141,8 @@ subprojects {
       jvmArgs '-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=7102'
     }
   }
+
+
 }
 
 defaultTasks ':clouddriver-web:run'
