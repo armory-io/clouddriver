@@ -96,11 +96,8 @@ public class KubernetesDeployManifestOperation implements AtomicOperation<Operat
     }
 
     List<Artifact> artifacts = new ArrayList<>();
-    // Optional artifacts are intentionally added before required artifacts. This is to ensure that
-    // when artifact replacement occurs the required artifacts are not overwritten by optional
-    // artifacts.
-    artifacts.addAll(optionalArtifacts);
     artifacts.addAll(requiredArtifacts);
+    artifacts.addAll(optionalArtifacts);
 
     Set<Artifact> boundArtifacts = new HashSet<>();
 
