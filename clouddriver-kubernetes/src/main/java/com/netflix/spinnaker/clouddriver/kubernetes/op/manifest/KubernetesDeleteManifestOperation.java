@@ -26,9 +26,16 @@ import com.netflix.spinnaker.clouddriver.kubernetes.op.OperationResult;
 import com.netflix.spinnaker.clouddriver.kubernetes.op.handler.KubernetesHandler;
 import com.netflix.spinnaker.clouddriver.kubernetes.security.KubernetesCredentials;
 import com.netflix.spinnaker.clouddriver.orchestration.AtomicOperation;
+import io.kubernetes.client.openapi.models.V1DeleteOptions;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class KubernetesDeleteManifestOperation implements AtomicOperation<OperationResult> {
+  private static final Logger log =
+      LoggerFactory.getLogger(KubernetesDeleteManifestOperation.class);
   private final KubernetesDeleteManifestDescription description;
   private final KubernetesCredentials credentials;
   private static final String OP_NAME = "DELETE_KUBERNETES_MANIFEST";
@@ -53,6 +60,25 @@ public class KubernetesDeleteManifestOperation implements AtomicOperation<Operat
       coordinates = ImmutableList.of(description.getPointCoordinates());
     }
 
+    // If "orphanDependents" is strictly defined by the stage then the cascade flag of kubectl
+    // delete will honor the setting
+    // If orphanDependents isn't set, then look at the value of the "Cascading" delete checkbox in
+    // the UI
+    V1DeleteOptions deleteOptions = new V1DeleteOptions();
+    Map<String, String> options =
+        description.getOptions() == null ? new HashMap<>() : description.getOptions();
+    if (options.containsKey("orphanDependents")) {
+      deleteOptions.setOrphanDependents(options.get("orphanDependents").equalsIgnoreCase("true"));
+    } else if (options.containsKey("cascading")) {
+      deleteOptions.setOrphanDependents(options.get("cascading").equalsIgnoreCase("false"));
+    }
+    if (options.containsKey("gracePeriodSeconds")) {
+      try {
+        deleteOptions.setGracePeriodSeconds(Long.parseLong(options.get("gracePeriodSeconds")));
+      } catch (NumberFormatException nfe) {
+        log.warn("Unable to parse gracePeriodSeconds; {}", nfe.getMessage());
+      }
+    }
     OperationResult result = new OperationResult();
     coordinates.forEach(
         c -> {
@@ -67,7 +93,9 @@ public class KubernetesDeleteManifestOperation implements AtomicOperation<Operat
                   c.getNamespace(),
                   c.getName(),
                   description.getLabelSelectors(),
-                  description.getOptions()));
+                  deleteOptions));
+          getTask()
+              .updateStatus(OP_NAME, " delete operation completed successfully for " + c.getName());
         });
 
     return result;
