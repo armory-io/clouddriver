@@ -31,7 +31,7 @@ import com.fasterxml.jackson.databind.type.MapType;
 import com.google.common.collect.ImmutableList;
 import com.netflix.spinnaker.clouddriver.data.task.DefaultTask;
 import com.netflix.spinnaker.clouddriver.data.task.TaskRepository;
-import com.netflix.spinnaker.clouddriver.kubernetes.config.KubernetesAccountProperties.ManagedAccount;
+import com.netflix.spinnaker.clouddriver.kubernetes.config.KubernetesConfigurationProperties;
 import com.netflix.spinnaker.clouddriver.kubernetes.converter.manifest.KubernetesDeleteManifestConverter;
 import com.netflix.spinnaker.clouddriver.kubernetes.description.GlobalResourcePropertyRegistry;
 import com.netflix.spinnaker.clouddriver.kubernetes.description.ResourcePropertyRegistry;
@@ -246,7 +246,8 @@ public class KubernetesDeleteManifestOperationTest {
   }
 
   private static KubernetesNamedAccountCredentials getNamedAccountCredentials() {
-    ManagedAccount managedAccount = new ManagedAccount();
+    KubernetesConfigurationProperties.ManagedAccount managedAccount =
+        new KubernetesConfigurationProperties.ManagedAccount();
     managedAccount.setName("my-account");
 
     KubernetesCredentials mockCredentials = mock(KubernetesCredentials.class);
