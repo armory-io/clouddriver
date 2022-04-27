@@ -41,7 +41,6 @@ import javax.annotation.Nullable;
 import lombok.Data;
 import lombok.extern.log4j.Log4j2;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.beans.factory.config.BeanDefinition;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -141,7 +140,11 @@ public class AccountDefinitionConfiguration {
     scanPackages.add(0, "com.netflix.spinnaker.clouddriver");
     return scanPackages.stream()
         .flatMap(packageName -> provider.findCandidateComponents(packageName).stream())
-        .map(BeanDefinition::getBeanClassName)
+        .map(
+            x -> {
+              log.info("======= {}", x.getBeanClassName());
+              return x.getBeanClassName();
+            })
         .filter(Objects::nonNull)
         .map(AccountDefinitionConfiguration::loadCredentialsDefinitionType)
         .filter(Objects::nonNull)
