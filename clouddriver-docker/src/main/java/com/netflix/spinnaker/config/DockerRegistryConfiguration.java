@@ -32,7 +32,6 @@ import com.netflix.spinnaker.credentials.definition.AbstractCredentialsLoader;
 import com.netflix.spinnaker.credentials.definition.BasicCredentialsLoader;
 import com.netflix.spinnaker.credentials.definition.CredentialsDefinitionSource;
 import com.netflix.spinnaker.credentials.poller.Poller;
-import javax.annotation.Nullable;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -68,19 +67,23 @@ public class DockerRegistryConfiguration {
 
   @Bean
   @ConditionalOnMissingBean(
+      value = ManagedAccount.class,
+      parameterizedContainer = CredentialsDefinitionSource.class)
+  public CredentialsDefinitionSource<ManagedAccount> defaultDockerRegistryCredentialsSource(
+      DockerRegistryConfigurationProperties accountProperties) {
+    return accountProperties::getAccounts;
+  }
+
+  @Bean
+  @ConditionalOnMissingBean(
       value = DockerRegistryNamedAccountCredentials.class,
       parameterizedContainer = AbstractCredentialsLoader.class)
   public AbstractCredentialsLoader<DockerRegistryNamedAccountCredentials>
       dockerRegistryCredentialsLoader(
-          @Nullable CredentialsDefinitionSource<ManagedAccount> dockerRegistryCredentialsSource,
-          DockerRegistryConfigurationProperties accountProperties,
+          CredentialsDefinitionSource<ManagedAccount> dockerRegistryCredentialsSource,
           DockerOkClientProvider dockerOkClientProvider,
           CredentialsRepository<DockerRegistryNamedAccountCredentials>
               dockerRegistryCredentialsRepository) {
-
-    if (dockerRegistryCredentialsSource == null) {
-      dockerRegistryCredentialsSource = accountProperties::getAccounts;
-    }
 
     return new BasicCredentialsLoader<>(
         dockerRegistryCredentialsSource,
