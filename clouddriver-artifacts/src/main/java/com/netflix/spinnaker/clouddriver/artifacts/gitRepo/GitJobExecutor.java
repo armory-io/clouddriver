@@ -55,6 +55,7 @@ public class GitJobExecutor {
   private enum AuthType {
     USER_PASS,
     TOKEN,
+    TOKEN_FILE,
     SSH,
     NONE
   }
@@ -68,9 +69,10 @@ public class GitJobExecutor {
     if (!StringUtils.isEmpty(account.getUsername())
         && !StringUtils.isEmpty(account.getPassword())) {
       authType = AuthType.USER_PASS;
-    } else if (account.getTokenAsString().isPresent()
-        && !StringUtils.isEmpty(account.getTokenAsString())) {
+    } else if (account.getToken().isPresent() && !StringUtils.isEmpty(account.getToken())) {
       authType = AuthType.TOKEN;
+    } else if (account.getTokenFile().isPresent() && !StringUtils.isEmpty(account.getTokenFile())) {
+      authType = AuthType.TOKEN_FILE;
     } else if (!StringUtils.isEmpty(account.getSshPrivateKeyFilePath())) {
       authType = AuthType.SSH;
     } else {
@@ -285,7 +287,9 @@ public class GitJobExecutor {
   }
 
   private boolean isValidReference(String reference) {
-    if (authType == AuthType.USER_PASS || authType == AuthType.TOKEN) {
+    if (authType == AuthType.USER_PASS
+        || authType == AuthType.TOKEN
+        || authType == AuthType.TOKEN_FILE) {
       return reference.startsWith("http");
     }
     if (authType == AuthType.SSH) {
@@ -299,6 +303,7 @@ public class GitJobExecutor {
     switch (authType) {
       case USER_PASS:
       case TOKEN:
+      case TOKEN_FILE:
         // "sh" subshell is used so that environment variables can be used as part of the command
         cmdList.add("sh");
         cmdList.add("-c");
@@ -313,15 +318,19 @@ public class GitJobExecutor {
   }
 
   private String repoUrlWithAuth(String repoUrl) {
-    if (authType != AuthType.USER_PASS && authType != AuthType.TOKEN) {
+    if (authType != AuthType.USER_PASS
+        && authType != AuthType.TOKEN
+        && authType != AuthType.TOKEN_FILE) {
       return repoUrl;
     }
 
     String authPart;
     if (authType == AuthType.USER_PASS) {
       authPart = "$GIT_USER:$GIT_PASS";
+    } else if (authType == AuthType.TOKEN) {
+      authPart = "$GIT_USER:$GIT_TOKEN";
     } else {
-      authPart = "token:$GIT_TOKEN";
+      authPart = "$GIT_TOKEN";
     }
 
     try {
@@ -347,15 +356,33 @@ public class GitJobExecutor {
         result.put("GIT_PASS", encodeURIComponent(account.getPassword()));
         break;
       case TOKEN:
+        result.put("GIT_USER", encodeURIComponent(account.getUsername()));
         result.put(
             "GIT_TOKEN",
             encodeURIComponent(
                 account
-                    .getTokenAsString()
+                    .getToken()
                     .orElseThrow(
                         () ->
                             new IllegalArgumentException(
                                 "Token or TokenFile must be present if using token auth."))));
+        break;
+      case TOKEN_FILE:
+        String token =
+            account
+                .getTokenAsString()
+                .map(
+                    t -> {
+                      String[] split = t.split(":");
+
+                      String passwordEncoded = encodeURIComponent(split[1]);
+                      return split[0] + ":" + passwordEncoded;
+                    })
+                .orElseThrow(
+                    () ->
+                        new IllegalArgumentException(
+                            "TokenFile must be present if using token auth."));
+        result.put("GIT_TOKEN", token);
         break;
       case SSH:
         result.put("GIT_SSH_COMMAND", buildSshCommand());

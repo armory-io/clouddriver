@@ -352,7 +352,21 @@ spring:
 #  port: 22
 #  proxyRegion: us-west-1
 #  proxyCluster: my-credentials-cluster
-
+artifacts:
+  git-repo:
+    enabled: true
+    accounts:
+      - name: ovidiupopa07-token
+        username: ovidiupopa07
+        token: LLPWCFwapUcmTvHqYWE2
+      - name: ovidiupopa07-token-file
+        tokenFile: /Users/armory/Development/Workspace/oss/clouddriver/clouddriver-web/config/tokenFile.txt
+  bitbucket:
+    enabled: true
+    accounts:
+      - name: ovidiupopa07-bitbucket-token
+        username: ovidiupopa07
+        token: LLPWCFwapUcmTvHqYWE2
 ---
 # This profile is used in HA deployments for a clouddriver that handles read-only requests from
 # other services
