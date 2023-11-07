@@ -38,11 +38,15 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.stereotype.Component;
 
 @KubernetesOperation(DEPLOY_MANIFEST)
 @Component
+@ConditionalOnMissingBean(value = KubernetesDeployManifestConverter.class)
 public class KubernetesDeployManifestConverter
     extends AbstractAtomicOperationsCredentialsConverter<KubernetesNamedAccountCredentials> {
 
@@ -50,6 +54,7 @@ public class KubernetesDeployManifestConverter
   private static final String KIND_LIST_ITEMS_KEY = "items";
 
   private final ResourceVersioner resourceVersioner;
+  protected final Logger log = LoggerFactory.getLogger(getClass());
 
   @Autowired
   public KubernetesDeployManifestConverter(
@@ -57,6 +62,7 @@ public class KubernetesDeployManifestConverter
       ResourceVersioner resourceVersioner) {
     this.setCredentialsRepository(credentialsRepository);
     this.resourceVersioner = resourceVersioner;
+    log.info("Clouddriver Converter");
   }
 
   @Override
