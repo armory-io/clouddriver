@@ -18,8 +18,10 @@ package com.netflix.spinnaker.clouddriver.config;
 
 import com.netflix.spinnaker.clouddriver.jobs.JobExecutor;
 import com.netflix.spinnaker.clouddriver.jobs.local.JobExecutorLocal;
-import org.springframework.beans.factory.annotation.Value;
+import lombok.*;
+import lombok.experimental.Accessors;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -27,8 +29,25 @@ import org.springframework.context.annotation.Configuration;
 public class LocalJobConfig {
   @Bean
   @ConditionalOnMissingBean(JobExecutor.class)
-  public JobExecutor jobExecutorLocal(
-      @Value("${jobs.local.timeout-minutes:10}") long timeoutMinutes) {
-    return new JobExecutorLocal(timeoutMinutes);
+  public JobExecutor jobExecutorLocal() {
+    return new JobExecutorLocal(localJobConfigProperties());
+  }
+
+  @Bean
+  LocalJobConfigProperties localJobConfigProperties() {
+    return new LocalJobConfigProperties();
+  }
+
+  @ConfigurationProperties(prefix = "jobs.local")
+  @NoArgsConstructor
+  @AllArgsConstructor
+  @Getter
+  @Setter
+  @Accessors(chain = true)
+  public static class LocalJobConfigProperties {
+
+    private boolean fixedThreadPoolEnabled;
+    private int numberOfThreadsInFixedPool = 500;
+    private long timeoutMinutes = 10;
   }
 }
