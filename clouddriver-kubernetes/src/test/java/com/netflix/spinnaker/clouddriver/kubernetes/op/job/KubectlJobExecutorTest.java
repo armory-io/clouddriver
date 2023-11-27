@@ -36,6 +36,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSetMultimap;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.gson.Gson;
+import com.netflix.spinnaker.clouddriver.config.LocalJobConfig.LocalJobConfigProperties;
 import com.netflix.spinnaker.clouddriver.data.task.InMemoryTaskRepository;
 import com.netflix.spinnaker.clouddriver.jobs.JobExecutionException;
 import com.netflix.spinnaker.clouddriver.jobs.JobExecutor;
@@ -556,7 +557,8 @@ final class KubectlJobExecutorTest {
 
     KubectlJobExecutor kubectlJobExecutor =
         new TestScriptJobExecutor(
-            new JobExecutorLocal(/* timeoutMinutes */ 1),
+            new JobExecutorLocal(
+                new LocalJobConfigProperties().setTimeoutMinutes(/* timeoutMinutes */ 1)),
             kubernetesConfigurationProperties,
             new SimpleMeterRegistry(),
             TestScriptJobExecutor.RetryBehavior.SUCCESS_AFTER_INITIAL_FAILURE);
@@ -591,7 +593,8 @@ final class KubectlJobExecutorTest {
 
     KubectlJobExecutor kubectlJobExecutor =
         new TestScriptJobExecutor(
-            new JobExecutorLocal(/* timeoutMinutes */ 1),
+            new JobExecutorLocal(
+                new LocalJobConfigProperties().setTimeoutMinutes(/* timeoutMinutes */ 1)),
             kubernetesConfigurationProperties,
             new SimpleMeterRegistry(),
             TestScriptJobExecutor.RetryBehavior.FAILED);
