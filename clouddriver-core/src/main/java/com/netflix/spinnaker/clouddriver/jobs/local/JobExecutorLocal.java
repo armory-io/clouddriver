@@ -39,14 +39,19 @@ public class JobExecutorLocal implements JobExecutor {
   // library, it is not worth the effort at this point.
   // This executor is only used to parsing the output of a job when running in streaming mode; the
   // main thread waits on the job while the output parsing is sent to the executor.
-  private final ExecutorService executorService =
-      Executors.newFixedThreadPool(
-          500,
-          new ThreadFactoryBuilder().setNameFormat(getClass().getSimpleName() + "-%d").build());
+  private final ExecutorService executorService;
   private final long timeoutMinutes;
 
   public JobExecutorLocal(long timeoutMinutes) {
+    this(timeoutMinutes, 500);
+  }
+
+  public JobExecutorLocal(long timeoutMinutes, int noOfThreads) {
     this.timeoutMinutes = timeoutMinutes;
+    this.executorService =
+        Executors.newFixedThreadPool(
+            noOfThreads,
+            new ThreadFactoryBuilder().setNameFormat(getClass().getSimpleName() + "-%d").build());
   }
 
   @Override

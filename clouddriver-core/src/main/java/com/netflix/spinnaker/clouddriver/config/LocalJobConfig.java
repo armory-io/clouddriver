@@ -28,7 +28,8 @@ public class LocalJobConfig {
   @Bean
   @ConditionalOnMissingBean(JobExecutor.class)
   public JobExecutor jobExecutorLocal(
-      @Value("${jobs.local.timeout-minutes:10}") long timeoutMinutes) {
-    return new JobExecutorLocal(timeoutMinutes);
+      @Value("${jobs.local.timeout-minutes:10}") long timeoutMinutes,
+      @Value("${jobs.local.number-of-threads:500}") int noOfThreads) {
+    return new JobExecutorLocal(timeoutMinutes, noOfThreads);
   }
 }
