@@ -3,7 +3,7 @@ name: Temporary Branch Build
 on:
   push:
     branches:
-    - CDSH-497-release-1.30.x
+    - CDSH-497
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Xmx6g -Xms6g
