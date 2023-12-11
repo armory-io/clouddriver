@@ -16,6 +16,7 @@
 package com.netflix.spinnaker.clouddriver.jobs.local;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.netflix.spinnaker.clouddriver.config.LocalJobConfig;
 import com.netflix.spinnaker.clouddriver.jobs.JobExecutionException;
 import com.netflix.spinnaker.clouddriver.jobs.JobExecutor;
 import com.netflix.spinnaker.clouddriver.jobs.JobRequest;
@@ -42,16 +43,18 @@ public class JobExecutorLocal implements JobExecutor {
   private final ExecutorService executorService;
   private final long timeoutMinutes;
 
-  public JobExecutorLocal(long timeoutMinutes) {
-    this(timeoutMinutes, 500);
-  }
-
-  public JobExecutorLocal(long timeoutMinutes, int noOfThreads) {
-    this.timeoutMinutes = timeoutMinutes;
-    this.executorService =
-        Executors.newFixedThreadPool(
-            noOfThreads,
-            new ThreadFactoryBuilder().setNameFormat(getClass().getSimpleName() + "-%d").build());
+  public JobExecutorLocal(LocalJobConfig.LocalJobConfigProperties localJobConfigProperties) {
+    this.timeoutMinutes = localJobConfigProperties.getTimeoutMinutes();
+    if (localJobConfigProperties.isFixedThreadPoolEnabled()) {
+      this.executorService =
+          Executors.newFixedThreadPool(
+              localJobConfigProperties.getNumberOfThreadsInFixedPool(),
+              new ThreadFactoryBuilder().setNameFormat(getClass().getSimpleName() + "-%d").build());
+    } else {
+      this.executorService =
+          Executors.newCachedThreadPool(
+              new ThreadFactoryBuilder().setNameFormat(getClass().getSimpleName() + "-%d").build());
+    }
   }
 
   @Override
