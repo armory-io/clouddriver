@@ -2,13 +2,12 @@ name: Release
 
 on:
   push:
-    tags:
-    - "v[0-9]+.[0-9]+.[0-9]+"
-    - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+    branches:
+      - CDSH-497-release-1.31.x
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Xmx12g -Xms12g
-  CONTAINER_REGISTRY: us-docker.pkg.dev/spinnaker-community/docker
+  CONTAINER_REGISTRY: index.docker.io
 
 jobs:
   release:
@@ -46,114 +45,60 @@ jobs:
         run: |
           echo REPO="${GITHUB_REPOSITORY##*/}" >> $GITHUB_OUTPUT
           echo VERSION="$(git rev-parse --short HEAD)-$(date --utc +'%Y%m%d%H%M')" >> $GITHUB_OUTPUT
-      - name: Release build
-        env:
-          ORG_GRADLE_PROJECT_version: ${{ steps.release_info.outputs.RELEASE_VERSION }}
-          ORG_GRADLE_PROJECT_nexusPublishEnabled: true
-          ORG_GRADLE_PROJECT_nexusUsername: ${{ secrets.NEXUS_USERNAME }}
-          ORG_GRADLE_PROJECT_nexusPassword: ${{ secrets.NEXUS_PASSWORD }}
-          ORG_GRADLE_PROJECT_nexusPgpSigningKey: ${{ secrets.NEXUS_PGP_SIGNING_KEY }}
-          ORG_GRADLE_PROJECT_nexusPgpSigningPassword: ${{ secrets.NEXUS_PGP_SIGNING_PASSWORD }}
-        run: |
-          ./gradlew --info build ${{ steps.build_variables.outputs.REPO }}-web:installDist publishToNexus closeAndReleaseNexusStagingRepository
-      - name: Publish apt packages to Google Artifact Registry
-        env:
-          ORG_GRADLE_PROJECT_version: ${{ steps.release_info.outputs.RELEASE_VERSION }}
-          ORG_GRADLE_PROJECT_artifactRegistryPublishEnabled: true
-          GAR_JSON_KEY: ${{ secrets.GAR_JSON_KEY }}
-        run: |
-          ./gradlew --info publish
-      - name: Login to Google Cloud
-        # Only run this on repositories in the 'spinnaker' org, not on forks.
-        if: startsWith(github.repository, 'spinnaker/')
-        uses: 'google-github-actions/auth@v2'
-        # use service account flow defined at: https://github.com/google-github-actions/upload-cloud-storage#authenticating-via-service-account-key-json
-        with:
-          credentials_json: '${{ secrets.GAR_JSON_KEY }}'
-      - name: Upload halconfig profiles to GCS
-        # https://console.cloud.google.com/storage/browser/halconfig
-        # Only run this on repositories in the 'spinnaker' org, not on forks.
-        if: startsWith(github.repository, 'spinnaker/')
-        uses: 'google-github-actions/upload-cloud-storage@v2'
-        with:
-          path: 'halconfig/'
-          destination: 'halconfig/${{ steps.build_variables.outputs.REPO }}/${{ steps.release_info.outputs.RELEASE_VERSION }}'
-          parent: false
-      - name: Login to GAR
-        # Only run this on repositories in the 'spinnaker' org, not on forks.
-        if: startsWith(github.repository, 'spinnaker/')
-        uses: docker/login-action@v3
-        # use service account flow defined at: https://github.com/docker/login-action#service-account-based-authentication-1
-        with:
-          registry: us-docker.pkg.dev
-          username: _json_key
-          password: ${{ secrets.GAR_JSON_KEY }}
-      - name: Build and publish slim container image
-        # Only run this on repositories in the 'spinnaker' org, not on forks.
-        if: startsWith(github.repository, 'spinnaker/')
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.slim
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-unvalidated"
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-unvalidated-slim"
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-unvalidated-slim"
-      - name: Build and publish ubuntu container image
-        # Only run this on repositories in the 'spinnaker' org, not on forks.
-        if: startsWith(github.repository, 'spinnaker/')
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.ubuntu
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-unvalidated-ubuntu"
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-unvalidated-ubuntu"
+      - name: Login to Docker Hub
+        run: docker login -u ${{ secrets.DOCKER_HUB_USER }} -p '${{ secrets.DOCKER_HUB_PASS }}'
+
+#      - name: Build and publish slim container image
+#        # Only run this on repositories in the 'spinnaker' org, not on forks.
+#        if: startsWith(github.repository, 'spinnaker/')
+#        uses: docker/build-push-action@v5
+#        with:
+#          context: .
+#          file: Dockerfile.slim
+#          platforms: linux/amd64,linux/arm64
+#          push: false
+#          tags: |
+#            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-unvalidated"
+#            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-unvalidated-slim"
+#            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-unvalidated-slim"
+#      - name: Build and publish ubuntu container image
+#        # Only run this on repositories in the 'spinnaker' org, not on forks.
+#        uses: docker/build-push-action@v5
+#        with:
+#          context: .
+#          file: Dockerfile.ubuntu
+#          platforms: linux/amd64,linux/arm64
+#          push: false
+#          tags: |
+#            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-unvalidated-ubuntu"
+#            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-unvalidated-ubuntu"
       - name: Build and publish slim JRE 11 container image
         # Only run this on repositories in the 'spinnaker' org, not on forks.
-        if: startsWith(github.repository, 'spinnaker/')
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile.java11.slim
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: false
           tags: |
             "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-java11-unvalidated"
             "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-java11-unvalidated-slim"
             "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-java11-unvalidated-slim"
       - name: Build and publish ubuntu JRE 11 container image
         # Only run this on repositories in the 'spinnaker' org, not on forks.
-        if: startsWith(github.repository, 'spinnaker/')
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile.java11.ubuntu
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: false
           tags: |
             "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-java11-unvalidated-ubuntu"
             "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-java11-unvalidated-ubuntu"
-      - name: Create release
-        if: steps.release_info.outputs.SKIP_RELEASE == 'false'
-        uses: softprops/action-gh-release@v1
-        with:
-          body: |
-            ${{ steps.release_info.outputs.CHANGELOG }}
-          draft: false
-          name: ${{ github.event.repository.name }} ${{ github.ref_name }}
-          prerelease: ${{ steps.release_info.outputs.IS_CANDIDATE }}
-          tag_name: ${{ github.ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Pause before dependency bump
-        run: sleep 900
-      - name: Trigger dependency bump workflow
-        uses: peter-evans/repository-dispatch@v2
-        with:
-          token: ${{ secrets.SPINNAKER_GITHUB_TOKEN }}
-          event-type: bump-dependencies
-          client-payload: '{"ref": "${{ github.ref }}"}'
+
+      - name: Publish Image to Docker Hub
+        run: |
+          docker image tag ${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-java11-unvalidated-slim armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-slim
+          docker push armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-slim
+          docker image tag "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-java11-unvalidated-ubuntu" armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-ubuntu
+          docker push armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-ubuntu
