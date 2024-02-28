@@ -7,7 +7,7 @@ on:
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Xmx12g -Xms12g
-  CONTAINER_REGISTRY: index.docker.io/armory
+  CONTAINER_REGISTRY: docker.io/armory
 
 jobs:
   release:
