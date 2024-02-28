@@ -81,9 +81,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: false
           tags: |
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-java11-unvalidated"
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-java11-unvalidated-slim"
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-java11-unvalidated-slim"
+            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:cdsh-497-java11-unvalidated-slim"
       - name: Build and publish ubuntu JRE 11 container image
         # Only run this on repositories in the 'spinnaker' org, not on forks.
         uses: docker/build-push-action@v5
@@ -93,12 +91,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: false
           tags: |
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-java11-unvalidated-ubuntu"
-            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-java11-unvalidated-ubuntu"
+            "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:cdsh-497-java11-unvalidated-ubuntu"
 
       - name: Publish Image to Docker Hub
         run: |
-          docker image tag ${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-java11-unvalidated-slim armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-slim
+          docker image tag "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:cdsh-497-java11-unvalidated-slim" armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-slim
           docker push armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-slim
-          docker image tag "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:${{ steps.release_info.outputs.RELEASE_VERSION }}-${{ steps.build_variables.outputs.VERSION }}-java11-unvalidated-ubuntu" armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-ubuntu
+          docker image tag "${{ env.CONTAINER_REGISTRY }}/${{ steps.build_variables.outputs.REPO }}:cdsh-497-java11-unvalidated-ubuntu" armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-ubuntu
           docker push armory/clouddriver:1.31.2024.02.28.15.12.05.CDSH-497-ubuntu
