@@ -18,7 +18,7 @@ package com.netflix.spinnaker.clouddriver.google.health
 
 import com.netflix.spectator.api.Registry
 import com.netflix.spinnaker.clouddriver.google.GoogleExecutorTraits
-import com.netflix.spinnaker.clouddriver.google.security.GoogleCredentials
+import com.netflix.spinnaker.clouddriver.google.config.GoogleConfigurationProperties
 import com.netflix.spinnaker.clouddriver.google.security.GoogleNamedAccountCredentials
 import com.netflix.spinnaker.clouddriver.security.AccountCredentialsProvider
 import groovy.transform.InheritConstructors
@@ -40,6 +40,9 @@ class GoogleHealthIndicator implements HealthIndicator, GoogleExecutorTraits {
   private static final Logger LOG = LoggerFactory.getLogger(GoogleHealthIndicator)
 
   @Autowired
+  GoogleConfigurationProperties googleConfigurationProperties
+
+  @Autowired
   Registry registry
 
   @Autowired
@@ -58,30 +61,34 @@ class GoogleHealthIndicator implements HealthIndicator, GoogleExecutorTraits {
     new Health.Builder().up().build()
   }
 
-  @Scheduled(fixedDelay = 300000L)
+  @Scheduled(fixedDelay = 3000L)
   void checkHealth() {
-    try {
-      Set<GoogleNamedAccountCredentials> googleCredentialsSet = accountCredentialsProvider.all.findAll {
-        it instanceof GoogleNamedAccountCredentials
-      } as Set<GoogleNamedAccountCredentials>
+      try {
+        Set<GoogleNamedAccountCredentials> googleCredentialsSet = accountCredentialsProvider.all.findAll {
+          it instanceof GoogleNamedAccountCredentials
+        } as Set<GoogleNamedAccountCredentials>
 
-      for (GoogleNamedAccountCredentials accountCredentials in googleCredentialsSet) {
-        try {
-          // This verifies that the specified credentials are sufficient to access the referenced project.
-          timeExecute(accountCredentials.compute.projects().get(accountCredentials.project),
-                      "compute.projects.get",
-                      TAG_SCOPE, SCOPE_GLOBAL)
-        } catch (IOException e) {
-          throw new GoogleIOException(e)
+        for (GoogleNamedAccountCredentials accountCredentials in googleCredentialsSet) {
+          if (googleConfigurationProperties.getHealth().getVerifyAccountHealth()) {
+            LOG.info("google.health.verifyAccountHealth flag is enabled - verifying connection to the Google accounts");
+            try {
+              // This verifies that the specified credentials are sufficient to access the referenced project.
+              timeExecute(accountCredentials.compute.projects().get(accountCredentials.project),
+                "compute.projects.get",
+                TAG_SCOPE, SCOPE_GLOBAL)
+            } catch (IOException e) {
+              throw new GoogleIOException(e)
+            }
+          } else {
+            LOG.info("google.health.verifyAccountHealth flag is disabled - not verifying connection to the Google accounts");
+          }
         }
+        lastException.set(null)
+      } catch (Exception ex) {
+        LOG.warn "Unhealthy", ex
+
+        lastException.set(ex)
       }
-
-      lastException.set(null)
-    } catch (Exception ex) {
-      LOG.warn "Unhealthy", ex
-
-      lastException.set(ex)
-    }
   }
 
   @ResponseStatus(value = HttpStatus.SERVICE_UNAVAILABLE, reason = "Problem communicating with Google.")
