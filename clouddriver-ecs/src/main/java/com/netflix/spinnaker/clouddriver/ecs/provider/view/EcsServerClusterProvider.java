@@ -120,8 +120,13 @@ public class EcsServerClusterProvider implements ClusterProvider<EcsServerCluste
       AmazonCredentials.AWSRegion awsRegion,
       String application) {
 
-    Collection<Service> services =
-        serviceCacheClient.getAll(credentials.getName(), awsRegion.getName());
+    String glob =
+        application != null
+            ? Keys.getServiceKey(credentials.getName(), awsRegion.getName(), application + "*")
+            : Keys.getServiceKey(credentials.getName(), awsRegion.getName(), "*");
+
+    Collection<String> ecsServices = serviceCacheClient.filterIdentifiers(glob);
+    Collection<Service> services = serviceCacheClient.getAll(ecsServices);
     Collection<Task> allTasks = taskCacheClient.getAll(credentials.getName(), awsRegion.getName());
 
     for (Service service : services) {
@@ -456,7 +461,7 @@ public class EcsServerClusterProvider implements ClusterProvider<EcsServerCluste
 
   @Override
   public Map<String, Set<EcsServerCluster>> getClusterSummaries(String application) {
-    return getClusters();
+    return getClusters0(application);
   }
 
   @Override
@@ -480,6 +485,15 @@ public class EcsServerClusterProvider implements ClusterProvider<EcsServerCluste
     return clusterMap;
   }
 
+  public Map<String, Set<EcsServerCluster>> getClusters0(String application) {
+    Map<String, Set<EcsServerCluster>> clusterMap = new HashMap<>();
+
+    for (AmazonCredentials credentials : getEcsCredentials()) {
+      clusterMap = findClusters(clusterMap, credentials, application);
+    }
+    return clusterMap;
+  }
+
   /** Gets Spinnaker clusters for a given Spinnaker application and ECS account. */
   @Override
   public Set<EcsServerCluster> getClusters(String application, String account) {
@@ -498,7 +512,9 @@ public class EcsServerClusterProvider implements ClusterProvider<EcsServerCluste
    */
   @Override
   public EcsServerCluster getCluster(String application, String account, String name) {
-    Set<EcsServerCluster> ecsServerClusters = getClusters(application, account);
+    Set<EcsServerCluster> ecsServerClusters =
+        getClusters(
+            application, account); // we already have a name so why go through all the clusters?
     if (ecsServerClusters != null && ecsServerClusters.size() > 0) {
       for (EcsServerCluster cluster : ecsServerClusters) {
         if (cluster.getName().equals(name)) {

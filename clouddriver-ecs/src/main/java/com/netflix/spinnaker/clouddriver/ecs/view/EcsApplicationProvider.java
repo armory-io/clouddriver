@@ -18,6 +18,7 @@ package com.netflix.spinnaker.clouddriver.ecs.view;
 
 import com.google.common.collect.Sets;
 import com.netflix.spinnaker.clouddriver.aws.security.AmazonCredentials;
+import com.netflix.spinnaker.clouddriver.ecs.cache.Keys;
 import com.netflix.spinnaker.clouddriver.ecs.cache.client.ServiceCacheClient;
 import com.netflix.spinnaker.clouddriver.ecs.cache.model.Service;
 import com.netflix.spinnaker.clouddriver.ecs.model.EcsApplication;
@@ -50,20 +51,20 @@ public class EcsApplicationProvider implements ApplicationProvider {
 
   @Override
   public Application getApplication(String name) {
-
-    for (Application application : getApplications(true)) {
+    name = name.toLowerCase();
+    String glob = Keys.getServiceKey("*", "*", name + "*");
+    Collection<String> ecsServices = serviceCacheClient.filterIdentifiers(glob);
+    for (Application application : populateApplicationSet(ecsServices, true)) {
       if (name.equals(application.getName())) {
         return application;
       }
     }
-
     return null;
   }
 
   @Override
   public Set<Application> getApplications(boolean expand) {
     Set<Application> applications = new HashSet<>();
-
     for (NetflixECSCredentials credentials : credentialsRepository.getAll()) {
       Set<Application> retrievedApplications = findApplicationsForAllRegions(credentials, expand);
       applications.addAll(retrievedApplications);
@@ -102,6 +103,18 @@ public class EcsApplicationProvider implements ApplicationProvider {
     return applicationHashMap;
   }
 
+  private Set<Application> populateApplicationSet(Collection<String> identifiers, boolean expand) {
+    HashMap<String, Application> applicationHashMap = new HashMap<>();
+    Collection<Service> services = serviceCacheClient.getAll(identifiers);
+
+    for (Service service : services) {
+      if (credentialsRepository.has(service.getAccount())) {
+        applicationHashMap = inferApplicationFromServices(applicationHashMap, service, expand);
+      }
+    }
+    return transposeApplicationMapToSet(applicationHashMap);
+  }
+
   private Set<Application> transposeApplicationMapToSet(
       HashMap<String, Application> applicationHashMap) {
     Set<Application> applications = new HashSet<>();
@@ -136,7 +149,11 @@ public class EcsApplicationProvider implements ApplicationProvider {
     } else {
       applicationHashMap.get(appName).getAttributes().putAll(application.getAttributes());
       if (expand) {
-        applicationHashMap.get(appName).getClusterNames().get(accountName).add(serviceName);
+        applicationHashMap
+            .get(appName)
+            .getClusterNames()
+            .computeIfAbsent(accountName, k -> Sets.newHashSet())
+            .add(serviceName);
       }
     }
 

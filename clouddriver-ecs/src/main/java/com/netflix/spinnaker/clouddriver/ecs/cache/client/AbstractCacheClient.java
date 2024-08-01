@@ -19,10 +19,7 @@ package com.netflix.spinnaker.clouddriver.ecs.cache.client;
 import com.netflix.spinnaker.cats.cache.Cache;
 import com.netflix.spinnaker.cats.cache.CacheData;
 import com.netflix.spinnaker.clouddriver.ecs.cache.Keys;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,6 +60,11 @@ abstract class AbstractCacheClient<T> {
   public Collection<T> getAll(String account, String region) {
     Collection<CacheData> data = fetchFromCache(account, region);
     return convertAll(data);
+  }
+
+  public Collection<T> getAll(Collection<String> identifiers) {
+    Collection<CacheData> allData = cacheView.getAll(keyNamespace, identifiers);
+    return convertAll(allData);
   }
 
   /**
@@ -109,5 +111,9 @@ abstract class AbstractCacheClient<T> {
     }
 
     return allData;
+  }
+
+  public Collection<String> filterIdentifiers(String glob) {
+    return cacheView.filterIdentifiers(keyNamespace, glob);
   }
 }
