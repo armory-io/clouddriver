@@ -33,8 +33,9 @@ class EcsCloudWatchAlarmCacheClientSpec extends Specification {
     given:
     def accountName = 'test-account-1'
     def region = 'us-west-1'
+    def ecsClusterName = 'my-cluster'
     def metricAlarm = new EcsMetricAlarm().withAlarmName("alarm-name").withAlarmArn("alarmArn").withRegion(region).withAccountName(accountName)
-    def key = Keys.getAlarmKey(accountName, region, metricAlarm.getAlarmArn())
+    def key = Keys.getAlarmKey(accountName, region, metricAlarm.getAlarmArn(), ecsClusterName)
     def attributes = EcsCloudMetricAlarmCachingAgent.convertMetricAlarmToAttributes(metricAlarm, accountName, region)
 
     when:
