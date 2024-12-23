@@ -64,9 +64,8 @@ class EcsCloudWatchAlarmCacheClientSpec extends Specification {
   def 'should convert cache data into object'() {
     given:
 
-    def ecsClusterName = 'my-cluster'
     def metricAlarm = new EcsMetricAlarm().withAlarmName("alarm-name").withAlarmArn("alarmArn").withRegion(REGION).withAccountName(ACCOUNT)
-    def key = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm.getAlarmArn(), ecsClusterName)
+    def key = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm.getAlarmArn())
     def attributes = EcsCloudMetricAlarmCachingAgent.convertMetricAlarmToAttributes(metricAlarm, ACCOUNT, REGION)
     when:
     def returnedMetricAlarm = client.get(key)
@@ -95,7 +94,7 @@ class EcsCloudWatchAlarmCacheClientSpec extends Specification {
         .withDimensions([new Dimension().withName("ClusterName").withValue(ecsClusterName)])
     )
     def keys = metricAlarms.collect { alarm ->
-      def key = Keys.getAlarmKey(ACCOUNT, REGION, alarm.getAlarmArn(), ecsClusterName)
+      def key = Keys.getAlarmKey(ACCOUNT, REGION, alarm.getAlarmArn())
       def attributes = agent.convertMetricAlarmToAttributes(alarm, ACCOUNT, REGION)
       [key, new DefaultCacheData(key, attributes, [:])]
     }
@@ -104,7 +103,7 @@ class EcsCloudWatchAlarmCacheClientSpec extends Specification {
     cacheView.getAll(Keys.Namespace.ALARMS.ns, _) >>  keys*.last()
 
     when:
-    def metricAlarmsReturned = client.getMetricAlarms(serviceName, ACCOUNT, REGION, ecsClusterName)
+    def metricAlarmsReturned = client.getMetricAlarms(serviceName, ACCOUNT, REGION)
 
     then:
     metricAlarmsReturned.size() == 2
@@ -125,40 +124,31 @@ class EcsCloudWatchAlarmCacheClientSpec extends Specification {
     def metricAlarm2 = new MetricAlarm().withAlarmName("alarm-name-2").withAlarmArn("alarmArn2")
       .withAlarmActions("arn:aws:sns:us-west-1:123456789012:${serviceName}")
       .withDimensions([new Dimension().withName("ClusterName").withValue(ecsClusterName)])
-    def metricAlarm3 =  new MetricAlarm().withAlarmName("alarm-name3").withAlarmArn("alarmArn3")
+    def metricAlarm3 =  new MetricAlarm().withAlarmName("alarm-name-3").withAlarmArn("alarmArn3")
       .withAlarmActions("arn:aws:sns:us-west-1:123456789012:${serviceName}")
       .withDimensions([new Dimension().withName("ClusterName").withValue(ecsClusterName2)])
 
-    def key1 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm1.getAlarmArn(), ecsClusterName)
+    def key1 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm1.getAlarmArn())
     def attributes1 = agent.convertMetricAlarmToAttributes(metricAlarm1, ACCOUNT, REGION)
-    def key2 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm2.getAlarmArn(), ecsClusterName)
+    def key2 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm2.getAlarmArn())
     def attributes2 = agent.convertMetricAlarmToAttributes(metricAlarm2, ACCOUNT, REGION)
-    def key3 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm3.getAlarmArn(), ecsClusterName2)
+    def key3 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm3.getAlarmArn())
     def attributes3 = agent.convertMetricAlarmToAttributes(metricAlarm3, ACCOUNT, REGION)
 
 
-    cacheView.filterIdentifiers(Keys.Namespace.ALARMS.ns, Keys.getAlarmKey(ACCOUNT, REGION, "*", ecsClusterName)) >> [key1,key2]
-    cacheView.filterIdentifiers(Keys.Namespace.ALARMS.ns, Keys.getAlarmKey(ACCOUNT, REGION, "*", ecsClusterName2)) >> [key3]
-    cacheView.getAll(Keys.Namespace.ALARMS.ns, [key1,key2]) >> [
+    cacheView.filterIdentifiers(Keys.Namespace.ALARMS.ns, Keys.getAlarmKey(ACCOUNT, REGION, "*")) >> [key1,key2,key3]
+    cacheView.getAll(Keys.Namespace.ALARMS.ns, [key1,key2,key3]) >> [
       new DefaultCacheData(key1, attributes1, [:]),
-      new DefaultCacheData(key2, attributes2, [:])
-    ]
-    cacheView.getAll(Keys.Namespace.ALARMS.ns, [key3]) >> [
+      new DefaultCacheData(key2, attributes2, [:]),
       new DefaultCacheData(key3, attributes3, [:])
     ]
     when:
-    def metricAlarmsReturned = client.getMetricAlarms(serviceName, ACCOUNT, REGION, ecsClusterName)
-    def metricAlarmsReturned2 = client.getMetricAlarms(serviceName, ACCOUNT, REGION, ecsClusterName2)
+    def metricAlarmsReturned = client.getMetricAlarms(serviceName, ACCOUNT, REGION)
 
     then:
-    metricAlarmsReturned.size() == 2
-    metricAlarmsReturned*.alarmName.containsAll(["alarm-name", "alarm-name-2"])
-    metricAlarmsReturned*.alarmArn.containsAll(["alarmArn", "alarmArn2"])
-    !metricAlarmsReturned*.alarmArn.contains(["alarmArn3"])
-    metricAlarmsReturned2.size() == 1
-    metricAlarmsReturned2*.alarmName.containsAll(["alarm-name3"])
-    !metricAlarmsReturned2*.alarmArn.containsAll(["alarmArn", "alarmArn2"])
-    metricAlarmsReturned2*.alarmArn.containsAll(["alarmArn3"])
+    metricAlarmsReturned.size() == 3
+    metricAlarmsReturned*.alarmName.containsAll(["alarm-name", "alarm-name-2","alarm-name-3"])
+    metricAlarmsReturned*.alarmArn.containsAll(["alarmArn", "alarmArn2","alarmArn3"])
   }
 
 def 'should return empty list if no metric alarms match the service'() {
@@ -169,7 +159,7 @@ def 'should return empty list if no metric alarms match the service'() {
   def metricAlarms = Set.of(new MetricAlarm().withAlarmName("alarm-name").withAlarmArn("alarmArn")
     .withAlarmActions("arn:aws:sns:us-west-1:123456789012:${serviceName}")
     .withDimensions([new Dimension().withName("ClusterName").withValue(ecsClusterName)]))
-  def key = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarms[0].getAlarmArn(), ecsClusterName)
+  def key = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarms[0].getAlarmArn())
   def attributes = agent.convertMetricAlarmToAttributes(metricAlarms[0], ACCOUNT, REGION)
 
   cacheView.filterIdentifiers(Keys.Namespace.ALARMS.ns, _) >> [key]
@@ -178,7 +168,7 @@ def 'should return empty list if no metric alarms match the service'() {
   ]
 
   when:
-  def metricAlarmsReturned = client.getMetricAlarms("some-other-service", ACCOUNT, REGION, ecsClusterName)
+  def metricAlarmsReturned = client.getMetricAlarms("some-other-service", ACCOUNT, REGION)
 
   then:
   metricAlarmsReturned.isEmpty()
@@ -212,7 +202,7 @@ def 'should return metric alarms with actions matching the service'() {
       .withDimensions([new Dimension().withName("ClusterName").withValue(ecsClusterName)])
   )
   def keys = metricAlarms.collect { alarm ->
-    def key = Keys.getAlarmKey(ACCOUNT, REGION, alarm.getAlarmArn(), ecsClusterName)
+    def key = Keys.getAlarmKey(ACCOUNT, REGION, alarm.getAlarmArn())
     def attributes = agent.convertMetricAlarmToAttributes(alarm, ACCOUNT, REGION)
     [key, new DefaultCacheData(key, attributes, [:])]
   }
@@ -221,7 +211,7 @@ def 'should return metric alarms with actions matching the service'() {
   cacheView.getAll(Keys.Namespace.ALARMS.ns, _) >>  keys*.last()
 
   when:
-  def metricAlarmsReturned = client.getMetricAlarms(serviceName, ACCOUNT, REGION, ecsClusterName)
+  def metricAlarmsReturned = client.getMetricAlarms(serviceName, ACCOUNT, REGION)
 
   then:
   metricAlarmsReturned.size() == 2

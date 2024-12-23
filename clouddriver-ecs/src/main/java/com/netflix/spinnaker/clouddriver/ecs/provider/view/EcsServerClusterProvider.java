@@ -374,9 +374,7 @@ public class EcsServerClusterProvider implements ClusterProvider<EcsServerCluste
       }
     }
     Set<String> metricAlarmNames =
-        ecsCloudWatchAlarmCacheClient
-            .getMetricAlarms(serviceName, account, region, ecsClusterName)
-            .stream()
+        ecsCloudWatchAlarmCacheClient.getMetricAlarms(serviceName, account, region).stream()
             .map(EcsMetricAlarm::getAlarmName)
             .collect(Collectors.toSet());
     EcsServerGroup serverGroup = new EcsServerGroup();

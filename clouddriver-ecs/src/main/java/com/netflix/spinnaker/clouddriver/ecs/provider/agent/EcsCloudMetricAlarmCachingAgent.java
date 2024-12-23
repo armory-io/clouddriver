@@ -118,13 +118,7 @@ public class EcsCloudMetricAlarmCachingAgent implements CachingAgent, AccountAwa
     Map<String, Collection<CacheData>> newDataMap = new HashMap<>();
 
     for (MetricAlarm metricAlarm : cacheableMetricAlarm) {
-      String cluster =
-          metricAlarm.getDimensions().stream()
-              .filter(t -> t.getName().equalsIgnoreCase("ClusterName"))
-              .map(t -> t.getValue())
-              .collect(Collectors.joining());
-
-      String key = Keys.getAlarmKey(accountName, region, metricAlarm.getAlarmArn(), cluster);
+      String key = Keys.getAlarmKey(accountName, region, metricAlarm.getAlarmArn());
       Map<String, Object> attributes =
           convertMetricAlarmToAttributes(metricAlarm, accountName, region);
 

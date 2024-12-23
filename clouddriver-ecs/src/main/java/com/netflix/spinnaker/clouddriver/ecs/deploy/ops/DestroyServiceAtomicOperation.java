@@ -45,10 +45,7 @@ public class DestroyServiceAtomicOperation
 
     updateTaskStatus("Removing MetricAlarms from " + description.getServerGroupName() + ".");
     ecsCloudMetricService.deleteMetrics(
-        description.getServerGroupName(),
-        description.getAccount(),
-        description.getRegion(),
-        ecsClusterName);
+        description.getServerGroupName(), description.getAccount(), description.getRegion());
     updateTaskStatus("Done removing MetricAlarms from " + description.getServerGroupName() + ".");
 
     UpdateServiceRequest updateServiceRequest = new UpdateServiceRequest();

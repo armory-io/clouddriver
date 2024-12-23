@@ -80,7 +80,7 @@ class EcsCloudMetricAlarmCachingAgentSpec extends Specification {
     metricAlarms*.region.containsAll(cacheData.get(Keys.Namespace.ALARMS.ns)*.getAttributes().region)
   }
 
-  def 'should evict old keys when id is appended'() {
+  def 'should evict old keys when id is changed'() {
     given:
     def metricAlarm1 = new MetricAlarm().withAlarmName("alarm-name-1").withAlarmArn("alarmArn-1").withDimensions([new Dimension().withName("ClusterName").withValue("my-cluster")])
     def metricAlarm2 = new MetricAlarm().withAlarmName("alarm-name-2").withAlarmArn("alarmArn-2").withDimensions([new Dimension().withName("ClusterName").withValue("my-cluster")])
@@ -91,13 +91,13 @@ class EcsCloudMetricAlarmCachingAgentSpec extends Specification {
     cloudWatch.describeAlarms(_) >> describeAlarmsResult
     clientProvider.getAmazonCloudWatch(_, _, _) >> cloudWatch
 
-    def oldKey1 = Keys.buildKey(Keys.Namespace.ALARMS.ns, ACCOUNT, REGION, metricAlarm1.getAlarmArn())
-    def oldKey2 = Keys.buildKey(Keys.Namespace.ALARMS.ns, ACCOUNT, REGION, metricAlarm2.getAlarmArn())
+    def oldKey1 = Keys.buildKey(Keys.Namespace.ALARMS.ns, ACCOUNT, REGION, metricAlarm1.getAlarmArn() + ";my-cluster")
+    def oldKey2 = Keys.buildKey(Keys.Namespace.ALARMS.ns, ACCOUNT, REGION, metricAlarm2.getAlarmArn() + ";my-cluster")
     def oldData = [new DefaultCacheData(oldKey1, attributes1, [:]), new DefaultCacheData(oldKey2, attributes2, [:])]
     providerCache.getAll(Keys.Namespace.ALARMS.ns) >> oldData
 
-    def newKey1 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm1.getAlarmArn(), "my-cluster")
-    def newKey2 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm2.getAlarmArn(), "my-cluster")
+    def newKey1 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm1.getAlarmArn())
+    def newKey2 = Keys.getAlarmKey(ACCOUNT, REGION, metricAlarm2.getAlarmArn())
 
     when:
     def cacheResult = agent.loadData(providerCache)

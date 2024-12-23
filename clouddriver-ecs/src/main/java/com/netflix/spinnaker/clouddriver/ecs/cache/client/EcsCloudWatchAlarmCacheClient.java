@@ -72,10 +72,10 @@ public class EcsCloudWatchAlarmCacheClient extends AbstractCacheClient<EcsMetric
   }
 
   public List<EcsMetricAlarm> getMetricAlarms(
-      String serviceName, String accountName, String region, String ecsClusterName) {
+      String serviceName, String accountName, String region) {
     List<EcsMetricAlarm> metricAlarms = new LinkedList<>();
 
-    String glob = Keys.getAlarmKey(accountName, region, "*", ecsClusterName);
+    String glob = Keys.getAlarmKey(accountName, region, "*");
     Collection<String> metricAlarmsIds = filterIdentifiers(glob);
     Collection<EcsMetricAlarm> allMetricAlarms = getAll(metricAlarmsIds);
 
