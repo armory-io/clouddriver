@@ -251,7 +251,8 @@ public class ProviderHelpers {
                 amazonClientProvider,
                 credentialsRepository,
                 awsConfigurationProperties.getCleanup().getAlarms().getDaysToKeep(),
-                awsConfigurationProperties.getCleanup().getAlarms().getAlarmsNamePattern()));
+                awsConfigurationProperties.getCleanup().getAlarms().getAlarmsNamePattern(),
+                awsConfigurationProperties.getCleanup().getAlarms().getDryRun()));
       }
       newlyAddedAgents.add(
           new CleanupDetachedInstancesAgent(amazonClientProvider, credentialsRepository));

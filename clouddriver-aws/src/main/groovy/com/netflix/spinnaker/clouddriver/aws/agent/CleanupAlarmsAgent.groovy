@@ -16,12 +16,12 @@
 
 package com.netflix.spinnaker.clouddriver.aws.agent
 
-import com.amazonaws.services.autoscaling.AmazonAutoScaling
 import com.amazonaws.services.cloudwatch.model.DeleteAlarmsRequest
 import com.amazonaws.services.cloudwatch.model.DescribeAlarmsRequest
 import com.amazonaws.services.cloudwatch.model.MetricAlarm
 import com.amazonaws.services.cloudwatch.model.StateValue
-import com.amazonaws.services.gamelift.model.DescribeScalingPoliciesRequest
+import com.amazonaws.services.ecs.model.ListClustersRequest
+import com.amazonaws.services.ecs.model.ListServicesRequest
 import com.netflix.spinnaker.cats.agent.RunnableAgent
 import com.netflix.spinnaker.clouddriver.aws.provider.AwsCleanupProvider
 import com.netflix.spinnaker.clouddriver.aws.security.AmazonClientProvider
@@ -38,7 +38,7 @@ import java.util.regex.Pattern
 @Slf4j
 class CleanupAlarmsAgent implements RunnableAgent, CustomScheduledAgent {
   public static final long POLL_INTERVAL_MILLIS = TimeUnit.HOURS.toMillis(24)
-  public static final long DEFAULT_TIMEOUT_MILLIS = TimeUnit.MINUTES.toMillis(20)
+  public static final long DEFAULT_TIMEOUT_MILLIS = TimeUnit.MINUTES.toMillis(30)
 
   public final Pattern ALARM_NAME_PATTERN = Pattern.compile(alarmsNamePattern)
 
@@ -48,13 +48,15 @@ class CleanupAlarmsAgent implements RunnableAgent, CustomScheduledAgent {
   final long timeoutMillis
   final int daysToLeave
   final String alarmsNamePattern;
+  final boolean dryRun;
 
 
   CleanupAlarmsAgent(AmazonClientProvider amazonClientProvider,
                      CredentialsRepository<NetflixAmazonCredentials> credentialsRepository,
                      int daysToLeave,
-                     String alarmsNamePattern) {
-    this(amazonClientProvider, credentialsRepository, POLL_INTERVAL_MILLIS, DEFAULT_TIMEOUT_MILLIS, daysToLeave, alarmsNamePattern)
+                     String alarmsNamePattern,
+                     boolean dryRun) {
+    this(amazonClientProvider, credentialsRepository, POLL_INTERVAL_MILLIS, DEFAULT_TIMEOUT_MILLIS, daysToLeave, alarmsNamePattern, dryRun)
   }
 
   CleanupAlarmsAgent(AmazonClientProvider amazonClientProvider,
@@ -62,13 +64,15 @@ class CleanupAlarmsAgent implements RunnableAgent, CustomScheduledAgent {
                      long pollIntervalMillis,
                      long timeoutMills,
                      int daysToLeave,
-                     String alarmsNamePattern) {
+                     String alarmsNamePattern,
+                     boolean dryRun) {
     this.amazonClientProvider = amazonClientProvider
     this.credentialsRepository = credentialsRepository
     this.pollIntervalMillis = pollIntervalMillis
     this.timeoutMillis = timeoutMills
     this.daysToLeave = daysToLeave
     this.alarmsNamePattern = alarmsNamePattern
+    this.dryRun = dryRun
   }
 
   @Override
@@ -86,36 +90,82 @@ class CleanupAlarmsAgent implements RunnableAgent, CustomScheduledAgent {
     getAccounts().each { NetflixAmazonCredentials credentials ->
       credentials.regions.each { AmazonCredentials.AWSRegion region ->
         log.info("Looking for alarms to delete")
+        try {
 
-        def cloudWatch = amazonClientProvider.getCloudWatch(credentials, region.name)
-        Set<String> attachedAlarms = getAttachedAlarms(amazonClientProvider.getAutoScaling(credentials, region.name))
-        def describeAlarmsRequest = new DescribeAlarmsRequest().withStateValue(StateValue.INSUFFICIENT_DATA)
+          def cloudWatch = amazonClientProvider.getCloudWatch(credentials, region.name)
+          def ecs = amazonClientProvider.getAmazonEcs(credentials, region.name, true)
 
-        while (true) {
-          def result = cloudWatch.describeAlarms(describeAlarmsRequest)
+          Set<MetricAlarm> autoscalingAlarms = []
+          def describeAlarmsRequest = new DescribeAlarmsRequest().withStateValue(StateValue.INSUFFICIENT_DATA)
 
-          List<MetricAlarm> alarmsToDelete = result.metricAlarms.findAll {
-            it.stateUpdatedTimestamp.before(DateTime.now().minusDays(daysToLeave).toDate()) &&
-              !attachedAlarms.contains(it.alarmName) &&
-              ALARM_NAME_PATTERN.matcher(it.alarmName).matches()
+          while (true) {
+            def result = cloudWatch.describeAlarms(describeAlarmsRequest)
+            autoscalingAlarms.addAll(result.metricAlarms.findAll {
+              it.stateUpdatedTimestamp.before(DateTime.now().minusDays(daysToLeave).toDate()) &&
+                ALARM_NAME_PATTERN.matcher(it.alarmName).matches()
+            })
+
+            if (result.nextToken) {
+              describeAlarmsRequest.withNextToken(result.nextToken)
+            } else {
+              break
+            }
+          }
+          Pattern ALARM_NAME_PATTERN_2 = Pattern.compile("v[0-9]{3}")
+          Map<String, List<MetricAlarm>> autoscalingMap = autoscalingAlarms.groupBy {
+            def matcher = ALARM_NAME_PATTERN_2.matcher(it.alarmName)
+            matcher.find() ? it.alarmName.substring(0, matcher.end()) : null
           }
 
-          if (alarmsToDelete) {
-            // terminate up to 20 alarms at a time (avoids any AWS limits on # of concurrent deletes)
-            alarmsToDelete.collate(20).each {
-              log.info("Deleting ${it.size()} alarms in ${credentials.name}/${region.name} " +
-                "(alarms: ${it.alarmName.join(", ")})")
-              cloudWatch.deleteAlarms(new DeleteAlarmsRequest().withAlarmNames(it.alarmName))
-              Thread.sleep(500)
+
+          log.info("Number of services whose autoscaling alarms still exist: ${autoscalingMap.size()}")
+
+          // Hunt through the ECS clusters looking for ECS services and match them to the alarms
+          def listClustersRequest = new ListClustersRequest()
+          while (true) {
+            def clustersResult = ecs.listClusters(listClustersRequest)
+            clustersResult.clusterArns.each { clusterArn ->
+              def clusterName = clusterArn.split('/').last()
+              def listServicesRequest = new ListServicesRequest().withCluster(clusterName)
+              while (true) {
+                def servicesResult = ecs.listServices(listServicesRequest)
+                servicesResult.serviceArns.each { serviceArn ->
+                  log.info("checking service $serviceArn")
+                  def serviceName = serviceArn.split('/').last()
+                  autoscalingMap.remove(serviceName)
+                }
+
+                if (servicesResult.nextToken) {
+                  listServicesRequest.withNextToken(servicesResult.nextToken)
+                } else {
+                  break
+                }
+              }
             }
 
+            if (clustersResult.nextToken) {
+              listClustersRequest.withNextToken(clustersResult.nextToken)
+            } else {
+              break
+            }
           }
 
-          if (result.nextToken) {
-            describeAlarmsRequest.withNextToken(result.nextToken)
-          } else {
-            break
+          log.info("Number of services whose autoscaling alarms still exist, but the services do not: ${autoscalingMap.size()}")
+
+          if (autoscalingMap) {
+            def alarmNamesToDelete = autoscalingMap.values().flatten().collect { it }
+            log.info("Removing ${alarmNamesToDelete.size()} alarms...")
+            alarmNamesToDelete.collate(100).each {
+              log.info("Deleting ${it.size()} alarms in ${credentials.name}/${region.name} " +
+                "(alarms: ${it.alarmName.join(", ")})")
+              if (!dryRun) {
+                cloudWatch.deleteAlarms(new DeleteAlarmsRequest().withAlarmNames(it.alarmName))
+              }
+              Thread.sleep(500)
+            }
           }
+        } catch (Exception e) {
+          log.error("Failed to cleanup alarms for ${credentials.name}/${region.name}", e)
         }
       }
     }
@@ -123,21 +173,5 @@ class CleanupAlarmsAgent implements RunnableAgent, CustomScheduledAgent {
 
   private Set<NetflixAmazonCredentials> getAccounts() {
     return credentialsRepository.getAll()
-  }
-
-  private static Set<String> getAttachedAlarms(AmazonAutoScaling autoScaling) {
-    Set<String> alarms = []
-    def request = new DescribeScalingPoliciesRequest()
-    while (true) {
-      def result = autoScaling.describePolicies()
-      alarms.addAll(result.scalingPolicies.alarms.alarmName.flatten())
-
-      if (result.nextToken) {
-        request.withNextToken(result.nextToken)
-      } else {
-        break
-      }
-    }
-    alarms
   }
 }
