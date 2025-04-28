@@ -52,6 +52,7 @@ dependencies {
   implementation "org.apache.groovy:groovy"
   implementation "org.springframework.boot:spring-boot-actuator"
   implementation "org.springframework.boot:spring-boot-starter-web"
+  implementation "org.apache.commons:commons-compress:1.21"
 
   testImplementation "com.github.tomakehurst:wiremock-jre8-standalone"
   testImplementation "io.spinnaker.kork:kork-aws"

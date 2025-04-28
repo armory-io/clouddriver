@@ -17,15 +17,57 @@
 
 package com.netflix.spinnaker.clouddriver.artifacts.docker;
 
+import com.google.common.base.Strings;
 import com.netflix.spinnaker.clouddriver.artifacts.config.ArtifactAccount;
 import com.netflix.spinnaker.kork.annotations.NonnullByDefault;
+import java.util.List;
+import java.util.Optional;
+import javax.annotation.ParametersAreNullableByDefault;
+import lombok.Builder;
 import lombok.Value;
+import org.springframework.boot.context.properties.ConstructorBinding;
 
 @NonnullByDefault
 @Value
-final class DockerArtifactAccount implements ArtifactAccount {
-  @Override
-  public String getName() {
-    return "docker-registry";
+public class DockerArtifactAccount implements ArtifactAccount {
+  private final String name;
+
+  private final Optional<String> username;
+  private final Optional<String> password;
+  private final Optional<String> passwordFile;
+  private final Optional<String> passwordCommand;
+  private final Optional<String> dockerconfigFile;
+  private final Optional<String> email;
+  private final Optional<String> address;
+  private final boolean insecureRegistry;
+  private final List<String> helmOciRepositories;
+
+  private final String type = DockerArtifactCredentials.CREDENTIALS_TYPE;
+  private final String provider = DockerArtifactCredentials.TYPE;
+
+  @Builder
+  @ConstructorBinding
+  @ParametersAreNullableByDefault
+  DockerArtifactAccount(
+      String name,
+      String username,
+      String password,
+      String passwordFile,
+      String passwordCommand,
+      String dockerconfigFile,
+      String email,
+      String address,
+      boolean insecureRegistry,
+      List<String> helmOciRepositories) {
+    this.name = Strings.nullToEmpty(name);
+    this.username = Optional.ofNullable(Strings.emptyToNull(username));
+    this.password = Optional.ofNullable(Strings.emptyToNull(password));
+    this.passwordFile = Optional.ofNullable(Strings.emptyToNull(passwordFile));
+    this.passwordCommand = Optional.ofNullable(Strings.emptyToNull(passwordCommand));
+    this.dockerconfigFile = Optional.ofNullable(Strings.emptyToNull(dockerconfigFile));
+    this.email = Optional.ofNullable(Strings.emptyToNull(email));
+    this.address = Optional.ofNullable(Strings.emptyToNull(address));
+    this.insecureRegistry = insecureRegistry;
+    this.helmOciRepositories = Optional.ofNullable(helmOciRepositories).orElse(List.of());
   }
 }

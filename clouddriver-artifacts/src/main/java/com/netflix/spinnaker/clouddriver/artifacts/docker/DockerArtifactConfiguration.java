@@ -17,28 +17,52 @@
 
 package com.netflix.spinnaker.clouddriver.artifacts.docker;
 
-import com.netflix.spinnaker.credentials.CredentialsRepository;
-import com.netflix.spinnaker.credentials.MapBackedCredentialsRepository;
-import com.netflix.spinnaker.credentials.NoopCredentialsLifecycleHandler;
+import com.netflix.spinnaker.credentials.CredentialsTypeProperties;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import okhttp3.OkHttpClient;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
 @ConditionalOnExpression(
     "${kubernetes.enabled:false} || ${cloudrun.enabled:false} || ${dockerRegistry.enabled:false}")
+@EnableConfigurationProperties({
+  DockerArtifactProviderProperties.class,
+  HelmChartArtifactProviderProperties.class
+})
 @RequiredArgsConstructor
 @Slf4j
 class DockerArtifactConfiguration {
+  private final DockerArtifactProviderProperties dockerArtifactProviderProperties;
+
+  private final HelmChartArtifactProviderProperties helmChartsFileSystemProperties;
 
   @Bean
-  public CredentialsRepository<DockerArtifactCredentials> dockerArtifactCredentialsRepository() {
-    CredentialsRepository<DockerArtifactCredentials> repository =
-        new MapBackedCredentialsRepository<>(
-            DockerArtifactCredentials.CREDENTIALS_TYPE, new NoopCredentialsLifecycleHandler<>());
-    repository.save(new DockerArtifactCredentials(new DockerArtifactAccount()));
-    return repository;
+  public CredentialsTypeProperties<DockerArtifactCredentials, DockerArtifactAccount>
+      dockerCredentialsProperties(
+          OkHttpClient okHttpClient, HelmChartsFileSystem helmChartsFileSystem) {
+    return CredentialsTypeProperties.<DockerArtifactCredentials, DockerArtifactAccount>builder()
+        .type(DockerArtifactCredentials.CREDENTIALS_TYPE)
+        .credentialsClass(DockerArtifactCredentials.class)
+        .credentialsDefinitionClass(DockerArtifactAccount.class)
+        .defaultCredentialsSource(dockerArtifactProviderProperties::getAccounts)
+        .credentialsParser(
+            a -> {
+              try {
+                return new DockerArtifactCredentials(a, okHttpClient, helmChartsFileSystem);
+              } catch (Exception e) {
+                log.warn("Failure instantiating Docker artifact account {}: ", a, e);
+                return null;
+              }
+            })
+        .build();
+  }
+
+  @Bean
+  public HelmChartsFileSystem helmChartsFileSystem() {
+    return new HelmChartsFileSystem(helmChartsFileSystemProperties);
   }
 }

@@ -73,4 +73,8 @@ public interface ArtifactCredentials extends Credentials {
   default boolean handlesType(String type) {
     return getTypes().contains(type);
   }
+
+  default boolean limitedHandlesTypes(String type) {
+    return getTypes().contains(type);
+  }
 }

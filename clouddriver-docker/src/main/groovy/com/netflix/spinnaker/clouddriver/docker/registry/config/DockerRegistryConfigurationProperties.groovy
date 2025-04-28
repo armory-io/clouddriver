@@ -69,6 +69,8 @@ class DockerRegistryConfigurationProperties {
     String catalogFile
     // Allow filter the repositories by a regular expression
     String repositoriesRegex
+    //List of Helm-OCI repositories to index
+    List<String> helmOciRepositories
     // Permissions for using this account
     Permissions.Builder permissions = new Permissions.Builder()
   }
