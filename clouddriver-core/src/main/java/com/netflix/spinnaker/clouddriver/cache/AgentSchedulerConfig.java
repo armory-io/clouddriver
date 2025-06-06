@@ -67,7 +67,10 @@ public class AgentSchedulerConfig {
           jedisPool,
           nodeStatusProvider,
           agentIntervalProvider,
-          redisConfigurationProperties.getParallelism());
+          redisConfigurationProperties.getAgent().getEnabledPattern(),
+          redisConfigurationProperties.getParallelism(),
+          shardingFilter,
+          dynamicConfigService);
     } else {
       throw new IllegalStateException("redis.scheduler must be one of 'default', 'sort', or ''.");
     }
