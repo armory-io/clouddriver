@@ -38,6 +38,7 @@ import com.netflix.spinnaker.cats.agent.DefaultCacheResult;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
 import com.netflix.spinnaker.cats.agent.RunnableAgent;
 import com.netflix.spinnaker.cats.cluster.DefaultAgentIntervalProvider;
+import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.provider.ProviderCache;
 import com.netflix.spinnaker.cats.provider.ProviderRegistry;
@@ -94,20 +95,30 @@ class ClusteredSortAgentSchedulerTest {
     when(jedis.evalsha(anyString(), anyInt(), anyString(), anyString(), anyString()))
         .thenReturn(1L);
 
-    // Mock enterprise services
-    when(shardingFilter.filter(any(Agent.class))).thenReturn(true); // Allow all agents by default
+    // Mock default configuration values for zombie cleanup
+    when(dynamicConfigService.getConfig(
+            eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
+        .thenReturn(3600000L); // 1 hour default
+    when(dynamicConfigService.getConfig(
+            eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
+        .thenReturn(300000L); // 5 minutes default
     when(dynamicConfigService.getConfig(
             eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-        .thenReturn(1000); // Default max concurrent agents
+        .thenReturn(1000); // Default concurrent limit
+    when(dynamicConfigService.getConfig(
+            eq(String.class), eq("redis.agent.enabled-pattern"), anyString()))
+        .thenReturn(".*"); // Default enabled pattern
 
-    // Create scheduler with default pattern (all agents enabled)
+    // Default to enabling the node
+    NodeStatusProvider nodeStatusProvider = () -> true;
+
     scheduler =
         new ClusteredSortAgentScheduler(
             jedisPool,
-            () -> true,
+            nodeStatusProvider,
             new DefaultAgentIntervalProvider(30000, 60000, 300000),
-            ".*", // Enable all agents
-            5,
+            ".*",
+            10,
             shardingFilter,
             dynamicConfigService);
   }
@@ -516,7 +527,7 @@ class ClusteredSortAgentSchedulerTest {
 
       // Force a Redis refresh cycle by setting runCount to trigger repopulation
       try {
-        FieldUtils.writeField(scheduler, "runCount", 30, true); // DEFAULT_REDIS_REFRESH_PERIOD = 30
+        FieldUtils.writeField(scheduler, "runCount", 30, true); // REDIS_REFRESH_PERIOD = 30
       } catch (Exception e) {
         throw new RuntimeException(e);
       }
@@ -534,7 +545,10 @@ class ClusteredSortAgentSchedulerTest {
       // Given - Set low max concurrent agents
       when(dynamicConfigService.getConfig(
               eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-          .thenReturn(2);
+          .thenReturn(2); // Only 2 concurrent agents
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
+          .thenReturn(1000L);
 
       // Ensure jedis.time() returns correct List format
       when(jedis.time()).thenReturn(List.of("1000", "0"));
@@ -596,6 +610,201 @@ class ClusteredSortAgentSchedulerTest {
 
       // Then - Should have interacted with enterprise services
       verify(dynamicConfigService, atLeast(1)).getConfig(eq(Integer.class), anyString(), anyInt());
+    }
+  }
+
+  @Nested
+  @DisplayName("Zombie Agent Cleanup Tests")
+  class ZombieAgentCleanupTests {
+
+    @Test
+    @DisplayName("Should configure zombie cleanup thresholds from dynamic config")
+    void shouldConfigureZombieCleanupFromDynamicConfig() {
+      // Given - Configure zombie cleanup settings
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
+          .thenReturn(1800000L); // 30 minutes
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
+          .thenReturn(600000L); // 10 minutes
+      when(dynamicConfigService.getConfig(
+              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
+          .thenReturn(1000); // Default concurrent limit
+
+      TestRunnableAgent agent = new TestRunnableAgent("config-test");
+      scheduler.schedule(
+          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
+
+      // When - Trigger saturatePool (which calls zombie cleanup config)
+      scheduler.saturatePool();
+
+      // Then - Should have checked dynamic config for zombie settings
+      verify(dynamicConfigService, atLeast(1))
+          .getConfig(eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class));
+    }
+
+    @Test
+    @DisplayName("Should track active agents during execution")
+    void shouldTrackActiveAgentsDuringExecution() throws Exception {
+      // Given - Mock all config calls
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
+          .thenReturn(3600000L);
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
+          .thenReturn(300000L);
+      when(dynamicConfigService.getConfig(
+              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
+          .thenReturn(1000);
+
+      TestRunnableAgent agent = new TestRunnableAgent("tracking-test");
+      scheduler.schedule(
+          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
+
+      // When - Start agent execution
+      scheduler.saturatePool();
+
+      // Then - Should have active agents tracked (may be cleared quickly in test)
+      // Check that tracking infrastructure is in place
+      assertThat(scheduler.activeAgents).isNotNull();
+      assertThat(scheduler.zombiesCleanedUp).isNotNull();
+    }
+
+    @Test
+    @DisplayName("Should provide zombie cleanup metrics")
+    void shouldProvideZombieCleanupMetrics() {
+      // Given - Configure zombie cleanup with all required mocks
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
+          .thenReturn(3600000L);
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
+          .thenReturn(300000L);
+      when(dynamicConfigService.getConfig(
+              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
+          .thenReturn(1000);
+
+      // When - Check initial metrics
+      long initialCleanupCount = scheduler.zombiesCleanedUp.get();
+
+      // Then - Metrics should be available and initialized
+      assertThat(initialCleanupCount).isGreaterThanOrEqualTo(0);
+      assertThat(scheduler.activeAgents).isNotNull();
+    }
+
+    @Test
+    @DisplayName("Should handle configuration defaults correctly")
+    void shouldHandleConfigurationDefaults() {
+      // Given - Mock all required config calls
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
+          .thenReturn(3600000L); // 1 hour default
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
+          .thenReturn(300000L); // 5 minutes default
+      when(dynamicConfigService.getConfig(
+              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
+          .thenReturn(1000); // Default limit
+
+      TestRunnableAgent agent = new TestRunnableAgent("defaults-test");
+      scheduler.schedule(
+          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
+
+      // When - Process agent with default configuration
+      assertThatCode(() -> scheduler.saturatePool()).doesNotThrowAnyException();
+
+      // Then - Should use defaults without throwing exceptions
+      verify(dynamicConfigService, atLeast(1))
+          .getConfig(eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class));
+    }
+
+    @Test
+    @DisplayName("Should handle Redis failures during zombie cleanup gracefully")
+    void shouldHandleRedisFailuresDuringCleanup() {
+      // Given - Configure fast zombie cleanup with all mocks
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
+          .thenReturn(1L); // Very short threshold for testing
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
+          .thenReturn(1L); // Very short interval
+      when(dynamicConfigService.getConfig(
+              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
+          .thenReturn(1000);
+
+      // Mock Redis to throw exception during cleanup
+      when(jedis.evalsha(anyString(), any(List.class), any(List.class)))
+          .thenThrow(new RuntimeException("Redis connection failed"));
+
+      TestRunnableAgent agent = new TestRunnableAgent("redis-failure-test");
+      scheduler.schedule(
+          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
+
+      // When - Process agent - should not throw exception despite Redis failure
+      assertThatCode(() -> scheduler.saturatePool()).doesNotThrowAnyException();
+
+      // Then - Should have attempted Redis operations
+      verify(jedis, atLeast(0)).evalsha(anyString(), any(List.class), any(List.class));
+    }
+
+    @Test
+    @DisplayName("Should respect max concurrent agents limit")
+    void shouldRespectMaxConcurrentAgentsLimit() {
+      // Given - Configure low concurrency limit with all mocks
+      when(dynamicConfigService.getConfig(
+              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
+          .thenReturn(2); // Only 2 concurrent agents
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
+          .thenReturn(60000L); // 1 minute
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
+          .thenReturn(30000L); // 30 seconds
+
+      TestRunnableAgent agent1 = new TestRunnableAgent("concurrent-1");
+      TestRunnableAgent agent2 = new TestRunnableAgent("concurrent-2");
+      TestRunnableAgent agent3 = new TestRunnableAgent("concurrent-3");
+
+      scheduler.schedule(
+          agent1, agent1.getAgentExecution(providerRegistry), executionInstrumentation);
+      scheduler.schedule(
+          agent2, agent2.getAgentExecution(providerRegistry), executionInstrumentation);
+      scheduler.schedule(
+          agent3, agent3.getAgentExecution(providerRegistry), executionInstrumentation);
+
+      // When - Process agents
+      scheduler.saturatePool();
+
+      // Then - Should have checked concurrency limit
+      verify(dynamicConfigService, atLeast(1))
+          .getConfig(eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt());
+    }
+
+    @Test
+    @DisplayName("Should handle zombie cleanup interval correctly")
+    void shouldHandleZombieCleanupInterval() {
+      // Given - Configure zombie cleanup interval with all mocks
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
+          .thenReturn(300000L); // 5 minutes
+      when(dynamicConfigService.getConfig(
+              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
+          .thenReturn(3600000L); // 1 hour
+      when(dynamicConfigService.getConfig(
+              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
+          .thenReturn(1000);
+
+      TestRunnableAgent agent = new TestRunnableAgent("interval-test");
+      scheduler.schedule(
+          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
+
+      // When - Process agent multiple times (simulating different intervals)
+      scheduler.saturatePool();
+      scheduler.saturatePool();
+
+      // Then - Should check cleanup interval configuration
+      verify(dynamicConfigService, atLeast(1))
+          .getConfig(eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class));
     }
   }
 

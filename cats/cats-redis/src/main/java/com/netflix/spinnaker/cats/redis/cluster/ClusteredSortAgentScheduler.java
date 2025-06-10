@@ -40,11 +40,20 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 
@@ -85,6 +94,7 @@ import redis.clients.jedis.JedisPool;
  * @see ClusteredAgentScheduler for the default Redis scheduler implementation
  * @see AgentScheduler for the base scheduler interface
  */
+@Component
 public class ClusteredSortAgentScheduler extends CatsModuleAware
     implements AgentScheduler<ClusteredSortAgentLock>, Runnable {
   private static enum Status {
@@ -98,32 +108,53 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private final ExecutorService agentWorkPool;
 
   // Configuration constants - following ClusteredAgentScheduler pattern
-  private final Pattern enabledAgentPattern;
+  private volatile Pattern enabledAgentPattern;
   private final int redisRefreshPeriod;
   private final long schedulerIntervalMs;
 
   // Runtime state
   /**
-   * NOW = 0: Used as offset in score() method to get current Redis timestamp. This is critical for
-   * priority scheduling - agents with lower scores (earlier times) get higher priority. NOW means
-   * "execute immediately", positive offsets mean "execute later".
+   * Local agent registry: Maps agent type to worker instance. This maintains the canonical list of
+   * agents this scheduler instance knows about. Updated when agents are scheduled/unscheduled via
+   * schedule()/unschedule() methods.
    */
-  private static final int NOW = 0;
+  private final ConcurrentHashMap<String, AgentWorker> agents = new ConcurrentHashMap<>();
 
-  /**
-   * Tracks scheduler execution cycles. Used to determine when to refresh Redis with all known
-   * agents (every redisRefreshPeriod cycles). This prevents agent loss if Redis restarts or agents
-   * get accidentally removed.
-   */
+  // Agent execution tracking
+  private final Optional<Semaphore> runningAgents;
+  private final ShardingFilter shardingFilter;
+  private final DynamicConfigService dynamicConfigService;
+
+  // Zombie agent cleanup - simplified tracking
+  private static class ActiveAgent {
+    final Future<?> future;
+    final long startTime;
+    final String acquireScore;
+
+    ActiveAgent(Future<?> future, long startTime, String acquireScore) {
+      this.future = future;
+      this.startTime = startTime;
+      this.acquireScore = acquireScore;
+    }
+  }
+
+  @VisibleForTesting
+  final ConcurrentHashMap<String, ActiveAgent> activeAgents = new ConcurrentHashMap<>();
+
+  private volatile long lastZombieCleanup = System.currentTimeMillis();
+  @VisibleForTesting final AtomicLong zombiesCleanedUp = new AtomicLong(0);
+  private volatile long lastConfigRefresh = System.currentTimeMillis();
+
+  private final Logger log = LoggerFactory.getLogger(ClusteredSortAgentScheduler.class);
+
+  private ScheduledExecutorService schedulerExecutorService;
+  private ScheduledFuture<?> schedulerFuture;
+
+  private ConcurrentHashMap<String, String> scriptShas;
+
+  private static final int NOW = 0;
   private int runCount = 0;
 
-  private final Logger log;
-
-  private Map<String, AgentWorker> agents;
-  private Optional<Semaphore> runningAgents;
-
-  // Agent state management: Agents can be in WAITING_SET (ready to run), WORKING_SET (currently
-  // executing), or neither (not scheduled)
   @VisibleForTesting static final String WAITING_SET = "WAITZ";
   @VisibleForTesting static final String WORKING_SET = "WORKZ";
   private static final String ADD_AGENT_SCRIPT = "addAgentScript";
@@ -131,15 +162,10 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private static final String SWAP_SET_SCRIPT = "swapSetScript";
   private static final String REMOVE_AGENT_SCRIPT = "removeAgentScript";
   private static final String CONDITIONAL_SWAP_SET_SCRIPT = "conditionalSwapSetScript";
+  private static final String CONDITIONAL_REMOVE_SCRIPT = "conditionalRemoveScript";
 
-  private ConcurrentHashMap<String, String> scriptShas;
-
-  // Configuration constants to eliminate magic numbers
   private static final int DEFAULT_REDIS_REFRESH_PERIOD = 30;
   private static final long DEFAULT_SCHEDULER_INTERVAL_MS = 1000L;
-
-  private final ShardingFilter shardingFilter;
-  private final DynamicConfigService dynamicConfigService;
 
   /**
    * Create scheduler with default configuration suitable for most deployments. Follows the same
@@ -157,6 +183,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    *     for large deployments where different pods may need different limits based on available
    *     resources, load patterns, or operational requirements.
    */
+  @Autowired
   public ClusteredSortAgentScheduler(
       JedisPool jedisPool,
       NodeStatusProvider nodeStatusProvider,
@@ -195,6 +222,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    *     operational tuning of concurrent limits, timeouts, and other parameters based on real-time
    *     load and resource availability.
    */
+  @Autowired
   public ClusteredSortAgentScheduler(
       JedisPool jedisPool,
       NodeStatusProvider nodeStatusProvider,
@@ -208,9 +236,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
     this.jedisPool = jedisPool;
     this.nodeStatusProvider = nodeStatusProvider;
-    this.agents = new ConcurrentHashMap<>();
     this.intervalProvider = intervalProvider;
-    this.log = LoggerFactory.getLogger(getClass());
 
     // Apply configuration following ClusteredAgentScheduler pattern
     this.enabledAgentPattern = Pattern.compile(enabledAgentPattern);
@@ -225,10 +251,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       this.runningAgents = Optional.empty();
     }
 
-    scriptShas = new ConcurrentHashMap<>();
-    storeScripts();
-
-    // Use cached thread pool like ClusteredAgentScheduler
     this.agentWorkPool =
         Executors.newCachedThreadPool(
             new ThreadFactoryBuilder()
@@ -238,12 +260,13 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     this.shardingFilter = shardingFilter;
     this.dynamicConfigService = dynamicConfigService;
 
-    // Start the scheduler thread
-    Executors.newSingleThreadScheduledExecutor(
+    this.schedulerExecutorService =
+        Executors.newSingleThreadScheduledExecutor(
             new ThreadFactoryBuilder()
                 .setNameFormat(ClusteredSortAgentScheduler.class.getSimpleName() + "-%d")
-                .build())
-        .scheduleAtFixedRate(this, 0, this.schedulerIntervalMs, TimeUnit.MILLISECONDS);
+                .build());
+    this.scriptShas = new ConcurrentHashMap<>();
+    storeScripts();
   }
 
   /**
@@ -315,6 +338,16 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
           jedis.scriptLoad(
               "redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from WAITING_SET
                   + "redis.call('zrem', KEYS[2], ARGV[1])\n")); // Remove from WORKING_SET
+
+      // SCRIPT 6: Conditional agent removal (zombie cleanup)
+      scriptShas.put(
+          CONDITIONAL_REMOVE_SCRIPT,
+          jedis.scriptLoad(
+              "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
+                  + "if score == ARGV[2] then\n" // If current score matches expected (we own it)
+                  + "  redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from WORKING_SET
+                  + "  return score\n" // Return original score as confirmation
+                  + "else return nil end\n")); // Score mismatch - we don't own this agent
     }
   }
 
@@ -615,188 +648,148 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    */
   @VisibleForTesting
   void saturatePool() {
+    cleanupZombieAgentsIfNeeded();
+    refreshConfigurationIfNeeded();
+
     log.debug("Starting saturatePool cycle {}, known agents: {}", runCount, agents.size());
 
     try (Jedis jedis = jedisPool.getResource()) {
-      // PHASE 1: Agent Repopulation (Redis Recovery)
-      // Occasionally repopulate Redis with all known agents in case Redis went down
-      // or agents were lost. If agents already exist in Redis, this is a no-op.
-      if (runCount % redisRefreshPeriod == 0) {
-        log.debug("Redis refresh cycle - repopulating {} agents", agents.size());
-
-        for (Map.Entry<String, AgentWorker> entry : agents.entrySet()) {
-          String agentType = entry.getKey();
-          AgentWorker worker = entry.getValue();
-
-          // Apply sharding filter - only process agents assigned to this instance
-          // ShardingFilter ensures distributed agent execution across multiple instances
-          // Each instance only processes agents assigned to it, preventing duplicate work
-          if (!shardingFilter.filter(worker.agent)) {
-            log.debug(
-                "Skipping agent {} - not assigned to this instance by sharding filter", agentType);
-            continue;
-          }
-
-          String currentScore = score(jedis, NOW);
-          log.debug("Adding agent {} to Redis WAITING_SET with score: {}", agentType, currentScore);
-
-          Object result =
-              jedis.evalsha(
-                  getScriptSha(ADD_AGENT_SCRIPT, jedis),
-                  2,
-                  WAITING_SET,
-                  WORKING_SET,
-                  agentType,
-                  currentScore);
-
-          if (result != null) {
-            log.debug("Repopulated agent {} in Redis with score {}", agentType, currentScore);
-          }
-        }
-        log.debug("Redis refresh complete");
-      }
-
-      // PHASE 2: Stale Agent Cleanup (Timeout Handling)
-      // Find agents that have been in WORKING_SET too long and release them.
-      // This handles cases where agent execution threads died or hung.
-      String timeoutScore = score(jedis, NOW); // Agents older than NOW are timed out
-      Set<String> timedOutAgents = jedis.zrangeByScore(WORKING_SET, "-inf", timeoutScore);
-
-      if (timedOutAgents != null && !timedOutAgents.isEmpty()) {
-        log.warn(
-            "Found {} timed-out agents in WORKING_SET: {}", timedOutAgents.size(), timedOutAgents);
-
-        for (String agentType : timedOutAgents) {
-          AgentWorker worker = agents.get(agentType);
-          if (worker != null) {
-            log.debug("Releasing timed-out agent: {}", agentType);
-            releaseAgent(worker.agent);
-          } else {
-            log.warn("Timed-out agent {} not found in local agents map", agentType);
-          }
-        }
-      }
-
-      // PHASE 3: Ready Agent Discovery (Priority Selection)
-      // Find agents ready to execute from WAITING_SET in priority order.
-      // Lower scores = higher priority (agents that missed their time get priority)
-      String currentScore = score(jedis, NOW);
-      Set<String> readyAgentSet = jedis.zrangeByScore(WAITING_SET, "-inf", currentScore);
-      List<String> readyAgents = new ArrayList<>(readyAgentSet);
-
-      log.debug(
-          "Found {} ready agents for execution (score <= {}): {}",
-          readyAgents.size(),
-          currentScore,
-          readyAgents);
-
-      // Apply dynamic configuration for max concurrent agents
-      // DynamicConfigService allows runtime tuning without restarts - critical for large
-      // deployments
-      // where different pods may need different limits based on available resources or load
-      // patterns
-      Integer maxConcurrentAgents =
+      // Check concurrent agent limits before processing
+      int maxConcurrentAgents =
           dynamicConfigService.getConfig(Integer.class, "redis.agent.max-concurrent-agents", 1000);
-      Integer currentlyRunning =
-          runningAgents.map(s -> maxConcurrentAgents - s.availablePermits()).orElse(0);
-      Integer availableSlots = maxConcurrentAgents - currentlyRunning;
+      int currentlyRunning = activeAgents.size();
 
-      if (availableSlots <= 0) {
+      if (currentlyRunning >= maxConcurrentAgents) {
         log.debug(
-            "Not acquiring more agents (maxConcurrentAgents: {}, currentlyRunning: {})",
-            maxConcurrentAgents,
-            currentlyRunning);
+            "Skipping agent acquisition - at max concurrent limit ({} running, {} max)",
+            currentlyRunning,
+            maxConcurrentAgents);
         return;
       }
 
+      // PHASE 1: Agent Repopulation (Redis Recovery)
+      if (runCount % redisRefreshPeriod == 0) {
+        repopulateRedisAgents(jedis);
+      }
+
+      // PHASE 2: Cleanup expired agents from WORKING_SET
+      cleanupExpiredWorkingAgents(jedis);
+
+      // PHASE 3: Find ready agents in priority order
+      String currentScore = score(jedis, System.currentTimeMillis());
+      Set<String> readyAgents =
+          jedis.zrangeByScore(WAITING_SET, 0, Double.parseDouble(currentScore));
+
       log.debug(
-          "Available agent slots: {} (max: {}, running: {})",
-          availableSlots,
-          maxConcurrentAgents,
-          currentlyRunning);
+          "Found {} agents ready for execution at score {}", readyAgents.size(), currentScore);
 
-      // Pre-size collections for performance
-      final int estimatedReadyAgents = Math.min(readyAgents.size(), availableSlots);
-      Set<AgentWorker> workersToSubmit = new HashSet<>(estimatedReadyAgents);
-
-      int threadsAcquired = 0;
-      int agentsProcessed = 0;
+      if (readyAgents.isEmpty()) {
+        log.debug("No agents ready for execution");
+        return;
+      }
 
       // PHASE 4: Agent Acquisition and Execution
-      // Loop through ready agents in priority order, acquire them atomically,
-      // and submit them to the thread pool for execution
-      while (!readyAgents.isEmpty()
-          && runningAgents.map(Semaphore::tryAcquire).orElse(true)
-          && threadsAcquired < availableSlots) {
+      Set<AgentWorker> workersToSubmit = new HashSet<>();
+      int threadsAcquired = 0;
+
+      for (String agentType : readyAgents) {
+        if (threadsAcquired >= maxConcurrentAgents) {
+          break;
+        }
+
+        if (!runningAgents.map(Semaphore::tryAcquire).orElse(true)) {
+          break;
+        }
+
         threadsAcquired++;
-
-        try {
-          String agentType = readyAgents.remove(0); // Take highest priority agent
-          agentsProcessed++;
-
-          log.debug("Processing ready agent: {} (priority rank: {})", agentType, agentsProcessed);
-
-          AgentWorker worker = agents.get(agentType);
-          if (worker == null) {
-            log.warn("Ready agent {} not found in local agents map, skipping", agentType);
-            runningAgents.ifPresent(Semaphore::release);
-            continue;
-          }
-
-          // Apply sharding filter - only process agents assigned to this instance
-          // This is the second sharding check during execution phase to ensure that even if
-          // an agent made it to the ready list, we double-check assignment before execution.
-          // Critical for HA deployments where agent assignments may change dynamically.
-          if (!shardingFilter.filter(worker.agent)) {
-            log.debug(
-                "Skipping agent {} - not assigned to this instance by sharding filter", agentType);
-            runningAgents.ifPresent(Semaphore::release);
-            continue;
-          }
-
-          // Atomically acquire the agent (WAITING → WORKING)
-          // This prevents other clouddriver instances from executing the same agent
-          ScoreTuple acquireResult = acquireAgent(worker.agent);
-          if (acquireResult == null) {
-            log.debug("Failed to acquire agent {} (already taken by another instance)", agentType);
-            runningAgents.ifPresent(Semaphore::release);
-            continue;
-          }
-
-          // Set the acquisition score for ownership verification during release
-          worker.setScore(acquireResult.acquireScore);
-          log.debug(
-              "Successfully acquired agent {} with score {}",
-              agentType,
-              acquireResult.acquireScore);
-
-          // Submit to thread pool for execution
-          if (workersToSubmit.add(worker)) {
-            agentWorkPool.submit(worker);
-            log.debug("Submitted agent {} to execution thread pool", agentType);
-          } else {
-            log.warn("Agent {} already in submission set, releasing permit", agentType);
-            runningAgents.ifPresent(Semaphore::release);
-          }
-
-        } catch (Throwable t) {
-          log.error("Failed to process agent during saturatePool", t);
+        AgentWorker worker = agents.get(agentType);
+        if (worker == null) {
+          log.warn("Ready agent {} not found in local agents map, skipping", agentType);
           runningAgents.ifPresent(Semaphore::release);
-          // Continue processing other agents - don't let one failure stop the whole cycle
+          continue;
+        }
+
+        ScoreTuple acquireResult = acquireAgent(worker.agent);
+        if (acquireResult == null) {
+          log.debug("Unable to acquire agent {} (likely acquired by another instance)", agentType);
+          runningAgents.ifPresent(Semaphore::release);
+          continue;
+        }
+
+        worker.acquireScore = acquireResult.acquireScore;
+
+        log.debug(
+            "Successfully acquired agent {} with score {}", agentType, acquireResult.acquireScore);
+
+        // Submit to thread pool for execution with tracking
+        if (workersToSubmit.add(worker)) {
+          Future<?> future = agentWorkPool.submit(worker);
+
+          // Track agent execution for zombie detection
+          activeAgents.put(
+              agentType, new ActiveAgent(future, System.currentTimeMillis(), worker.acquireScore));
+
+          log.debug("Submitted agent {} to execution thread pool with tracking", agentType);
         }
       }
 
       log.debug(
-          "SaturatePool cycle {} complete: processed={}, acquired={}, submitted={}",
+          "Scheduler cycle {} completed: {} agents processed, {} threads acquired, {} workers submitted",
           runCount,
-          agentsProcessed,
+          readyAgents.size(),
           threadsAcquired,
           workersToSubmit.size());
 
     } catch (Exception e) {
-      log.error("Critical error in saturatePool cycle {}", runCount, e);
-      // Don't rethrow - let the scheduler continue and try again next cycle
+      log.error("Failed to saturate pool: {}", e.getMessage(), e);
     }
+  }
+
+  /** Repopulate Redis with known agents for recovery scenarios. */
+  private void repopulateRedisAgents(Jedis jedis) {
+    log.debug("Repopulating Redis with {} known agents", agents.size());
+    for (Map.Entry<String, AgentWorker> entry : agents.entrySet()) {
+      try {
+        String agentType = entry.getKey();
+        Agent agent = entry.getValue().agent;
+
+        if (shardingFilter.filter(agent)) {
+          scheduleAgentInRedis(jedis, agent);
+        }
+      } catch (Exception e) {
+        log.warn("Failed to repopulate agent {}: {}", entry.getKey(), e.getMessage());
+      }
+    }
+  }
+
+  /** Clean up agents that have been in WORKING_SET too long. */
+  private void cleanupExpiredWorkingAgents(Jedis jedis) {
+    long currentTime = System.currentTimeMillis();
+    Set<String> expiredAgents = jedis.zrangeByScore(WORKING_SET, 0, currentTime);
+
+    if (!expiredAgents.isEmpty()) {
+      log.info("Found {} expired agents in WORKING_SET, cleaning up", expiredAgents.size());
+      for (String agentType : expiredAgents) {
+        try {
+          jedis.evalsha(
+              getScriptSha(REMOVE_AGENT_SCRIPT, jedis),
+              Arrays.asList(WORKING_SET),
+              Arrays.asList(agentType));
+          log.debug("Removed expired agent {} from WORKING_SET", agentType);
+        } catch (Exception e) {
+          log.warn("Failed to remove expired agent {}: {}", agentType, e.getMessage());
+        }
+      }
+    }
+  }
+
+  /** Schedule an agent in Redis using atomic operations. */
+  private void scheduleAgentInRedis(Jedis jedis, Agent agent) {
+    String currentScore = score(jedis, System.currentTimeMillis());
+    jedis.evalsha(
+        getScriptSha(ADD_AGENT_SCRIPT, jedis),
+        Arrays.asList(WAITING_SET, WORKING_SET),
+        Arrays.asList(agent.getAgentType(), currentScore));
   }
 
   /**
@@ -846,12 +839,10 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       Agent agent, String acquireScore, String newAcquireScore) {
     try (Jedis jedis = jedisPool.getResource()) {
       Object releaseScore =
-          jedis
-              .evalsha(
-                  getScriptSha(CONDITIONAL_SWAP_SET_SCRIPT, jedis),
-                  Arrays.asList(WORKING_SET, WAITING_SET),
-                  Arrays.asList(agent.getAgentType(), newAcquireScore, acquireScore))
-              .toString();
+          jedis.evalsha(
+              getScriptSha(CONDITIONAL_SWAP_SET_SCRIPT, jedis),
+              Arrays.asList(WORKING_SET, WAITING_SET),
+              Arrays.asList(agent.getAgentType(), newAcquireScore, acquireScore));
 
       return releaseScore != null ? new ScoreTuple(newAcquireScore, releaseScore.toString()) : null;
     }
@@ -872,6 +863,113 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
   }
 
+  /** Clean up zombie agents that have been running too long. */
+  private void cleanupZombieAgentsIfNeeded() {
+    long now = System.currentTimeMillis();
+    long cleanupInterval =
+        dynamicConfigService.getConfig(
+            Long.class, "redis.agent.zombie-cleanup-interval-ms", 300000L); // 5 minutes
+
+    if (now - lastZombieCleanup > cleanupInterval) {
+      cleanupZombieAgents();
+      lastZombieCleanup = now;
+    }
+  }
+
+  private void cleanupZombieAgents() {
+    long zombieThreshold =
+        dynamicConfigService.getConfig(
+            Long.class, "redis.agent.zombie-threshold-ms", 3600000L); // 1 hour
+    long currentTime = System.currentTimeMillis();
+    List<String> zombieAgents = new ArrayList<>();
+
+    // Find zombie agents
+    for (Map.Entry<String, ActiveAgent> entry : activeAgents.entrySet()) {
+      String agentType = entry.getKey();
+      ActiveAgent activeAgent = entry.getValue();
+
+      if ((currentTime - activeAgent.startTime) > zombieThreshold) {
+        zombieAgents.add(agentType);
+      }
+    }
+
+    if (zombieAgents.isEmpty()) {
+      return;
+    }
+
+    log.warn(
+        "Found {} zombie agents, cleaning up: {}",
+        zombieAgents.size(),
+        zombieAgents.stream().limit(5).collect(Collectors.toList()));
+
+    // Clean up zombies
+    int cleaned = 0;
+    for (String agentType : zombieAgents) {
+      try {
+        cleanupZombieAgent(agentType);
+        cleaned++;
+      } catch (Exception e) {
+        log.error("Failed to cleanup zombie agent {}: {}", agentType, e.getMessage());
+      }
+    }
+
+    zombiesCleanedUp.addAndGet(cleaned);
+    log.warn("Zombie cleanup completed: {}/{} agents cleaned", cleaned, zombieAgents.size());
+  }
+
+  private void cleanupZombieAgent(String agentType) {
+    ActiveAgent activeAgent = activeAgents.remove(agentType);
+    if (activeAgent == null) {
+      return;
+    }
+
+    // Cancel the thread
+    try {
+      if (activeAgent.future.cancel(true)) {
+        log.info("Cancelled zombie agent execution: {}", agentType);
+      }
+    } catch (Exception e) {
+      log.warn("Failed to cancel zombie agent {}: {}", agentType, e.getMessage());
+    }
+
+    // Remove from Redis
+    try (Jedis jedis = jedisPool.getResource()) {
+      jedis.evalsha(
+          getScriptSha(CONDITIONAL_REMOVE_SCRIPT, jedis),
+          Arrays.asList(WORKING_SET),
+          Arrays.asList(
+              agentType, activeAgent.acquireScore, String.valueOf(System.currentTimeMillis())));
+      log.debug("Removed zombie agent {} from Redis WORKING_SET", agentType);
+    } catch (Exception e) {
+      log.warn("Failed to remove zombie agent {} from Redis: {}", agentType, e.getMessage());
+    }
+
+    // Release semaphore
+    runningAgents.ifPresent(Semaphore::release);
+  }
+
+  /** Refresh dynamic configuration periodically. */
+  private void refreshConfigurationIfNeeded() {
+    long now = System.currentTimeMillis();
+    if (now - lastConfigRefresh > 30000) {
+      refreshConfiguration();
+      lastConfigRefresh = now;
+    }
+  }
+
+  private void refreshConfiguration() {
+    try {
+      // Refresh enabled agent pattern
+      String enabledPattern =
+          dynamicConfigService.getConfig(String.class, "redis.agent.enabled-pattern", ".*");
+      this.enabledAgentPattern = Pattern.compile(enabledPattern, Pattern.CASE_INSENSITIVE);
+
+      log.debug("Refreshed agent configuration - enabled pattern: {}", enabledPattern);
+    } catch (Exception e) {
+      log.warn("Failed to refresh agent configuration: {}", e.getMessage());
+    }
+  }
+
   /**
    * Runnable wrapper for agent execution with proper cleanup and error handling.
    *
@@ -880,12 +978,12 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * Releases semaphore permits and Redis locks on completion 4. Handles both success and failure
    * scenarios gracefully
    */
-  private static class AgentWorker implements Runnable {
+  private class AgentWorker implements Runnable {
     private final Agent agent;
     private final AgentExecution agentExecution;
     private final ExecutionInstrumentation executionInstrumentation;
     private final ClusteredSortAgentScheduler scheduler;
-    private String acquireScore;
+    String acquireScore;
 
     AgentWorker(
         Agent agent,
@@ -898,25 +996,40 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       this.scheduler = scheduler;
     }
 
-    public void setScore(String score) {
-      acquireScore = score;
-    }
-
     @Override
     public void run() {
       assert acquireScore != null;
       Status status = Status.FAILURE;
       long startTimeMs = System.currentTimeMillis();
+      String agentType = agent.getAgentType();
+
       try {
+        log.debug("Starting execution of agent: {}", agentType);
         executionInstrumentation.executionStarted(agent);
         agentExecution.executeAgent(agent);
         executionInstrumentation.executionCompleted(agent, elapsedTimeMs(startTimeMs));
         status = Status.SUCCESS;
+        log.debug(
+            "Successfully completed execution of agent: {} in {}ms",
+            agentType,
+            elapsedTimeMs(startTimeMs));
       } catch (Throwable cause) {
+        if (cause instanceof InterruptedException) {
+          log.warn("Agent {} execution was interrupted (likely due to zombie cleanup)", agentType);
+          Thread.currentThread().interrupt(); // Restore interrupt status
+        } else {
+          log.error(
+              "Agent {} execution failed after {}ms", agentType, elapsedTimeMs(startTimeMs), cause);
+        }
         executionInstrumentation.executionFailed(agent, cause, elapsedTimeMs(startTimeMs));
       } finally {
+        // Clean up tracking data - this happens for both normal and zombie cleanup
+        scheduler.activeAgents.remove(agentType);
+
         scheduler.runningAgents.ifPresent(Semaphore::release);
         scheduler.conditionalReleaseAgent(agent, acquireScore, status);
+
+        log.debug("Agent {} execution cleanup completed", agentType);
       }
     }
   }
@@ -930,5 +1043,17 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       this.acquireScore = acquireScore;
       this.releaseScore = releaseScore;
     }
+  }
+
+  @PostConstruct
+  public void startScheduler() {
+    schedulerFuture =
+        schedulerExecutorService.scheduleAtFixedRate(
+            this, 0, schedulerIntervalMs, TimeUnit.MILLISECONDS);
+  }
+
+  @PreDestroy
+  public void stopScheduler() {
+    schedulerFuture.cancel(true);
   }
 }
