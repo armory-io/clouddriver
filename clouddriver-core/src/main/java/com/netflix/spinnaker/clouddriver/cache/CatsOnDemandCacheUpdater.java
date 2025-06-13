@@ -150,6 +150,13 @@ public class CatsOnDemandCacheUpdater implements OnDemandCacheUpdater {
                 "We likely just wrote stale data. If you're seeing this, file a github issue: https://github.com/spinnaker/spinnaker/issues");
           }
 
+          // Boost priority of related caching agents if using ClusteredSortAgentScheduler
+          if (agentScheduler
+              instanceof com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentScheduler) {
+            ((com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentScheduler) agentScheduler)
+                .handleOnDemandCompletion(agent, result);
+          }
+
           final long elapsed = System.nanoTime() - startTime;
           agent.getMetricsSupport().recordTotalRunTimeNanos(elapsed);
 
