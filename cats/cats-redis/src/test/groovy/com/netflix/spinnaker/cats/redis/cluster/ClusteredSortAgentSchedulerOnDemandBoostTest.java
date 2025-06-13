@@ -87,6 +87,11 @@ class ClusteredSortAgentSchedulerOnDemandBoostTest {
     when(dynamicConfigService.getConfig(Long.class, "redis.agent.scheduler-interval-ms", 1000L))
         .thenReturn(1000L);
 
+    // Mock batch operations flag specifically (disabled by default)
+    when(dynamicConfigService.getConfig(
+            eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
+        .thenReturn(false);
+
     scheduler =
         new ClusteredSortAgentScheduler(
             jedisPool,

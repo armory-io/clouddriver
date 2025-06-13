@@ -125,8 +125,8 @@ import redis.clients.jedis.JedisPool;
  * redis.agent.on-demand.max-boosts-per-second: 30.0 # Moderate rate limiting for busy systems
  * </pre>
  *
- * <p><strong>Suitable for:</strong> 500-3000+ AWS accounts, high deployment frequency, dedicated
- * Redis infrastructure.
+ * <p><strong>Suitable for:</strong> 500+ AWS accounts, high deployment frequency, dedicated Redis
+ * infrastructure.
  *
  * <p><strong>Performance:</strong> ~0.5 second agent pickup, 1800 boosts/minute capacity,
  * sub-10-second OnDemand processing.
@@ -182,6 +182,38 @@ import redis.clients.jedis.JedisPool;
  *       running, increase zombie-threshold-ms
  * </ul>
  *
+ * <p><strong>Batch Operations (Performance Optimization):</strong>
+ *
+ * <p>For enterprise-scale deployments (1000+ agents), batch operations provide significant
+ * performance improvements by reducing Redis round-trips from O(n) to O(1). All batch operations
+ * are controlled by a single feature flag:
+ *
+ * <pre>
+ * redis.agent.batch-operations-enabled: false      # All batch operations (disabled by default for safety)
+ * </pre>
+ *
+ * <p><strong>Performance Impact:</strong> Batch operations can improve performance by 10-1000x for
+ * large agent counts:
+ *
+ * <ul>
+ *   <li><strong>Agent Repopulation:</strong> 1000 agents: 1000 Redis calls → 1 Redis call (1000x
+ *       improvement)
+ *   <li><strong>Zombie Cleanup:</strong> 50 zombie agents: 50 Redis calls → 1 Redis call (50x
+ *       improvement)
+ *   <li><strong>OnDemand Boost:</strong> 10 related agents: 10 Redis calls → 1 Redis call (10x
+ *       improvement)
+ * </ul>
+ *
+ * <p><strong>Deployment Strategy:</strong> Enable batch operations gradually:
+ *
+ * <ol>
+ *   <li>Enable in development environment first: {@code redis.agent.batch-operations-enabled: true}
+ *   <li>Monitor Redis performance and error rates
+ *   <li>Enable in staging with full load testing
+ *   <li>Enable in production during low-traffic periods
+ *   <li>All operations have automatic fallback to individual calls if batch operations fail
+ * </ol>
+ *
  * @see ClusteredAgentScheduler for the default Redis scheduler implementation
  * @see AgentScheduler for the base scheduler interface
  */
@@ -217,7 +249,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private final DynamicConfigService dynamicConfigService;
 
   // Zombie agent cleanup - simplified tracking
-  private static class ActiveAgent {
+  static class ActiveAgent {
     final Future<?> future;
     final long startTime;
     final String acquireScore;
@@ -256,11 +288,16 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private static final String CONDITIONAL_REMOVE_SCRIPT = "conditionalRemoveScript";
   private static final String BOOST_PRIORITY_SCRIPT = "boostPriorityScript";
 
+  // Batch operation scripts for O(n) → O(1) performance optimization
+  private static final String BATCH_ADD_AGENTS_SCRIPT = "batchAddAgentsScript";
+  private static final String BATCH_CLEANUP_AGENTS_SCRIPT = "batchCleanupAgentsScript";
+  private static final String BATCH_BOOST_PRIORITY_SCRIPT = "batchBoostPriorityScript";
+
   private static final int DEFAULT_REDIS_REFRESH_PERIOD = 30;
   private static final long DEFAULT_SCHEDULER_INTERVAL_MS = 1000L;
 
   // OnDemand boost rate limiting
-  private final Map<String, Long> lastBoostTimes = new ConcurrentHashMap<>();
+  Map<String, Long> lastBoostTimes = new ConcurrentHashMap<>();
 
   /**
    * Create scheduler with default configuration suitable for most deployments. Follows the same
@@ -492,6 +529,59 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
                   + "  -- Agent not in WAITING_SET, nothing to boost\n"
                   + "  return nil\n"
                   + "end"));
+
+      // SCRIPT 8: Batch add agents to WAITING_SET
+      scriptShas.put(
+          BATCH_ADD_AGENTS_SCRIPT,
+          jedis.scriptLoad(
+              "-- Args: score, agent1, agent2, ...\n"
+                  + "local score = ARGV[1]\n"
+                  + "local added = 0\n"
+                  + "for i = 2, #ARGV do\n"
+                  + "  local agent = ARGV[i]\n"
+                  + "  if redis.call('zrank', KEYS[1], agent) == nil then\n"
+                  + "    if redis.call('zrank', KEYS[2], agent) == nil then\n"
+                  + "      redis.call('zadd', KEYS[1], score, agent)\n"
+                  + "      added = added + 1\n"
+                  + "    end\n"
+                  + "  end\n"
+                  + "end\n"
+                  + "return added"));
+
+      // SCRIPT 9: Batch cleanup agents from both sets
+      scriptShas.put(
+          BATCH_CLEANUP_AGENTS_SCRIPT,
+          jedis.scriptLoad(
+              "-- Args: agent1, agent2, ...\n"
+                  + "local removed = 0\n"
+                  + "for i = 1, #ARGV do\n"
+                  + "  local agent = ARGV[i]\n"
+                  + "  local working_removed = redis.call('zrem', KEYS[1], agent)\n"
+                  + "  local waiting_removed = redis.call('zrem', KEYS[2], agent)\n"
+                  + "  removed = removed + working_removed + waiting_removed\n"
+                  + "end\n"
+                  + "return removed"));
+
+      // SCRIPT 10: Batch boost priority for OnDemand-related agents
+      scriptShas.put(
+          BATCH_BOOST_PRIORITY_SCRIPT,
+          jedis.scriptLoad(
+              "-- Args: new_score, agent1, agent2, ...\n"
+                  + "local new_score = ARGV[1]\n"
+                  + "local boosted = 0\n"
+                  + "for i = 2, #ARGV do\n"
+                  + "  local agent = ARGV[i]\n"
+                  + "  local score = redis.call('zscore', KEYS[1], agent)\n"
+                  + "  if score ~= nil then\n"
+                  + "    -- Only boost if agent is in WAITING_SET and not in WORKING_SET\n"
+                  + "    local working_score = redis.call('zscore', KEYS[2], agent)\n"
+                  + "    if working_score == nil then\n"
+                  + "      redis.call('zadd', KEYS[1], new_score, agent)\n"
+                  + "      boosted = boosted + 1\n"
+                  + "    end\n"
+                  + "  end\n"
+                  + "end\n"
+                  + "return boosted"));
     }
   }
 
@@ -790,7 +880,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * <p>Concurrency Safety: All Redis operations use Lua scripts for atomicity. Multiple clouddriver
    * instances can safely coordinate without double-executing agents or losing work.
    */
-  @VisibleForTesting
   void saturatePool() {
     cleanupZombieAgentsIfNeeded();
     refreshConfigurationIfNeeded();
@@ -889,19 +978,84 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
   }
 
-  /** Repopulate Redis with known agents for recovery scenarios. */
+  /** Repopulate Redis with known agents for recovery scenarios using batch operations. */
   private void repopulateRedisAgents(Jedis jedis) {
     log.debug("Repopulating Redis with {} known agents", agents.size());
+
+    // Check if batch operations are enabled (disabled by default for safety)
+    boolean batchOperationsEnabled =
+        dynamicConfigService.getConfig(
+            Boolean.class, "redis.agent.batch-operations-enabled", false);
+
+    if (!batchOperationsEnabled) {
+      log.debug("Batch repopulation disabled, using individual operations");
+      // Use individual operations (existing proven approach)
+      for (Map.Entry<String, AgentWorker> entry : agents.entrySet()) {
+        try {
+          String agentType = entry.getKey();
+          Agent agent = entry.getValue().agent;
+
+          if (shardingFilter.filter(agent)) {
+            scheduleAgentInRedis(jedis, agent);
+          }
+        } catch (Exception e) {
+          log.warn("Failed to repopulate agent {}: {}", entry.getKey(), e.getMessage());
+        }
+      }
+      return;
+    }
+
+    // Collect agents that pass sharding filter
+    List<String> agentsToAdd = new ArrayList<>();
+    String defaultScore = score(jedis, 0); // Default score for new agents
+
     for (Map.Entry<String, AgentWorker> entry : agents.entrySet()) {
       try {
         String agentType = entry.getKey();
         Agent agent = entry.getValue().agent;
 
         if (shardingFilter.filter(agent)) {
-          scheduleAgentInRedis(jedis, agent);
+          agentsToAdd.add(agentType);
         }
       } catch (Exception e) {
-        log.warn("Failed to repopulate agent {}: {}", entry.getKey(), e.getMessage());
+        log.warn(
+            "Failed to evaluate agent {} for repopulation: {}", entry.getKey(), e.getMessage());
+      }
+    }
+
+    if (agentsToAdd.isEmpty()) {
+      log.debug("No agents to repopulate after sharding filter");
+      return;
+    }
+
+    // Batch add agents using single Redis call
+    try {
+      List<String> scriptArgs = new ArrayList<>();
+      scriptArgs.add(defaultScore); // First arg is the score
+      scriptArgs.addAll(agentsToAdd); // Remaining args are agent names
+
+      Object result =
+          jedis.evalsha(
+              getScriptSha(BATCH_ADD_AGENTS_SCRIPT, jedis),
+              Arrays.asList(WAITING_SET, WORKING_SET),
+              scriptArgs);
+
+      int added = result instanceof Long ? ((Long) result).intValue() : 0;
+      log.debug("Repopulation completed: {}/{} agents added to Redis", added, agentsToAdd.size());
+
+    } catch (Exception e) {
+      log.error(
+          "Batch repopulation failed, falling back to individual operations: {}", e.getMessage());
+      // Fallback to individual operations
+      for (String agentType : agentsToAdd) {
+        try {
+          scheduleAgentInRedis(jedis, agents.get(agentType).agent);
+        } catch (Exception fallbackError) {
+          log.warn(
+              "Failed to repopulate agent {} individually: {}",
+              agentType,
+              fallbackError.getMessage());
+        }
       }
     }
   }
@@ -925,15 +1079,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         }
       }
     }
-  }
-
-  /** Schedule an agent in Redis using atomic operations. */
-  private void scheduleAgentInRedis(Jedis jedis, Agent agent) {
-    String currentScore = score(jedis, System.currentTimeMillis());
-    jedis.evalsha(
-        getScriptSha(ADD_AGENT_SCRIPT, jedis),
-        Arrays.asList(WAITING_SET, WORKING_SET),
-        Arrays.asList(agent.getAgentType(), currentScore));
   }
 
   /**
@@ -1007,8 +1152,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
   }
 
-  /** Clean up zombie agents that have been running too long. */
-  private void cleanupZombieAgentsIfNeeded() {
+  void cleanupZombieAgentsIfNeeded() {
     long now = System.currentTimeMillis();
     long cleanupInterval =
         dynamicConfigService.getConfig(
@@ -1046,19 +1190,84 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         zombieAgents.size(),
         zombieAgents.stream().limit(5).collect(Collectors.toList()));
 
-    // Clean up zombies
-    int cleaned = 0;
+    // Check if batch zombie cleanup is enabled (disabled by default for safety)
+    boolean batchOperationsEnabled =
+        dynamicConfigService.getConfig(
+            Boolean.class, "redis.agent.batch-operations-enabled", false);
+
+    if (!batchOperationsEnabled) {
+      log.debug("Batch zombie cleanup disabled, using individual operations");
+      // Use individual cleanup operations (existing proven approach)
+      int cleaned = 0;
+      for (String agentType : zombieAgents) {
+        try {
+          cleanupZombieAgent(agentType);
+          cleaned++;
+        } catch (Exception e) {
+          log.error("Failed to cleanup zombie agent {}: {}", agentType, e.getMessage());
+        }
+      }
+      zombiesCleanedUp.addAndGet(cleaned);
+      log.warn("Zombie cleanup completed: {}/{} agents cleaned", cleaned, zombieAgents.size());
+      return;
+    }
+
+    // Cancel futures for zombie agents before Redis cleanup
+    int futuresCanceled = 0;
     for (String agentType : zombieAgents) {
-      try {
-        cleanupZombieAgent(agentType);
-        cleaned++;
-      } catch (Exception e) {
-        log.error("Failed to cleanup zombie agent {}: {}", agentType, e.getMessage());
+      ActiveAgent activeAgent = activeAgents.get(agentType);
+      if (activeAgent != null && activeAgent.future != null) {
+        try {
+          if (activeAgent.future.cancel(true)) {
+            futuresCanceled++;
+          }
+        } catch (Exception e) {
+          log.warn("Failed to cancel future for zombie agent {}: {}", agentType, e.getMessage());
+        }
       }
     }
 
-    zombiesCleanedUp.addAndGet(cleaned);
-    log.warn("Zombie cleanup completed: {}/{} agents cleaned", cleaned, zombieAgents.size());
+    // Batch cleanup from Redis using single call
+    int redisRemoved = 0;
+    try (Jedis jedis = jedisPool.getResource()) {
+      Object result =
+          jedis.evalsha(
+              getScriptSha(BATCH_CLEANUP_AGENTS_SCRIPT, jedis),
+              Arrays.asList(WORKING_SET, WAITING_SET),
+              zombieAgents);
+
+      redisRemoved = result instanceof Long ? ((Long) result).intValue() : 0;
+
+    } catch (Exception e) {
+      log.error(
+          "Batch zombie cleanup failed, falling back to individual operations: {}", e.getMessage());
+      // Fallback to individual cleanup
+      for (String agentType : zombieAgents) {
+        try {
+          cleanupZombieAgent(agentType);
+        } catch (Exception fallbackError) {
+          log.warn(
+              "Failed to cleanup zombie agent {} individually: {}",
+              agentType,
+              fallbackError.getMessage());
+        }
+      }
+    }
+
+    // Remove from active agents tracking
+    int trackingRemoved = 0;
+    for (String agentType : zombieAgents) {
+      if (activeAgents.remove(agentType) != null) {
+        trackingRemoved++;
+      }
+    }
+
+    zombiesCleanedUp.addAndGet(Math.max(redisRemoved, trackingRemoved));
+    log.warn(
+        "Zombie cleanup completed: {} futures canceled, {} removed from Redis, {} removed from tracking",
+        futuresCanceled,
+        redisRemoved,
+        trackingRemoved);
   }
 
   private void cleanupZombieAgent(String agentType) {
@@ -1129,97 +1338,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   }
 
   /**
-   * Runnable wrapper for agent execution with proper cleanup and error handling.
-   *
-   * <p>Encapsulates the complete agent execution lifecycle: 1. Executes the agent via
-   * AgentExecution.executeAgent() 2. Reports execution metrics via ExecutionInstrumentation 3.
-   * Releases semaphore permits and Redis locks on completion 4. Handles both success and failure
-   * scenarios gracefully
-   */
-  private class AgentWorker implements Runnable {
-    private final Agent agent;
-    private final AgentExecution agentExecution;
-    private final ExecutionInstrumentation executionInstrumentation;
-    private final ClusteredSortAgentScheduler scheduler;
-    String acquireScore;
-
-    AgentWorker(
-        Agent agent,
-        AgentExecution agentExecution,
-        ExecutionInstrumentation executionInstrumentation,
-        ClusteredSortAgentScheduler scheduler) {
-      this.agent = agent;
-      this.agentExecution = agentExecution;
-      this.executionInstrumentation = executionInstrumentation;
-      this.scheduler = scheduler;
-    }
-
-    @Override
-    public void run() {
-      assert acquireScore != null;
-      Status status = Status.FAILURE;
-      long startTimeMs = System.currentTimeMillis();
-      String agentType = agent.getAgentType();
-
-      try {
-        log.debug("Starting execution of agent: {}", agentType);
-        executionInstrumentation.executionStarted(agent);
-        agentExecution.executeAgent(agent);
-        executionInstrumentation.executionCompleted(agent, elapsedTimeMs(startTimeMs));
-        status = Status.SUCCESS;
-        log.debug(
-            "Successfully completed execution of agent: {} in {}ms",
-            agentType,
-            elapsedTimeMs(startTimeMs));
-      } catch (Throwable cause) {
-        if (cause instanceof InterruptedException) {
-          log.warn("Agent {} execution was interrupted (likely due to zombie cleanup)", agentType);
-          Thread.currentThread().interrupt(); // Restore interrupt status
-        } else {
-          log.error(
-              "Agent {} execution failed after {}ms", agentType, elapsedTimeMs(startTimeMs), cause);
-        }
-        executionInstrumentation.executionFailed(agent, cause, elapsedTimeMs(startTimeMs));
-      } finally {
-        // Clean up tracking data - this happens for both normal and zombie cleanup
-        scheduler.activeAgents.remove(agentType);
-
-        scheduler.runningAgents.ifPresent(Semaphore::release);
-        scheduler.conditionalReleaseAgent(agent, acquireScore, status);
-
-        log.debug("Agent {} execution cleanup completed", agentType);
-      }
-    }
-  }
-
-  /** Simple data holder for Redis acquisition and release scores. */
-  private static class ScoreTuple {
-    private final String acquireScore;
-    private final String releaseScore;
-
-    public ScoreTuple(String acquireScore, String releaseScore) {
-      this.acquireScore = acquireScore;
-      this.releaseScore = releaseScore;
-    }
-  }
-
-  @PostConstruct
-  public void startScheduler() {
-    schedulerFuture =
-        schedulerExecutorService.scheduleAtFixedRate(
-            this, 0, schedulerIntervalMs, TimeUnit.MILLISECONDS);
-  }
-
-  @PreDestroy
-  public void stopScheduler() {
-    schedulerFuture.cancel(true);
-  }
-
-  // ========================================================================================
-  // ONDEMAND PRIORITY BOOSTING
-  // ========================================================================================
-
-  /**
    * Boost priority of specified agents to run immediately. Used when OnDemand cache refresh
    * completes to prioritize related caching agents.
    *
@@ -1233,44 +1351,150 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
     log.debug("Attempting to boost priority for {} agents: {}", agentTypes.size(), agentTypes);
 
+    // Check if batch operations are enabled (disabled by default for safety)
+    boolean batchOperationsEnabled =
+        dynamicConfigService.getConfig(
+            Boolean.class, "redis.agent.batch-operations-enabled", false);
+
+    if (!batchOperationsEnabled) {
+      log.debug("Batch boost disabled, using individual operations");
+      // Use individual boost operations (existing proven approach)
+      boolean anyBoosted = false;
+      try (Jedis jedis = jedisPool.getResource()) {
+        String immediateScore = score(jedis, 0);
+
+        for (String agentType : agentTypes) {
+          if (shouldRateLimit(agentType)) {
+            log.debug("Rate limiting priority boost for agent: {}", agentType);
+            continue;
+          }
+
+          try {
+            Object oldScore =
+                jedis.evalsha(
+                    getScriptSha(BOOST_PRIORITY_SCRIPT, jedis),
+                    Arrays.asList(WAITING_SET, WORKING_SET),
+                    Arrays.asList(agentType, immediateScore));
+
+            if (oldScore != null) {
+              log.info(
+                  "Boosted priority for agent {} from score {} to {} (immediate execution)",
+                  agentType,
+                  oldScore,
+                  immediateScore);
+              updateBoostTimestamp(agentType);
+              anyBoosted = true;
+            } else {
+              log.debug("Agent {} not found in WAITING_SET, cannot boost priority", agentType);
+            }
+          } catch (Exception e) {
+            log.warn("Failed to boost priority for agent {}: {}", agentType, e.getMessage());
+          }
+        }
+      } catch (Exception e) {
+        log.error("Redis error during priority boost: {}", e.getMessage());
+        return false;
+      }
+
+      log.debug("Priority boost completed. Boosted {} agents", anyBoosted);
+      return anyBoosted;
+    }
+
+    // Filter agents that pass rate limiting
+    List<String> agentsToBoost = new ArrayList<>();
+    List<String> rateLimitedAgents = new ArrayList<>();
+
+    for (String agentType : agentTypes) {
+      if (shouldRateLimit(agentType)) {
+        rateLimitedAgents.add(agentType);
+      } else {
+        agentsToBoost.add(agentType);
+      }
+    }
+
+    if (!rateLimitedAgents.isEmpty()) {
+      log.debug(
+          "Rate limiting priority boost for {} agents: {}",
+          rateLimitedAgents.size(),
+          rateLimitedAgents);
+    }
+
+    if (agentsToBoost.isEmpty()) {
+      log.debug("No agents to boost after rate limiting");
+      return false;
+    }
+
+    // Batch boost using single Redis call
     boolean anyBoosted = false;
     try (Jedis jedis = jedisPool.getResource()) {
       String immediateScore = score(jedis, 0); // Current Redis time = run now
 
-      for (String agentType : agentTypes) {
-        if (shouldRateLimit(agentType)) {
-          log.debug("Rate limiting priority boost for agent: {}", agentType);
-          continue;
-        }
+      List<String> scriptArgs = new ArrayList<>();
+      scriptArgs.add(immediateScore); // First arg is the new score
+      scriptArgs.addAll(agentsToBoost); // Remaining args are agent names
 
-        try {
-          Object oldScore =
-              jedis.evalsha(
-                  getScriptSha(BOOST_PRIORITY_SCRIPT, jedis),
-                  Arrays.asList(WAITING_SET, WORKING_SET),
-                  Arrays.asList(agentType, immediateScore));
+      Object result =
+          jedis.evalsha(
+              getScriptSha(BATCH_BOOST_PRIORITY_SCRIPT, jedis),
+              Arrays.asList(WAITING_SET, WORKING_SET),
+              scriptArgs);
 
-          if (oldScore != null) {
-            log.info(
-                "Boosted priority for agent {} from score {} to {} (immediate execution)",
-                agentType,
-                oldScore,
-                immediateScore);
-            updateBoostTimestamp(agentType);
-            anyBoosted = true;
-          } else {
-            log.debug("Agent {} not found in WAITING_SET, cannot boost priority", agentType);
-          }
-        } catch (Exception e) {
-          log.warn("Failed to boost priority for agent {}: {}", agentType, e.getMessage());
+      int boosted = result instanceof Long ? ((Long) result).intValue() : 0;
+      anyBoosted = boosted > 0;
+
+      if (anyBoosted) {
+        log.info(
+            "Batch priority boost completed: {}/{} agents boosted to immediate execution",
+            boosted,
+            agentsToBoost.size());
+
+        // Update rate limiting timestamps for successfully boosted agents
+        // (We update all since the batch operation doesn't tell us which specific ones succeeded)
+        for (String agentType : agentsToBoost) {
+          updateBoostTimestamp(agentType);
         }
+      } else {
+        log.debug("No agents were boosted - all agents may be executing or not in WAITING_SET");
       }
+
     } catch (Exception e) {
-      log.error("Redis error during priority boost: {}", e.getMessage());
-      return false;
+      log.error(
+          "Batch priority boost failed, falling back to individual operations: {}", e.getMessage());
+      // Fallback to individual boost operations
+      try (Jedis jedis = jedisPool.getResource()) {
+        String immediateScore = score(jedis, 0);
+
+        for (String agentType : agentsToBoost) {
+          try {
+            Object oldScore =
+                jedis.evalsha(
+                    getScriptSha(BOOST_PRIORITY_SCRIPT, jedis),
+                    Arrays.asList(WAITING_SET, WORKING_SET),
+                    Arrays.asList(agentType, immediateScore));
+
+            if (oldScore != null) {
+              log.info(
+                  "Boosted priority for agent {} from score {} to {} (immediate execution)",
+                  agentType,
+                  oldScore,
+                  immediateScore);
+              updateBoostTimestamp(agentType);
+              anyBoosted = true;
+            }
+          } catch (Exception fallbackError) {
+            log.warn(
+                "Failed to boost priority for agent {} individually: {}",
+                agentType,
+                fallbackError.getMessage());
+          }
+        }
+      } catch (Exception fallbackError) {
+        log.error("Redis error during fallback priority boost: {}", fallbackError.getMessage());
+        return false;
+      }
     }
 
-    log.debug("Priority boost completed. Boosted {} agents", anyBoosted);
+    log.debug("Priority boost completed. Any boosted: {}", anyBoosted);
     return anyBoosted;
   }
 
@@ -1527,5 +1751,101 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    */
   private void updateBoostTimestamp(String agentType) {
     lastBoostTimes.put(agentType, System.currentTimeMillis());
+  }
+
+  /** Schedule an agent in Redis using atomic operations (fallback for batch failures). */
+  private void scheduleAgentInRedis(Jedis jedis, Agent agent) {
+    String currentScore = score(jedis, System.currentTimeMillis());
+    jedis.evalsha(
+        getScriptSha(ADD_AGENT_SCRIPT, jedis),
+        Arrays.asList(WAITING_SET, WORKING_SET),
+        Arrays.asList(agent.getAgentType(), currentScore));
+  }
+
+  @PostConstruct
+  public void startScheduler() {
+    schedulerFuture =
+        schedulerExecutorService.scheduleAtFixedRate(
+            this, 0, schedulerIntervalMs, TimeUnit.MILLISECONDS);
+  }
+
+  @PreDestroy
+  public void stopScheduler() {
+    schedulerFuture.cancel(true);
+  }
+
+  /**
+   * Runnable wrapper for agent execution with proper cleanup and error handling.
+   *
+   * <p>Encapsulates the complete agent execution lifecycle: 1. Executes the agent via
+   * AgentExecution.executeAgent() 2. Reports execution metrics via ExecutionInstrumentation 3.
+   * Releases semaphore permits and Redis locks on completion 4. Handles both success and failure
+   * scenarios gracefully
+   */
+  private class AgentWorker implements Runnable {
+    private final Agent agent;
+    private final AgentExecution agentExecution;
+    private final ExecutionInstrumentation executionInstrumentation;
+    private final ClusteredSortAgentScheduler scheduler;
+    String acquireScore;
+
+    AgentWorker(
+        Agent agent,
+        AgentExecution agentExecution,
+        ExecutionInstrumentation executionInstrumentation,
+        ClusteredSortAgentScheduler scheduler) {
+      this.agent = agent;
+      this.agentExecution = agentExecution;
+      this.executionInstrumentation = executionInstrumentation;
+      this.scheduler = scheduler;
+    }
+
+    @Override
+    public void run() {
+      assert acquireScore != null;
+      Status status = Status.FAILURE;
+      long startTimeMs = System.currentTimeMillis();
+      String agentType = agent.getAgentType();
+
+      try {
+        log.debug("Starting execution of agent: {}", agentType);
+        executionInstrumentation.executionStarted(agent);
+        agentExecution.executeAgent(agent);
+        executionInstrumentation.executionCompleted(agent, elapsedTimeMs(startTimeMs));
+        status = Status.SUCCESS;
+        log.debug(
+            "Successfully completed execution of agent: {} in {}ms",
+            agentType,
+            elapsedTimeMs(startTimeMs));
+      } catch (Throwable cause) {
+        if (cause instanceof InterruptedException) {
+          log.warn("Agent {} execution was interrupted (likely due to zombie cleanup)", agentType);
+          Thread.currentThread().interrupt(); // Restore interrupt status
+        } else {
+          log.error(
+              "Agent {} execution failed after {}ms", agentType, elapsedTimeMs(startTimeMs), cause);
+        }
+        executionInstrumentation.executionFailed(agent, cause, elapsedTimeMs(startTimeMs));
+      } finally {
+        // Clean up tracking data - this happens for both normal and zombie cleanup
+        scheduler.activeAgents.remove(agentType);
+
+        scheduler.runningAgents.ifPresent(Semaphore::release);
+        scheduler.conditionalReleaseAgent(agent, acquireScore, status);
+
+        log.debug("Agent {} execution cleanup completed", agentType);
+      }
+    }
+  }
+
+  /** Simple data holder for Redis acquisition and release scores. */
+  private static class ScoreTuple {
+    private final String acquireScore;
+    private final String releaseScore;
+
+    public ScoreTuple(String acquireScore, String releaseScore) {
+      this.acquireScore = acquireScore;
+      this.releaseScore = releaseScore;
+    }
   }
 }

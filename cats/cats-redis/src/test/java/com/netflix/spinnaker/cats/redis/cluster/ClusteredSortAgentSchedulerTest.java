@@ -25,6 +25,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -506,18 +507,25 @@ class ClusteredSortAgentSchedulerTest {
     @Test
     @DisplayName("Should respect sharding filter during agent repopulation")
     void shouldRespectShardingFilterDuringRepopulation() {
-      // Given - Mock sharding filter to reject certain agents
-      when(shardingFilter.filter(any(Agent.class)))
-          .thenAnswer(
-              invocation -> {
-                Agent agent = invocation.getArgument(0);
-                return !agent.getAgentType().contains("filtered");
-              });
+      // Given - Enable batch operations to trigger repopulation OR expect individual
+      // scheduleAgentInRedis calls
+      when(dynamicConfigService.getConfig(
+              eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
+          .thenReturn(false); // Keep individual operations to test sharding
 
-      TestRunnableAgent allowedAgent = new TestRunnableAgent("allowedAgent");
-      TestRunnableAgent filteredAgent = new TestRunnableAgent("filteredAgent");
+      Agent allowedAgent = mock(Agent.class);
+      when(allowedAgent.getAgentType()).thenReturn("allowedAgent");
+      when(allowedAgent.getAgentExecution(any())).thenReturn(mock(AgentExecution.class));
 
-      // When - Schedule both agents
+      Agent filteredAgent = mock(Agent.class);
+      when(filteredAgent.getAgentType()).thenReturn("filteredAgent");
+      when(filteredAgent.getAgentExecution(any())).thenReturn(mock(AgentExecution.class));
+
+      // Configure sharding filter
+      when(shardingFilter.filter(allowedAgent)).thenReturn(true);
+      when(shardingFilter.filter(filteredAgent)).thenReturn(false);
+
+      // Schedule both agents
       scheduler.schedule(
           allowedAgent, allowedAgent.getAgentExecution(providerRegistry), executionInstrumentation);
       scheduler.schedule(
@@ -536,7 +544,9 @@ class ClusteredSortAgentSchedulerTest {
       scheduler.saturatePool();
 
       // Then - Sharding filter should have been called for both agents during repopulation
-      verify(shardingFilter, atLeast(1)).filter(any(Agent.class));
+      verify(shardingFilter, times(2)).filter(any(Agent.class));
+      verify(shardingFilter).filter(allowedAgent);
+      verify(shardingFilter).filter(filteredAgent);
     }
 
     @Test
