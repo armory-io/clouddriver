@@ -46,7 +46,7 @@ public class AgentSchedulerConfig {
       NodeStatusProvider nodeStatusProvider,
       DynamicConfigService dynamicConfigService,
       ShardingFilter shardingFilter) {
-    if (redisConfigurationProperties.getScheduler().equalsIgnoreCase("default")) {
+    if (redisConfigurationProperties.getScheduler().getType().equalsIgnoreCase("default")) {
       URI redisUri = URI.create(redisConfigurationProperties.getConnection());
       String redisHost = redisUri.getHost();
       int redisPort = redisUri.getPort();
@@ -62,13 +62,13 @@ public class AgentSchedulerConfig {
           redisConfigurationProperties.getAgent().getAgentLockAcquisitionIntervalSeconds(),
           dynamicConfigService,
           shardingFilter);
-    } else if (redisConfigurationProperties.getScheduler().equalsIgnoreCase("sort")) {
+    } else if (redisConfigurationProperties.getScheduler().getType().equalsIgnoreCase("sort")) {
       return new ClusteredSortAgentScheduler(
           jedisPool,
           nodeStatusProvider,
           agentIntervalProvider,
           redisConfigurationProperties.getAgent().getEnabledPattern(),
-          redisConfigurationProperties.getParallelism(),
+          redisConfigurationProperties.getScheduler().getParallelism(),
           shardingFilter,
           dynamicConfigService);
     } else {
