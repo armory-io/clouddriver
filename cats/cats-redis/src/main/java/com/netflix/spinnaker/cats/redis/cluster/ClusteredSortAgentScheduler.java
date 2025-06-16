@@ -483,13 +483,13 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       scriptShas.put(
           ADD_AGENT_SCRIPT,
           jedis.scriptLoad(
-              "if redis.call('zrank', KEYS[1], ARGV[1]) == nil then\n" // If NOT in WAITING_SET
-                  + "  if redis.call('zrank', KEYS[2], ARGV[1]) == nil then\n" // AND NOT in
-                  // WORKING_SET
-                  + "    return redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n" // Add to
-                  // WAITING_SET
-                  + "  else return nil end\n" // Agent is currently executing
-                  + "else return nil end\n")); // Agent already waiting
+              "if redis.call('zscore', KEYS[2], ARGV[1]) then\n" // If agent is in WORKING_SET
+                  // (KEYS[2])
+                  + "  return 0\n" // Return 0 (indicate not added to WAITING_SET as it's working)
+                  + "end\n"
+                  + "redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n" // Add/Update in WAITING_SET
+                  // (KEYS[1])
+                  + "return 1\n")); // Return 1 (successfully added/updated in WAITING_SET)
 
       // SCRIPT 5: Complete agent removal (cleanup)
       scriptShas.put(
@@ -536,17 +536,17 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
           jedis.scriptLoad(
               "-- Args: score, agent1, agent2, ...\n"
                   + "local score = ARGV[1]\n"
-                  + "local added = 0\n"
+                  + "local processedCount = 0\n"
                   + "for i = 2, #ARGV do\n"
                   + "  local agent = ARGV[i]\n"
-                  + "  if redis.call('zrank', KEYS[1], agent) == nil then\n"
-                  + "    if redis.call('zrank', KEYS[2], agent) == nil then\n"
-                  + "      redis.call('zadd', KEYS[1], score, agent)\n"
-                  + "      added = added + 1\n"
-                  + "    end\n"
+                  + "  if not redis.call('zscore', KEYS[2], agent) then\n" // If agent is NOT in
+                  // WORKING_SET (KEYS[2])
+                  + "    redis.call('zadd', KEYS[1], score, agent)\n" // Add/Update in WAITING_SET
+                  // (KEYS[1])
+                  + "    processedCount = processedCount + 1\n"
                   + "  end\n"
                   + "end\n"
-                  + "return added"));
+                  + "return processedCount"));
 
       // SCRIPT 9: Batch cleanup agents from both sets
       scriptShas.put(

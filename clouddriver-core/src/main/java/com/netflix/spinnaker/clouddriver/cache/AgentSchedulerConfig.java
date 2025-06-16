@@ -72,7 +72,8 @@ public class AgentSchedulerConfig {
           shardingFilter,
           dynamicConfigService);
     } else {
-      throw new IllegalStateException("redis.scheduler must be one of 'default', 'sort', or ''.");
+      throw new IllegalStateException(
+          "redis.scheduler.type must be one of 'default', 'sort', or ''.");
     }
   }
 }
