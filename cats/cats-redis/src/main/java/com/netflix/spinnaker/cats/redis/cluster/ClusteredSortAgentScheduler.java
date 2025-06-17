@@ -865,10 +865,15 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * Core scheduling logic: Move agents from WAITING → WORKING and execute them.
    *
    * <p>This is the heart of the sort scheduler's priority-based execution. Called periodically by
-   * the scheduler thread, this method: 1. Repopulates Redis with known agents (recovery from Redis
-   * failures) 2. Cleans up stale agents in WORKING_SET (timeout handling) 3. Finds agents ready to
-   * execute from WAITING_SET (priority order) 4. Atomically moves agents WAITING → WORKING
-   * (prevents double execution) 5. Submits agents to thread pool for execution
+   * the scheduler thread, this method: 1. Periodically repopulates Redis with known agents (e.g.,
+   * every 30 seconds, for recovery). 2. Finds agents ready to execute from WAITING_SET based on
+   * their scores (priority order). 3. Atomically moves ready agents from WAITING_SET to WORKING_SET
+   * (prevents double execution). 4. Submits acquired agents to a thread pool for execution.
+   *
+   * <p>Stale or "zombie" agent cleanup (agents stuck in WORKING_SET for too long) is handled by
+   * {@code cleanupZombieAgentsIfNeeded()}, which is checked at the beginning of each {@code
+   * saturatePool} cycle but performs its full cleanup logic on a configurable interval (e.g., every
+   * 5 minutes).
    *
    * <p>Key Differences from Other Schedulers: - DefaultAgentScheduler: No coordination, each
    * instance runs independently - ClusteredAgentScheduler: Random agent selection, Redis locks -
@@ -900,15 +905,12 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         return;
       }
 
-      // PHASE 1: Agent Repopulation (Redis Recovery)
+      // PHASE 1: Agent Repopulation (Redis Recovery, periodic)
       if (runCount % redisRefreshPeriod == 0) {
         repopulateRedisAgents(jedis);
       }
 
-      // PHASE 2: Cleanup expired agents from WORKING_SET
-      cleanupExpiredWorkingAgents(jedis);
-
-      // PHASE 3: Find ready agents in priority order
+      // PHASE 2: Find ready agents in priority order
       String currentScore = score(jedis, System.currentTimeMillis());
       Set<String> readyAgents =
           jedis.zrangeByScore(WAITING_SET, 0, Double.parseDouble(currentScore));
@@ -921,7 +923,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         return;
       }
 
-      // PHASE 4: Agent Acquisition and Execution
+      // PHASE 3: Agent Acquisition and Execution
       Set<AgentWorker> workersToSubmit = new HashSet<>();
       int threadsAcquired = 0;
 
@@ -1060,27 +1062,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
   }
 
-  /** Clean up agents that have been in WORKING_SET too long. */
-  private void cleanupExpiredWorkingAgents(Jedis jedis) {
-    long currentTime = System.currentTimeMillis();
-    Set<String> expiredAgents = jedis.zrangeByScore(WORKING_SET, 0, currentTime);
-
-    if (!expiredAgents.isEmpty()) {
-      log.info("Found {} expired agents in WORKING_SET, cleaning up", expiredAgents.size());
-      for (String agentType : expiredAgents) {
-        try {
-          jedis.evalsha(
-              getScriptSha(REMOVE_AGENT_SCRIPT, jedis),
-              Arrays.asList(WORKING_SET),
-              Arrays.asList(agentType));
-          log.debug("Removed expired agent {} from WORKING_SET", agentType);
-        } catch (Exception e) {
-          log.warn("Failed to remove expired agent {}: {}", agentType, e.getMessage());
-        }
-      }
-    }
-  }
-
   /**
    * Atomically acquire an agent for execution (WAITING → WORKING).
    *
@@ -1153,6 +1134,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   }
 
   void cleanupZombieAgentsIfNeeded() {
+    log.info(
+        "Active agents map size: {}, checking if zombie cleanup is needed.", activeAgents.size());
     long now = System.currentTimeMillis();
     long cleanupInterval =
         dynamicConfigService.getConfig(
@@ -1756,6 +1739,10 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   /** Schedule an agent in Redis using atomic operations (fallback for batch failures). */
   private void scheduleAgentInRedis(Jedis jedis, Agent agent) {
     String currentScore = score(jedis, System.currentTimeMillis());
+    log.debug(
+        "Scheduling agent {} in Redis with initial timestamp score: {}",
+        agent.getAgentType(),
+        currentScore);
     jedis.evalsha(
         getScriptSha(ADD_AGENT_SCRIPT, jedis),
         Arrays.asList(WAITING_SET, WORKING_SET),
