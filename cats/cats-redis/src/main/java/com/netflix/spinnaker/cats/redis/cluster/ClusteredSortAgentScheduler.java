@@ -821,18 +821,26 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    *
    * <p>This enables priority-based scheduling where agents with earlier execution times get
    * processed first.
+   *
+   * <p>Note: offsetMillis is expected to be in milliseconds (e.g., from
+   * System.currentTimeMillis()), and will be converted to seconds before being added to the Redis
+   * TIME (which is in seconds).
    */
   @SuppressWarnings(
       "deprecation") // jedis.time() is deprecated but still the correct method for Redis TIME
   // coordination
-  private static String score(Jedis jedis, long offset) {
+  private static String score(Jedis jedis, long offsetMillis) {
     // Use Redis TIME command for server-side time coordination across multiple instances
     List<String> times = jedis.time();
     if (times == null || times.size() != 2) {
       throw new AgentSchedulingException("Error retrieving time from Redis");
     }
-    int time = Integer.parseInt(times.get(0));
-    return String.format("%d", time + offset);
+    long timeSeconds = Long.parseLong(times.get(0)); // Use Long.parseLong for robustness (Y2K38)
+
+    // Convert offsetMillis from milliseconds to seconds for proper time unit compatibility
+    long offsetSeconds = offsetMillis / 1000;
+
+    return String.format("%d", timeSeconds + offsetSeconds);
   }
 
   /**
@@ -911,7 +919,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       }
 
       // PHASE 2: Find ready agents in priority order
-      String currentScore = score(jedis, System.currentTimeMillis());
+      String currentScore = score(jedis, 0L);
       Set<String> readyAgents =
           jedis.zrangeByScore(WAITING_SET, 0, Double.parseDouble(currentScore));
 
@@ -1009,7 +1017,9 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
     // Collect agents that pass sharding filter
     List<String> agentsToAdd = new ArrayList<>();
-    String defaultScore = score(jedis, 0); // Default score for new agents
+    // Use score(jedis, 0) for immediate execution or current time for normal scheduling
+    // For new agents, schedule them for "now" by using 0L as the offset.
+    String defaultScore = score(jedis, 0L); // Default score for new agents
 
     for (Map.Entry<String, AgentWorker> entry : agents.entrySet()) {
       try {
@@ -1738,7 +1748,12 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
   /** Schedule an agent in Redis using atomic operations (fallback for batch failures). */
   private void scheduleAgentInRedis(Jedis jedis, Agent agent) {
-    String currentScore = score(jedis, System.currentTimeMillis());
+    // When scheduling a new agent like this (typically from repopulateRedisAgents as a fallback),
+    // the offset should be 0 to schedule it for "now", consistent with other initial scheduling
+    // paths.
+    // Passing System.currentTimeMillis() as offset was causing the score to be current_redis_time +
+    // current_system_time.
+    String currentScore = score(jedis, 0L);
     log.debug(
         "Scheduling agent {} in Redis with initial timestamp score: {}",
         agent.getAgentType(),
