@@ -933,54 +933,97 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
       // PHASE 3: Agent Acquisition and Execution
       Set<AgentWorker> workersToSubmit = new HashSet<>();
-      int threadsAcquired = 0;
+      int agentsAcquiredThisCycle = 0;
 
-      for (String agentType : readyAgents) {
-        if (threadsAcquired >= maxConcurrentAgents) {
-          break;
-        }
+      // Calculate how many new agents this pod can try to acquire
+      int availableSlotsForNewAgents = maxConcurrentAgents - currentlyRunning;
 
-        if (!runningAgents.map(Semaphore::tryAcquire).orElse(true)) {
-          break;
-        }
-
-        threadsAcquired++;
-        AgentWorker worker = agents.get(agentType);
-        if (worker == null) {
-          log.warn("Ready agent {} not found in local agents map, skipping", agentType);
-          runningAgents.ifPresent(Semaphore::release);
-          continue;
-        }
-
-        ScoreTuple acquireResult = acquireAgent(worker.agent);
-        if (acquireResult == null) {
-          log.debug("Unable to acquire agent {} (likely acquired by another instance)", agentType);
-          runningAgents.ifPresent(Semaphore::release);
-          continue;
-        }
-
-        worker.acquireScore = acquireResult.acquireScore;
-
+      if (availableSlotsForNewAgents <= 0) {
         log.debug(
-            "Successfully acquired agent {} with score {}", agentType, acquireResult.acquireScore);
+            "No available slots to acquire new agents this cycle ({} running, {} max). Skipping acquisition phase.",
+            currentlyRunning,
+            maxConcurrentAgents);
+      } else if (readyAgents.isEmpty()) {
+        log.debug("No agents ready for execution in WAITING_SET. Skipping acquisition phase.");
+      } else {
+        log.debug(
+            "Attempting to acquire up to {} new agents ({} running, {} max, {} ready in WAITING_SET)",
+            availableSlotsForNewAgents,
+            currentlyRunning,
+            maxConcurrentAgents,
+            readyAgents.size());
 
-        // Submit to thread pool for execution with tracking
-        if (workersToSubmit.add(worker)) {
-          Future<?> future = agentWorkPool.submit(worker);
+        for (String agentType : readyAgents) {
+          if (agentsAcquiredThisCycle >= availableSlotsForNewAgents) {
+            log.debug(
+                "Reached available slot limit for new agents this cycle ({} acquired out of {} target slots).",
+                agentsAcquiredThisCycle,
+                availableSlotsForNewAgents);
+            break;
+          }
 
-          // Track agent execution for zombie detection
-          activeAgents.put(
-              agentType, new ActiveAgent(future, System.currentTimeMillis(), worker.acquireScore));
+          if (!runningAgents.map(Semaphore::tryAcquire).orElse(true)) {
+            log.debug(
+                "Instance concurrent agent limit reached (no permits from 'runningAgents' semaphore). Cannot acquire more agents this cycle.");
+            break; // Stop trying if semaphore is full
+          }
 
-          log.debug("Submitted agent {} to execution thread pool with tracking", agentType);
+          // Semaphore permit acquired
+          AgentWorker worker = agents.get(agentType);
+          if (worker == null) {
+            log.warn(
+                "Ready agent {} not found in local agents map, releasing semaphore permit and skipping.",
+                agentType);
+            runningAgents.ifPresent(Semaphore::release);
+            continue;
+          }
+
+          ScoreTuple acquireResult = acquireAgent(worker.agent);
+          if (acquireResult == null) {
+            log.debug(
+                "Unable to acquire agent {} from Redis (likely acquired by another instance), releasing semaphore permit and skipping.",
+                agentType);
+            runningAgents.ifPresent(Semaphore::release);
+            continue;
+          }
+
+          // Successfully acquired from Redis and semaphore permit is held
+          agentsAcquiredThisCycle++;
+          worker.acquireScore = acquireResult.acquireScore;
+
+          log.debug(
+              "Successfully acquired agent {} from Redis with score {}. (Acquired {} of {} target this cycle)",
+              agentType,
+              acquireResult.acquireScore,
+              agentsAcquiredThisCycle,
+              availableSlotsForNewAgents);
+
+          // Submit to thread pool for execution with tracking
+          if (workersToSubmit.add(worker)) {
+            Future<?> future = agentWorkPool.submit(worker);
+
+            // Track agent execution for zombie detection
+            activeAgents.put(
+                agentType,
+                new ActiveAgent(future, System.currentTimeMillis(), worker.acquireScore));
+
+            log.debug("Submitted agent {} to execution thread pool with tracking", agentType);
+          } else {
+            // Should not happen if acquireAgent is unique per worker instance, but good to handle.
+            log.warn(
+                "Worker for agent {} was already in workersToSubmit set. Releasing semaphore permit.",
+                agentType);
+            runningAgents.ifPresent(Semaphore::release);
+            agentsAcquiredThisCycle--; // Decrement as it was not actually submitted
+          }
         }
       }
 
       log.debug(
-          "Scheduler cycle {} completed: {} agents processed, {} threads acquired, {} workers submitted",
+          "Scheduler cycle {} completed: {} ready agents found in WAITING_SET, {} agents acquired this cycle, {} new workers submitted",
           runCount,
           readyAgents.size(),
-          threadsAcquired,
+          agentsAcquiredThisCycle,
           workersToSubmit.size());
 
     } catch (Exception e) {
