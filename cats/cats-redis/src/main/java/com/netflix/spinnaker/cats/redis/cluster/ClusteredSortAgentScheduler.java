@@ -946,12 +946,14 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       } else if (readyAgents.isEmpty()) {
         log.debug("No agents ready for execution in WAITING_SET. Skipping acquisition phase.");
       } else {
+        int effectiveMaxToAcquire = Math.min(availableSlotsForNewAgents, readyAgents.size());
         log.debug(
-            "Attempting to acquire up to {} new agents ({} running, {} max, {} ready in WAITING_SET)",
-            availableSlotsForNewAgents,
+            "Attempting to acquire up to {} new agents ({} running, {} max, {} ready in WAITING_SET, {} effective max for this cycle)",
+            availableSlotsForNewAgents, // Still log the theoretical max slots if all were available
             currentlyRunning,
             maxConcurrentAgents,
-            readyAgents.size());
+            readyAgents.size(),
+            effectiveMaxToAcquire); // Add the more accurate number for this specific cycle
 
         for (String agentType : readyAgents) {
           if (agentsAcquiredThisCycle >= availableSlotsForNewAgents) {
@@ -991,12 +993,12 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
           agentsAcquiredThisCycle++;
           worker.acquireScore = acquireResult.acquireScore;
 
-          log.debug(
+          log.info(
               "Successfully acquired agent {} from Redis with score {}. (Acquired {} of {} target this cycle)",
               agentType,
               acquireResult.acquireScore,
               agentsAcquiredThisCycle,
-              availableSlotsForNewAgents);
+              effectiveMaxToAcquire);
 
           // Submit to thread pool for execution with tracking
           if (workersToSubmit.add(worker)) {
