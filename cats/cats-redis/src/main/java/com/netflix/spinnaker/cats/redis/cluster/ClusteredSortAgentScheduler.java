@@ -33,6 +33,7 @@ import com.netflix.spinnaker.cats.module.CatsModuleAware;
 import com.netflix.spinnaker.clouddriver.cache.OnDemandAgent;
 import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import java.lang.reflect.Method;
+import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -41,6 +42,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -60,6 +62,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Tuple;
 
 /**
  * Priority-based Redis agent scheduler that uses sorted sets for coordinated execution across
@@ -277,9 +280,14 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
   private static final int NOW = 0;
   private int runCount = 0;
+  private volatile boolean shuttingDown = false;
+  private volatile long lastOrphanCleanup = System.currentTimeMillis();
+  @VisibleForTesting final AtomicLong orphansCleanedUp = new AtomicLong(0);
 
   @VisibleForTesting static final String WAITING_SET = "WAITZ";
   @VisibleForTesting static final String WORKING_SET = "WORKZ";
+  private static final String CLEANUP_LEADER_KEY = "CLEANUP_LEADER";
+  private String currentLeadershipId = null; // Stores the current leadership ID for this instance
   private static final String ADD_AGENT_SCRIPT = "addAgentScript";
   private static final String VALID_SCORE_SCRIPT = "validScoreScript";
   private static final String SWAP_SET_SCRIPT = "swapSetScript";
@@ -287,11 +295,13 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private static final String CONDITIONAL_SWAP_SET_SCRIPT = "conditionalSwapSetScript";
   private static final String CONDITIONAL_REMOVE_SCRIPT = "conditionalRemoveScript";
   private static final String BOOST_PRIORITY_SCRIPT = "boostPriorityScript";
+  private static final String BATCH_ORPHAN_REMOVE_SCRIPT = "batchOrphanRemoveScript";
 
   // Batch operation scripts for O(n) → O(1) performance optimization
   private static final String BATCH_ADD_AGENTS_SCRIPT = "batchAddAgentsScript";
   private static final String BATCH_CLEANUP_AGENTS_SCRIPT = "batchCleanupAgentsScript";
   private static final String BATCH_BOOST_PRIORITY_SCRIPT = "batchBoostPriorityScript";
+  private static final String ORPHAN_REMOVE_SCRIPT = "orphanRemoveScript";
 
   private static final int DEFAULT_REDIS_REFRESH_PERIOD = 30;
   private static final long DEFAULT_SCHEDULER_INTERVAL_MS = 1000L;
@@ -434,20 +444,62 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * instances coordinate agent execution. Without atomic operations, agents could be
    * double-executed or lost during state transitions.
    *
-   * <p>Scripts stored: - ADD_AGENT_SCRIPT: Add agent to WAITING (if not in either set) -
-   * SWAP_SET_SCRIPT: Move agent WAITING → WORKING unconditionally - CONDITIONAL_SWAP_SET_SCRIPT:
-   * Move agent WORKING → WAITING (if score matches) - VALID_SCORE_SCRIPT: Check if agent lock is
-   * still valid - REMOVE_AGENT_SCRIPT: Remove agent from both sets - BOOST_PRIORITY_SCRIPT: Boost
-   * priority of OnDemand-related agents
+   * <p>Scripts are grouped by functional area:
    *
-   * <p>Each script returns SHA hash for efficient execution via EVALSHA.
+   * <p><strong>Agent Lifecycle Management:</strong>
+   *
+   * <ul>
+   *   <li>{@code ADD_AGENT_SCRIPT}: Safely add agent to WAITING set (if not in either set)
+   *   <li>{@code REMOVE_AGENT_SCRIPT}: Remove agent from both WAITING and WORKING sets
+   * </ul>
+   *
+   * <p><strong>Agent State Transitions:</strong>
+   *
+   * <ul>
+   *   <li>{@code SWAP_SET_SCRIPT}: Move agent WAITING → WORKING unconditionally
+   *   <li>{@code CONDITIONAL_SWAP_SET_SCRIPT}: Move agent WORKING → WAITING (if score matches)
+   *   <li>{@code VALID_SCORE_SCRIPT}: Check if agent lock is still valid
+   * </ul>
+   *
+   * <p><strong>Optimization Scripts:</strong>
+   *
+   * <ul>
+   *   <li>{@code BOOST_PRIORITY_SCRIPT}: Boost priority of OnDemand-related agents
+   *   <li>{@code ORPHAN_REMOVE_SCRIPT}: Remove a single orphaned agent
+   *   <li>{@code BATCH_ORPHAN_REMOVE_SCRIPT}: Remove multiple orphaned agents in one operation
+   *   <li>{@code BATCH_ADD_AGENTS_SCRIPT}: Add multiple agents in one operation
+   *   <li>{@code BATCH_CLEANUP_AGENTS_SCRIPT}: Remove multiple zombie agents in one operation
+   * </ul>
+   *
+   * <p>Each script is stored in Redis and returns a SHA hash for efficient execution via EVALSHA.
    *
    * @throws AgentSchedulingException if script loading fails
    */
   private void storeScripts() {
     try (Jedis jedis = jedisPool.getResource()) {
-      // SCRIPT 1: Unconditional agent state transition (WORKING → WAITING)
-      // Used when releasing agents after execution completion
+      // --- AGENT LIFECYCLE SCRIPTS ---
+
+      // Add agent to WAITING set (only if not in either WAITING or WORKING set)
+      scriptShas.put(
+          ADD_AGENT_SCRIPT,
+          jedis.scriptLoad(
+              "local exists = redis.call('zscore', KEYS[1], ARGV[1]) or redis.call('zscore', KEYS[2], ARGV[1])\n"
+                  + "if not exists then\n" // If not in either set
+                  + "  redis.call('zadd', KEYS[2], ARGV[2], ARGV[1])\n" // Add to WAITING set
+                  + "  return 'added'\n" // Success
+                  + "else return nil end\n")); // Already exists in one of the sets
+
+      // Remove agent from both WAITING and WORKING sets
+      scriptShas.put(
+          REMOVE_AGENT_SCRIPT,
+          jedis.scriptLoad(
+              "redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from WORKING_SET
+                  + "redis.call('zrem', KEYS[2], ARGV[1])\n" // Remove from WAITING_SET
+                  + "return 1\n")); // Always return success
+
+      // --- AGENT STATE TRANSITION SCRIPTS ---
+
+      // Move agent WAITING → WORKING unconditionally
       scriptShas.put(
           SWAP_SET_SCRIPT,
           jedis.scriptLoad(
@@ -458,130 +510,130 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
                   + "  return score\n" // Return original score as confirmation
                   + "else return nil end\n")); // Agent wasn't in source set
 
-      // SCRIPT 2: Conditional agent state transition (WORKING → WAITING)
-      // Used for safe agent release - only moves agent if we still own it
+      // Move agent WORKING → WAITING conditionally (only if we still own it)
       scriptShas.put(
           CONDITIONAL_SWAP_SET_SCRIPT,
           jedis.scriptLoad(
               "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
-                  + "if score == ARGV[3] then\n" // If current score matches expected (we own it)
+                  + "if score and tonumber(score) == tonumber(ARGV[3]) then\n" // Numeric comparison
                   + "  redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from source
                   + "  redis.call('zadd', KEYS[2], ARGV[2], ARGV[1])\n" // Add to destination
                   + "  return score\n" // Return original score as confirmation
                   + "else return nil end\n")); // Score mismatch - we don't own this agent
 
-      // SCRIPT 3: Agent ownership validation
+      // Validate agent ownership by checking score
       scriptShas.put(
           VALID_SCORE_SCRIPT,
           jedis.scriptLoad(
               "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
-                  + "if score == ARGV[2] then\n" // If score matches our expectation
+                  + "if score and tonumber(score) == tonumber(ARGV[2]) then\n" // Numeric comparison
                   + "  return score\n" // We still own it
                   + "else return nil end\n")); // Ownership lost or agent not found
 
-      // SCRIPT 4: Safe agent addition (WAITING_SET only if not in either set)
-      scriptShas.put(
-          ADD_AGENT_SCRIPT,
-          jedis.scriptLoad(
-              "if redis.call('zscore', KEYS[2], ARGV[1]) then\n" // If agent is in WORKING_SET
-                  // (KEYS[2])
-                  + "  return 0\n" // Return 0 (indicate not added to WAITING_SET as it's working)
-                  + "end\n"
-                  + "redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n" // Add/Update in WAITING_SET
-                  // (KEYS[1])
-                  + "return 1\n")); // Return 1 (successfully added/updated in WAITING_SET)
+      // --- OPTIMIZATION SCRIPTS ---
 
-      // SCRIPT 5: Complete agent removal (cleanup)
-      scriptShas.put(
-          REMOVE_AGENT_SCRIPT,
-          jedis.scriptLoad(
-              "redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from WAITING_SET
-                  + "redis.call('zrem', KEYS[2], ARGV[1])\n")); // Remove from WORKING_SET
-
-      // SCRIPT 6: Conditional agent removal (zombie cleanup)
-      scriptShas.put(
-          CONDITIONAL_REMOVE_SCRIPT,
-          jedis.scriptLoad(
-              "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
-                  + "if score == ARGV[2] then\n" // If current score matches expected (we own it)
-                  + "  redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from WORKING_SET
-                  + "  return score\n" // Return original score as confirmation
-                  + "else return nil end\n")); // Score mismatch - we don't own this agent
-
-      // SCRIPT 7: Priority boosting for OnDemand-related agents
-      // SAFETY: Only boost if agent is in WAITING_SET (not being acquired)
+      // Boost priority of OnDemand-related agents to run immediately
       scriptShas.put(
           BOOST_PRIORITY_SCRIPT,
           jedis.scriptLoad(
-              "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
-                  + "if score ~= nil then\n"
-                  + "  -- Only boost if agent is still in WAITING_SET (not being acquired)\n"
-                  + "  local working_score = redis.call('zscore', KEYS[2], ARGV[1])\n"
-                  + "  if working_score == nil then\n"
-                  + "    -- Agent is in WAITING_SET and not in WORKING_SET, safe to boost\n"
-                  + "    redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n"
-                  + "    return score\n"
-                  + "  else\n"
-                  + "    -- Agent is being executed, don't interfere\n"
-                  + "    return nil\n"
-                  + "  end\n"
-                  + "else\n"
-                  + "  -- Agent not in WAITING_SET, nothing to boost\n"
-                  + "  return nil\n"
-                  + "end"));
+              "local newScore = ARGV[2]\n"
+                  + "local waitingScore = redis.call('zscore', KEYS[1], ARGV[1])\n" // Check WAITING
+                  // score
+                  + "if waitingScore ~= nil then\n" // If exists in WAITING
+                  + "  redis.call('zadd', KEYS[1], newScore, ARGV[1])\n" // Update score
+                  + "  return waitingScore\n" // Return original score
+                  + "end\n"
+                  + "local workingScore = redis.call('zscore', KEYS[2], ARGV[1])\n" // Check WORKING
+                  // score
+                  + "if workingScore ~= nil then\n" // If exists in WORKING
+                  + "  redis.call('zadd', KEYS[2], newScore, ARGV[1])\n" // Update score
+                  + "  return workingScore\n" // Return original score
+                  + "end\n"
+                  + "return nil\n")); // Agent not found in either set
 
-      // SCRIPT 8: Batch add agents to WAITING_SET
+      // Remove a single orphaned agent if score matches
+      scriptShas.put(
+          ORPHAN_REMOVE_SCRIPT,
+          jedis.scriptLoad(
+              "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
+                  + "if score and tonumber(score) == tonumber(ARGV[2]) then\n" // Numeric comparison
+                  + "  redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from WORKZ
+                  + "  return 1\n" // Success
+                  + "else return 0 end\n")); // Failed - score mismatch or agent missing
+
+      // Remove multiple orphaned agents in a single batch operation
+      scriptShas.put(
+          BATCH_ORPHAN_REMOVE_SCRIPT,
+          jedis.scriptLoad(
+              "local removed = {}\n" // Track removed agents for logging
+                  + "local count = 0\n" // Count of successful removals
+                  + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
+                  + "for i=2,#ARGV,2 do\n" // For each agent-score pair
+                  + "  local agent = ARGV[i]\n" // Current agent name
+                  + "  local expectedScore = ARGV[i+1]\n" // Expected score from our scan
+                  + "  local currentScore = redis.call('zscore', KEYS[1], agent)\n" // Current Redis
+                  // score
+                  + "  if currentScore and tonumber(currentScore) == tonumber(expectedScore) then\n" // Exact match
+                  + "    redis.call('zrem', KEYS[1], agent)\n" // Remove from WORKZ
+                  + "    count = count + 1\n" // Increment success count
+                  + "    table.insert(removed, agent)\n" // Add to removal list
+                  + "  end\n"
+                  + "end\n"
+                  + "return {count, removed}\n")); // Return count and list for logging
+
+      // Add multiple agents to WAITING set in a single operation
       scriptShas.put(
           BATCH_ADD_AGENTS_SCRIPT,
           jedis.scriptLoad(
-              "-- Args: score, agent1, agent2, ...\n"
-                  + "local score = ARGV[1]\n"
-                  + "local processedCount = 0\n"
-                  + "for i = 2, #ARGV do\n"
-                  + "  local agent = ARGV[i]\n"
-                  + "  if not redis.call('zscore', KEYS[2], agent) then\n" // If agent is NOT in
-                  // WORKING_SET (KEYS[2])
-                  + "    redis.call('zadd', KEYS[1], score, agent)\n" // Add/Update in WAITING_SET
-                  // (KEYS[1])
-                  + "    processedCount = processedCount + 1\n"
+              "local score = ARGV[1]\n" // Score for all agents (same for batch)
+                  + "local addedCount = 0\n" // Track successful additions
+                  + "for i=2,#ARGV do\n" // For each agent in batch
+                  + "  local agent = ARGV[i]\n" // Current agent name
+                  + "  local exists = redis.call('zscore', KEYS[1], agent) or redis.call('zscore', KEYS[2], agent)\n" // Check sets
+                  + "  if not exists then\n" // If not in either set
+                  + "    redis.call('zadd', KEYS[2], score, agent)\n" // Add to WAITING set
+                  // (KEYS[2])
+                  + "    addedCount = addedCount + 1\n" // Increment count
                   + "  end\n"
                   + "end\n"
-                  + "return processedCount"));
+                  + "return addedCount\n")); // Return count of successful additions
 
-      // SCRIPT 9: Batch cleanup agents from both sets
+      // Remove multiple zombie agents from both sets in a single operation
       scriptShas.put(
           BATCH_CLEANUP_AGENTS_SCRIPT,
           jedis.scriptLoad(
-              "-- Args: agent1, agent2, ...\n"
-                  + "local removed = 0\n"
-                  + "for i = 1, #ARGV do\n"
-                  + "  local agent = ARGV[i]\n"
-                  + "  local working_removed = redis.call('zrem', KEYS[1], agent)\n"
-                  + "  local waiting_removed = redis.call('zrem', KEYS[2], agent)\n"
-                  + "  removed = removed + working_removed + waiting_removed\n"
+              "local cleaned = 0\n" // Track number of agents removed
+                  + "for i=1,#ARGV do\n" // For each agent in batch
+                  + "  local agent = ARGV[i]\n" // Current agent name
+                  + "  redis.call('zrem', KEYS[1], agent)\n" // Remove from WORKING
+                  + "  redis.call('zrem', KEYS[2], agent)\n" // Remove from WAITING
+                  + "  cleaned = cleaned + 1\n" // Increment count
                   + "end\n"
-                  + "return removed"));
+                  + "return cleaned\n")); // Return cleanup count
 
-      // SCRIPT 10: Batch boost priority for OnDemand-related agents
+      // Batch boost priority for multiple OnDemand-related agents in one operation
       scriptShas.put(
           BATCH_BOOST_PRIORITY_SCRIPT,
           jedis.scriptLoad(
               "-- Args: new_score, agent1, agent2, ...\n"
-                  + "local new_score = ARGV[1]\n"
-                  + "local boosted = 0\n"
-                  + "for i = 2, #ARGV do\n"
-                  + "  local agent = ARGV[i]\n"
-                  + "  local score = redis.call('zscore', KEYS[1], agent)\n"
-                  + "  if score ~= nil then\n"
-                  + "    -- Only boost if agent is in WAITING_SET and not in WORKING_SET\n"
-                  + "    local working_score = redis.call('zscore', KEYS[2], agent)\n"
-                  + "    if working_score == nil then\n"
-                  + "      redis.call('zadd', KEYS[1], new_score, agent)\n"
-                  + "      boosted = boosted + 1\n"
-                  + "    end\n"
+                  + "local newScore = ARGV[1]\n" // New score to set for all agents
+                  + "local processedCount = 0\n" // Track number of agents boosted
+                  + "for i = 2, #ARGV do\n" // For each agent in the batch
+                  + "  local agent = ARGV[i]\n" // Current agent name
+                  + "  local waitingScore = redis.call('zscore', KEYS[1], agent)\n" // Check WAITING
+                  + "  local workingScore = redis.call('zscore', KEYS[2], agent)\n" // Check WORKING
+                  + "  if waitingScore ~= nil then\n" // If in WAITING set
+                  + "    redis.call('zadd', KEYS[1], newScore, agent)\n" // Update score
+                  + "    processedCount = processedCount + 1\n" // Increment count
+                  + "  elseif workingScore ~= nil then\n" // If in WORKING set
+                  + "    redis.call('zadd', KEYS[2], newScore, agent)\n" // Update score
+                  + "    processedCount = processedCount + 1\n" // Increment count
                   + "  end\n"
                   + "end\n"
-                  + "return boosted"));
+                  + "return processedCount\n")); // Return total number of boosted agents
+
+    } catch (Exception e) {
+      throw new AgentSchedulingException("Failed to store Redis Lua scripts", e);
     }
   }
 
@@ -732,7 +784,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    */
   @Override
   public boolean tryRelease(ClusteredSortAgentLock lock) {
-    return conditionalReleaseAgent(lock.getAgent(), lock.getAcquireScore(), lock.getReleaseScore())
+    return conditionalReleaseAgent(
+            lock.getAgent(), lock.getAcquireScore(), ClusteredSortAgentScheduler.Status.FAILURE)
         != null;
   }
 
@@ -816,7 +869,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   /**
    * Generate Redis sorted set score based on current time + offset.
    *
-   * <p>Lower scores = higher priority in Redis sorted sets. - NOW (0) = execute immediately
+   * <p>Lower scores = higher priority in Redis sorted sets: - NOW (0) = execute immediately
    * (highest priority) - Positive offset = execute later (lower priority)
    *
    * <p>This enables priority-based scheduling where agents with earlier execution times get
@@ -824,7 +877,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    *
    * <p>Note: offsetMillis is expected to be in milliseconds (e.g., from
    * System.currentTimeMillis()), and will be converted to seconds before being added to the Redis
-   * TIME (which is in seconds).
+   * TIME (which is in seconds). This conversion is critical because Redis stores scores as seconds,
+   * while Java timestamps are in milliseconds.
    */
   @SuppressWarnings(
       "deprecation") // jedis.time() is deprecated but still the correct method for Redis TIME
@@ -841,6 +895,30 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     long offsetSeconds = offsetMillis / 1000;
 
     return String.format("%d", timeSeconds + offsetSeconds);
+  }
+
+  /**
+   * Determines if an agent is still valid according to the current configuration. This helps
+   * distinguish between truly orphaned agents (from crashed pods) and agents that are no longer
+   * needed due to account/configuration changes.
+   *
+   * @param agentType The agent type to validate
+   * @return True if the agent should still be scheduled according to current config, false
+   *     otherwise
+   */
+  private boolean isAgentStillValid(String agentType) {
+    // First check if it's in our local agents map, which gets updated via schedule/unschedule calls
+    if (!agents.containsKey(agentType)) {
+      log.debug(
+          "Agent {} is no longer in local agents map, likely removed via API/config change",
+          agentType);
+      return false;
+    }
+
+    // Additional validation logic could be added here, like checking the provider registry
+    // or querying account information
+
+    return true;
   }
 
   /**
@@ -948,12 +1026,12 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       } else {
         int effectiveMaxToAcquire = Math.min(availableSlotsForNewAgents, readyAgents.size());
         log.debug(
-            "Attempting to acquire up to {} new agents ({} running, {} max, {} ready in WAITING_SET, {} effective max for this cycle)",
-            availableSlotsForNewAgents, // Still log the theoretical max slots if all were available
+            "Attempting to acquire agents ({} running, {} max capacity, {} ready in Redis, limited by {} available slots and {} ready agents)",
             currentlyRunning,
             maxConcurrentAgents,
             readyAgents.size(),
-            effectiveMaxToAcquire); // Add the more accurate number for this specific cycle
+            availableSlotsForNewAgents,
+            effectiveMaxToAcquire); // Min of available slots and ready agent count
 
         for (String agentType : readyAgents) {
           if (agentsAcquiredThisCycle >= availableSlotsForNewAgents) {
@@ -994,11 +1072,10 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
           worker.acquireScore = acquireResult.acquireScore;
 
           log.info(
-              "Successfully acquired agent {} from Redis with score {}. (Acquired {} of {} target this cycle)",
+              "Successfully acquired agent {} from Redis with score {} seconds. (Total acquired: {})",
               agentType,
               acquireResult.acquireScore,
-              agentsAcquiredThisCycle,
-              effectiveMaxToAcquire);
+              agentsAcquiredThisCycle);
 
           // Submit to thread pool for execution with tracking
           if (workersToSubmit.add(worker)) {
@@ -1138,38 +1215,98 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
               getScriptSha(SWAP_SET_SCRIPT, jedis),
               Arrays.asList(WAITING_SET, WORKING_SET),
               Arrays.asList(agent.getAgentType(), acquireScore));
-
       return releaseScore != null ? new ScoreTuple(acquireScore, releaseScore.toString()) : null;
     }
   }
 
-  private ScoreTuple conditionalReleaseAgent(Agent agent, String acquireScore, Status status) {
-    try (Jedis jedis = jedisPool.getResource()) {
-      long newInterval =
+  /**
+   * Conditionally releases an agent, moving it from the {@code WORKING_SET} to the {@code
+   * WAITING_SET} in Redis. This version is typically called by an {@link AgentWorker} upon
+   * completion or error.
+   *
+   * <p>If the scheduler is shutting down ({@link #shuttingDown} is true), the agent is re-queued
+   * with a zero interval (i.e., for immediate execution by another available scheduler instance).
+   * Otherwise, the new interval is determined by the agent's execution {@link Status}.
+   *
+   * @param agent The agent to release.
+   * @param acquireScoreInWorkZ The score the agent had when it was acquired and put into {@code
+   *     WORKING_SET}. This is used by the conditional Lua script to ensure atomicity.
+   * @param status The execution status of the agent.
+   * @return A {@link ScoreTuple} containing the new score in {@code WAITING_SET} and the release
+   *     score from Redis, or null if release failed.
+   */
+  private ScoreTuple conditionalReleaseAgent(
+      Agent agent, String acquireScoreInWorkZ, Status status) {
+    long newInterval;
+    if (this.shuttingDown) {
+      newInterval = 0; // Reschedule immediately (score will be current time)
+      log.info(
+          "Scheduler shutting down: Re-queuing agent {} immediately from conditionalReleaseAgent.",
+          agent.getAgentType());
+    } else {
+      newInterval =
           status == Status.SUCCESS
               ? intervalProvider.getInterval(agent).getInterval()
               : intervalProvider.getInterval(agent).getErrorInterval();
-      String newAcquireScore = score(jedis, newInterval);
-      Object releaseScore =
-          jedis.evalsha(
-              getScriptSha(CONDITIONAL_SWAP_SET_SCRIPT, jedis),
-              Arrays.asList(WORKING_SET, WAITING_SET),
-              Arrays.asList(agent.getAgentType(), newAcquireScore, acquireScore));
-
-      return releaseScore != null ? new ScoreTuple(newAcquireScore, releaseScore.toString()) : null;
     }
+
+    String newScoreForWaitingSet;
+    try (Jedis jedis = jedisPool.getResource()) {
+      newScoreForWaitingSet = score(jedis, newInterval);
+    }
+
+    // Call the helper method that performs the actual Redis operation.
+    // acquireScoreInWorkZ is the agent's score it had in WORKING_SET.
+    // newScoreForWaitingSet is the score it will get in WAITING_SET.
+    return doConditionalRedisRelease(agent, acquireScoreInWorkZ, newScoreForWaitingSet);
   }
 
-  private ScoreTuple conditionalReleaseAgent(
-      Agent agent, String acquireScore, String newAcquireScore) {
+  /**
+   * Helper method to perform the conditional Redis operation to move an agent from {@code
+   * WORKING_SET} to {@code WAITING_SET}. Uses {@code CONDITIONAL_SWAP_SET_SCRIPT} for atomicity.
+   *
+   * @param agent The agent to release.
+   * @param currentScoreInWorkZ The score the agent is expected to have in {@code WORKING_SET}.
+   * @param newScoreForWaitZ The new score the agent will receive in {@code WAITING_SET}.
+   * @return A {@link ScoreTuple} if successful, null otherwise.
+   */
+  private ScoreTuple doConditionalRedisRelease(
+      Agent agent, String currentScoreInWorkZ, String newScoreForWaitZ) {
     try (Jedis jedis = jedisPool.getResource()) {
-      Object releaseScore =
+      // The script CONDITIONAL_SWAP_SET_SCRIPT moves from KEYS[1] (WORKING_SET) to KEYS[2]
+      // (WAITING_SET)
+      // ARGV[1] = agentType
+      // ARGV[2] = newScoreForWaitZ (the new score for the agent in WAITING_SET)
+      // ARGV[3] = currentScoreInWorkZ (the score the agent must currently have in WORKING_SET to be
+      // moved)
+      Object releaseResult =
           jedis.evalsha(
               getScriptSha(CONDITIONAL_SWAP_SET_SCRIPT, jedis),
-              Arrays.asList(WORKING_SET, WAITING_SET),
-              Arrays.asList(agent.getAgentType(), newAcquireScore, acquireScore));
+              Arrays.asList(WORKING_SET, WAITING_SET), // KEYS
+              Arrays.asList(agent.getAgentType(), newScoreForWaitZ, currentScoreInWorkZ)); // ARGS
 
-      return releaseScore != null ? new ScoreTuple(newAcquireScore, releaseScore.toString()) : null;
+      if (releaseResult != null) {
+        log.debug(
+            "Agent {} moved from WORKING_SET (score: {}) to WAITING_SET (new score: {}).",
+            agent.getAgentType(),
+            currentScoreInWorkZ,
+            newScoreForWaitZ);
+        return new ScoreTuple(newScoreForWaitZ, releaseResult.toString());
+      } else {
+        log.warn(
+            "Failed to conditionally move agent {} from WORKING_SET (expected score: {}) to WAITING_SET. Agent not found in WORKING_SET with that score, or script failed.",
+            agent.getAgentType(),
+            currentScoreInWorkZ);
+        return null;
+      }
+    } catch (Exception e) {
+      log.error(
+          "Exception during conditional release of agent {} from WORKING_SET (expected score: {}): {}",
+          agent.getAgentType(),
+          currentScoreInWorkZ,
+          e.getMessage(),
+          e);
+      return null;
     }
   }
 
@@ -1188,20 +1325,590 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
   }
 
-  void cleanupZombieAgentsIfNeeded() {
-    log.info(
-        "Active agents map size: {}, checking if zombie cleanup is needed.", activeAgents.size());
-    long now = System.currentTimeMillis();
-    long cleanupInterval =
+  /**
+   * Attempts to acquire leader status for the orphaned agent cleanup process. Uses Redis SET with
+   * NX option and expiry to implement a distributed lock.
+   *
+   * @return true if leadership was acquired, false otherwise
+   */
+  private boolean tryAcquireCleanupLeadership() {
+    Long leadershipTtlMsObj =
         dynamicConfigService.getConfig(
-            Long.class, "redis.agent.zombie-cleanup-interval-ms", 300000L); // 5 minutes
+            Long.class,
+            "redis.agent.orphan-cleanup-leadership-ttl-ms",
+            120000L); // Default 2 minutes
+    long leadershipTtlMs = leadershipTtlMsObj != null ? leadershipTtlMsObj : 120000L;
 
-    if (now - lastZombieCleanup > cleanupInterval) {
-      cleanupZombieAgents();
-      lastZombieCleanup = now;
+    try (Jedis jedis = jedisPool.getResource()) {
+      // Create a unique instance ID to identify this instance as the leader
+      String instanceId = InetAddress.getLocalHost().getHostName() + "::" + UUID.randomUUID();
+
+      // Use setnx to set the key only if it doesn't already exist
+      Long result = jedis.setnx(CLEANUP_LEADER_KEY, instanceId);
+
+      boolean acquired = (result != null && result == 1L);
+      if (acquired) {
+        // If we acquired the lock, set the expiry separately
+        jedis.expire(CLEANUP_LEADER_KEY, (int) (leadershipTtlMs / 1000));
+
+        // Store the leadership ID for later release
+        currentLeadershipId = instanceId;
+        log.debug(
+            "Acquired orphaned agent cleanup leadership with ID {} - this pod will perform cleanup operations",
+            instanceId);
+      } else {
+        log.debug("Another pod is the cleanup leader - skipping orphaned agent cleanup");
+      }
+
+      return acquired;
+    } catch (Exception e) {
+      log.warn(
+          "Failed to acquire cleanup leadership, will assume not the leader: {}", e.getMessage());
+      return false;
     }
   }
 
+  /**
+   * Releases leadership for orphaned agent cleanup if this pod is the current leader. This prevents
+   * the lock from being held longer than necessary.
+   */
+  private void releaseCleanupLeadership() {
+    // If we don't have a stored leadership ID, nothing to release
+    if (currentLeadershipId == null) {
+      return;
+    }
+
+    try (Jedis jedis = jedisPool.getResource()) {
+      // Only delete the key if we own it (atomic check-and-delete)
+      String script =
+          "if redis.call('get', KEYS[1]) == ARGV[1] then "
+              + "return redis.call('del', KEYS[1]) "
+              + "else return 0 end";
+
+      // Execute the Lua script
+      Object result =
+          jedis.eval(
+              script,
+              Collections.singletonList(CLEANUP_LEADER_KEY),
+              Collections.singletonList(currentLeadershipId));
+
+      if (result != null && ((Long) result) > 0) {
+        log.debug("Released orphaned agent cleanup leadership with ID {}", currentLeadershipId);
+        // Clear the leadership ID after successful release
+        currentLeadershipId = null;
+      }
+    } catch (Exception e) {
+      log.warn("Failed to release cleanup leadership: {}", e.getMessage());
+    }
+  }
+
+  /**
+   * Periodically checks for and cleans up two distinct types of problematic agents:
+   *
+   * <p>1. "Zombie" agents: Agents running for too long on THIS instance, tracked in the {@code
+   * activeAgents} map. These can occur due to rate limits, excessive processing time, or other
+   * performance issues. Configuration: {@code redis.agent.zombie-threshold-ms} (default: 30
+   * minutes), {@code redis.agent.zombie-cleanup-interval-ms} (default: 5 minutes). This threshold
+   * is optimized to allow long-running but legitimate operations to complete without interruption,
+   * while still catching actual zombie agents that may be stuck.
+   *
+   * <p>2. "Orphaned" agents: Agents abandoned in the Redis {@code WORKZ} set because their
+   * executing instance crashed or terminated unexpectedly. Since no instance is tracking them
+   * anymore, they remain "stuck" in the WORKZ set and prevent proper scheduling. Configuration:
+   * {@code redis.agent.orphan-threshold-ms} (default: 10 minutes), {@code
+   * redis.agent.orphan-cleanup-interval-ms} (default: 2 minutes). Thresholds are intentionally
+   * aggressive to minimize stale data exposure, while staying under the on-demand agent circuit
+   * breaker (12 minutes) to prevent cascading failures.
+   *
+   * <p>These are separate problems requiring different detection mechanisms and thresholds.
+   * Orphaned agents use more aggressive thresholds as they have no recovery path other than
+   * explicit cleanup.
+   */
+  void cleanupZombieAgentsIfNeeded() {
+    // Standard zombie cleanup based on local activeAgents map
+    long now = System.currentTimeMillis();
+    long zombieCleanupIntervalMs =
+        dynamicConfigService.getConfig(
+            Long.class, "redis.agent.zombie-cleanup-interval-ms", 300000L); // Default 5 minutes
+
+    if (now - lastZombieCleanup > zombieCleanupIntervalMs) {
+      log.debug(
+          "Checking for zombie agents based on local activeAgents map ({} items).",
+          activeAgents.size());
+      cleanupZombieAgents(); // This cleans based on local activeAgents
+      lastZombieCleanup = now;
+    }
+
+    // Orphaned agent cleanup - scan WORKZ set for agents left by crashed instances
+    // Default cleanup interval: 2 minutes (aggressive to minimize time stale data persists)
+    long orphanCleanupIntervalMs =
+        dynamicConfigService.getConfig(
+            Long.class, "redis.agent.orphan-cleanup-interval-ms", 120000L); // Default 2 minutes
+
+    if (now - lastOrphanCleanup > orphanCleanupIntervalMs) {
+      // Only attempt cleanup if we become the leader or if force refresh is enabled
+      Boolean forceRefreshObj =
+          dynamicConfigService.getConfig(
+              Boolean.class, "redis.agent.orphan-cleanup.force-all-pods", false);
+      boolean forceRefresh = forceRefreshObj != null ? forceRefreshObj : false;
+
+      if (forceRefresh || tryAcquireCleanupLeadership()) {
+        try {
+          cleanupOrphanedAgentsFromRedis(); // This cleans based on scanning Redis WORKZ set
+        } finally {
+          // Release leadership if we acquired it
+          if (!forceRefresh) {
+            releaseCleanupLeadership();
+          }
+        }
+      }
+
+      // Always update the last cleanup timestamp even if we didn't run the cleanup
+      // This prevents pods from constantly trying to run cleanup if leadership is held by another
+      // pod
+      lastOrphanCleanup = now;
+    }
+  }
+
+  /**
+   * Cleans up orphaned agents directly from the Redis WORKZ set.
+   *
+   * <p>Orphaned agents are entries in the Redis WORKZ set that are no longer tracked by any active
+   * Clouddriver instance, typically due to instance crashes, terminations, or network partitions.
+   * Unlike zombie agents (which are tracked locally but running too long), orphaned agents have no
+   * running instance associated with them at all.
+   *
+   * <p>This cleanup mechanism is critical for preventing agent starvation in distributed
+   * environments, where without it orphaned agents would remain "stuck" in the WORKZ set
+   * indefinitely.
+   *
+   * <p>The detection works by scanning the Redis WORKZ set for agent timeouts older than a
+   * configurable threshold ({@code redis.agent.orphan-threshold-ms}), and uses an atomic Lua script
+   * for conditional removal in batches to efficiently process large numbers of orphans in high-load
+   * environments. If orphaned agents are also found in the local activeAgents map, they are cleaned
+   * up as well.
+   *
+   * <p>Configuration:
+   *
+   * <ul>
+   *   <li>{@code redis.agent.orphan-threshold-ms} - Time after which an agent in WORKZ is
+   *       considered orphaned (default: 10min). This aggressive threshold is set below the
+   *       12-minute on-demand circuit breaker to ensure orphaned on-demand agents don't prevent
+   *       data refresh.
+   *   <li>{@code redis.agent.orphan-cleanup-interval-ms} - How often this cleanup process runs
+   *       (default: 2min). Frequent scanning minimizes the time stale data persists.
+   *   <li>{@code redis.agent.orphan-cleanup-batch-size} - Number of orphans to clean in a single
+   *       Redis operation (default: 50). This optimizes Redis performance in high-load
+   *       environments.
+   * </ul>
+   */
+  private void cleanupOrphanedAgentsFromRedis() {
+    long orphanCleanupStartTime = System.currentTimeMillis();
+    log.info("Starting orphaned agent cleanup from Redis WORKZ set.");
+
+    // Default orphan threshold: 10 minutes. Agents with timeout scores older than this in WORKZ are
+    // considered potential orphans
+    Long orphanThresholdMsObj =
+        dynamicConfigService.getConfig(
+            Long.class, "redis.agent.orphan-threshold-ms", 10 * 60 * 1000L); // Default 10 minutes
+    long orphanThresholdMs = orphanThresholdMsObj != null ? orphanThresholdMsObj : 10 * 60 * 1000L;
+
+    // Check if batch operations are enabled and configure batch size accordingly
+    Boolean batchOperationsEnabledObj =
+        dynamicConfigService.getConfig(
+            Boolean.class, "redis.agent.batch-operations-enabled", false);
+    boolean batchOperationsEnabled =
+        batchOperationsEnabledObj != null ? batchOperationsEnabledObj : false;
+
+    int maxOrphanBatchSize = 50; // Default to 50 agents per batch
+
+    if (batchOperationsEnabled) {
+      Integer maxOrphanBatchSizeObj =
+          dynamicConfigService.getConfig(
+              Integer.class, "redis.agent.orphan-cleanup-batch-size", 50);
+      maxOrphanBatchSize = maxOrphanBatchSizeObj != null ? maxOrphanBatchSizeObj : 50;
+    }
+
+    // Calculate the score cutoff for querying Redis. Agents with scores (timeout timestamps)
+    // less than this cutoff are considered for cleanup
+    // NOTE: Redis stores scores as seconds, while Java uses milliseconds
+    long actualOrphanTimeCutoffMs = System.currentTimeMillis() - orphanThresholdMs;
+    // Convert cutoff to seconds for Redis compatibility
+    long actualOrphanTimeCutoffSec = actualOrphanTimeCutoffMs / 1000;
+
+    // First, retrieve all potential orphaned agents
+    Set<Tuple> potentialOrphans;
+    try (Jedis jedis = jedisPool.getResource()) {
+      potentialOrphans =
+          jedis.zrangeByScoreWithScores(
+              WORKING_SET,
+              "-inf", // from the beginning of time
+              String.valueOf(
+                  actualOrphanTimeCutoffSec) // up to the calculated cutoff score (in seconds)
+              );
+    } catch (Exception e) {
+      log.error(
+          "Failed to retrieve potential orphaned agents from Redis WORKZ set: {}",
+          e.getMessage(),
+          e);
+      return;
+    }
+
+    if (potentialOrphans == null || potentialOrphans.isEmpty()) {
+      log.info("No potential orphaned agents found in WORKZ set older than the orphan threshold.");
+      return;
+    }
+
+    log.warn(
+        "Found {} potential orphaned agents in WORKZ set with timeouts older than {}ms ago (cutoff: {} seconds). Attempting cleanup.",
+        potentialOrphans.size(),
+        orphanThresholdMs,
+        actualOrphanTimeCutoffSec);
+
+    // If batch operations are enabled, attempt to use batch processing
+    int totalSuccessfullyCleaned = 0;
+    if (batchOperationsEnabled) {
+      log.debug(
+          "Using batch processing for orphaned agent cleanup of {} agents",
+          potentialOrphans.size());
+      try {
+        // Prepare for batch processing
+        List<Tuple> orphansList = new ArrayList<>(potentialOrphans);
+        int totalOrphans = orphansList.size();
+        int processedSoFar = 0;
+
+        // Process in batches of maxOrphanBatchSize
+        while (processedSoFar < totalOrphans) {
+          // Determine the end index for this batch (not exceeding the list size)
+          int batchEndIndex = Math.min(processedSoFar + maxOrphanBatchSize, totalOrphans);
+          List<Tuple> currentBatch = orphansList.subList(processedSoFar, batchEndIndex);
+
+          // Process the current batch using our batch Lua script
+          int cleanedInBatch =
+              processBatchOfOrphans(currentBatch, actualOrphanTimeCutoffSec, maxOrphanBatchSize);
+          totalSuccessfullyCleaned += cleanedInBatch;
+
+          // Move to the next batch
+          processedSoFar = batchEndIndex;
+
+          // Log progress for large batches
+          if (totalOrphans > 100) {
+            log.info(
+                "Orphaned agent cleanup progress: {}% ({}/{} processed, {} cleaned)",
+                (int) ((processedSoFar * 100.0) / totalOrphans),
+                processedSoFar,
+                totalOrphans,
+                totalSuccessfullyCleaned);
+          }
+        }
+
+        log.info(
+            "Successfully cleaned {} orphaned agents using batch processing",
+            totalSuccessfullyCleaned);
+      } catch (Exception e) {
+        // If batch processing fails, log the error but don't attempt individual processing
+        // This prevents infinite recursion and allows tests to verify the behavior
+        log.error(
+            "Batch orphaned agent cleanup failed with error, skipping cleanup: {}", e.getMessage());
+        // Return early to avoid falling through to individual processing
+        return;
+      }
+    }
+
+    // If batch processing is disabled or failed, fall back to individual processing
+    if (!batchOperationsEnabled) {
+      log.debug("Batch orphaned agent cleanup disabled, using individual operations");
+      for (Tuple orphanTuple : potentialOrphans) {
+        String agentType = orphanTuple.getElement();
+        // Score from Redis is a double, convert to string for Lua script argument
+        String scoreInWorkZ = String.valueOf(orphanTuple.getScore());
+
+        try (Jedis jedis = jedisPool.getResource()) {
+          // First determine if this is a valid agent or an agent for a removed account
+          boolean isStillValid = isAgentStillValid(agentType);
+
+          if (isStillValid) {
+            // For valid agents (truly orphaned due to crashes), move them to WAITZ for rescheduling
+            // Use a Lua script to atomically remove from WORKZ and add to WAITZ
+            String newScore = score(jedis, 0L); // Schedule for immediate execution
+            Object result =
+                jedis.evalsha(
+                    getScriptSha(CONDITIONAL_SWAP_SET_SCRIPT, jedis),
+                    Arrays.asList(WORKING_SET, WAITING_SET),
+                    Arrays.asList(
+                        agentType,
+                        newScore, // New score in WAITING set
+                        scoreInWorkZ // Expected score in WORKING set
+                        ));
+
+            if (result != null) {
+              totalSuccessfullyCleaned++;
+              log.info(
+                  "Successfully moved orphaned agent {} (original score: {}, new score: {}) from WORKZ to WAITZ set.",
+                  agentType,
+                  Double.valueOf(scoreInWorkZ).longValue(),
+                  Double.valueOf(newScore).longValue());
+
+              // Also clean up local state if needed
+              ActiveAgent localCopy = activeAgents.remove(agentType);
+              if (localCopy != null) {
+                log.warn(
+                    "Orphaned agent {} (moved to WAITZ) was also found in this instance's local activeAgents map. Cleaning up local state.",
+                    agentType);
+                if (localCopy.future != null) {
+                  localCopy.future.cancel(true);
+                }
+                runningAgents.ifPresent(Semaphore::release);
+              }
+            } else {
+              log.debug(
+                  "Failed to move orphaned agent {} (original score: {}) from WORKZ to WAITZ. It might have been removed or modified by another process.",
+                  agentType,
+                  Double.valueOf(scoreInWorkZ).longValue());
+            }
+          } else {
+            // For invalid agents (removed accounts), completely remove them
+            Object result =
+                jedis.evalsha(
+                    getScriptSha(ORPHAN_REMOVE_SCRIPT, jedis),
+                    Collections.singletonList(WORKING_SET), // KEYS[1] = WORKING_SET
+                    Arrays.asList(
+                        agentType,
+                        scoreInWorkZ) // ARGV[1] = agentType, ARGV[2] = expectedScoreInWorkZ
+                    );
+
+            if (result != null && ((Long) result).intValue() == 1) {
+              totalSuccessfullyCleaned++;
+              log.info(
+                  "Successfully removed invalid orphaned agent {} (original score: {}) from WORKZ set and local registry.",
+                  agentType,
+                  Double.valueOf(scoreInWorkZ).longValue());
+
+              // Remove from local registry to prevent re-adding
+              agents.remove(agentType);
+
+              // Also clean up local state if needed
+              ActiveAgent localCopy = activeAgents.remove(agentType);
+              if (localCopy != null) {
+                if (localCopy.future != null) {
+                  localCopy.future.cancel(true);
+                }
+                runningAgents.ifPresent(Semaphore::release);
+              }
+            } else {
+              log.debug(
+                  "Failed to remove invalid orphaned agent {} (score: {}) from WORKZ set. It might have been removed by another process.",
+                  agentType,
+                  Double.valueOf(scoreInWorkZ).longValue());
+            }
+          }
+        } catch (Exception e) {
+          log.error(
+              "Error during orphaned agent cleanup attempt for {} (original score: {}): {}",
+              agentType,
+              Double.valueOf(scoreInWorkZ).longValue(),
+              e.getMessage(),
+              e);
+        }
+      }
+    }
+
+    if (totalSuccessfullyCleaned > 0) {
+      orphansCleanedUp.addAndGet(totalSuccessfullyCleaned);
+      log.warn(
+          "Orphaned agent cleanup cycle completed. Removed {} agents from WORKZ set. Total orphans cleaned by this instance: {}.",
+          totalSuccessfullyCleaned,
+          orphansCleanedUp.get());
+    }
+    log.info(
+        "Orphaned agent cleanup process from Redis WORKZ set took {}ms.",
+        System.currentTimeMillis() - orphanCleanupStartTime);
+  }
+
+  /**
+   * Process a batch of orphaned agents, handling valid vs. invalid agents differently. Valid agents
+   * (truly orphaned due to crashes) are moved from WORKZ → WAITZ. Invalid agents (removed accounts)
+   * are completely removed from Redis and local registry.
+   *
+   * @param orphanBatch List of orphaned agent tuples to process
+   * @param cutoffScoreSec The cutoff score in seconds (agents with scores before this are
+   *     considered orphaned)
+   * @param maxBatchSize Maximum number of agents to process in this batch
+   * @return Number of agents successfully cleaned
+   */
+  @SuppressWarnings("unchecked")
+  private int processBatchOfOrphans(
+      List<Tuple> orphanBatch, long cutoffScoreSec, int maxBatchSize) {
+    if (orphanBatch.isEmpty()) {
+      return 0;
+    }
+
+    int totalProcessed = 0;
+
+    try (Jedis jedis = jedisPool.getResource()) {
+      // Classify orphans as valid (still configured) or invalid (removed accounts)
+      Map<Boolean, List<Tuple>> partitionedOrphans =
+          orphanBatch.stream()
+              .collect(Collectors.partitioningBy(orphan -> isAgentStillValid(orphan.getElement())));
+
+      // Process valid orphans - move them to WAITZ for proper rescheduling
+      List<Tuple> validOrphans = partitionedOrphans.get(true);
+      int validProcessed = processValidOrphans(jedis, validOrphans);
+
+      // Process invalid orphans - remove them completely
+      List<Tuple> invalidOrphans = partitionedOrphans.get(false);
+      int invalidProcessed = processInvalidOrphans(jedis, invalidOrphans, maxBatchSize);
+
+      // Log the results
+      if (validProcessed > 0) {
+        log.info(
+            "Batch cleanup: Moved {} valid orphaned agents from WORKZ to WAITZ for rescheduling",
+            validProcessed);
+      }
+
+      if (invalidProcessed > 0) {
+        log.info(
+            "Batch cleanup: Completely removed {} invalid orphaned agents (removed accounts)",
+            invalidProcessed);
+      }
+
+      totalProcessed = validProcessed + invalidProcessed;
+    } catch (Exception e) {
+      log.error("Error during batch orphaned agent cleanup: {}", e.getMessage(), e);
+    }
+
+    return totalProcessed;
+  }
+
+  /**
+   * Process valid orphaned agents by moving them from WORKZ → WAITZ for proper rescheduling. These
+   * are agents that correspond to valid accounts but were orphaned due to pod crashes.
+   */
+  private int processValidOrphans(Jedis jedis, List<Tuple> validOrphans) {
+    int processed = 0;
+
+    // Process each valid orphan individually to move from WORKZ → WAITZ
+    for (Tuple orphan : validOrphans) {
+      String agentType = orphan.getElement();
+      String scoreInWorkZ = String.valueOf(orphan.getScore());
+      String newScore = score(jedis, 0L); // Schedule for immediate execution
+
+      try {
+        // Use conditional swap to atomically move from WORKZ → WAITZ
+        Object result =
+            jedis.evalsha(
+                getScriptSha(CONDITIONAL_SWAP_SET_SCRIPT, jedis),
+                Arrays.asList(WORKING_SET, WAITING_SET),
+                Arrays.asList(agentType, newScore, scoreInWorkZ));
+
+        if (result != null) {
+          processed++;
+          log.debug(
+              "Moved valid orphaned agent {} from WORKZ (score: {}) to WAITZ (new score: {})",
+              agentType,
+              Double.valueOf(scoreInWorkZ).longValue(),
+              Double.valueOf(newScore).longValue());
+
+          // Clean up local execution state
+          ActiveAgent localCopy = activeAgents.remove(agentType);
+          if (localCopy != null) {
+            if (localCopy.future != null) {
+              localCopy.future.cancel(true);
+            }
+            runningAgents.ifPresent(Semaphore::release);
+          }
+        }
+      } catch (Exception e) {
+        log.warn("Failed to move valid orphaned agent {}: {}", agentType, e.getMessage());
+      }
+    }
+
+    return processed;
+  }
+
+  /**
+   * Process invalid orphaned agents (from removed accounts) by removing them completely from Redis
+   * and the local registry to prevent reprocessing.
+   */
+  private int processInvalidOrphans(Jedis jedis, List<Tuple> invalidOrphans, int maxBatchSize) {
+    if (invalidOrphans.isEmpty()) {
+      return 0;
+    }
+
+    int processed = 0;
+
+    try {
+      // Build arguments for batch removal: [maxBatchSize, agent1, score1, agent2, score2, ...]
+      List<String> batchArgs = new ArrayList<>(1 + invalidOrphans.size() * 2);
+      batchArgs.add(String.valueOf(maxBatchSize));
+
+      for (Tuple orphan : invalidOrphans) {
+        batchArgs.add(orphan.getElement());
+        batchArgs.add(String.valueOf(orphan.getScore()));
+      }
+
+      // Execute the batch removal script
+      Object result =
+          jedis.evalsha(
+              getScriptSha(BATCH_ORPHAN_REMOVE_SCRIPT, jedis),
+              Collections.singletonList(WORKING_SET),
+              batchArgs);
+
+      // Process results
+      if (result instanceof List) {
+        List<Object> resultList = (List<Object>) result;
+        if (resultList.size() >= 2) {
+          processed = ((Long) resultList.get(0)).intValue();
+          List<String> removedAgents = (List<String>) resultList.get(1);
+
+          // Clean up local registry state for each removed agent
+          for (String agentType : removedAgents) {
+            // Remove from local agents registry to prevent re-addition
+            agents.remove(agentType);
+
+            // Clean up execution state
+            ActiveAgent localCopy = activeAgents.remove(agentType);
+            if (localCopy != null) {
+              if (localCopy.future != null) {
+                localCopy.future.cancel(true);
+              }
+              runningAgents.ifPresent(Semaphore::release);
+            }
+
+            log.debug(
+                "Removed invalid orphaned agent {} from both Redis and local registry", agentType);
+          }
+        }
+      }
+    } catch (Exception e) {
+      log.error("Batch removal of invalid orphaned agents failed: {}", e.getMessage());
+    }
+
+    return processed;
+  }
+
+  /**
+   * Cleans up zombie agents on the local instance based on execution duration.
+   *
+   * <p>Zombie agents are those that have been running for too long on this Clouddriver instance.
+   * This can happen due to rate limiting, excessive processing time, or other performance issues.
+   * Unlike orphaned agents (which have no running instance), zombies are still executing but have
+   * exceeded their expected runtime.
+   *
+   * <p>This cleanup mechanism is important for preventing resource exhaustion on the local
+   * instance. It works by checking the local {@code activeAgents} map for agents that have been
+   * running longer than a configurable threshold ({@code redis.agent.zombie-threshold-ms}).
+   *
+   * <p>Configuration:
+   *
+   * <ul>
+   *   <li>{@code redis.agent.zombie-threshold-ms} - Time after which a running agent is considered
+   *       a zombie (default: 30min). This balanced threshold allows time for rate-limited
+   *       operations while catching truly stuck agents before they consume excessive resources.
+   *   <li>{@code redis.agent.zombie-cleanup-interval-ms} - How often this cleanup process runs
+   *       (default: 5min)
+   * </ul>
+   */
   private void cleanupZombieAgents() {
     long zombieThreshold =
         dynamicConfigService.getConfig(
@@ -1816,9 +2523,131 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
             this, 0, schedulerIntervalMs, TimeUnit.MILLISECONDS);
   }
 
+  /**
+   * Stops the scheduler and attempts a graceful shutdown of active agents and thread pools. This
+   * method is annotated with {@link PreDestroy} to be called by the Spring container on context
+   * destruction.
+   *
+   * <p>Shutdown sequence:
+   *
+   * <ol>
+   *   <li>Sets the {@link #shuttingDown} flag to true.
+   *   <li>Cancels the main scheduling future and shuts down the {@code schedulerExecutorService}.
+   *   <li>Calls {@link #gracefullyReleaseActiveAgents()} to attempt to cancel and re-queue active
+   *       agents.
+   *   <li>Shuts down the {@code agentWorkPool}.
+   * </ol>
+   */
   @PreDestroy
   public void stopScheduler() {
-    schedulerFuture.cancel(true);
+    log.info("ClusteredSortAgentScheduler initiating shutdown...");
+    this.shuttingDown = true; // Signal that shutdown is in progress
+
+    // 1. Stop accepting new work / stop the main scheduling loop
+    if (schedulerFuture != null) {
+      if (!schedulerFuture.isDone()) {
+        log.debug("Attempting to cancel main scheduler future.");
+        schedulerFuture.cancel(true); // true to interrupt the running task (saturatePool)
+      }
+    }
+    if (schedulerExecutorService != null) {
+      log.debug("Shutting down scheduler executor service.");
+      schedulerExecutorService.shutdown(); // Disable new tasks from being submitted
+      try {
+        if (!schedulerExecutorService.awaitTermination(5, TimeUnit.SECONDS)) {
+          log.warn("Scheduler executor service did not terminate in 5s, forcing shutdown.");
+          schedulerExecutorService.shutdownNow();
+        }
+      } catch (InterruptedException ie) {
+        log.warn("Interrupted while waiting for scheduler executor service to terminate.");
+        schedulerExecutorService.shutdownNow();
+        Thread.currentThread().interrupt();
+      }
+    }
+
+    // 2. Attempt to gracefully release currently active agents
+    gracefullyReleaseActiveAgents();
+
+    // 3. Shutdown the agent worker pool
+    if (agentWorkPool != null) {
+      log.debug("Shutting down agent worker pool.");
+      agentWorkPool.shutdown(); // Disable new tasks
+      try {
+        // Wait a finite time for existing tasks to complete or be cancelled
+        if (!agentWorkPool.awaitTermination(30, TimeUnit.SECONDS)) { // Adjust timeout as needed
+          log.warn("Agent worker pool did not terminate in 30s, forcing shutdown.");
+          agentWorkPool.shutdownNow(); // Cancel currently executing tasks
+        }
+      } catch (InterruptedException ie) {
+        log.warn("Interrupted while waiting for agent worker pool to terminate.");
+        agentWorkPool.shutdownNow();
+        Thread.currentThread().interrupt();
+      }
+    }
+    log.info("ClusteredSortAgentScheduler shutdown process completed.");
+  }
+
+  /**
+   * Attempts to gracefully release agents currently active on this scheduler instance. This
+   * involves cancelling their {@link Future}s, which should trigger their {@code finally} blocks in
+   * {@link AgentWorker} to call {@link #conditionalReleaseAgent(Agent, String, Status)}. Since
+   * {@link #shuttingDown} is true, {@code conditionalReleaseAgent} will re-queue them immediately.
+   */
+  private void gracefullyReleaseActiveAgents() {
+    if (activeAgents.isEmpty()) {
+      log.info("No active agents to release during shutdown.");
+      return;
+    }
+
+    log.info(
+        "Attempting to gracefully release {} active agents during shutdown...",
+        activeAgents.size());
+    // Create a copy of keys to avoid ConcurrentModificationException if AgentWorker's finally block
+    // modifies activeAgents
+    List<String> agentTypesToProcess = new ArrayList<>(activeAgents.keySet());
+
+    for (String agentType : agentTypesToProcess) {
+      ActiveAgent activeAgent = activeAgents.get(agentType);
+      if (activeAgent
+          == null) { // Agent might have completed and been removed by its worker already
+        continue;
+      }
+
+      log.info("Graceful shutdown: Requesting cancellation for active agent {}", agentType);
+      try {
+        if (activeAgent.future != null && !activeAgent.future.isDone()) {
+          activeAgent.future.cancel(true); // Interrupt the worker thread
+          log.debug("Graceful shutdown: Cancelled future for agent {}", agentType);
+        }
+      } catch (Exception e) {
+        log.warn(
+            "Graceful shutdown: Error attempting to cancel future for agent {}: {}",
+            agentType,
+            e.getMessage(),
+            e);
+      }
+    }
+
+    int activeCountAfterCancel = activeAgents.size();
+    if (activeCountAfterCancel > 0) {
+      log.info(
+          "Graceful shutdown: Waiting briefly for {} agents to complete their finally blocks.",
+          activeCountAfterCancel);
+      try {
+        Thread.sleep(
+            Math.min(activeCountAfterCancel * 100L, 5000L)); // Max 5 seconds, or 100ms per agent
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        log.warn("Graceful shutdown: Interrupted while waiting for agents to release.");
+      }
+      log.info(
+          "Graceful shutdown: {} agents potentially still in active map after waiting period.",
+          activeAgents.size());
+    } else {
+      log.info(
+          "Graceful shutdown: All active agents appear to have been processed or removed by their workers.");
+    }
+    log.info("Graceful release attempt for active agents completed.");
   }
 
   /**
