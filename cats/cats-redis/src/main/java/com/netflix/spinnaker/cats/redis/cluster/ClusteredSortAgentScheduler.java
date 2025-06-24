@@ -1110,9 +1110,112 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
   }
 
+  /**
+   * Clean up orphaned agents from the WAITZ set (waiting set). If an agent is in WAITZ but not in
+   * our local agents map, it was likely removed from the configuration and should be removed from
+   * Redis.
+   *
+   * <p>Special handling is provided for boosted agents (score=0) which are preserved even if not in
+   * the local registry, as they may be scheduled by other pods after on-demand processing.
+   *
+   * @param jedis Redis connection to use
+   * @return Number of orphaned agents removed from WAITZ
+   */
+  private int cleanupOrphanedAgentsFromWaitz(Jedis jedis) {
+    long cleanupStartTime = System.currentTimeMillis();
+    int totalRemoved = 0;
+
+    try {
+      // Get current Redis time for timestamp comparisons
+      long currentTimeSeconds = Long.parseLong(jedis.time().get(0));
+
+      // Get agents from the WAITZ set with scores in the past (ready for execution)
+      // These are the problematic ones that should have been executed already
+      Set<Tuple> agentsWithScores =
+          jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", String.valueOf(currentTimeSeconds));
+
+      if (agentsWithScores.isEmpty()) {
+        log.debug("No agents with past timestamps found in WAITZ");
+        return 0;
+      }
+
+      log.debug(
+          "Checking {} agents with past timestamps in WAITZ set for orphaned entries",
+          agentsWithScores.size());
+
+      // Find agents that are in WAITZ but not in our local map
+      List<String> orphanedAgents = new ArrayList<>();
+      for (Tuple tuple : agentsWithScores) {
+        String agentType = tuple.getElement();
+        long score = Double.valueOf(tuple.getScore()).longValue();
+
+        if (!agents.containsKey(agentType)) {
+          // This agent is in WAITZ but not in our local registry - it might be orphaned
+
+          // Special case: NEVER remove agents with score=0, as they are boosted by on-demand
+          // processing
+          if (score == 0) {
+            // Use info level for boosted agents to track frequency
+            log.info("Preserving on-demand boosted agent {} in WAITZ set (score=0)", agentType);
+            continue;
+          }
+
+          // We've already filtered to agents with scores in the past (ready to execute)
+          // Agent is not in our local registry, so it's orphaned
+          orphanedAgents.add(agentType);
+          log.debug(
+              "Agent {} with score {} is not in local registry and will be removed (pastDue: {}s)",
+              agentType,
+              score,
+              currentTimeSeconds - score);
+        }
+      }
+
+      if (orphanedAgents.isEmpty()) {
+        return 0;
+      }
+
+      // Remove all orphaned agents from WAITZ
+      log.info(
+          "Found {} orphaned agents in WAITZ set that are no longer in configuration",
+          orphanedAgents.size());
+
+      for (String orphanedAgent : orphanedAgents) {
+        try {
+          long removed = jedis.zrem(WAITING_SET, orphanedAgent);
+          if (removed > 0) {
+            totalRemoved++;
+            log.info("Successfully removed orphaned agent {} from WAITZ set", orphanedAgent);
+          }
+        } catch (Exception e) {
+          log.warn(
+              "Failed to remove orphaned agent {} from WAITZ set: {}",
+              orphanedAgent,
+              e.getMessage());
+        }
+      }
+
+      log.info(
+          "Removed {} orphaned agents from WAITZ set in {}ms",
+          totalRemoved,
+          System.currentTimeMillis() - cleanupStartTime);
+    } catch (Exception e) {
+      log.error("Error during WAITZ orphaned agent cleanup: {}", e.getMessage(), e);
+    }
+
+    return totalRemoved;
+  }
+
   /** Repopulate Redis with known agents for recovery scenarios using batch operations. */
   private void repopulateRedisAgents(Jedis jedis) {
+    if (agents.isEmpty()) {
+      return;
+    }
+
     log.debug("Repopulating Redis with {} known agents", agents.size());
+
+    // Clean up any orphaned agents in WAITZ that are no longer in our configuration
+    int orphansRemoved = cleanupOrphanedAgentsFromWaitz(jedis);
 
     // Check if batch operations are enabled (disabled by default for safety)
     boolean batchOperationsEnabled =
@@ -1209,12 +1312,28 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    */
   private ScoreTuple acquireAgent(Agent agent) {
     try (Jedis jedis = jedisPool.getResource()) {
+      // Always assign a proper timeout score when moving to WORKZ
       String acquireScore = score(jedis, intervalProvider.getInterval(agent).getTimeout());
+
+      // First check if this is a boosted agent (score=0 in WAITZ)
+      Double waitingScore = jedis.zscore(WAITING_SET, agent.getAgentType());
+      boolean isBoosted = waitingScore != null && waitingScore == 0;
+
+      // Atomically move agent from WAITING_SET to WORKING_SET
       Object releaseScore =
           jedis.evalsha(
               getScriptSha(SWAP_SET_SCRIPT, jedis),
               Arrays.asList(WAITING_SET, WORKING_SET),
               Arrays.asList(agent.getAgentType(), acquireScore));
+
+      // Log when moving boosted agents
+      if (releaseScore != null && isBoosted) {
+        log.info(
+            "Acquired on-demand boosted agent {} from WAITZ (score=0) with timeout {}",
+            agent.getAgentType(),
+            acquireScore);
+      }
+
       return releaseScore != null ? new ScoreTuple(acquireScore, releaseScore.toString()) : null;
     }
   }
@@ -1439,13 +1558,20 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       lastZombieCleanup = now;
     }
 
-    // Orphaned agent cleanup - scan WORKZ set for agents left by crashed instances
+    // Comprehensive orphaned agent cleanup - scan both WORKZ and WAITZ sets for abandoned agents
     // Default cleanup interval: 2 minutes (aggressive to minimize time stale data persists)
     long orphanCleanupIntervalMs =
         dynamicConfigService.getConfig(
             Long.class, "redis.agent.orphan-cleanup-interval-ms", 120000L); // Default 2 minutes
 
-    if (now - lastOrphanCleanup > orphanCleanupIntervalMs) {
+    // Check if this pod should participate in orphan cleanup
+    Boolean orphanCleanupEnabledObj =
+        dynamicConfigService.getConfig(
+            Boolean.class, "redis.agent.orphan-cleanup-enabled", true); // Default enabled
+    boolean orphanCleanupEnabled = orphanCleanupEnabledObj != null ? orphanCleanupEnabledObj : true;
+
+    // Only proceed if cleanup is enabled for this pod
+    if (orphanCleanupEnabled && now - lastOrphanCleanup > orphanCleanupIntervalMs) {
       // Only attempt cleanup if we become the leader or if force refresh is enabled
       Boolean forceRefreshObj =
           dynamicConfigService.getConfig(
@@ -1454,7 +1580,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
       if (forceRefresh || tryAcquireCleanupLeadership()) {
         try {
-          cleanupOrphanedAgentsFromRedis(); // This cleans based on scanning Redis WORKZ set
+          // New comprehensive cleanup that handles both WORKZ and WAITZ sets
+          cleanupOrphanedAgents();
         } finally {
           // Release leadership if we acquired it
           if (!forceRefresh) {
@@ -1491,21 +1618,86 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * <p>Configuration:
    *
    * <ul>
-   *   <li>{@code redis.agent.orphan-threshold-ms} - Time after which an agent in WORKZ is
-   *       considered orphaned (default: 10min). This aggressive threshold is set below the
-   *       12-minute on-demand circuit breaker to ensure orphaned on-demand agents don't prevent
-   *       data refresh.
+   *   <li>{@code redis.agent.orphan-threshold-ms} - How old (in ms) a WORKZ agent must be to be
+   *       considered orphaned (default: 10min). Balances cleanup speed vs. risk of false positives.
    *   <li>{@code redis.agent.orphan-cleanup-interval-ms} - How often this cleanup process runs
    *       (default: 2min). Frequent scanning minimizes the time stale data persists.
+   *   <li>{@code redis.agent.orphan-cleanup-enabled} - Whether this pod participates in orphaned
+   *       agent cleanup (default: true). Useful in complex deployments where some pods have
+   *       different agent filtering than others, allowing only pods with the most complete agent
+   *       configuration to perform cleanup.
    *   <li>{@code redis.agent.orphan-cleanup-batch-size} - Number of orphans to clean in a single
    *       Redis operation (default: 50). This optimizes Redis performance in high-load
    *       environments.
    * </ul>
+   *
+   * <p>For both sets, we apply safety thresholds to avoid race conditions during deployment. The
+   * safety threshold for WAITZ is longer than for WORKZ since WAITZ entries are legitimate pending
+   * work.
    */
-  private void cleanupOrphanedAgentsFromRedis() {
+  void cleanupOrphanedAgents() {
+    // Start timestamp for timing the entire cleanup process
+    long orphanCleanupStartTime = System.currentTimeMillis();
+    log.info("Starting comprehensive orphaned agent cleanup process for both WORKZ and WAITZ sets");
+
+    // Track total agents cleaned across both sets
+    int totalAgentsCleaned = 0;
+
+    try (Jedis jedis = jedisPool.getResource()) {
+      // First, clean up orphaned agents from WORKZ (working set)
+      int workzCleaned = cleanupOrphanedAgentsFromWorkz(jedis);
+      totalAgentsCleaned += workzCleaned;
+
+      // Next, clean up orphaned agents from WAITZ (waiting set)
+      int waitzCleaned = cleanupOrphanedAgentsFromWaitz(jedis);
+      totalAgentsCleaned += waitzCleaned;
+
+      log.warn(
+          "Comprehensive orphaned agent cleanup completed: {} agents cleaned from WORKZ, {} from WAITZ.",
+          workzCleaned,
+          waitzCleaned);
+    } catch (Exception e) {
+      log.error("Error during comprehensive orphaned agent cleanup: {}", e.getMessage(), e);
+    }
+
+    log.info(
+        "Comprehensive orphaned agent cleanup process took {}ms, removed {} total agents.",
+        System.currentTimeMillis() - orphanCleanupStartTime,
+        totalAgentsCleaned);
+  }
+
+  /**
+   * Legacy method specifically for cleaning up the WORKZ set. Now delegates to the specialized
+   * helper method with proper resource handling.
+   */
+  void cleanupOrphanedAgentsFromRedis() {
+    // Start timestamp for timing the entire cleanup process
+    long orphanCleanupStartTime = System.currentTimeMillis();
+    log.info("Starting orphaned agent cleanup process for WORKZ set only");
+
+    try (Jedis jedis = jedisPool.getResource()) {
+      int cleaned = cleanupOrphanedAgentsFromWorkz(jedis);
+
+      if (cleaned > 0) {
+        orphansCleanedUp.addAndGet(cleaned);
+        log.warn(
+            "Orphaned agent cleanup cycle completed. Removed {} agents from WORKZ set. Total orphans cleaned by this instance: {}.",
+            cleaned,
+            orphansCleanedUp.get());
+      }
+
+      log.info(
+          "Orphaned agent cleanup process from Redis WORKZ set took {}ms.",
+          System.currentTimeMillis() - orphanCleanupStartTime);
+    } catch (Exception e) {
+      log.error("Error during orphaned agent cleanup from WORKZ: {}", e.getMessage(), e);
+    }
+  }
+
+  private int cleanupOrphanedAgentsFromWorkz(Jedis jedis) {
+    // Start timestamp for timing the WORKZ cleanup process
     long orphanCleanupStartTime = System.currentTimeMillis();
     log.info("Starting orphaned agent cleanup from Redis WORKZ set.");
-
     // Default orphan threshold: 10 minutes. Agents with timeout scores older than this in WORKZ are
     // considered potential orphans
     Long orphanThresholdMsObj =
@@ -1538,7 +1730,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
     // First, retrieve all potential orphaned agents
     Set<Tuple> potentialOrphans;
-    try (Jedis jedis = jedisPool.getResource()) {
+    try {
       potentialOrphans =
           jedis.zrangeByScoreWithScores(
               WORKING_SET,
@@ -1551,12 +1743,12 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
           "Failed to retrieve potential orphaned agents from Redis WORKZ set: {}",
           e.getMessage(),
           e);
-      return;
+      return 0;
     }
 
     if (potentialOrphans == null || potentialOrphans.isEmpty()) {
       log.info("No potential orphaned agents found in WORKZ set older than the orphan threshold.");
-      return;
+      return 0;
     }
 
     log.warn(
@@ -1611,7 +1803,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         log.error(
             "Batch orphaned agent cleanup failed with error, skipping cleanup: {}", e.getMessage());
         // Return early to avoid falling through to individual processing
-        return;
+        return totalSuccessfullyCleaned;
       }
     }
 
@@ -1623,7 +1815,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         // Score from Redis is a double, convert to string for Lua script argument
         String scoreInWorkZ = String.valueOf(orphanTuple.getScore());
 
-        try (Jedis jedis = jedisPool.getResource()) {
+        try {
           // First determine if this is a valid agent or an agent for a removed account
           boolean isStillValid = isAgentStillValid(agentType);
 
@@ -1723,6 +1915,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     log.info(
         "Orphaned agent cleanup process from Redis WORKZ set took {}ms.",
         System.currentTimeMillis() - orphanCleanupStartTime);
+
+    return totalSuccessfullyCleaned;
   }
 
   /**
