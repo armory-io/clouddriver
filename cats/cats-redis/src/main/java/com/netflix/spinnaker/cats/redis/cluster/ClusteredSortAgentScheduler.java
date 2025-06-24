@@ -2467,10 +2467,13 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     if ("aws".equals(providerName)) {
       if (onDemandType.contains("ServerGroup")) {
         relatedAgents.add("AmazonServerGroupCachingAgent");
+        relatedAgents.add("ClusterCachingAgent");
         relatedAgents.add("AmazonInstanceCachingAgent");
       }
       if (onDemandType.contains("LoadBalancer")) {
         relatedAgents.add("AmazonLoadBalancerCachingAgent");
+        relatedAgents.add("AmazonApplicationLoadBalancerCachingAgent");
+        relatedAgents.add("AmazonNetworkLoadBalancerCachingAgent");
       }
       if (onDemandType.contains("SecurityGroup")) {
         relatedAgents.add("AmazonSecurityGroupCachingAgent");
@@ -2486,10 +2489,37 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       }
     }
 
+    // ECS Provider mappings
+    if ("ecs".equals(providerName) || onDemandType.toLowerCase().contains("ecs")) {
+      // ECS server group (service) related agents
+      if (onDemandType.contains("ServerGroup") || onDemandType.contains("Service")) {
+        relatedAgents.add("ServiceCachingAgent"); // Main server group agent
+        relatedAgents.add("TaskCachingAgent"); // Tasks are part of services
+        relatedAgents.add("TaskHealthCachingAgent"); // Health status of tasks
+        relatedAgents.add("TaskDefinitionCachingAgent"); // Task definitions used by services
+        relatedAgents.add("ScalableTargetsCachingAgent"); // For scaling policies
+      }
+
+      // ECS cluster related agents
+      if (onDemandType.contains("Cluster")) {
+        relatedAgents.add("EcsClusterCachingAgent");
+        relatedAgents.add("ContainerInstanceCachingAgent");
+      }
+
+      // ECS task related agents
+      if (onDemandType.contains("Task")) {
+        relatedAgents.add("TaskCachingAgent");
+        relatedAgents.add("TaskHealthCachingAgent");
+        relatedAgents.add("TaskDefinitionCachingAgent");
+      }
+    }
+
     // Google Cloud Provider mappings
     if ("gce".equals(providerName)) {
       if (onDemandType.contains("ServerGroup")) {
         relatedAgents.add("GoogleServerGroupCachingAgent");
+        relatedAgents.add("GoogleZonalServerGroupCachingAgent");
+        relatedAgents.add("GoogleRegionalServerGroupCachingAgent");
         relatedAgents.add("GoogleInstanceCachingAgent");
       }
       if (onDemandType.contains("LoadBalancer")) {
@@ -2502,6 +2532,43 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       }
       if (onDemandType.contains("SecurityGroup")) {
         relatedAgents.add("GoogleSecurityGroupCachingAgent");
+      }
+    }
+
+    // Azure Provider mappings
+    if ("azure".equals(providerName)) {
+      if (onDemandType.contains("ServerGroup")) {
+        relatedAgents.add("AzureServerGroupCachingAgent");
+        relatedAgents.add("AzureInstanceCachingAgent");
+      }
+      if (onDemandType.contains("LoadBalancer")) {
+        relatedAgents.add("AzureLoadBalancerCachingAgent");
+      }
+      if (onDemandType.contains("SecurityGroup")) {
+        relatedAgents.add("AzureSecurityGroupCachingAgent");
+      }
+    }
+
+    // Note: Kubernetes provider uses live calls rather than traditional caching
+    // and doesn't implement OnDemandAgent in a way that would benefit from boosting
+
+    // Cloud Foundry Provider mappings
+    if ("cloudfoundry".equals(providerName)) {
+      if (onDemandType.contains("ServerGroup")) {
+        relatedAgents.add("CloudFoundryServerGroupCachingAgent");
+      }
+      if (onDemandType.contains("LoadBalancer")) {
+        relatedAgents.add("CloudFoundryLoadBalancerCachingAgent");
+      }
+    }
+
+    // App Engine Provider mappings
+    if ("appengine".equals(providerName)) {
+      if (onDemandType.contains("ServerGroup")) {
+        relatedAgents.add("AppengineServerGroupCachingAgent");
+      }
+      if (onDemandType.contains("LoadBalancer")) {
+        relatedAgents.add("AppengineLoadBalancerCachingAgent");
       }
     }
 
@@ -2519,24 +2586,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     if ("cloudrun".equals(providerName)) {
       if (onDemandType.contains("ServerGroup")) {
         relatedAgents.add("CloudrunServerGroupCachingAgent");
-      }
-    }
-
-    // Cloud Foundry Provider mappings
-    if ("cloudfoundry".equals(providerName)) {
-      if (onDemandType.contains("ServerGroup")) {
-        relatedAgents.add("CloudFoundryServerGroupCachingAgent");
-      }
-      if (onDemandType.contains("LoadBalancer")) {
-        relatedAgents.add("CloudFoundryLoadBalancerCachingAgent");
-      }
-    }
-
-    // ECS Provider mappings
-    if ("ecs".equals(providerName)) {
-      if (onDemandType.contains("ServerGroup")) {
-        relatedAgents.add("EcsServerGroupCachingAgent");
-        relatedAgents.add("EcsClusterCachingAgent");
       }
     }
 

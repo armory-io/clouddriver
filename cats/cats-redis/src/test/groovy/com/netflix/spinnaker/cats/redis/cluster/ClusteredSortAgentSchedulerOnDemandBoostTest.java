@@ -164,9 +164,10 @@ class ClusteredSortAgentSchedulerOnDemandBoostTest {
     // WHEN: We find related caching agents
     Set<String> relatedAgents = scheduler.findRelatedCachingAgents(onDemandAgent);
 
-    // THEN: Should return ServerGroup and Instance agents
-    assertEquals(2, relatedAgents.size());
+    // THEN: Should return ServerGroup, Cluster, and Instance agents
+    assertEquals(3, relatedAgents.size());
     assertTrue(relatedAgents.contains("AmazonServerGroupCachingAgent"));
+    assertTrue(relatedAgents.contains("ClusterCachingAgent"));
     assertTrue(relatedAgents.contains("AmazonInstanceCachingAgent"));
   }
 
@@ -179,9 +180,11 @@ class ClusteredSortAgentSchedulerOnDemandBoostTest {
     // WHEN: We find related caching agents
     Set<String> relatedAgents = scheduler.findRelatedCachingAgents(onDemandAgent);
 
-    // THEN: Should return LoadBalancer agent
-    assertEquals(1, relatedAgents.size());
+    // THEN: Should return all LoadBalancer agent types
+    assertEquals(3, relatedAgents.size());
     assertTrue(relatedAgents.contains("AmazonLoadBalancerCachingAgent"));
+    assertTrue(relatedAgents.contains("AmazonApplicationLoadBalancerCachingAgent"));
+    assertTrue(relatedAgents.contains("AmazonNetworkLoadBalancerCachingAgent"));
   }
 
   @Test
@@ -241,8 +244,8 @@ class ClusteredSortAgentSchedulerOnDemandBoostTest {
     scheduler.handleOnDemandCompletion(combinedAgent, onDemandResult);
 
     // THEN: Related agents should be boosted with account/region scoping
-    verify(jedis, times(2))
-        .evalsha(anyString(), anyList(), anyList()); // ServerGroup + Instance agents
+    verify(jedis, times(3))
+        .evalsha(anyString(), anyList(), anyList()); // ServerGroup + Cluster + Instance agents
   }
 
   @Test
