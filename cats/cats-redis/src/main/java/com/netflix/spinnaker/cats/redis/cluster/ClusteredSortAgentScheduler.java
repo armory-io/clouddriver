@@ -20,7 +20,6 @@ import static com.netflix.spinnaker.cats.agent.ExecutionInstrumentation.elapsedT
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
-import com.netflix.spinnaker.cats.agent.AccountAware;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.AgentScheduler;
@@ -30,9 +29,7 @@ import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.module.CatsModuleAware;
-import com.netflix.spinnaker.clouddriver.cache.OnDemandAgent;
 import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
-import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -107,15 +104,13 @@ import redis.clients.jedis.Tuple;
  * redis.agent.refresh-period-seconds: 30         # 30 sec Redis sync
  * redis.agent.zombie-threshold-ms: 1800000       # 30 min zombie detection
  * redis.agent.zombie-cleanup-interval-ms: 300000 # 5 min cleanup cycles
- * redis.agent.on-demand.boost-enabled: false     # Disabled by default - enable only if needed
- * redis.agent.on-demand.max-boosts-per-second: 10.0 # Standard rate limiting
  * </pre>
  *
  * <p><strong>Suitable for:</strong> 1-500 AWS accounts, normal deployment frequency, standard Redis
  * resources.
  *
- * <p><strong>Performance:</strong> ~1 second agent pickup, 600 boosts/minute capacity, deployment
- * circuit breaker protection.
+ * <p><strong>Performance:</strong> ~1 second agent pickup, efficient deployment circuit breaker
+ * protection.
  *
  * <p><strong>High-Load Configuration (for enterprise-scale deployments):</strong>
  *
@@ -124,15 +119,12 @@ import redis.clients.jedis.Tuple;
  * redis.agent.refresh-period-seconds: 15         # 15 sec Redis sync - frequent updates
  * redis.agent.zombie-threshold-ms: 2100000       # 35 min zombie detection - allows 30min + buffer
  * redis.agent.zombie-cleanup-interval-ms: 120000 # 2 min cleanup cycles - very frequent
- * redis.agent.on-demand.boost-enabled: true      # Enable only for high-frequency deployment environments
- * redis.agent.on-demand.max-boosts-per-second: 30.0 # Moderate rate limiting for busy systems
  * </pre>
  *
  * <p><strong>Suitable for:</strong> 500+ AWS accounts, high deployment frequency, dedicated Redis
  * infrastructure.
  *
- * <p><strong>Performance:</strong> ~0.5 second agent pickup, 1800 boosts/minute capacity,
- * sub-10-second OnDemand processing.
+ * <p><strong>Performance:</strong> ~0.5 second agent pickup, fast cache processing.
  *
  * <p><strong>Key Parameter Guidelines:</strong>
  *
@@ -157,30 +149,17 @@ import redis.clients.jedis.Tuple;
  *       find stuck agents. <em>Mechanics:</em> Scans WORKING_SET for agents exceeding
  *       zombie-threshold-ms and cancels their threads. Should be 5-10x more frequent than threshold
  *       to prevent accumulation. High-load environments benefit from 2-3 minute cycles.
- *   <li><strong>on-demand.boost-enabled:</strong> Whether to prioritize caching agents after
- *       OnDemand completion. <em>Mechanics:</em> When OnDemand agent completes on RW pod,
- *       immediately boost related caching agents to priority 0 for next pickup. <em>Impact:</em>
- *       Reduces OnDemand processing from 2-10 minutes to 10-20 seconds, critical for deployment
- *       circuit breakers. <em>Default:</em> Disabled - only enable if experiencing slow deployments
- *       or circuit breaker timeouts.
- *   <li><strong>max-boosts-per-second:</strong> Rate limiting to prevent Redis overload during
- *       deployment storms. <em>Mechanics:</em> Tracks last boost time per agent type, rejects boost
- *       requests exceeding this rate. <em>Sizing:</em> Scale with deployment frequency: 10-20 for
- *       normal environments, 30-50 for high-volume enterprises. Monitor boost success rates -
- *       increase if seeing "rate limited" warnings during busy periods.
  * </ul>
  *
  * <p><strong>Monitoring & Troubleshooting:</strong>
  *
  * <ul>
- *   <li><strong>Key Metrics:</strong> Agent execution times (P95), OnDemand boost success rate,
- *       Redis CPU/memory, queue depth
- *   <li><strong>Slow OnDemand:</strong> Enable boost feature, increase rate limit, verify
- *       account/region scoping in logs
+ *   <li><strong>Key Metrics:</strong> Agent execution times (P95), Redis CPU/memory, queue depth
+ *   <li><strong>Slow OnDemand:</strong> Reduce scheduler interval, check agent configuration
  *   <li><strong>High Redis Load:</strong> Increase scheduler interval, reduce refresh frequency,
  *       check connection pooling
- *   <li><strong>Circuit Breaker Timeouts:</strong> Reduce scheduler interval, enable OnDemand
- *       boost, check pod network latency
+ *   <li><strong>Circuit Breaker Timeouts:</strong> Reduce scheduler interval, check pod network
+ *       latency
  *   <li><strong>Premature Zombie Cleanup:</strong> If agents are being killed while legitimately
  *       running, increase zombie-threshold-ms
  * </ul>
@@ -202,8 +181,6 @@ import redis.clients.jedis.Tuple;
  *   <li><strong>Agent Repopulation:</strong> 1000 agents: 1000 Redis calls → 1 Redis call (1000x
  *       improvement)
  *   <li><strong>Zombie Cleanup:</strong> 50 zombie agents: 50 Redis calls → 1 Redis call (50x
- *       improvement)
- *   <li><strong>OnDemand Boost:</strong> 10 related agents: 10 Redis calls → 1 Redis call (10x
  *       improvement)
  * </ul>
  *
@@ -294,20 +271,16 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private static final String REMOVE_AGENT_SCRIPT = "removeAgentScript";
   private static final String CONDITIONAL_SWAP_SET_SCRIPT = "conditionalSwapSetScript";
   private static final String CONDITIONAL_REMOVE_SCRIPT = "conditionalRemoveScript";
-  private static final String BOOST_PRIORITY_SCRIPT = "boostPriorityScript";
   private static final String BATCH_ORPHAN_REMOVE_SCRIPT = "batchOrphanRemoveScript";
 
   // Batch operation scripts for O(n) → O(1) performance optimization
   private static final String BATCH_ADD_AGENTS_SCRIPT = "batchAddAgentsScript";
   private static final String BATCH_CLEANUP_AGENTS_SCRIPT = "batchCleanupAgentsScript";
-  private static final String BATCH_BOOST_PRIORITY_SCRIPT = "batchBoostPriorityScript";
+
   private static final String ORPHAN_REMOVE_SCRIPT = "orphanRemoveScript";
 
   private static final int DEFAULT_REDIS_REFRESH_PERIOD = 30;
   private static final long DEFAULT_SCHEDULER_INTERVAL_MS = 1000L;
-
-  // OnDemand boost rate limiting
-  Map<String, Long> lastBoostTimes = new ConcurrentHashMap<>();
 
   /**
    * Create scheduler with default configuration suitable for most deployments. Follows the same
@@ -372,13 +345,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * @param dynamicConfigService Enables runtime configuration changes without restarts. Allows
    *     operational tuning of concurrent limits, timeouts, and other parameters based on real-time
    *     load and resource availability.
-   *     <p><b>OnDemand Priority Boost Configuration:</b>
-   *     <ul>
-   *       <li><code>redis.agent.on-demand.boost-enabled</code> (default: false) - Enable/disable
-   *           OnDemand priority boosting feature
-   *       <li><code>redis.agent.on-demand.max-boosts-per-second</code> (default: 10.0) - Rate
-   *           limiting for priority boosts
-   *     </ul>
    *     <p><b>Other Dynamic Configuration Keys:</b>
    *     <ul>
    *       <li><code>redis.agent.enabled-pattern</code> - Regex pattern for filtering agents
@@ -464,7 +430,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * <p><strong>Optimization Scripts:</strong>
    *
    * <ul>
-   *   <li>{@code BOOST_PRIORITY_SCRIPT}: Boost priority of OnDemand-related agents
    *   <li>{@code ORPHAN_REMOVE_SCRIPT}: Remove a single orphaned agent
    *   <li>{@code BATCH_ORPHAN_REMOVE_SCRIPT}: Remove multiple orphaned agents in one operation
    *   <li>{@code BATCH_ADD_AGENTS_SCRIPT}: Add multiple agents in one operation
@@ -532,25 +497,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
       // --- OPTIMIZATION SCRIPTS ---
 
-      // Boost priority of OnDemand-related agents to run immediately
-      scriptShas.put(
-          BOOST_PRIORITY_SCRIPT,
-          jedis.scriptLoad(
-              "local newScore = ARGV[2]\n"
-                  + "local waitingScore = redis.call('zscore', KEYS[1], ARGV[1])\n" // Check WAITING
-                  // score
-                  + "if waitingScore ~= nil then\n" // If exists in WAITING
-                  + "  redis.call('zadd', KEYS[1], newScore, ARGV[1])\n" // Update score
-                  + "  return waitingScore\n" // Return original score
-                  + "end\n"
-                  + "local workingScore = redis.call('zscore', KEYS[2], ARGV[1])\n" // Check WORKING
-                  // score
-                  + "if workingScore ~= nil then\n" // If exists in WORKING
-                  + "  redis.call('zadd', KEYS[2], newScore, ARGV[1])\n" // Update score
-                  + "  return workingScore\n" // Return original score
-                  + "end\n"
-                  + "return nil\n")); // Agent not found in either set
-
       // Remove a single orphaned agent if score matches
       scriptShas.put(
           ORPHAN_REMOVE_SCRIPT,
@@ -610,27 +556,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
                   + "  cleaned = cleaned + 1\n" // Increment count
                   + "end\n"
                   + "return cleaned\n")); // Return cleanup count
-
-      // Batch boost priority for multiple OnDemand-related agents in one operation
-      scriptShas.put(
-          BATCH_BOOST_PRIORITY_SCRIPT,
-          jedis.scriptLoad(
-              "-- Args: new_score, agent1, agent2, ...\n"
-                  + "local newScore = ARGV[1]\n" // New score to set for all agents
-                  + "local processedCount = 0\n" // Track number of agents boosted
-                  + "for i = 2, #ARGV do\n" // For each agent in the batch
-                  + "  local agent = ARGV[i]\n" // Current agent name
-                  + "  local waitingScore = redis.call('zscore', KEYS[1], agent)\n" // Check WAITING
-                  + "  local workingScore = redis.call('zscore', KEYS[2], agent)\n" // Check WORKING
-                  + "  if waitingScore ~= nil then\n" // If in WAITING set
-                  + "    redis.call('zadd', KEYS[1], newScore, agent)\n" // Update score
-                  + "    processedCount = processedCount + 1\n" // Increment count
-                  + "  elseif workingScore ~= nil then\n" // If in WORKING set
-                  + "    redis.call('zadd', KEYS[2], newScore, agent)\n" // Update score
-                  + "    processedCount = processedCount + 1\n" // Increment count
-                  + "  end\n"
-                  + "end\n"
-                  + "return processedCount\n")); // Return total number of boosted agents
 
     } catch (Exception e) {
       throw new AgentSchedulingException("Failed to store Redis Lua scripts", e);
@@ -1115,9 +1040,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * our local agents map, it was likely removed from the configuration and should be removed from
    * Redis.
    *
-   * <p>Special handling is provided for boosted agents (score=0) which are preserved even if not in
-   * the local registry, as they may be scheduled by other pods after on-demand processing.
-   *
    * @param jedis Redis connection to use
    * @return Number of orphaned agents removed from WAITZ
    */
@@ -1150,18 +1072,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         long score = Double.valueOf(tuple.getScore()).longValue();
 
         if (!agents.containsKey(agentType)) {
-          // This agent is in WAITZ but not in our local registry - it might be orphaned
-
-          // Special case: NEVER remove agents with score=0, as they are boosted by on-demand
-          // processing
-          if (score == 0) {
-            // Use info level for boosted agents to track frequency
-            log.info("Preserving on-demand boosted agent {} in WAITZ set (score=0)", agentType);
-            continue;
-          }
-
-          // We've already filtered to agents with scores in the past (ready to execute)
-          // Agent is not in our local registry, so it's orphaned
+          // This agent is in WAITZ but not in our local registry - it's orphaned
           orphanedAgents.add(agentType);
           log.debug(
               "Agent {} with score {} is not in local registry and will be removed (pastDue: {}s)",
@@ -1315,24 +1226,12 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       // Always assign a proper timeout score when moving to WORKZ
       String acquireScore = score(jedis, intervalProvider.getInterval(agent).getTimeout());
 
-      // First check if this is a boosted agent (score=0 in WAITZ)
-      Double waitingScore = jedis.zscore(WAITING_SET, agent.getAgentType());
-      boolean isBoosted = waitingScore != null && waitingScore == 0;
-
       // Atomically move agent from WAITING_SET to WORKING_SET
       Object releaseScore =
           jedis.evalsha(
               getScriptSha(SWAP_SET_SCRIPT, jedis),
               Arrays.asList(WAITING_SET, WORKING_SET),
               Arrays.asList(agent.getAgentType(), acquireScore));
-
-      // Log when moving boosted agents
-      if (releaseScore != null && isBoosted) {
-        log.info(
-            "Acquired on-demand boosted agent {} from WAITZ (score=0) with timeout {}",
-            agent.getAgentType(),
-            acquireScore);
-      }
 
       return releaseScore != null ? new ScoreTuple(acquireScore, releaseScore.toString()) : null;
     }
@@ -2274,490 +2173,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     } catch (Exception e) {
       log.warn("Failed to refresh agent configuration: {}", e.getMessage());
     }
-  }
-
-  /**
-   * Boost priority of specified agents to run immediately. Used when OnDemand cache refresh
-   * completes to prioritize related caching agents.
-   *
-   * @param agentTypes Set of agent type names to boost
-   * @return true if any agents were boosted, false otherwise
-   */
-  public boolean boostAgentPriority(Set<String> agentTypes) {
-    if (agentTypes == null || agentTypes.isEmpty()) {
-      return false;
-    }
-
-    String agents = agentTypes.isEmpty() ? "" : String.join(", ", agentTypes);
-    log.info("Attempting to boost priority for agents: {}", agents);
-
-    // Check if batch operations are enabled (disabled by default for safety)
-    boolean batchOperationsEnabled =
-        dynamicConfigService.getConfig(
-            Boolean.class, "redis.agent.batch-operations-enabled", false);
-
-    if (!batchOperationsEnabled) {
-      log.debug("Batch boost disabled, using individual operations");
-      // Use individual boost operations (existing proven approach)
-      boolean anyBoosted = false;
-      try (Jedis jedis = jedisPool.getResource()) {
-        String immediateScore = score(jedis, 0);
-
-        for (String agentType : agentTypes) {
-          if (shouldRateLimit(agentType)) {
-            log.debug("Rate limiting priority boost for agent: {}", agentType);
-            continue;
-          }
-
-          try {
-            Object oldScore =
-                jedis.evalsha(
-                    getScriptSha(BOOST_PRIORITY_SCRIPT, jedis),
-                    Arrays.asList(WAITING_SET, WORKING_SET),
-                    Arrays.asList(agentType, immediateScore));
-
-            if (oldScore != null) {
-              log.info(
-                  "Boosted priority for agent {} from score {} to {} (immediate execution)",
-                  agentType,
-                  oldScore,
-                  immediateScore);
-              updateBoostTimestamp(agentType);
-              anyBoosted = true;
-            } else {
-              log.debug("Agent {} not found in WAITING_SET, cannot boost priority", agentType);
-            }
-          } catch (Exception e) {
-            log.warn("Failed to boost priority for agent {}: {}", agentType, e.getMessage());
-          }
-        }
-      } catch (Exception e) {
-        log.error("Redis error during priority boost: {}", e.getMessage());
-        return false;
-      }
-
-      log.debug("Priority boost completed. Boosted {} agents", anyBoosted);
-      return anyBoosted;
-    }
-
-    // Filter agents that pass rate limiting
-    List<String> agentsToBoost = new ArrayList<>();
-    List<String> rateLimitedAgents = new ArrayList<>();
-
-    for (String agentType : agentTypes) {
-      if (shouldRateLimit(agentType)) {
-        rateLimitedAgents.add(agentType);
-      } else {
-        agentsToBoost.add(agentType);
-      }
-    }
-
-    if (!rateLimitedAgents.isEmpty()) {
-      log.debug(
-          "Rate limiting priority boost for {} agents: {}",
-          rateLimitedAgents.size(),
-          rateLimitedAgents);
-    }
-
-    if (agentsToBoost.isEmpty()) {
-      log.debug("No agents to boost after rate limiting");
-      return false;
-    }
-
-    // Batch boost using single Redis call
-    boolean anyBoosted = false;
-    try (Jedis jedis = jedisPool.getResource()) {
-      String immediateScore = score(jedis, 0); // Current Redis time = run now
-
-      List<String> scriptArgs = new ArrayList<>();
-      scriptArgs.add(immediateScore); // First arg is the new score
-      scriptArgs.addAll(agentsToBoost); // Remaining args are agent names
-
-      Object result =
-          jedis.evalsha(
-              getScriptSha(BATCH_BOOST_PRIORITY_SCRIPT, jedis),
-              Arrays.asList(WAITING_SET, WORKING_SET),
-              scriptArgs);
-
-      int boosted = result instanceof Long ? ((Long) result).intValue() : 0;
-      anyBoosted = boosted > 0;
-
-      if (anyBoosted) {
-        log.info(
-            "Batch priority boost completed: {}/{} agents boosted to immediate execution",
-            boosted,
-            agentsToBoost.size());
-
-        // Update rate limiting timestamps for successfully boosted agents
-        // (We update all since the batch operation doesn't tell us which specific ones succeeded)
-        for (String agentType : agentsToBoost) {
-          updateBoostTimestamp(agentType);
-        }
-      } else {
-        log.debug("No agents were boosted - all agents may be executing or not in WAITING_SET");
-      }
-
-    } catch (Exception e) {
-      log.error(
-          "Batch priority boost failed, falling back to individual operations: {}", e.getMessage());
-      // Fallback to individual boost operations
-      try (Jedis jedis = jedisPool.getResource()) {
-        String immediateScore = score(jedis, 0);
-
-        for (String agentType : agentsToBoost) {
-          try {
-            Object oldScore =
-                jedis.evalsha(
-                    getScriptSha(BOOST_PRIORITY_SCRIPT, jedis),
-                    Arrays.asList(WAITING_SET, WORKING_SET),
-                    Arrays.asList(agentType, immediateScore));
-
-            if (oldScore != null) {
-              log.info(
-                  "Boosted priority for agent {} from score {} to {} (immediate execution)",
-                  agentType,
-                  oldScore,
-                  immediateScore);
-              updateBoostTimestamp(agentType);
-              anyBoosted = true;
-            }
-          } catch (Exception fallbackError) {
-            log.warn(
-                "Failed to boost priority for agent {} individually: {}",
-                agentType,
-                fallbackError.getMessage());
-          }
-        }
-      } catch (Exception fallbackError) {
-        log.error("Redis error during fallback priority boost: {}", fallbackError.getMessage());
-        return false;
-      }
-    }
-
-    log.debug("Priority boost completed. Any boosted: {}", anyBoosted);
-    return anyBoosted;
-  }
-
-  /**
-   * Find caching agents related to the OnDemand agent that should be boosted. Maps OnDemand agent
-   * types to their corresponding caching agents.
-   *
-   * @param onDemandAgent The OnDemand agent that completed
-   * @return Set of related caching agent type names
-   */
-  public Set<String> findRelatedCachingAgents(OnDemandAgent onDemandAgent) {
-    if (onDemandAgent == null) {
-      return Collections.emptySet();
-    }
-
-    String providerName = onDemandAgent.getProviderName();
-    String onDemandType = onDemandAgent.getOnDemandAgentType();
-
-    // Early return if onDemandType is null or empty
-    if (onDemandType == null || onDemandType.isEmpty()) {
-      log.debug("OnDemand agent type is null or empty for provider: {}", providerName);
-      return Collections.emptySet();
-    }
-
-    log.debug(
-        "Finding related caching agents for provider: {}, type: {}", providerName, onDemandType);
-
-    Set<String> relatedAgents = new HashSet<>();
-
-    // AWS Provider mappings
-    if ("aws".equals(providerName)) {
-      if (onDemandType.contains("ServerGroup")) {
-        relatedAgents.add("AmazonServerGroupCachingAgent");
-        relatedAgents.add("ClusterCachingAgent");
-        relatedAgents.add("AmazonInstanceCachingAgent");
-      }
-      if (onDemandType.contains("LoadBalancer")) {
-        relatedAgents.add("AmazonLoadBalancerCachingAgent");
-        relatedAgents.add("AmazonApplicationLoadBalancerCachingAgent");
-        relatedAgents.add("AmazonNetworkLoadBalancerCachingAgent");
-      }
-      if (onDemandType.contains("SecurityGroup")) {
-        relatedAgents.add("AmazonSecurityGroupCachingAgent");
-      }
-      if (onDemandType.contains("TargetGroup")) {
-        relatedAgents.add("AmazonTargetGroupCachingAgent");
-      }
-      if (onDemandType.contains("CloudFormation")) {
-        relatedAgents.add("AmazonCloudFormationCachingAgent");
-      }
-      if (onDemandType.contains("Function")) {
-        relatedAgents.add("LambdaCachingAgent");
-      }
-    }
-
-    // ECS Provider mappings
-    if ("ecs".equals(providerName) || onDemandType.toLowerCase().contains("ecs")) {
-      log.info("Processing ECS provider with onDemandType: {}", onDemandType);
-
-      // ECS server group (service) related agents - handle ALL ServerGroup on-demand types for ECS
-      // This ensures any on-demand operation for ECS server groups triggers all relevant agents
-      if (onDemandType.contains("ServerGroup")
-          || onDemandType.contains("Service")
-          || onDemandType.equals("ServerGroup")) { // Exact match for just "ServerGroup"
-        log.info("Adding ECS service-related caching agents for boosting");
-        relatedAgents.add("ServiceCachingAgent"); // Main server group agent
-        relatedAgents.add("TaskCachingAgent"); // Tasks are part of services
-        relatedAgents.add("TaskHealthCachingAgent"); // Health status of tasks
-        relatedAgents.add("TaskDefinitionCachingAgent"); // Task definitions used by services
-        relatedAgents.add("ContainerInstanceCachingAgent"); // Needed for service placement
-        relatedAgents.add("ScalableTargetsCachingAgent"); // For scaling policies
-        relatedAgents.add("EcsClusterCachingAgent"); // Also boost cluster when services change
-      }
-
-      // ECS cluster related agents
-      if (onDemandType.contains("Cluster")) {
-        log.info("Adding ECS cluster-related caching agents for boosting");
-        relatedAgents.add("EcsClusterCachingAgent");
-        relatedAgents.add("ContainerInstanceCachingAgent");
-      }
-
-      // ECS task related agents
-      if (onDemandType.contains("Task")) {
-        log.info("Adding ECS task-related caching agents for boosting");
-        relatedAgents.add("TaskCachingAgent");
-        relatedAgents.add("TaskHealthCachingAgent");
-        relatedAgents.add("TaskDefinitionCachingAgent");
-      }
-    }
-
-    // Google Cloud Provider mappings
-    if ("gce".equals(providerName)) {
-      if (onDemandType.contains("ServerGroup")) {
-        relatedAgents.add("GoogleServerGroupCachingAgent");
-        relatedAgents.add("GoogleZonalServerGroupCachingAgent");
-        relatedAgents.add("GoogleRegionalServerGroupCachingAgent");
-        relatedAgents.add("GoogleInstanceCachingAgent");
-      }
-      if (onDemandType.contains("LoadBalancer")) {
-        relatedAgents.add("GoogleLoadBalancerCachingAgent");
-        relatedAgents.add("GoogleHttpLoadBalancerCachingAgent");
-        relatedAgents.add("GoogleInternalLoadBalancerCachingAgent");
-        relatedAgents.add("GoogleInternalHttpLoadBalancerCachingAgent");
-        relatedAgents.add("GoogleSslLoadBalancerCachingAgent");
-        relatedAgents.add("GoogleTcpLoadBalancerCachingAgent");
-      }
-      if (onDemandType.contains("SecurityGroup")) {
-        relatedAgents.add("GoogleSecurityGroupCachingAgent");
-      }
-    }
-
-    // Azure Provider mappings
-    if ("azure".equals(providerName)) {
-      if (onDemandType.contains("ServerGroup")) {
-        relatedAgents.add("AzureServerGroupCachingAgent");
-        relatedAgents.add("AzureInstanceCachingAgent");
-      }
-      if (onDemandType.contains("LoadBalancer")) {
-        relatedAgents.add("AzureLoadBalancerCachingAgent");
-      }
-      if (onDemandType.contains("SecurityGroup")) {
-        relatedAgents.add("AzureSecurityGroupCachingAgent");
-      }
-    }
-
-    // Note: Kubernetes provider uses live calls rather than traditional caching
-    // and doesn't implement OnDemandAgent in a way that would benefit from boosting
-
-    // Cloud Foundry Provider mappings
-    if ("cloudfoundry".equals(providerName)) {
-      if (onDemandType.contains("ServerGroup")) {
-        relatedAgents.add("CloudFoundryServerGroupCachingAgent");
-      }
-      if (onDemandType.contains("LoadBalancer")) {
-        relatedAgents.add("CloudFoundryLoadBalancerCachingAgent");
-      }
-    }
-
-    // App Engine Provider mappings
-    if ("appengine".equals(providerName)) {
-      if (onDemandType.contains("ServerGroup")) {
-        relatedAgents.add("AppengineServerGroupCachingAgent");
-      }
-      if (onDemandType.contains("LoadBalancer")) {
-        relatedAgents.add("AppengineLoadBalancerCachingAgent");
-      }
-    }
-
-    // Yandex Provider mappings
-    if ("yandex".equals(providerName)) {
-      if (onDemandType.contains("ServerGroup")) {
-        relatedAgents.add("YandexServerGroupCachingAgent");
-      }
-      if (onDemandType.contains("LoadBalancer")) {
-        relatedAgents.add("YandexNetworkLoadBalancerCachingAgent");
-      }
-    }
-
-    // Cloud Run Provider mappings
-    if ("cloudrun".equals(providerName)) {
-      if (onDemandType.contains("ServerGroup")) {
-        relatedAgents.add("CloudrunServerGroupCachingAgent");
-      }
-    }
-
-    // AliCloud Provider mappings
-    if ("alicloud".equals(providerName)) {
-      if (onDemandType.contains("LoadBalancer")) {
-        relatedAgents.add("AliCloudLoadBalancerCachingAgent");
-      }
-      if (onDemandType.contains("SecurityGroup")) {
-        relatedAgents.add("AliCloudSecurityGroupCachingAgent");
-      }
-    }
-
-    // Huawei Cloud Provider mappings
-    if ("huaweicloud".equals(providerName)) {
-      if (onDemandType.contains("SecurityGroup")) {
-        relatedAgents.add("HuaweiCloudSecurityGroupCachingAgent");
-      }
-    }
-
-    log.debug("Found {} related caching agents: {}", relatedAgents.size(), relatedAgents);
-    return relatedAgents;
-  }
-
-  /**
-   * Handle OnDemand completion and boost related caching agents. This is the main integration point
-   * called after OnDemand agents complete.
-   *
-   * @param onDemandAgent The OnDemand agent that completed
-   * @param result The result of the OnDemand execution
-   */
-  public void handleOnDemandCompletion(
-      OnDemandAgent onDemandAgent, OnDemandAgent.OnDemandResult result) {
-    log.info(
-        "Handling OnDemand completion for agent: {}, type: {}, providerName: {}",
-        onDemandAgent,
-        onDemandAgent.getOnDemandAgentType(),
-        onDemandAgent.getProviderName());
-
-    // Check if OnDemand priority boosting is enabled (disabled by default)
-    boolean onDemandBoostEnabled =
-        dynamicConfigService.getConfig(Boolean.class, "redis.agent.on-demand.boost-enabled", false);
-
-    if (!onDemandBoostEnabled) {
-      log.debug(
-          "OnDemand priority boosting is disabled. Skipping boost for agent: {}", onDemandAgent);
-      return;
-    }
-
-    // Extract agent details for better targeting
-    log.info("Agent class: {}", onDemandAgent.getClass().getName());
-
-    // Extract account/region information for targeted boosting
-    String accountName = null;
-    String region = null;
-
-    // Try to get account name from AccountAware interface
-    if (onDemandAgent instanceof AccountAware) {
-      accountName = ((AccountAware) onDemandAgent).getAccountName();
-      log.info("Found AccountAware agent with account: {}", accountName);
-    }
-
-    // Try to get region from getRegion() method if it exists (some providers have this)
-    try {
-      Method getRegionMethod = onDemandAgent.getClass().getMethod("getRegion");
-      Object regionResult = getRegionMethod.invoke(onDemandAgent);
-      if (regionResult instanceof String) {
-        region = (String) regionResult;
-      }
-    } catch (Exception e) {
-      // getRegion() method doesn't exist or failed - this is expected for most agents
-      log.trace(
-          "No getRegion() method found on agent {}, will extract from agent type",
-          onDemandAgent.getClass().getSimpleName());
-    }
-
-    // Extract account/region from agent type as fallback (always do this as agents store the
-    // canonical format)
-    if (onDemandAgent instanceof Agent) {
-      String agentType = ((Agent) onDemandAgent).getAgentType();
-      // Agent type format: "account/region/AgentClass"
-      String[] parts = agentType.split("/");
-      if (parts.length >= 3) {
-        // Standard format: account/region/ClassName
-        if (accountName == null) {
-          accountName = parts[0];
-        }
-        if (region == null) {
-          region = parts[1];
-        }
-      } else if (parts.length >= 2) {
-        // Fallback format: account/region or region/ClassName
-        if (region == null) {
-          region = parts[1];
-        }
-        if (accountName == null) {
-          accountName = parts[0];
-        }
-      }
-    }
-
-    log.debug("OnDemand agent account: {}, region: {}", accountName, region);
-
-    Set<String> relatedAgentTypes = findRelatedCachingAgents(onDemandAgent);
-    if (!relatedAgentTypes.isEmpty() && accountName != null && region != null) {
-      // Build fully qualified agent identifiers with account/region
-      Set<String> qualifiedAgentTypes = new HashSet<>();
-      for (String agentType : relatedAgentTypes) {
-        String qualifiedAgentType = String.format("%s/%s/%s", accountName, region, agentType);
-        qualifiedAgentTypes.add(qualifiedAgentType);
-      }
-
-      boolean boosted = boostAgentPriority(qualifiedAgentTypes);
-      log.info(
-          "OnDemand completion for {} (account: {}, region: {}): boosted {} related caching agents (success: {})",
-          onDemandAgent.getOnDemandAgentType(),
-          accountName,
-          region,
-          qualifiedAgentTypes.size(),
-          boosted);
-    } else {
-      log.warn(
-          "Cannot boost related agents - missing account/region information or no related agents found. Account: {}, Region: {}, Related agents: {}",
-          accountName,
-          region,
-          relatedAgentTypes.size());
-    }
-  }
-
-  /**
-   * Check if agent priority boost should be rate limited. Prevents boost storms that could impact
-   * Redis performance.
-   *
-   * @param agentType Agent type to check
-   * @return true if should be rate limited, false otherwise
-   */
-  private boolean shouldRateLimit(String agentType) {
-    long currentTime = System.currentTimeMillis();
-    Long lastBoostTime = lastBoostTimes.get(agentType);
-
-    if (lastBoostTime == null) {
-      return false; // First boost for this agent
-    }
-
-    long timeSinceLastBoost = currentTime - lastBoostTime;
-    long minIntervalMs =
-        (long)
-            (1000.0
-                / dynamicConfigService.getConfig(
-                    Double.class, "redis.agent.on-demand.max-boosts-per-second", 10.0));
-
-    return timeSinceLastBoost < minIntervalMs;
-  }
-
-  /**
-   * Update the timestamp for the last priority boost of an agent. Used for rate limiting.
-   *
-   * @param agentType Agent type that was boosted
-   */
-  private void updateBoostTimestamp(String agentType) {
-    lastBoostTimes.put(agentType, System.currentTimeMillis());
   }
 
   /** Schedule an agent in Redis using atomic operations (fallback for batch failures). */

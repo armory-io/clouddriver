@@ -37,7 +37,7 @@ import redis.clients.jedis.JedisPool;
 
 /**
  * Tests for batch Redis operations in ClusteredSortAgentScheduler to validate O(n) → O(1)
- * performance optimizations.
+ * performance optimizations for agent management operations.
  */
 class ClusteredSortAgentSchedulerBatchOperationsTest {
 
@@ -65,10 +65,10 @@ class ClusteredSortAgentSchedulerBatchOperationsTest {
     when(dynamicConfigService.getConfig(eq(Double.class), anyString(), anyDouble()))
         .thenReturn(10.0);
 
-    // Mock batch operations flag specifically (disabled by default for safety)
+    // Mock batch operations flag (true for these tests, false by default for safety)
     when(dynamicConfigService.getConfig(
             eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
-        .thenReturn(false);
+        .thenReturn(true);
 
     // Mock Redis TIME command for score generation
     when(jedis.time()).thenReturn(Arrays.asList("1609459200", "0"));
@@ -142,60 +142,6 @@ class ClusteredSortAgentSchedulerBatchOperationsTest {
   }
 
   @Test
-  void shouldUseBatchBoostForMultipleAgents() {
-    // GIVEN: Batch operations enabled and multiple agents to boost
-    when(dynamicConfigService.getConfig(
-            eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
-        .thenReturn(true);
-    Set<String> agentsToBoost = Set.of("Agent1", "Agent2", "Agent3", "Agent4");
-
-    // Mock batch boost script returning number of agents boosted
-    when(jedis.evalsha(anyString(), anyList(), anyList())).thenReturn(4L);
-
-    // WHEN: Boosting priority
-    boolean result = scheduler.boostAgentPriority(agentsToBoost);
-
-    // THEN: Should use batch boost script
-    assertTrue(result);
-
-    ArgumentCaptor<List<String>> keysCaptor = ArgumentCaptor.forClass(List.class);
-    ArgumentCaptor<List<String>> argsCaptor = ArgumentCaptor.forClass(List.class);
-
-    verify(jedis).evalsha(anyString(), keysCaptor.capture(), argsCaptor.capture());
-
-    assertEquals(Arrays.asList(WAITING_SET, WORKING_SET), keysCaptor.getValue());
-
-    List<String> args = argsCaptor.getValue();
-    assertEquals(5, args.size()); // Score + 4 agents
-    assertTrue(agentsToBoost.containsAll(args.subList(1, args.size())));
-  }
-
-  @Test
-  void shouldFallbackToIndividualOperationsOnBatchFailure() {
-    // GIVEN: Batch operations enabled but batch operation fails
-    when(dynamicConfigService.getConfig(
-            eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
-        .thenReturn(true);
-
-    Set<String> agentsToBoost = Set.of("Agent1", "Agent2");
-
-    // Mock batch operation failure, then individual operations success
-    when(jedis.evalsha(anyString(), anyList(), anyList()))
-        .thenThrow(new RuntimeException("Batch operation failed"))
-        .thenReturn("oldScore1") // Individual operation 1
-        .thenReturn("oldScore2"); // Individual operation 2
-
-    // WHEN: Boosting priority
-    boolean result = scheduler.boostAgentPriority(agentsToBoost);
-
-    // THEN: Should fallback to individual operations and still succeed
-    assertTrue(result);
-
-    // Should have 1 batch call + 2 individual calls = 3 total calls
-    verify(jedis, times(3)).evalsha(anyString(), anyList(), anyList());
-  }
-
-  @Test
   void shouldHandleBatchZombieCleanup() {
     // GIVEN: Batch operations enabled and zombie agents in the scheduler
     when(dynamicConfigService.getConfig(
@@ -241,132 +187,5 @@ class ClusteredSortAgentSchedulerBatchOperationsTest {
 
     // Should have attempted Redis operations (batch or individual)
     verify(jedis, atLeastOnce()).evalsha(anyString(), anyList(), anyList());
-  }
-
-  @Test
-  void shouldRespectRateLimitingInBatchBoost() {
-    // GIVEN: Batch operations enabled and some agents that should be rate limited
-    when(dynamicConfigService.getConfig(
-            eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
-        .thenReturn(true);
-
-    // Configure rate limiting to be very strict (1 second interval)
-    when(dynamicConfigService.getConfig(
-            eq(Double.class), eq("redis.agent.on-demand.max-boosts-per-second"), anyDouble()))
-        .thenReturn(1.0); // 1 boost per second = 1000ms interval
-
-    Set<String> agentsToBoost = Set.of("Agent1", "Agent2", "Agent3");
-
-    // Set recent boost times to trigger rate limiting
-    long now = System.currentTimeMillis();
-    scheduler.lastBoostTimes.put("Agent1", now - 500); // 500ms ago - should be rate limited
-    scheduler.lastBoostTimes.put("Agent2", now - 2000); // 2 seconds ago - should be allowed
-    // Agent3 has no previous boost time - should be allowed
-
-    // Mock batch boost script for 2 agents (Agent2 and Agent3)
-    when(jedis.evalsha(anyString(), anyList(), anyList())).thenReturn(2L);
-
-    // WHEN: Boosting priority
-    boolean result = scheduler.boostAgentPriority(agentsToBoost);
-
-    // THEN: Should only boost non-rate-limited agents
-    assertTrue(result);
-
-    ArgumentCaptor<List<String>> argsCaptor = ArgumentCaptor.forClass(List.class);
-    verify(jedis).evalsha(anyString(), anyList(), argsCaptor.capture());
-
-    List<String> args = argsCaptor.getValue();
-    assertEquals(3, args.size()); // Score + 2 agents (Agent1 should be rate limited)
-    assertFalse(args.contains("Agent1")); // Should be rate limited
-    assertTrue(args.contains("Agent2")); // Should be allowed
-    assertTrue(args.contains("Agent3")); // Should be allowed
-  }
-
-  @Test
-  void shouldHandleEmptyBatchOperations() {
-    // GIVEN: Empty agent sets
-
-    // WHEN: Boosting with empty set
-    boolean boostResult = scheduler.boostAgentPriority(Collections.emptySet());
-
-    // THEN: Should return false without calling Redis
-    assertFalse(boostResult);
-    verify(jedis, never()).evalsha(anyString(), anyList(), anyList());
-  }
-
-  @Test
-  void shouldProvidePerformanceMetricsForBatchOperations() {
-    // GIVEN: Batch operations enabled and large number of agents to test performance improvement
-    when(dynamicConfigService.getConfig(
-            eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
-        .thenReturn(true);
-
-    Set<String> manyAgents = new HashSet<>();
-    for (int i = 0; i < 100; i++) {
-      manyAgents.add("Agent" + i);
-    }
-
-    // Mock batch boost returning all agents boosted
-    when(jedis.evalsha(anyString(), anyList(), anyList())).thenReturn(100L);
-
-    long startTime = System.currentTimeMillis();
-
-    // WHEN: Boosting many agents
-    boolean result = scheduler.boostAgentPriority(manyAgents);
-
-    long duration = System.currentTimeMillis() - startTime;
-
-    // THEN: Should complete quickly with single Redis call
-    assertTrue(result);
-    assertTrue(duration < 1000, "Batch operation should complete in <1000ms");
-
-    // Should only make 1 Redis call instead of 100
-    verify(jedis, times(1)).evalsha(anyString(), anyList(), anyList());
-  }
-
-  @Test
-  void shouldFallbackToIndividualOperationsWhenBatchDisabled() {
-    // GIVEN: Batch operations are disabled (default behavior)
-    when(dynamicConfigService.getConfig(
-            eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
-        .thenReturn(false);
-
-    Set<String> agentsToBoost = Set.of("Agent1", "Agent2");
-
-    // Mock individual operations success
-    when(jedis.evalsha(anyString(), anyList(), anyList()))
-        .thenReturn("oldScore1") // Individual operation 1
-        .thenReturn("oldScore2"); // Individual operation 2
-
-    // WHEN: Boosting priority (should use individual operations)
-    boolean result = scheduler.boostAgentPriority(agentsToBoost);
-
-    // THEN: Should succeed with individual operations
-    assertTrue(result);
-
-    // Should make individual calls for each agent (not batch)
-    verify(jedis, times(2)).evalsha(anyString(), anyList(), anyList());
-  }
-
-  @Test
-  void shouldUseBatchOperationsWhenEnabled() {
-    // GIVEN: Batch operations are explicitly enabled
-    when(dynamicConfigService.getConfig(
-            eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
-        .thenReturn(true);
-
-    Set<String> agentsToBoost = Set.of("Agent1", "Agent2", "Agent3");
-
-    // Mock batch operation success
-    when(jedis.evalsha(anyString(), anyList(), anyList())).thenReturn(3L);
-
-    // WHEN: Boosting priority (should use batch operations)
-    boolean result = scheduler.boostAgentPriority(agentsToBoost);
-
-    // THEN: Should succeed with single batch call
-    assertTrue(result);
-
-    // Should make only 1 batch call instead of 3 individual calls
-    verify(jedis, times(1)).evalsha(anyString(), anyList(), anyList());
   }
 }
