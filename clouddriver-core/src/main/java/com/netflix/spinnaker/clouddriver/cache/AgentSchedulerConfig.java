@@ -70,7 +70,8 @@ public class AgentSchedulerConfig {
           redisConfigurationProperties.getAgent().getEnabledPattern(),
           redisConfigurationProperties.getScheduler().getParallelism(),
           shardingFilter,
-          dynamicConfigService);
+          dynamicConfigService,
+          redisConfigurationProperties.getAgent().getDisabledAgents());
     } else {
       throw new IllegalStateException(
           "redis.scheduler.type must be one of 'default', 'sort', or ''.");

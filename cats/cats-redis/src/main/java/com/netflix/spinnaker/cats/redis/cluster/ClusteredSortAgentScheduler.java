@@ -209,6 +209,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private final NodeStatusProvider nodeStatusProvider;
   private final AgentIntervalProvider intervalProvider;
   private final ExecutorService agentWorkPool;
+  private final List<String> disabledAgents;
 
   // Configuration constants - following ClusteredAgentScheduler pattern
   private volatile Pattern enabledAgentPattern;
@@ -297,6 +298,9 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * @param dynamicConfigService Enables runtime configuration changes without restarts. Critical
    *     for large deployments where different pods may need different limits based on available
    *     resources, load patterns, or operational requirements.
+   * @param disabledAgents List of specific agent types to explicitly disable, regardless of the
+   *     enabledAgentPattern. This allows for quickly disabling problematic agents without changing
+   *     regex patterns.
    */
   @Autowired
   public ClusteredSortAgentScheduler(
@@ -306,7 +310,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       String enabledAgentPattern,
       Integer parallelism,
       ShardingFilter shardingFilter,
-      DynamicConfigService dynamicConfigService) {
+      DynamicConfigService dynamicConfigService,
+      List<String> disabledAgents) {
     this(
         jedisPool,
         nodeStatusProvider,
@@ -318,7 +323,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         dynamicConfigService.getConfig(
             Long.class, "redis.agent.scheduler-interval-ms", DEFAULT_SCHEDULER_INTERVAL_MS),
         shardingFilter,
-        dynamicConfigService);
+        dynamicConfigService,
+        disabledAgents);
   }
 
   /**
@@ -354,6 +360,10 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    *       <li><code>redis.agent.zombie-threshold-ms</code> - Zombie agent detection threshold
    *       <li><code>redis.agent.zombie-cleanup-interval-ms</code> - Zombie cleanup frequency
    *     </ul>
+   *
+   * @param disabledAgents List of specific agent types to explicitly disable, regardless of the
+   *     enabledAgentPattern. Provides a way to quickly disable problematic agents without changing
+   *     the global pattern.
    */
   @Autowired
   public ClusteredSortAgentScheduler(
@@ -365,7 +375,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       Integer redisRefreshPeriod,
       Long schedulerIntervalMs,
       ShardingFilter shardingFilter,
-      DynamicConfigService dynamicConfigService) {
+      DynamicConfigService dynamicConfigService,
+      List<String> disabledAgents) {
 
     this.jedisPool = jedisPool;
     this.nodeStatusProvider = nodeStatusProvider;
@@ -373,7 +384,13 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
     // Apply configuration following ClusteredAgentScheduler pattern
     this.enabledAgentPattern =
-        Pattern.compile(enabledAgentPattern != null ? enabledAgentPattern : ".*");
+        Pattern.compile(
+            enabledAgentPattern != null ? enabledAgentPattern : ".*", Pattern.CASE_INSENSITIVE);
+
+    this.disabledAgents =
+        disabledAgents != null
+            ? disabledAgents.stream().map(String::toLowerCase).collect(Collectors.toList())
+            : Collections.emptyList();
     this.redisRefreshPeriod =
         redisRefreshPeriod != null ? redisRefreshPeriod : DEFAULT_REDIS_REFRESH_PERIOD;
     this.schedulerIntervalMs =
@@ -624,10 +641,11 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       Agent agent,
       AgentExecution agentExecution,
       ExecutionInstrumentation executionInstrumentation) {
+    String agentType = agent.getAgentType().toLowerCase();
 
-    if (!enabledAgentPattern.matcher(agent.getAgentType().toLowerCase()).matches()) {
+    if (!enabledAgentPattern.matcher(agentType).matches() || disabledAgents.contains(agentType)) {
       log.debug(
-          "Agent is not enabled (agent: {}, agentType: {}, pattern: {})",
+          "Agent is not enabled (agent: {}, agentType: {}, pattern: {}) or is explicitly disabled",
           agent.getClass().getSimpleName(),
           agent.getAgentType(),
           enabledAgentPattern.pattern());

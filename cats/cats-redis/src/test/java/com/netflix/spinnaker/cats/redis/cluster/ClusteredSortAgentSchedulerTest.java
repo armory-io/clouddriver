@@ -77,6 +77,7 @@ class ClusteredSortAgentSchedulerTest {
   private JedisPool jedisPool;
   private Jedis jedis;
   private ExecutionInstrumentation executionInstrumentation;
+  private List<String> disabledAgents;
   private ProviderRegistry providerRegistry;
   private ShardingFilter shardingFilter;
   private DynamicConfigService dynamicConfigService;
@@ -89,6 +90,7 @@ class ClusteredSortAgentSchedulerTest {
     providerRegistry = mock(ProviderRegistry.class);
     shardingFilter = mock(ShardingFilter.class);
     dynamicConfigService = mock(DynamicConfigService.class);
+    disabledAgents = new ArrayList<>();
 
     when(jedisPool.getResource()).thenReturn(jedis);
     when(jedis.scriptLoad(anyString())).thenReturn("sha1");
@@ -131,11 +133,12 @@ class ClusteredSortAgentSchedulerTest {
         new ClusteredSortAgentScheduler(
             jedisPool,
             nodeStatusProvider,
-            new DefaultAgentIntervalProvider(30000, 60000, 300000),
+            new DefaultAgentIntervalProvider(30, 30, 300),
             ".*",
             10,
             shardingFilter,
-            dynamicConfigService);
+            dynamicConfigService,
+            disabledAgents);
   }
 
   @Nested
@@ -326,6 +329,125 @@ class ClusteredSortAgentSchedulerTest {
   }
 
   @Nested
+  @DisplayName("DisabledAgentsTests")
+  class DisabledAgentsTests {
+
+    private NodeStatusProvider nodeStatusProvider;
+
+    @BeforeEach
+    void setUp() {
+      nodeStatusProvider = () -> true;
+    }
+
+    @Test
+    @DisplayName("Should not schedule explicitly disabled agents")
+    void shouldNotScheduleDisabledAgents() {
+      // Create a scheduler with specific agent types disabled
+      disabledAgents = Arrays.asList("DisabledAgent", "AnotherDisabledAgent");
+      scheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              new DefaultAgentIntervalProvider(30, 30, 300),
+              ".*", // enabled pattern (matches everything)
+              4, // parallelism
+              shardingFilter,
+              dynamicConfigService,
+              disabledAgents);
+
+      // Create test agents
+      TestRunnableAgent enabledAgent = new TestRunnableAgent("EnabledAgent");
+      TestRunnableAgent disabledAgent = new TestRunnableAgent("DisabledAgent");
+
+      // When - create an agent execution for each agent
+      AgentExecution enabledExecution = agent -> {}; // Empty execution for testing
+      AgentExecution disabledExecution = agent -> {}; // Empty execution for testing
+
+      scheduler.schedule(enabledAgent, enabledExecution, executionInstrumentation);
+      scheduler.schedule(disabledAgent, disabledExecution, executionInstrumentation);
+
+      // Then
+      // The disabled agent should not be added to Redis
+      verify(jedis).evalsha(any(), eq(2), eq("WAITZ"), eq("WORKZ"), eq("EnabledAgent"), any());
+      verify(jedis, never())
+          .evalsha(any(), eq(2), eq("WAITZ"), eq("WORKZ"), eq("DisabledAgent"), any());
+    }
+
+    @Test
+    @DisplayName("Should respect both pattern and explicit disabling")
+    void shouldRespectBothPatternAndDisabling() {
+      // Create a scheduler that only allows agents matching "Allowed.*" pattern,
+      // but explicitly disables "AllowedDisabled"
+      disabledAgents = List.of("AllowedDisabled");
+      scheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              new DefaultAgentIntervalProvider(30, 30, 300),
+              "Allowed.*", // enabled pattern
+              4, // parallelism
+              shardingFilter,
+              dynamicConfigService,
+              disabledAgents);
+
+      // Create test agents
+      TestRunnableAgent allowedAgent = new TestRunnableAgent("AllowedAgent");
+      TestRunnableAgent disallowedAgent = new TestRunnableAgent("DisallowedAgent");
+      TestRunnableAgent allowedButDisabledAgent = new TestRunnableAgent("AllowedDisabled");
+
+      // When - create agent executions for testing
+      AgentExecution execution = agent -> {}; // Empty execution for testing
+
+      scheduler.schedule(allowedAgent, execution, executionInstrumentation);
+      scheduler.schedule(disallowedAgent, execution, executionInstrumentation);
+      scheduler.schedule(allowedButDisabledAgent, execution, executionInstrumentation);
+
+      // Then
+      // Only the allowed and not explicitly disabled agent should be scheduled
+      verify(jedis).evalsha(any(), eq(2), eq("WAITZ"), eq("WORKZ"), eq("AllowedAgent"), any());
+      verify(jedis, never())
+          .evalsha(any(), eq(2), eq("WAITZ"), eq("WORKZ"), eq("DisallowedAgent"), any());
+      verify(jedis, never())
+          .evalsha(any(), eq(2), eq("WAITZ"), eq("WORKZ"), eq("AllowedDisabled"), any());
+    }
+
+    @Test
+    @DisplayName("Should handle case insensitivity in disabled agents list")
+    void shouldHandleCaseInsensitivityInDisabledList() {
+      // Create a scheduler with mixed-case disabled agents
+      disabledAgents = Arrays.asList("MixedCaseAgent", "anothermixedcaseagent");
+      scheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              new DefaultAgentIntervalProvider(30, 30, 300),
+              ".*", // enabled pattern
+              4, // parallelism
+              shardingFilter,
+              dynamicConfigService,
+              disabledAgents);
+
+      // Create test agents with different case than in the disabled list
+      TestRunnableAgent agent1 =
+          new TestRunnableAgent("mixedCaseAgent"); // Different case from disabledAgents
+      TestRunnableAgent agent2 =
+          new TestRunnableAgent("AnotherMixedCaseAgent"); // Different case from disabledAgents
+
+      // When - create agent execution for testing
+      AgentExecution execution = agent -> {}; // Empty execution for testing
+
+      scheduler.schedule(agent1, execution, executionInstrumentation);
+      scheduler.schedule(agent2, execution, executionInstrumentation);
+
+      // Then - neither should be scheduled due to case-insensitive matching
+      verify(jedis, never())
+          .evalsha(any(), eq(2), eq("WAITZ"), eq("WORKZ"), eq("mixedCaseAgent"), any());
+      verify(jedis, never())
+          .evalsha(any(), eq(2), eq("WAITZ"), eq("WORKZ"), eq("AnotherMixedCaseAgent"), any());
+    }
+  }
+
+  @Nested
   @DisplayName("Redis Integration Tests")
   class RedisIntegrationTests {
 
@@ -400,7 +522,8 @@ class ClusteredSortAgentSchedulerTest {
               ".*", // Enable all agents
               2, // Only 2 concurrent agents
               shardingFilter,
-              dynamicConfigService);
+              dynamicConfigService,
+              java.util.Collections.emptyList()); // No explicitly disabled agents
 
       // Then - Should create successfully
       assertThat(limitedScheduler).isNotNull();
@@ -465,7 +588,8 @@ class ClusteredSortAgentSchedulerTest {
               "(?i).*(aws|gcp|azure).*caching.*", // Case-insensitive pattern
               5,
               shardingFilter,
-              dynamicConfigService);
+              dynamicConfigService,
+              java.util.Collections.emptyList()); // No explicitly disabled agents
 
       // Test agents
       TestRunnableAgent awsAgent = new TestRunnableAgent("awsCachingAgent");
@@ -615,11 +739,12 @@ class ClusteredSortAgentSchedulerTest {
           new ClusteredSortAgentScheduler(
               jedisPool,
               () -> true,
-              new DefaultAgentIntervalProvider(30000, 60000, 300000),
+              new DefaultAgentIntervalProvider(10000, 10000, 20000),
               ".*",
               10,
               shardingFilter,
-              dynamicConfigService);
+              dynamicConfigService,
+              java.util.Collections.emptyList());
 
       TestRunnableAgent agent = new TestRunnableAgent("enterpriseAgent");
 

@@ -27,6 +27,7 @@ import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import java.util.*;
+import java.util.Collections;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -87,7 +88,8 @@ class ClusteredSortAgentSchedulerBatchOperationsTest {
             30, // redisRefreshPeriod
             1000L, // schedulerIntervalMs
             shardingFilter,
-            dynamicConfigService);
+            dynamicConfigService,
+            Collections.emptyList()); // No explicitly disabled agents
   }
 
   @Test

@@ -29,6 +29,7 @@ import com.netflix.spinnaker.cats.cluster.DefaultAgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.provider.ProviderRegistry;
 import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
+import java.util.Collections;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -86,7 +87,8 @@ class ClusteredSortAgentSchedulerIntegrationTest {
             ".*", // Enable all agents
             5,
             shardingFilter,
-            dynamicConfigService);
+            dynamicConfigService,
+            Collections.emptyList()); // No explicitly disabled agents
   }
 
   @Test
