@@ -34,6 +34,7 @@ import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -44,9 +45,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
@@ -59,7 +63,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Response;
 import redis.clients.jedis.Tuple;
+import redis.clients.jedis.params.SetParams;
 
 /**
  * Priority-based Redis agent scheduler that uses sorted sets for coordinated execution across
@@ -106,11 +112,11 @@ import redis.clients.jedis.Tuple;
  * redis.agent.zombie-cleanup-interval-ms: 300000 # 5 min cleanup cycles
  * </pre>
  *
- * <p><strong>Suitable for:</strong> 1-500 AWS accounts, normal deployment frequency, standard Redis
- * resources.
+ * <p><strong>Suitable for:</strong> Standard deployments with moderate cache agent load, normal
+ * deployment frequency, and standard Redis resources.
  *
- * <p><strong>Performance:</strong> ~1 second agent pickup, efficient deployment circuit breaker
- * protection.
+ * <p><strong>Performance:</strong> Moderate agent pickup latency with efficient resource
+ * utilization and deployment protection.
  *
  * <p><strong>High-Load Configuration (for enterprise-scale deployments):</strong>
  *
@@ -121,10 +127,10 @@ import redis.clients.jedis.Tuple;
  * redis.agent.zombie-cleanup-interval-ms: 120000 # 2 min cleanup cycles - very frequent
  * </pre>
  *
- * <p><strong>Suitable for:</strong> 500+ AWS accounts, high deployment frequency, dedicated Redis
- * infrastructure.
+ * <p><strong>Suitable for:</strong> Large-scale deployments with higher cache agent load, frequent
+ * deployments, and dedicated Redis infrastructure.
  *
- * <p><strong>Performance:</strong> ~0.5 second agent pickup, fast cache processing.
+ * <p><strong>Performance:</strong> Low agent pickup latency and responsive cache processing.
  *
  * <p><strong>Key Parameter Guidelines:</strong>
  *
@@ -151,48 +157,15 @@ import redis.clients.jedis.Tuple;
  *       to prevent accumulation. High-load environments benefit from 2-3 minute cycles.
  * </ul>
  *
- * <p><strong>Monitoring & Troubleshooting:</strong>
- *
- * <ul>
- *   <li><strong>Key Metrics:</strong> Agent execution times (P95), Redis CPU/memory, queue depth
- *   <li><strong>Slow OnDemand:</strong> Reduce scheduler interval, check agent configuration
- *   <li><strong>High Redis Load:</strong> Increase scheduler interval, reduce refresh frequency,
- *       check connection pooling
- *   <li><strong>Circuit Breaker Timeouts:</strong> Reduce scheduler interval, check pod network
- *       latency
- *   <li><strong>Premature Zombie Cleanup:</strong> If agents are being killed while legitimately
- *       running, increase zombie-threshold-ms
- * </ul>
- *
  * <p><strong>Batch Operations (Performance Optimization):</strong>
  *
- * <p>For enterprise-scale deployments (1000+ agents), batch operations provide significant
- * performance improvements by reducing Redis round-trips from O(n) to O(1). All batch operations
- * are controlled by a single feature flag:
+ * <p>For large-scale deployments with many agents, batch operations provide significant performance
+ * improvements by reducing the number of Redis round-trips. All batch operations are controlled by
+ * a single feature flag:
  *
  * <pre>
  * redis.agent.batch-operations-enabled: false      # All batch operations (disabled by default for safety)
  * </pre>
- *
- * <p><strong>Performance Impact:</strong> Batch operations can improve performance by 10-1000x for
- * large agent counts:
- *
- * <ul>
- *   <li><strong>Agent Repopulation:</strong> 1000 agents: 1000 Redis calls → 1 Redis call (1000x
- *       improvement)
- *   <li><strong>Zombie Cleanup:</strong> 50 zombie agents: 50 Redis calls → 1 Redis call (50x
- *       improvement)
- * </ul>
- *
- * <p><strong>Deployment Strategy:</strong> Enable batch operations gradually:
- *
- * <ol>
- *   <li>Enable in development environment first: {@code redis.agent.batch-operations-enabled: true}
- *   <li>Monitor Redis performance and error rates
- *   <li>Enable in staging with full load testing
- *   <li>Enable in production during low-traffic periods
- *   <li>All operations have automatic fallback to individual calls if batch operations fail
- * </ol>
  *
  * @see ClusteredAgentScheduler for the default Redis scheduler implementation
  * @see AgentScheduler for the base scheduler interface
@@ -274,7 +247,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private static final String CONDITIONAL_REMOVE_SCRIPT = "conditionalRemoveScript";
   private static final String BATCH_ORPHAN_REMOVE_SCRIPT = "batchOrphanRemoveScript";
 
-  // Batch operation scripts for O(n) → O(1) performance optimization
+  // Batch operation scripts for reduced per-agent overhead through batched operations
   private static final String BATCH_ADD_AGENTS_SCRIPT = "batchAddAgentsScript";
   private static final String BATCH_CLEANUP_AGENTS_SCRIPT = "batchCleanupAgentsScript";
 
@@ -402,11 +375,59 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       this.runningAgents = Optional.empty();
     }
 
+    // Create a bounded thread pool with proper rejection handling instead of unbounded cached pool
+
+    // First determine maximum pool size based on config or available processors
+    int maximumPoolSize =
+        dynamicConfigService.getConfig(
+            Integer.class,
+            "redis.agent.thread-pool-size",
+            Math.max(
+                Runtime.getRuntime().availableProcessors() * 2,
+                20)); // Scale with available processors
+
+    // Use percentage of max size for core size (default 50%)
+    int corePoolPercentage =
+        dynamicConfigService.getConfig(
+            Integer.class,
+            "redis.agent.thread-pool-core-size-percentage",
+            50); // Default to 50% of max size
+
+    // Ensure percentage is valid (between 10% and 100%)
+    corePoolPercentage = Math.min(Math.max(corePoolPercentage, 10), 100);
+
+    // Calculate core pool size based on percentage, ensuring at least 1 thread
+    int corePoolSize = Math.max(1, (maximumPoolSize * corePoolPercentage) / 100);
+
+    // Configurable keep-alive time
+    long keepAliveTime =
+        dynamicConfigService.getConfig(
+            Long.class, "redis.agent.thread-pool-keep-alive-seconds", 60L); // Default 60 seconds
+
+    // Use bounded queue to prevent resource exhaustion
+    int queueCapacity =
+        dynamicConfigService.getConfig(
+            Integer.class, "redis.agent.thread-pool-queue-size", 1000); // Default queue size
+
     this.agentWorkPool =
-        Executors.newCachedThreadPool(
+        new ThreadPoolExecutor(
+            corePoolSize,
+            maximumPoolSize,
+            keepAliveTime,
+            TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(queueCapacity),
             new ThreadFactoryBuilder()
                 .setNameFormat(AgentWorker.class.getSimpleName() + "-%d")
-                .build());
+                .build(),
+            new RejectedExecutionHandler() {
+              @Override
+              public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+                // CallerRunsPolicy - execute the task in the caller's thread as a fallback
+                if (!executor.isShutdown()) {
+                  r.run();
+                }
+              }
+            }); // Throttle when queue is full
 
     this.shardingFilter = shardingFilter;
     this.dynamicConfigService = dynamicConfigService;
@@ -826,18 +847,51 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   @SuppressWarnings(
       "deprecation") // jedis.time() is deprecated but still the correct method for Redis TIME
   // coordination
-  private static String score(Jedis jedis, long offsetMillis) {
-    // Use Redis TIME command for server-side time coordination across multiple instances
-    List<String> times = jedis.time();
-    if (times == null || times.size() != 2) {
-      throw new AgentSchedulingException("Error retrieving time from Redis");
+  private static final AtomicLong lastTimeCheck = new AtomicLong(0);
+
+  private static final AtomicLong serverClientOffset = new AtomicLong(0);
+
+  /**
+   * Calculate a score for Redis sorted sets based on current time plus an offset. Uses a cached
+   * time offset between Redis server and client to reduce Redis calls.
+   *
+   * @param jedis The Jedis connection
+   * @param offsetMillis Offset to add to the current time in milliseconds
+   * @return Score string for Redis sorted set
+   */
+  private String score(Jedis jedis, long offsetMillis) {
+    long now = System.currentTimeMillis();
+    long lastCheck = lastTimeCheck.get();
+
+    // Get time cache duration from dynamic config (default 10 seconds)
+    long timeCacheDurationMs =
+        dynamicConfigService.getConfig(Long.class, "redis.agent.time-cache-duration-ms", 10000L);
+
+    // Refresh the server-client offset if needed
+    if (now - lastCheck > timeCacheDurationMs) {
+      // Use Redis TIME command for server-side time coordination
+      try {
+        List<String> times = jedis.time();
+        if (times != null && times.size() == 2) {
+          // Redis TIME returns seconds and microseconds
+          long serverTimeSeconds = Long.parseLong(times.get(0));
+          long serverTimeMs = serverTimeSeconds * 1000;
+          // Update the offset (server time - client time)
+          serverClientOffset.set(serverTimeMs - now);
+          lastTimeCheck.set(now);
+        }
+      } catch (Exception e) {
+        // In case of Redis TIME command failure, we'll use client time
+        // No need to throw exception, just log and continue
+        log.warn("Failed to get Redis server time, using client time: {}", e.getMessage());
+      }
     }
-    long timeSeconds = Long.parseLong(times.get(0)); // Use Long.parseLong for robustness (Y2K38)
 
-    // Convert offsetMillis from milliseconds to seconds for proper time unit compatibility
-    long offsetSeconds = offsetMillis / 1000;
+    // Get the current time accounting for server-client offset
+    long adjustedTimeMs = now + serverClientOffset.get() + offsetMillis;
+    long adjustedTimeSeconds = adjustedTimeMs / 1000;
 
-    return String.format("%d", timeSeconds + offsetSeconds);
+    return String.format("%d", adjustedTimeSeconds);
   }
 
   /**
@@ -876,16 +930,30 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    */
   private String agentScore(Agent agent) {
     try (Jedis jedis = jedisPool.getResource()) {
-      Double score = jedis.zscore(WORKING_SET, agent.getAgentType());
+      // Use pipelined operations to reduce round-trips to Redis
+      redis.clients.jedis.Pipeline pipeline = jedis.pipelined();
+
+      // Queue both score lookups in a single pipeline
+      Response<Double> workingScore = pipeline.zscore(WORKING_SET, agent.getAgentType());
+      Response<Double> waitingScore = pipeline.zscore(WAITING_SET, agent.getAgentType());
+
+      // Execute the pipeline
+      pipeline.sync();
+
+      // Check results in order of priority
+      Double score = workingScore.get();
       if (score != null) {
         return score.toString();
       }
 
-      score = jedis.zscore(WAITING_SET, agent.getAgentType());
+      score = waitingScore.get();
       if (score != null) {
         return score.toString();
       }
 
+      return null;
+    } catch (Exception e) {
+      log.warn("Failed to get agent score for {}: {}", agent.getAgentType(), e.getMessage());
       return null;
     }
   }
@@ -1001,6 +1069,15 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
             continue;
           }
 
+          // Ensure we have a valid agent reference before attempting acquisition
+          if (worker.agent == null) {
+            log.warn(
+                "Agent {} found in local map but has null agent reference, releasing semaphore permit and skipping.",
+                agentType);
+            runningAgents.ifPresent(Semaphore::release);
+            continue;
+          }
+
           ScoreTuple acquireResult = acquireAgent(worker.agent);
           if (acquireResult == null) {
             log.debug(
@@ -1062,6 +1139,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * @return Number of orphaned agents removed from WAITZ
    */
   private int cleanupOrphanedAgentsFromWaitz(Jedis jedis) {
+    // Note: This method doesn't actually use the orphan threshold for cleanup decisions,
+    // it simply removes agents in WAITZ that aren't in the local registry.
     long cleanupStartTime = System.currentTimeMillis();
     int totalRemoved = 0;
 
@@ -1252,6 +1331,15 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
               Arrays.asList(agent.getAgentType(), acquireScore));
 
       return releaseScore != null ? new ScoreTuple(acquireScore, releaseScore.toString()) : null;
+    } catch (Exception e) {
+      log.error(
+          "Failed to acquire agent {} from Redis due to exception: {}",
+          agent.getAgentType(),
+          e.getMessage(),
+          e);
+      // The error is already handled in saturatePool() where semaphore is released
+      // This method only does Redis operations, not semaphore management
+      return null;
     }
   }
 
@@ -1379,19 +1467,22 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       // Create a unique instance ID to identify this instance as the leader
       String instanceId = InetAddress.getLocalHost().getHostName() + "::" + UUID.randomUUID();
 
-      // Use setnx to set the key only if it doesn't already exist
-      Long result = jedis.setnx(CLEANUP_LEADER_KEY, instanceId);
+      // Use Redis SET with NX and EX options for atomic lock acquisition with built-in expiry
+      // This prevents race conditions where a pod could acquire the lock but crash before setting
+      // expiry
+      int leadershipTtlSeconds = (int) (leadershipTtlMs / 1000);
+      String result =
+          jedis.set(
+              CLEANUP_LEADER_KEY, instanceId, SetParams.setParams().nx().ex(leadershipTtlSeconds));
 
-      boolean acquired = (result != null && result == 1L);
+      boolean acquired = "OK".equals(result);
       if (acquired) {
-        // If we acquired the lock, set the expiry separately
-        jedis.expire(CLEANUP_LEADER_KEY, (int) (leadershipTtlMs / 1000));
-
         // Store the leadership ID for later release
         currentLeadershipId = instanceId;
         log.debug(
-            "Acquired orphaned agent cleanup leadership with ID {} - this pod will perform cleanup operations",
-            instanceId);
+            "Acquired orphaned agent cleanup leadership with ID {} for {} seconds - this pod will perform cleanup operations",
+            instanceId,
+            leadershipTtlSeconds);
       } else {
         log.debug("Another pod is the cleanup leader - skipping orphaned agent cleanup");
       }
@@ -1489,6 +1580,11 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
     // Only proceed if cleanup is enabled for this pod
     if (orphanCleanupEnabled && now - lastOrphanCleanup > orphanCleanupIntervalMs) {
+      // Get the orphan threshold for cleanup - this is the proper place to check this configuration
+      // since we're deciding whether to run orphan cleanup here
+      Long orphanThresholdMsObj =
+          dynamicConfigService.getConfig(
+              Long.class, "redis.agent.orphan-threshold-ms", 10 * 60 * 1000L); // Default 10 minutes
       // Only attempt cleanup if we become the leader or if force refresh is enabled
       Boolean forceRefreshObj =
           dynamicConfigService.getConfig(
@@ -1612,15 +1708,15 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   }
 
   private int cleanupOrphanedAgentsFromWorkz(Jedis jedis) {
-    // Start timestamp for timing the WORKZ cleanup process
-    long orphanCleanupStartTime = System.currentTimeMillis();
-    log.info("Starting orphaned agent cleanup from Redis WORKZ set.");
-    // Default orphan threshold: 10 minutes. Agents with timeout scores older than this in WORKZ are
-    // considered potential orphans
+    // Get orphan threshold from configuration
     Long orphanThresholdMsObj =
         dynamicConfigService.getConfig(
             Long.class, "redis.agent.orphan-threshold-ms", 10 * 60 * 1000L); // Default 10 minutes
     long orphanThresholdMs = orphanThresholdMsObj != null ? orphanThresholdMsObj : 10 * 60 * 1000L;
+    // Start timestamp for timing the WORKZ cleanup process
+    long orphanCleanupStartTime = System.currentTimeMillis();
+    log.info("Starting orphaned agent cleanup from Redis WORKZ set.");
+    // The orphan threshold is used to determine which agents in WORKZ have been abandoned
 
     // Check if batch operations are enabled and configure batch size accordingly
     Boolean batchOperationsEnabledObj =
@@ -2289,22 +2385,28 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * {@link #shuttingDown} is true, {@code conditionalReleaseAgent} will re-queue them immediately.
    */
   private void gracefullyReleaseActiveAgents() {
-    if (activeAgents.isEmpty()) {
-      log.info("No active agents to release during shutdown.");
-      return;
+    // Use a synchronized block to get a consistent view of the active agents map
+    // and ensure thread safety during inspection and cancellation
+    Map<String, ActiveAgent> agentsSnapshot;
+    synchronized (activeAgents) {
+      if (activeAgents.isEmpty()) {
+        log.info("No active agents to release during shutdown.");
+        return;
+      }
+
+      log.info(
+          "Attempting to gracefully release {} active agents during shutdown...",
+          activeAgents.size());
+      // Create a deep copy of both keys and values to avoid any potential concurrent modification
+      agentsSnapshot = new HashMap<>(activeAgents);
     }
 
-    log.info(
-        "Attempting to gracefully release {} active agents during shutdown...",
-        activeAgents.size());
-    // Create a copy of keys to avoid ConcurrentModificationException if AgentWorker's finally block
-    // modifies activeAgents
-    List<String> agentTypesToProcess = new ArrayList<>(activeAgents.keySet());
+    // Now work with the static snapshot, outside of synchronization to avoid blocking other threads
+    for (Map.Entry<String, ActiveAgent> entry : agentsSnapshot.entrySet()) {
+      String agentType = entry.getKey();
+      ActiveAgent activeAgent = entry.getValue();
 
-    for (String agentType : agentTypesToProcess) {
-      ActiveAgent activeAgent = activeAgents.get(agentType);
-      if (activeAgent
-          == null) { // Agent might have completed and been removed by its worker already
+      if (activeAgent == null) {
         continue;
       }
 
@@ -2323,7 +2425,12 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       }
     }
 
-    int activeCountAfterCancel = activeAgents.size();
+    // Get a safe size count for the waiting period
+    int activeCountAfterCancel;
+    synchronized (activeAgents) {
+      activeCountAfterCancel = activeAgents.size();
+    }
+
     if (activeCountAfterCancel > 0) {
       log.info(
           "Graceful shutdown: Waiting briefly for {} agents to complete their finally blocks.",
@@ -2335,9 +2442,15 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         Thread.currentThread().interrupt();
         log.warn("Graceful shutdown: Interrupted while waiting for agents to release.");
       }
+
+      int remainingAgents;
+      synchronized (activeAgents) {
+        remainingAgents = activeAgents.size();
+      }
+
       log.info(
           "Graceful shutdown: {} agents potentially still in active map after waiting period.",
-          activeAgents.size());
+          remainingAgents);
     } else {
       log.info(
           "Graceful shutdown: All active agents appear to have been processed or removed by their workers.");

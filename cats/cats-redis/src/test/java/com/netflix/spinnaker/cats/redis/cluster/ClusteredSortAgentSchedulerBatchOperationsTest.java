@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 Armory, Inc.
+ * Copyright 2025 Harness, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,8 +37,8 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 
 /**
- * Tests for batch Redis operations in ClusteredSortAgentScheduler to validate O(n) → O(1)
- * performance optimizations for agent management operations.
+ * Tests for batch Redis operations in ClusteredSortAgentScheduler to validate the reduced per-agent
+ * overhead through batched operations for agent management tasks.
  */
 class ClusteredSortAgentSchedulerBatchOperationsTest {
 
@@ -61,10 +61,28 @@ class ClusteredSortAgentSchedulerBatchOperationsTest {
     when(nodeStatusProvider.isNodeEnabled()).thenReturn(true);
     when(dynamicConfigService.getConfig(eq(Boolean.class), anyString(), anyBoolean()))
         .thenReturn(false);
-    when(dynamicConfigService.getConfig(eq(Integer.class), anyString(), anyInt())).thenReturn(30);
-    when(dynamicConfigService.getConfig(eq(Long.class), anyString(), anyLong())).thenReturn(1000L);
-    when(dynamicConfigService.getConfig(eq(Double.class), anyString(), anyDouble()))
-        .thenReturn(10.0);
+    when(dynamicConfigService.getConfig(eq(Long.class), anyString(), any(Long.class)))
+        .thenReturn(1000L);
+    when(dynamicConfigService.getConfig(eq(Integer.class), anyString(), anyInt())).thenReturn(1000);
+    when(dynamicConfigService.getConfig(eq(String.class), anyString(), anyString()))
+        .thenReturn(".*");
+
+    // Explicitly mock the new thread pool configuration parameters
+    when(dynamicConfigService.getConfig(
+            eq(Integer.class), eq("redis.agent.thread-pool-size"), anyInt()))
+        .thenReturn(20);
+    when(dynamicConfigService.getConfig(
+            eq(Integer.class), eq("redis.agent.thread-pool-core-size-percentage"), anyInt()))
+        .thenReturn(50);
+    when(dynamicConfigService.getConfig(
+            eq(Long.class), eq("redis.agent.thread-pool-keep-alive-seconds"), any(Long.class)))
+        .thenReturn(60L);
+    when(dynamicConfigService.getConfig(
+            eq(Integer.class), eq("redis.agent.thread-pool-queue-size"), anyInt()))
+        .thenReturn(1000);
+    when(dynamicConfigService.getConfig(
+            eq(Long.class), eq("redis.agent.time-cache-duration-ms"), any(Long.class)))
+        .thenReturn(10000L);
 
     // Mock batch operations flag (true for these tests, false by default for safety)
     when(dynamicConfigService.getConfig(

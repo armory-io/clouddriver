@@ -18,6 +18,7 @@ package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -78,6 +79,23 @@ class ClusteredSortAgentSchedulerIntegrationTest {
     when(dynamicConfigService.getConfig(
             eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
         .thenReturn(1000);
+
+    // Explicitly mock the new thread pool configuration parameters
+    when(dynamicConfigService.getConfig(
+            eq(Integer.class), eq("redis.agent.thread-pool-size"), anyInt()))
+        .thenReturn(20);
+    when(dynamicConfigService.getConfig(
+            eq(Integer.class), eq("redis.agent.thread-pool-core-size-percentage"), anyInt()))
+        .thenReturn(50);
+    when(dynamicConfigService.getConfig(
+            eq(Long.class), eq("redis.agent.thread-pool-keep-alive-seconds"), any(Long.class)))
+        .thenReturn(60L);
+    when(dynamicConfigService.getConfig(
+            eq(Integer.class), eq("redis.agent.thread-pool-queue-size"), anyInt()))
+        .thenReturn(1000);
+    when(dynamicConfigService.getConfig(
+            eq(Long.class), eq("redis.agent.time-cache-duration-ms"), any(Long.class)))
+        .thenReturn(10000L);
 
     scheduler =
         new ClusteredSortAgentScheduler(

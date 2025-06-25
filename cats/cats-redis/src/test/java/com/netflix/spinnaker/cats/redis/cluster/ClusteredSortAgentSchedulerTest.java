@@ -126,6 +126,23 @@ class ClusteredSortAgentSchedulerTest {
             eq(String.class), eq("redis.agent.enabled-pattern"), anyString()))
         .thenReturn(".*"); // Default enabled pattern
 
+    // Mock the new thread pool configuration parameters
+    when(dynamicConfigService.getConfig(
+            eq(Integer.class), eq("redis.agent.thread-pool-size"), anyInt()))
+        .thenReturn(20);
+    when(dynamicConfigService.getConfig(
+            eq(Integer.class), eq("redis.agent.thread-pool-core-size-percentage"), anyInt()))
+        .thenReturn(50);
+    when(dynamicConfigService.getConfig(
+            eq(Long.class), eq("redis.agent.thread-pool-keep-alive-seconds"), any(Long.class)))
+        .thenReturn(60L);
+    when(dynamicConfigService.getConfig(
+            eq(Integer.class), eq("redis.agent.thread-pool-queue-size"), anyInt()))
+        .thenReturn(1000);
+    when(dynamicConfigService.getConfig(
+            eq(Long.class), eq("redis.agent.time-cache-duration-ms"), any(Long.class)))
+        .thenReturn(10000L);
+
     // Default to enabling the node
     NodeStatusProvider nodeStatusProvider = () -> true;
 
@@ -1411,12 +1428,10 @@ class ClusteredSortAgentSchedulerTest {
               eq(Long.class), eq("redis.agent.orphan-cleanup-interval-ms"), any(Long.class)))
           .thenReturn(0L); // Will force cleanup to run immediately
 
-      // Mock successful leadership acquisition
-      when(jedis.setnx(eq("CLEANUP_LEADER"), anyString()))
-          .thenReturn(1L); // Successfully acquired leadership (1L = success)
-
-      // Mock successful expire call which happens after setnx
-      when(jedis.expire(eq("CLEANUP_LEADER"), anyInt())).thenReturn(1L); // Successfully set expiry
+      // Mock successful leadership acquisition using the new atomic SET command
+      when(jedis.set(
+              eq("CLEANUP_LEADER"), anyString(), any(redis.clients.jedis.params.SetParams.class)))
+          .thenReturn("OK"); // Successfully acquired leadership ("OK" = success)
 
       // Mock empty orphan set (no orphans to clean)
       Set<redis.clients.jedis.Tuple> emptySet = new HashSet<>();
@@ -1426,9 +1441,10 @@ class ClusteredSortAgentSchedulerTest {
       // When
       scheduler.saturatePool(); // This calls cleanupZombieAgentsIfNeeded internally
 
-      // Then - Should attempt leadership acquisition and release
-      verify(jedis).setnx(eq("CLEANUP_LEADER"), anyString()); // Verify setnx was called
-      verify(jedis).expire(eq("CLEANUP_LEADER"), anyInt()); // Verify expire was called
+      // Then - Should attempt atomic leadership acquisition and release
+      verify(jedis)
+          .set(eq("CLEANUP_LEADER"), anyString(), any(redis.clients.jedis.params.SetParams.class));
+      // No longer need to verify expire call since it's now part of the atomic SET operation
       verify(jedis).eval(anyString(), anyList(), anyList()); // Leadership release
     }
 
@@ -1441,14 +1457,16 @@ class ClusteredSortAgentSchedulerTest {
           .thenReturn(0L); // Will force cleanup to run immediately
 
       // Mock leadership acquisition failure (another pod is the leader)
-      when(jedis.setnx(eq("CLEANUP_LEADER"), anyString()))
-          .thenReturn(0L); // Failed to acquire leadership (0L = failure, key exists)
+      when(jedis.set(
+              eq("CLEANUP_LEADER"), anyString(), any(redis.clients.jedis.params.SetParams.class)))
+          .thenReturn(null); // Failed to acquire leadership (null = failure, key exists)
 
       // When
       scheduler.saturatePool(); // This calls cleanupZombieAgentsIfNeeded internally
 
       // Then - Should try to acquire leadership but not perform any cleanup
-      verify(jedis).setnx(eq("CLEANUP_LEADER"), anyString()); // Verify setnx was called
+      verify(jedis)
+          .set(eq("CLEANUP_LEADER"), anyString(), any(redis.clients.jedis.params.SetParams.class));
       verify(jedis, never()).zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString());
     }
 
