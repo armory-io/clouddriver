@@ -2288,7 +2288,8 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       return false;
     }
 
-    log.debug("Attempting to boost priority for {} agents: {}", agentTypes.size(), agentTypes);
+    String agents = agentTypes.isEmpty() ? "" : String.join(", ", agentTypes);
+    log.info("Attempting to boost priority for agents: {}", agents);
 
     // Check if batch operations are enabled (disabled by default for safety)
     boolean batchOperationsEnabled =
@@ -2491,23 +2492,33 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
     // ECS Provider mappings
     if ("ecs".equals(providerName) || onDemandType.toLowerCase().contains("ecs")) {
-      // ECS server group (service) related agents
-      if (onDemandType.contains("ServerGroup") || onDemandType.contains("Service")) {
+      log.info("Processing ECS provider with onDemandType: {}", onDemandType);
+
+      // ECS server group (service) related agents - handle ALL ServerGroup on-demand types for ECS
+      // This ensures any on-demand operation for ECS server groups triggers all relevant agents
+      if (onDemandType.contains("ServerGroup")
+          || onDemandType.contains("Service")
+          || onDemandType.equals("ServerGroup")) { // Exact match for just "ServerGroup"
+        log.info("Adding ECS service-related caching agents for boosting");
         relatedAgents.add("ServiceCachingAgent"); // Main server group agent
         relatedAgents.add("TaskCachingAgent"); // Tasks are part of services
         relatedAgents.add("TaskHealthCachingAgent"); // Health status of tasks
         relatedAgents.add("TaskDefinitionCachingAgent"); // Task definitions used by services
+        relatedAgents.add("ContainerInstanceCachingAgent"); // Needed for service placement
         relatedAgents.add("ScalableTargetsCachingAgent"); // For scaling policies
+        relatedAgents.add("EcsClusterCachingAgent"); // Also boost cluster when services change
       }
 
       // ECS cluster related agents
       if (onDemandType.contains("Cluster")) {
+        log.info("Adding ECS cluster-related caching agents for boosting");
         relatedAgents.add("EcsClusterCachingAgent");
         relatedAgents.add("ContainerInstanceCachingAgent");
       }
 
       // ECS task related agents
       if (onDemandType.contains("Task")) {
+        log.info("Adding ECS task-related caching agents for boosting");
         relatedAgents.add("TaskCachingAgent");
         relatedAgents.add("TaskHealthCachingAgent");
         relatedAgents.add("TaskDefinitionCachingAgent");
@@ -2619,7 +2630,11 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    */
   public void handleOnDemandCompletion(
       OnDemandAgent onDemandAgent, OnDemandAgent.OnDemandResult result) {
-    log.debug("Handling OnDemand completion for agent: {}", onDemandAgent);
+    log.info(
+        "Handling OnDemand completion for agent: {}, type: {}, providerName: {}",
+        onDemandAgent,
+        onDemandAgent.getOnDemandAgentType(),
+        onDemandAgent.getProviderName());
 
     // Check if OnDemand priority boosting is enabled (disabled by default)
     boolean onDemandBoostEnabled =
@@ -2631,6 +2646,9 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       return;
     }
 
+    // Extract agent details for better targeting
+    log.info("Agent class: {}", onDemandAgent.getClass().getName());
+
     // Extract account/region information for targeted boosting
     String accountName = null;
     String region = null;
@@ -2638,6 +2656,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     // Try to get account name from AccountAware interface
     if (onDemandAgent instanceof AccountAware) {
       accountName = ((AccountAware) onDemandAgent).getAccountName();
+      log.info("Found AccountAware agent with account: {}", accountName);
     }
 
     // Try to get region from getRegion() method if it exists (some providers have this)

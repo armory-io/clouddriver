@@ -93,6 +93,8 @@ public class CatsOnDemandCacheUpdater implements OnDemandCacheUpdater {
         }
 
         final OnDemandAgent.OnDemandResult result = agent.handle(providerCache, data);
+
+        // Process and store the result if it's not null
         if (result != null) {
           if (agentScheduler.isAtomic() && !agentScheduler.lockValid(lock)) {
             // force Orca to retry
@@ -100,73 +102,92 @@ public class CatsOnDemandCacheUpdater implements OnDemandCacheUpdater {
             continue;
           }
 
-          if (agent.getMetricsSupport() == null) {
-            continue;
-          }
-
-          if (result.getCacheResult() != null) {
-            final Map<String, Collection<CacheData>> results =
-                result.getCacheResult().getCacheResults();
-            if (agentHasOnDemandResults(results)) {
-              hasOnDemandResults = true;
-              results.forEach(
-                  (k, v) -> {
-                    if (v != null && !v.isEmpty()) {
-                      if (!cachedIdentifiersByType.containsKey(k)) {
-                        cachedIdentifiersByType.put(k, new ArrayList<>());
+          if (agent.getMetricsSupport() != null) {
+            if (result.getCacheResult() != null) {
+              final Map<String, Collection<CacheData>> results =
+                  result.getCacheResult().getCacheResults();
+              if (agentHasOnDemandResults(results)) {
+                hasOnDemandResults = true;
+                results.forEach(
+                    (k, v) -> {
+                      if (v != null && !v.isEmpty()) {
+                        if (!cachedIdentifiersByType.containsKey(k)) {
+                          cachedIdentifiersByType.put(k, new ArrayList<>());
+                        }
+                        cachedIdentifiersByType
+                            .get(k)
+                            .addAll(v.stream().map(CacheData::getId).collect(Collectors.toList()));
                       }
-                      cachedIdentifiersByType
-                          .get(k)
-                          .addAll(v.stream().map(CacheData::getId).collect(Collectors.toList()));
-                    }
-                  });
+                    });
+              }
+
+              agent
+                  .getMetricsSupport()
+                  .cacheWrite(
+                      () -> {
+                        if (result.cacheResult.isPartialResult()) {
+                          providerCache.addCacheResult(
+                              result.sourceAgentType,
+                              result.authoritativeTypes,
+                              result.cacheResult);
+                        } else {
+                          providerCache.putCacheResult(
+                              result.sourceAgentType,
+                              result.authoritativeTypes,
+                              result.cacheResult);
+                        }
+                      });
             }
 
-            agent
-                .getMetricsSupport()
-                .cacheWrite(
-                    () -> {
-                      if (result.cacheResult.isPartialResult()) {
-                        providerCache.addCacheResult(
-                            result.sourceAgentType, result.authoritativeTypes, result.cacheResult);
-                      } else {
-                        providerCache.putCacheResult(
-                            result.sourceAgentType, result.authoritativeTypes, result.cacheResult);
-                      }
-                    });
-          }
-
-          if (result.getEvictions() != null && !result.getEvictions().isEmpty()) {
-            agent
-                .getMetricsSupport()
-                .cacheEvict(
-                    () -> {
-                      result.evictions.forEach(providerCache::evictDeletedItems);
-                    });
+            if (result.getEvictions() != null && !result.getEvictions().isEmpty()) {
+              agent
+                  .getMetricsSupport()
+                  .cacheEvict(
+                      () -> {
+                        result.evictions.forEach(providerCache::evictDeletedItems);
+                      });
+            }
           }
 
           if (agentScheduler.isAtomic() && !(agentScheduler.tryRelease(lock))) {
             throw new IllegalStateException(
                 "We likely just wrote stale data. If you're seeing this, file a github issue: https://github.com/spinnaker/spinnaker/issues");
           }
+        } // End of result != null processing
 
-          // Boost priority of related caching agents if using ClusteredSortAgentScheduler
-          if (agentScheduler
-              instanceof com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentScheduler) {
+        // IMPORTANT: Boost priority regardless of result - moved outside the conditionals
+        // to ensure it always runs for every on-demand agent
+        if (agentScheduler
+            instanceof com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentScheduler) {
+          try {
+            log.info(
+                "Attempting to boost priority for agent: {}, type: {}, providerName: {}",
+                agent,
+                agent.getOnDemandAgentType(),
+                agent.getProviderName());
             ((com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentScheduler) agentScheduler)
                 .handleOnDemandCompletion(agent, result);
+            log.info("Successfully completed boost request for agent: {}", agent);
+          } catch (Exception e) {
+            log.error("Failed to boost related agents for {}: {}", agent, e.getMessage(), e);
           }
-
-          final long elapsed = System.nanoTime() - startTime;
-          agent.getMetricsSupport().recordTotalRunTimeNanos(elapsed);
-
-          log.info(
-              "{}/{} handled {} in {}ms.",
-              agent.getProviderName(),
-              agent.getOnDemandAgentType(),
-              type,
-              TimeUnit.NANOSECONDS.toMillis(elapsed));
+        } else {
+          log.debug(
+              "Not a ClusteredSortAgentScheduler ({}), skipping boost",
+              agentScheduler.getClass().getName());
         }
+
+        final long elapsed = System.nanoTime() - startTime;
+        if (agent.getMetricsSupport() != null) {
+          agent.getMetricsSupport().recordTotalRunTimeNanos(elapsed);
+        }
+
+        log.info(
+            "{}/{} handled {} in {}ms.",
+            agent.getProviderName(),
+            agent.getOnDemandAgentType(),
+            type,
+            TimeUnit.NANOSECONDS.toMillis(elapsed));
 
       } catch (Exception e) {
         if (agent.getMetricsSupport() != null) {
