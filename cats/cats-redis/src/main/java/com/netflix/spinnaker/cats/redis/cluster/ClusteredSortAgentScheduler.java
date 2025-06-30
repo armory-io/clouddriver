@@ -52,6 +52,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -191,11 +192,13 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
   // Runtime state
   /**
-   * Local agent registry: Maps agent type to worker instance. This maintains the canonical list of
-   * agents this scheduler instance knows about. Updated when agents are scheduled/unscheduled via
-   * schedule()/unschedule() methods.
+   * Map of AgentWorkers that this scheduler instance knows about. This is essentially a local cache
+   * of agents this scheduler instance knows about. Updated when agents are scheduled/unscheduled
+   * via schedule()/unschedule() methods.
    */
   private final ConcurrentHashMap<String, AgentWorker> agents = new ConcurrentHashMap<>();
+
+  private final AtomicLong agentMapSize = new AtomicLong(0);
 
   // Agent execution tracking
   private final Optional<Semaphore> runningAgents;
@@ -215,24 +218,31 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
   }
 
+  /** Thread-safe tracking of active agents to prevent race conditions */
   @VisibleForTesting
   final ConcurrentHashMap<String, ActiveAgent> activeAgents = new ConcurrentHashMap<>();
 
-  private volatile long lastZombieCleanup = System.currentTimeMillis();
+  private final AtomicLong activeAgentMapSize = new AtomicLong(0);
+
+  // Use AtomicLong for thread-safe timing operations
+  private final AtomicLong lastZombieCleanup = new AtomicLong(System.currentTimeMillis());
   @VisibleForTesting final AtomicLong zombiesCleanedUp = new AtomicLong(0);
-  private volatile long lastConfigRefresh = System.currentTimeMillis();
+  private final AtomicLong lastConfigRefresh = new AtomicLong(System.currentTimeMillis());
 
   private final Logger log = LoggerFactory.getLogger(ClusteredSortAgentScheduler.class);
 
   private ScheduledExecutorService schedulerExecutorService;
   private ScheduledFuture<?> schedulerFuture;
 
-  private ConcurrentHashMap<String, String> scriptShas;
+  /** Script SHA cache for Lua scripts */
+  private final ConcurrentHashMap<String, String> scriptShas = new ConcurrentHashMap<>();
 
   private static final int NOW = 0;
-  private int runCount = 0;
-  private volatile boolean shuttingDown = false;
-  private volatile long lastOrphanCleanup = System.currentTimeMillis();
+  private volatile int runCount = 0;
+
+  // Use AtomicBoolean for shutdown coordination
+  private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
+  private final AtomicLong lastOrphanCleanup = new AtomicLong(System.currentTimeMillis());
   @VisibleForTesting final AtomicLong orphansCleanedUp = new AtomicLong(0);
 
   @VisibleForTesting static final String WAITING_SET = "WAITZ";
@@ -436,7 +446,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
             new ThreadFactoryBuilder()
                 .setNameFormat(ClusteredSortAgentScheduler.class.getSimpleName() + "-%d")
                 .build());
-    this.scriptShas = new ConcurrentHashMap<>();
+
     storeScripts();
   }
 
@@ -599,8 +609,14 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
   }
 
+  // Thread-safe script reloading using proper synchronization
+  private final Object scriptLoadingLock = new Object();
+
   /**
    * Retrieve SHA hash for a Lua script, reloading if necessary.
+   *
+   * <p>Fixed race condition using proper double-checked locking pattern. Multiple threads can now
+   * safely call this method without causing duplicate script loading.
    *
    * <p>Redis stores Lua scripts by SHA hash for efficient execution. This method: 1. Returns cached
    * SHA if available and script exists in Redis 2. Reloads all scripts if SHA is missing or script
@@ -614,24 +630,79 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * @throws AgentSchedulingException if script cannot be loaded
    */
   private String getScriptSha(String scriptName, Jedis jedis) {
+    // First check without synchronization (fast path)
     String scriptSha = scriptShas.get(scriptName);
+
     if (scriptSha == null) {
-      storeScripts();
-      scriptSha = scriptShas.get(scriptName);
-      if (scriptSha == null) {
-        throw new AgentSchedulingException("Failed to load caching scripts.");
+      // Synchronized script loading to prevent race conditions
+      synchronized (scriptLoadingLock) {
+        // Double-check: another thread might have loaded scripts
+        scriptSha = scriptShas.get(scriptName);
+        if (scriptSha == null) {
+          storeScripts();
+          scriptSha = scriptShas.get(scriptName);
+          if (scriptSha == null) {
+            throw new AgentSchedulingException("Failed to load caching scripts.");
+          }
+        }
       }
     }
 
+    // Check if script exists in Redis (scripts can be evicted)
     if (!jedis.scriptExists(scriptSha)) {
-      storeScripts();
-      scriptSha = scriptShas.get(scriptName); // Get updated SHA after reload
-      if (scriptSha == null) {
-        throw new AgentSchedulingException("Failed to reload caching scripts.");
+      // Synchronized script reloading
+      synchronized (scriptLoadingLock) {
+        // Double-check: another thread might have reloaded scripts
+        String currentSha = scriptShas.get(scriptName);
+        if (currentSha != null && jedis.scriptExists(currentSha)) {
+          return currentSha; // Another thread successfully reloaded
+        }
+
+        storeScripts();
+        scriptSha = scriptShas.get(scriptName);
+        if (scriptSha == null) {
+          throw new AgentSchedulingException("Failed to reload caching scripts.");
+        }
       }
     }
 
     return scriptSha;
+  }
+
+  /** Thread-safe method to add an active agent */
+  private boolean addActiveAgent(String agentType, ActiveAgent activeAgent) {
+    ActiveAgent previous = activeAgents.put(agentType, activeAgent);
+    if (previous == null) {
+      activeAgentMapSize.incrementAndGet();
+    }
+    return true;
+  }
+
+  /** Thread-safe method to remove an active agent */
+  private ActiveAgent removeActiveAgent(String agentType) {
+    ActiveAgent removed = activeAgents.remove(agentType);
+    if (removed != null) {
+      activeAgentMapSize.decrementAndGet();
+    }
+    return removed;
+  }
+
+  /** Thread-safe method to add an agent */
+  private boolean addAgent(String agentType, AgentWorker worker) {
+    AgentWorker previous = agents.put(agentType, worker);
+    if (previous == null) {
+      agentMapSize.incrementAndGet();
+    }
+    return true;
+  }
+
+  /** Thread-safe method to remove an agent */
+  private AgentWorker removeAgent(String agentType) {
+    AgentWorker removed = agents.remove(agentType);
+    if (removed != null) {
+      agentMapSize.decrementAndGet();
+    }
+    return removed;
   }
 
   /**
@@ -682,14 +753,14 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       log.debug("Agent {} is scheduler-aware, reference set", agent.getAgentType());
     }
 
-    agents.put(
-        agent.getAgentType(),
-        new AgentWorker(agent, agentExecution, executionInstrumentation, this));
+    // Use thread-safe method for agent registration
+    AgentWorker worker = new AgentWorker(agent, agentExecution, executionInstrumentation, this);
+    addAgent(agent.getAgentType(), worker);
 
     log.debug(
         "Agent {} stored in local agents map, total agents: {}",
         agent.getAgentType(),
-        agents.size());
+        agentMapSize.get());
 
     try (Jedis jedis = jedisPool.getResource()) {
       String currentScore = score(jedis, NOW);
@@ -781,7 +852,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    */
   @Override
   public void unschedule(Agent agent) {
-    agents.remove(agent.getAgentType());
+    removeAgent(agent.getAgentType());
     try (Jedis jedis = jedisPool.getResource()) {
       jedis.evalsha(
           getScriptSha(REMOVE_AGENT_SCRIPT, jedis),
@@ -991,7 +1062,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       // Check concurrent agent limits before processing
       int maxConcurrentAgents =
           dynamicConfigService.getConfig(Integer.class, "redis.agent.max-concurrent-agents", 1000);
-      int currentlyRunning = activeAgents.size();
+      int currentlyRunning = (int) activeAgentMapSize.get();
 
       if (currentlyRunning >= maxConcurrentAgents) {
         log.debug(
@@ -1101,7 +1172,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
             Future<?> future = agentWorkPool.submit(worker);
 
             // Track agent execution for zombie detection
-            activeAgents.put(
+            addActiveAgent(
                 agentType,
                 new ActiveAgent(future, System.currentTimeMillis(), worker.acquireScore));
 
@@ -1361,7 +1432,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private ScoreTuple conditionalReleaseAgent(
       Agent agent, String acquireScoreInWorkZ, Status status) {
     long newInterval;
-    if (this.shuttingDown) {
+    if (this.shuttingDown.get()) {
       newInterval = 0; // Reschedule immediately (score will be current time)
       log.info(
           "Scheduler shutting down: Re-queuing agent {} immediately from conditionalReleaseAgent.",
@@ -1557,12 +1628,13 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         dynamicConfigService.getConfig(
             Long.class, "redis.agent.zombie-cleanup-interval-ms", 300000L); // Default 5 minutes
 
-    if (now - lastZombieCleanup > zombieCleanupIntervalMs) {
+    long lastCleanup = lastZombieCleanup.get();
+    if (now - lastCleanup > zombieCleanupIntervalMs
+        && lastZombieCleanup.compareAndSet(lastCleanup, now)) {
       log.debug(
           "Checking for zombie agents based on local activeAgents map ({} items).",
-          activeAgents.size());
+          activeAgentMapSize.get());
       cleanupZombieAgents(); // This cleans based on local activeAgents
-      lastZombieCleanup = now;
     }
 
     // Comprehensive orphaned agent cleanup - scan both WORKZ and WAITZ sets for abandoned agents
@@ -1578,7 +1650,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     boolean orphanCleanupEnabled = orphanCleanupEnabledObj != null ? orphanCleanupEnabledObj : true;
 
     // Only proceed if cleanup is enabled for this pod
-    if (orphanCleanupEnabled && now - lastOrphanCleanup > orphanCleanupIntervalMs) {
+    if (orphanCleanupEnabled && now - lastOrphanCleanup.get() > orphanCleanupIntervalMs) {
       // Get the orphan threshold for cleanup - this is the proper place to check this configuration
       // since we're deciding whether to run orphan cleanup here
       Long orphanThresholdMsObj =
@@ -1605,7 +1677,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       // Always update the last cleanup timestamp even if we didn't run the cleanup
       // This prevents pods from constantly trying to run cleanup if leadership is held by another
       // pod
-      lastOrphanCleanup = now;
+      lastOrphanCleanup.set(now);
     }
   }
 
@@ -1854,7 +1926,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
                   Double.valueOf(newScore).longValue());
 
               // Also clean up local state if needed
-              ActiveAgent localCopy = activeAgents.remove(agentType);
+              ActiveAgent localCopy = removeActiveAgent(agentType);
               if (localCopy != null) {
                 log.warn(
                     "Orphaned agent {} (moved to WAITZ) was also found in this instance's local activeAgents map. Cleaning up local state.",
@@ -1889,10 +1961,10 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
                   Double.valueOf(scoreInWorkZ).longValue());
 
               // Remove from local registry to prevent re-adding
-              agents.remove(agentType);
+              removeAgent(agentType);
 
               // Also clean up local state if needed
-              ActiveAgent localCopy = activeAgents.remove(agentType);
+              ActiveAgent localCopy = removeActiveAgent(agentType);
               if (localCopy != null) {
                 if (localCopy.future != null) {
                   localCopy.future.cancel(true);
@@ -2016,7 +2088,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
               Double.valueOf(newScore).longValue());
 
           // Clean up local execution state
-          ActiveAgent localCopy = activeAgents.remove(agentType);
+          ActiveAgent localCopy = removeActiveAgent(agentType);
           if (localCopy != null) {
             if (localCopy.future != null) {
               localCopy.future.cancel(true);
@@ -2073,7 +2145,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
             agents.remove(agentType);
 
             // Clean up execution state
-            ActiveAgent localCopy = activeAgents.remove(agentType);
+            ActiveAgent localCopy = removeActiveAgent(agentType);
             if (localCopy != null) {
               if (localCopy.future != null) {
                 localCopy.future.cancel(true);
@@ -2208,7 +2280,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     // Remove from active agents tracking
     int trackingRemoved = 0;
     for (String agentType : zombieAgents) {
-      if (activeAgents.remove(agentType) != null) {
+      if (removeActiveAgent(agentType) != null) {
         trackingRemoved++;
       }
     }
@@ -2222,7 +2294,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   }
 
   private void cleanupZombieAgent(String agentType) {
-    ActiveAgent activeAgent = activeAgents.remove(agentType);
+    ActiveAgent activeAgent = removeActiveAgent(agentType);
     if (activeAgent == null) {
       return;
     }
@@ -2255,9 +2327,11 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   /** Refresh dynamic configuration periodically. */
   private void refreshConfigurationIfNeeded() {
     long now = System.currentTimeMillis();
-    if (now - lastConfigRefresh > 30000) {
+    long lastRefresh = lastConfigRefresh.get();
+    long refreshIntervalMs = this.redisRefreshPeriod * 1000L; // Convert seconds to milliseconds
+    if (now - lastRefresh > refreshIntervalMs
+        && lastConfigRefresh.compareAndSet(lastRefresh, now)) {
       refreshConfiguration();
-      lastConfigRefresh = now;
     }
   }
 
@@ -2331,7 +2405,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   @PreDestroy
   public void stopScheduler() {
     log.info("ClusteredSortAgentScheduler initiating shutdown...");
-    this.shuttingDown = true; // Signal that shutdown is in progress
+    this.shuttingDown.set(true); // Signal that shutdown is in progress
 
     // 1. Stop accepting new work / stop the main scheduling loop
     if (schedulerFuture != null) {
@@ -2395,7 +2469,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
       log.info(
           "Attempting to gracefully release {} active agents during shutdown...",
-          activeAgents.size());
+          activeAgentMapSize.get());
       // Create a deep copy of both keys and values to avoid any potential concurrent modification
       agentsSnapshot = new HashMap<>(activeAgents);
     }
@@ -2425,10 +2499,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
 
     // Get a safe size count for the waiting period
-    int activeCountAfterCancel;
-    synchronized (activeAgents) {
-      activeCountAfterCancel = activeAgents.size();
-    }
+    int activeCountAfterCancel = (int) activeAgentMapSize.get();
 
     if (activeCountAfterCancel > 0) {
       log.info(
@@ -2442,10 +2513,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         log.warn("Graceful shutdown: Interrupted while waiting for agents to release.");
       }
 
-      int remainingAgents;
-      synchronized (activeAgents) {
-        remainingAgents = activeAgents.size();
-      }
+      int remainingAgents = (int) activeAgentMapSize.get();
 
       log.info(
           "Graceful shutdown: {} agents potentially still in active map after waiting period.",
@@ -2511,7 +2579,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         executionInstrumentation.executionFailed(agent, cause, elapsedTimeMs(startTimeMs));
       } finally {
         // Clean up tracking data - this happens for both normal and zombie cleanup
-        scheduler.activeAgents.remove(agentType);
+        scheduler.removeActiveAgent(agentType);
 
         scheduler.runningAgents.ifPresent(Semaphore::release);
         scheduler.conditionalReleaseAgent(agent, acquireScore, status);
