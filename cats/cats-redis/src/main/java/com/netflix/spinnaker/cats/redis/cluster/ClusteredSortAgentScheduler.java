@@ -247,7 +247,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private static final String CONDITIONAL_REMOVE_SCRIPT = "conditionalRemoveScript";
   private static final String BATCH_ORPHAN_REMOVE_SCRIPT = "batchOrphanRemoveScript";
 
-  // Batch operation scripts for reduced per-agent overhead through batched operations
+  // Batch operation scripts for reduced per-agent overhead
   private static final String BATCH_ADD_AGENTS_SCRIPT = "batchAddAgentsScript";
   private static final String BATCH_CLEANUP_AGENTS_SCRIPT = "batchCleanupAgentsScript";
 
@@ -266,8 +266,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * @param enabledAgentPattern Regex pattern for filtering which agents to schedule
    * @param parallelism Maximum concurrent agents (0 = unlimited)
    * @param shardingFilter Distributes agents across multiple clouddriver instances for HA
-   *     deployments. Each instance only processes agents assigned to it, preventing duplicate work
-   *     and enabling horizontal scaling across 40+ pods.
+   *     deployments. Each instance only processes agents assigned to it, preventing duplicate work.
    * @param dynamicConfigService Enables runtime configuration changes without restarts. Critical
    *     for large deployments where different pods may need different limits based on available
    *     resources, load patterns, or operational requirements.
@@ -320,7 +319,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    *     redis.agent.scheduler-interval-ms)
    * @param shardingFilter Distributes agents across multiple clouddriver instances for HA
    *     deployments. Prevents duplicate work and enables horizontal scaling. Essential for
-   *     deployments with 40+ pods processing 28K+ agents.
+   *     deployments with higher cache agent load.
    * @param dynamicConfigService Enables runtime configuration changes without restarts. Allows
    *     operational tuning of concurrent limits, timeouts, and other parameters based on real-time
    *     load and resource availability.
