@@ -21,11 +21,15 @@ import com.netflix.spinnaker.cats.cluster.DefaultNodeIdentity;
 import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.redis.cluster.ClusteredAgentScheduler;
+import com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentProperties;
 import com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentScheduler;
+import com.netflix.spinnaker.cats.redis.cluster.ClusteredSortSchedulerProperties;
 import com.netflix.spinnaker.clouddriver.core.RedisConfigurationProperties;
 import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import com.netflix.spinnaker.kork.jedis.RedisClientDelegate;
 import java.net.URI;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -35,6 +39,8 @@ import redis.clients.jedis.JedisPool;
 @Configuration
 @ConditionalOnProperty(value = "caching.write-enabled", matchIfMissing = true)
 public class AgentSchedulerConfig {
+
+  private static final Logger log = LoggerFactory.getLogger(AgentSchedulerConfig.class);
 
   @Bean
   @ConditionalOnExpression("${redis.enabled:true} && ${redis.scheduler.enabled:true}")
@@ -63,14 +69,35 @@ public class AgentSchedulerConfig {
           dynamicConfigService,
           shardingFilter);
     } else if (redisConfigurationProperties.getScheduler().getType().equalsIgnoreCase("sort")) {
+      // Create properties instances from existing config
+      ClusteredSortAgentProperties agentProperties = new ClusteredSortAgentProperties();
+      agentProperties.setEnabledPattern(
+          redisConfigurationProperties.getAgent().getEnabledPattern());
+      agentProperties.setDisabledAgents(
+          redisConfigurationProperties.getAgent().getDisabledAgents());
+      agentProperties.setMaxConcurrentAgents(
+          redisConfigurationProperties.getAgent().getMaxConcurrentAgents());
+
+      ClusteredSortSchedulerProperties schedulerProperties = new ClusteredSortSchedulerProperties();
+
+      // Always warn if parallelism is configured since sort scheduler completely ignores it
+      int parallelism = redisConfigurationProperties.getScheduler().getParallelism();
+      if (parallelism != 0) { // Warn for any non-zero value (positive or negative)
+        log.warn(
+            "redis.scheduler.parallelism ({}) is completely ignored by ClusteredSortAgentScheduler. "
+                + "Use redis.agent.maxConcurrentAgents instead (current: {})",
+            parallelism,
+            agentProperties.getMaxConcurrentAgents());
+      }
+
       return new ClusteredSortAgentScheduler(
           jedisPool,
           nodeStatusProvider,
           agentIntervalProvider,
           redisConfigurationProperties.getAgent().getEnabledPattern(),
-          redisConfigurationProperties.getScheduler().getParallelism(),
           shardingFilter,
-          dynamicConfigService,
+          agentProperties,
+          schedulerProperties,
           redisConfigurationProperties.getAgent().getDisabledAgents());
     } else {
       throw new IllegalStateException(

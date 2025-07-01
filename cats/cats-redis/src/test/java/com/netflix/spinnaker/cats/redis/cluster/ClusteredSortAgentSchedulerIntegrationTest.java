@@ -18,18 +18,12 @@ package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
 import com.netflix.spinnaker.cats.agent.RunnableAgent;
 import com.netflix.spinnaker.cats.cluster.DefaultAgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.provider.ProviderRegistry;
-import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import java.util.Collections;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.BeforeEach;
@@ -46,12 +40,20 @@ import redis.clients.jedis.JedisPool;
  */
 class ClusteredSortAgentSchedulerIntegrationTest {
 
+  // Helper methods to create properties for tests
+  private static ClusteredSortAgentProperties createDefaultAgentProperties() {
+    return new ClusteredSortAgentProperties();
+  }
+
+  private static ClusteredSortSchedulerProperties createDefaultSchedulerProperties() {
+    return new ClusteredSortSchedulerProperties();
+  }
+
   private ClusteredSortAgentScheduler scheduler;
   private JedisPool jedisPool;
   private ExecutionInstrumentation executionInstrumentation;
   private ProviderRegistry providerRegistry;
   private ShardingFilter shardingFilter;
-  private DynamicConfigService dynamicConfigService;
 
   @BeforeEach
   void setUp() {
@@ -75,27 +77,7 @@ class ClusteredSortAgentSchedulerIntegrationTest {
 
     // Mock enterprise services for integration test
     shardingFilter = agent -> true; // Allow all agents
-    dynamicConfigService = mock(DynamicConfigService.class);
-    when(dynamicConfigService.getConfig(
-            eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-        .thenReturn(1000);
-
-    // Explicitly mock the new thread pool configuration parameters
-    when(dynamicConfigService.getConfig(
-            eq(Integer.class), eq("redis.agent.thread-pool-size"), anyInt()))
-        .thenReturn(20);
-    when(dynamicConfigService.getConfig(
-            eq(Integer.class), eq("redis.agent.thread-pool-core-size-percentage"), anyInt()))
-        .thenReturn(50);
-    when(dynamicConfigService.getConfig(
-            eq(Long.class), eq("redis.agent.thread-pool-keep-alive-seconds"), any(Long.class)))
-        .thenReturn(60L);
-    when(dynamicConfigService.getConfig(
-            eq(Integer.class), eq("redis.agent.thread-pool-queue-size"), anyInt()))
-        .thenReturn(1000);
-    when(dynamicConfigService.getConfig(
-            eq(Long.class), eq("redis.agent.time-cache-duration-ms"), any(Long.class)))
-        .thenReturn(10000L);
+    // All configuration now handled via cached properties
 
     scheduler =
         new ClusteredSortAgentScheduler(
@@ -103,9 +85,9 @@ class ClusteredSortAgentSchedulerIntegrationTest {
             () -> true,
             new DefaultAgentIntervalProvider(30000, 60000, 300000),
             ".*", // Enable all agents
-            5,
             shardingFilter,
-            dynamicConfigService,
+            createDefaultAgentProperties(),
+            createDefaultSchedulerProperties(),
             Collections.emptyList()); // No explicitly disabled agents
   }
 

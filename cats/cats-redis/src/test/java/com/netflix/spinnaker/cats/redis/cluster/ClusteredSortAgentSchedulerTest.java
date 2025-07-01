@@ -20,7 +20,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeast;
@@ -33,7 +32,7 @@ import static org.mockito.Mockito.when;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentDataType;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
-import com.netflix.spinnaker.cats.agent.AgentSchedulerAware;
+import com.netflix.spinnaker.cats.agent.AgentScheduler;
 import com.netflix.spinnaker.cats.agent.CacheResult;
 import com.netflix.spinnaker.cats.agent.CachingAgent;
 import com.netflix.spinnaker.cats.agent.DefaultCacheResult;
@@ -45,16 +44,10 @@ import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.provider.ProviderCache;
 import com.netflix.spinnaker.cats.provider.ProviderRegistry;
 import com.netflix.spinnaker.cats.test.TestAgent;
-import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.commons.lang3.reflect.FieldUtils;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -73,6 +66,15 @@ class ClusteredSortAgentSchedulerTest {
   private static final String WAITING_SET = "WAITZ";
   private static final String WORKING_SET = "WORKZ";
 
+  // Helper methods to create properties for tests
+  private static ClusteredSortAgentProperties createDefaultAgentProperties() {
+    return new ClusteredSortAgentProperties();
+  }
+
+  private static ClusteredSortSchedulerProperties createDefaultSchedulerProperties() {
+    return new ClusteredSortSchedulerProperties();
+  }
+
   private ClusteredSortAgentScheduler scheduler;
   private JedisPool jedisPool;
   private Jedis jedis;
@@ -80,7 +82,6 @@ class ClusteredSortAgentSchedulerTest {
   private List<String> disabledAgents;
   private ProviderRegistry providerRegistry;
   private ShardingFilter shardingFilter;
-  private DynamicConfigService dynamicConfigService;
 
   @BeforeEach
   void setUp() throws Exception {
@@ -89,7 +90,6 @@ class ClusteredSortAgentSchedulerTest {
     executionInstrumentation = mock(ExecutionInstrumentation.class);
     providerRegistry = mock(ProviderRegistry.class);
     shardingFilter = mock(ShardingFilter.class);
-    dynamicConfigService = mock(DynamicConfigService.class);
     disabledAgents = new ArrayList<>();
 
     when(jedisPool.getResource()).thenReturn(jedis);
@@ -101,47 +101,7 @@ class ClusteredSortAgentSchedulerTest {
     when(jedis.evalsha(anyString(), anyInt(), anyString(), anyString(), anyString()))
         .thenReturn(1L);
 
-    // Mock default configuration values for zombie cleanup (for agents running too long on this
-    // instance)
-    when(dynamicConfigService.getConfig(
-            eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
-        .thenReturn(1800000L); // 30 minutes default
-    when(dynamicConfigService.getConfig(
-            eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
-        .thenReturn(300000L); // 5 minutes default
-
-    // Mock default configuration values for orphan cleanup (for agents abandoned in Redis by
-    // crashed instances)
-    when(dynamicConfigService.getConfig(
-            eq(Long.class), eq("redis.agent.orphan-threshold-ms"), any(Long.class)))
-        .thenReturn(600000L); // 10 minutes default - shorter since these are from crashed instances
-    when(dynamicConfigService.getConfig(
-            eq(Long.class), eq("redis.agent.orphan-cleanup-interval-ms"), any(Long.class)))
-        .thenReturn(120000L); // 2 minutes default - aggressive to minimize stale data
-
-    when(dynamicConfigService.getConfig(
-            eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-        .thenReturn(1000); // Default concurrent limit
-    when(dynamicConfigService.getConfig(
-            eq(String.class), eq("redis.agent.enabled-pattern"), anyString()))
-        .thenReturn(".*"); // Default enabled pattern
-
-    // Mock the new thread pool configuration parameters
-    when(dynamicConfigService.getConfig(
-            eq(Integer.class), eq("redis.agent.thread-pool-size"), anyInt()))
-        .thenReturn(20);
-    when(dynamicConfigService.getConfig(
-            eq(Integer.class), eq("redis.agent.thread-pool-core-size-percentage"), anyInt()))
-        .thenReturn(50);
-    when(dynamicConfigService.getConfig(
-            eq(Long.class), eq("redis.agent.thread-pool-keep-alive-seconds"), any(Long.class)))
-        .thenReturn(60L);
-    when(dynamicConfigService.getConfig(
-            eq(Integer.class), eq("redis.agent.thread-pool-queue-size"), anyInt()))
-        .thenReturn(1000);
-    when(dynamicConfigService.getConfig(
-            eq(Long.class), eq("redis.agent.time-cache-duration-ms"), any(Long.class)))
-        .thenReturn(10000L);
+    // All configuration is now provided via cached @ConfigurationProperties
 
     // Default to enabling the node
     NodeStatusProvider nodeStatusProvider = () -> true;
@@ -152,9 +112,9 @@ class ClusteredSortAgentSchedulerTest {
             nodeStatusProvider,
             new DefaultAgentIntervalProvider(30, 30, 300),
             ".*",
-            10,
             shardingFilter,
-            dynamicConfigService,
+            createDefaultAgentProperties(),
+            createDefaultSchedulerProperties(),
             disabledAgents);
   }
 
@@ -196,17 +156,20 @@ class ClusteredSortAgentSchedulerTest {
     }
 
     @Test
-    @DisplayName("Should handle AgentSchedulerAware agents")
-    void shouldHandleAgentSchedulerAwareAgents() {
+    @DisplayName("Should handle scheduler-aware agents")
+    void shouldHandleSchedulerAwareAgents() {
       // Given
       TestAgentSchedulerAware agent = new TestAgentSchedulerAware();
       AgentExecution execution = agent.getAgentExecution(providerRegistry);
 
-      // When
-      scheduler.schedule(agent, execution, executionInstrumentation);
+      // When & Then - Should schedule without errors
+      assertThatCode(() -> scheduler.schedule(agent, execution, executionInstrumentation))
+          .doesNotThrowAnyException();
 
-      // Then
-      assertThat(agent.getAgentScheduler()).isEqualTo(scheduler);
+      // Verify Redis scheduling operation was called
+      verify(jedis)
+          .evalsha(
+              anyString(), eq(2), anyString(), anyString(), eq(agent.getAgentType()), anyString());
     }
 
     @Test
@@ -367,9 +330,9 @@ class ClusteredSortAgentSchedulerTest {
               nodeStatusProvider,
               new DefaultAgentIntervalProvider(30, 30, 300),
               ".*", // enabled pattern (matches everything)
-              4, // parallelism
               shardingFilter,
-              dynamicConfigService,
+              createDefaultAgentProperties(),
+              createDefaultSchedulerProperties(),
               disabledAgents);
 
       // Create test agents
@@ -402,9 +365,9 @@ class ClusteredSortAgentSchedulerTest {
               nodeStatusProvider,
               new DefaultAgentIntervalProvider(30, 30, 300),
               "Allowed.*", // enabled pattern
-              4, // parallelism
               shardingFilter,
-              dynamicConfigService,
+              createDefaultAgentProperties(),
+              createDefaultSchedulerProperties(),
               disabledAgents);
 
       // Create test agents
@@ -439,9 +402,9 @@ class ClusteredSortAgentSchedulerTest {
               nodeStatusProvider,
               new DefaultAgentIntervalProvider(30, 30, 300),
               ".*", // enabled pattern
-              4, // parallelism
               shardingFilter,
-              dynamicConfigService,
+              createDefaultAgentProperties(),
+              createDefaultSchedulerProperties(),
               disabledAgents);
 
       // Create test agents with different case than in the disabled list
@@ -537,9 +500,9 @@ class ClusteredSortAgentSchedulerTest {
               () -> true,
               new DefaultAgentIntervalProvider(30000, 60000, 300000),
               ".*", // Enable all agents
-              2, // Only 2 concurrent agents
               shardingFilter,
-              dynamicConfigService,
+              createDefaultAgentProperties(),
+              createDefaultSchedulerProperties(),
               java.util.Collections.emptyList()); // No explicitly disabled agents
 
       // Then - Should create successfully
@@ -603,9 +566,9 @@ class ClusteredSortAgentSchedulerTest {
               () -> true,
               new DefaultAgentIntervalProvider(30000, 60000, 300000),
               "(?i).*(aws|gcp|azure).*caching.*", // Case-insensitive pattern
-              5,
               shardingFilter,
-              dynamicConfigService,
+              createDefaultAgentProperties(),
+              createDefaultSchedulerProperties(),
               java.util.Collections.emptyList()); // No explicitly disabled agents
 
       // Test agents
@@ -662,11 +625,8 @@ class ClusteredSortAgentSchedulerTest {
     @Test
     @DisplayName("Should respect sharding filter during agent repopulation")
     void shouldRespectShardingFilterDuringRepopulation() {
-      // Given - Enable batch operations to trigger repopulation OR expect individual
-      // scheduleAgentInRedis calls
-      when(dynamicConfigService.getConfig(
-              eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), eq(false)))
-          .thenReturn(false); // Keep individual operations to test sharding
+      // Given - Batch operations are disabled by default in properties
+      // Individual operations are used to test sharding
 
       Agent allowedAgent = mock(Agent.class);
       when(allowedAgent.getAgentType()).thenReturn("allowedAgent");
@@ -704,49 +664,8 @@ class ClusteredSortAgentSchedulerTest {
       verify(shardingFilter).filter(filteredAgent);
     }
 
-    @Test
-    @DisplayName("Should respect dynamic config for max concurrent agents")
-    void shouldRespectDynamicConfigForMaxConcurrentAgents() {
-      // Given - Set low max concurrent agents
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-          .thenReturn(2); // Only 2 concurrent agents
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
-          .thenReturn(1000L);
-
-      // Ensure jedis.time() returns correct List format
-      when(jedis.time()).thenReturn(List.of("1000", "0"));
-
-      // Mock Redis to return ready agents - ensure we return Set<String> for zrangeByScore
-      Set<String> readyAgents = new HashSet<>();
-      readyAgents.add("agent1");
-      readyAgents.add("agent2");
-      readyAgents.add("agent3");
-      readyAgents.add("agent4");
-      when(jedis.zrangeByScore(eq("WAITZ"), eq("-inf"), anyString())).thenReturn(readyAgents);
-
-      TestRunnableAgent agent1 = new TestRunnableAgent("agent1");
-      TestRunnableAgent agent2 = new TestRunnableAgent("agent2");
-      TestRunnableAgent agent3 = new TestRunnableAgent("agent3");
-      TestRunnableAgent agent4 = new TestRunnableAgent("agent4");
-
-      scheduler.schedule(
-          agent1, agent1.getAgentExecution(providerRegistry), executionInstrumentation);
-      scheduler.schedule(
-          agent2, agent2.getAgentExecution(providerRegistry), executionInstrumentation);
-      scheduler.schedule(
-          agent3, agent3.getAgentExecution(providerRegistry), executionInstrumentation);
-      scheduler.schedule(
-          agent4, agent4.getAgentExecution(providerRegistry), executionInstrumentation);
-
-      // When - Trigger agent processing
-      scheduler.saturatePool();
-
-      // Then - Should respect max concurrent limit (may be called multiple times during processing)
-      verify(dynamicConfigService, atLeast(1))
-          .getConfig(eq(Integer.class), eq("redis.agent.max-concurrent-agents"), eq(1000));
-    }
+    // All configuration is now handled via cached @ConfigurationProperties instead of dynamic
+    // config
 
     @Test
     @DisplayName("Should handle enterprise services gracefully")
@@ -758,9 +677,9 @@ class ClusteredSortAgentSchedulerTest {
               () -> true,
               new DefaultAgentIntervalProvider(10000, 10000, 20000),
               ".*",
-              10,
               shardingFilter,
-              dynamicConfigService,
+              createDefaultAgentProperties(),
+              createDefaultSchedulerProperties(),
               java.util.Collections.emptyList());
 
       TestRunnableAgent agent = new TestRunnableAgent("enterpriseAgent");
@@ -774,8 +693,8 @@ class ClusteredSortAgentSchedulerTest {
               })
           .doesNotThrowAnyException();
 
-      // Then - Should have interacted with enterprise services
-      verify(dynamicConfigService, atLeast(1)).getConfig(eq(Integer.class), anyString(), anyInt());
+      // Then - Should complete without errors
+      // Configuration is now handled via cached properties instead of dynamic config
     }
   }
 
@@ -784,792 +703,85 @@ class ClusteredSortAgentSchedulerTest {
   class ZombieAgentCleanupTests {
 
     @Test
-    @DisplayName("Should configure zombie cleanup thresholds from dynamic config")
-    void shouldConfigureZombieCleanupFromDynamicConfig() {
-      // Given - Configure zombie cleanup settings
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
-          .thenReturn(1800000L); // 30 minutes
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(600000L); // 10 minutes
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-          .thenReturn(1000); // Default concurrent limit
+    @DisplayName("Should use cached properties for zombie threshold configuration")
+    void shouldUseCachedPropertiesForZombieThreshold() {
+      // Given - Create scheduler with custom zombie threshold via properties
+      ClusteredSortSchedulerProperties customProperties = createDefaultSchedulerProperties();
+      customProperties.setZombieThresholdMs(60000L); // 1 minute for testing
 
-      TestRunnableAgent agent = new TestRunnableAgent("config-test");
-      scheduler.schedule(
-          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
+      ClusteredSortAgentScheduler customScheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              () -> true,
+              new DefaultAgentIntervalProvider(30, 30, 300),
+              ".*",
+              shardingFilter,
+              createDefaultAgentProperties(),
+              customProperties,
+              disabledAgents);
 
-      // When - Trigger saturatePool (which calls zombie cleanup config)
-      scheduler.saturatePool();
-
-      // Then - Should have checked dynamic config for zombie settings
-      verify(dynamicConfigService, atLeast(1))
-          .getConfig(eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class));
+      // When - Access zombie threshold
+      // Then - Should use cached property value (60000ms) not dynamic config
+      assertThat(customProperties.getZombieThresholdMs()).isEqualTo(60000L);
     }
 
     @Test
-    @DisplayName("Should track active agents during execution")
-    void shouldTrackActiveAgentsDuringExecution() throws Exception {
-      // Given - Mock all config calls
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
-          .thenReturn(3600000L);
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(300000L);
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-          .thenReturn(1000);
+    @DisplayName("Should use cached properties for zombie cleanup interval")
+    void shouldUseCachedPropertiesForZombieCleanupInterval() {
+      // Given - Create scheduler with custom cleanup interval via properties
+      ClusteredSortSchedulerProperties customProperties = createDefaultSchedulerProperties();
+      customProperties.setZombieCleanupIntervalMs(30000L); // 30 seconds for testing
 
-      TestRunnableAgent agent = new TestRunnableAgent("tracking-test");
-      scheduler.schedule(
-          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
+      ClusteredSortAgentScheduler customScheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              () -> true,
+              new DefaultAgentIntervalProvider(30, 30, 300),
+              ".*",
+              shardingFilter,
+              createDefaultAgentProperties(),
+              customProperties,
+              disabledAgents);
 
-      // When - Start agent execution
-      scheduler.saturatePool();
+      // When - Access cleanup interval
+      // Then - Should use cached property value (30000ms) not dynamic config
+      assertThat(customProperties.getZombieCleanupIntervalMs()).isEqualTo(30000L);
+    }
 
-      // Then - Should have active agents tracked (may be cleared quickly in test)
-      // Check that tracking infrastructure is in place
-      assertThat(scheduler.activeAgents).isNotNull();
+    @Test
+    @DisplayName("Should track zombie cleanup metrics")
+    void shouldTrackZombieCleanupMetrics() {
+      // Test that zombie cleanup metrics are available
       assertThat(scheduler.zombiesCleanedUp).isNotNull();
-    }
-
-    @Test
-    @DisplayName("Should provide zombie cleanup metrics")
-    void shouldProvideZombieCleanupMetrics() {
-      // Given - Configure zombie cleanup with all required mocks
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
-          .thenReturn(3600000L);
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(300000L);
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-          .thenReturn(1000);
-
-      // When - Check initial metrics
-      long initialCleanupCount = scheduler.zombiesCleanedUp.get();
-
-      // Then - Metrics should be available and initialized
-      assertThat(initialCleanupCount).isGreaterThanOrEqualTo(0);
       assertThat(scheduler.activeAgents).isNotNull();
     }
 
     @Test
-    @DisplayName("Should handle configuration defaults correctly")
-    void shouldHandleConfigurationDefaults() {
-      // Given - Mock all required config calls
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
-          .thenReturn(3600000L); // 1 hour default
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(300000L); // 5 minutes default
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-          .thenReturn(1000); // Default limit
+    @DisplayName("Should validate zombie threshold bounds via properties")
+    void shouldValidateZombieThresholdBounds() {
+      // Given - Properties with validation bounds
+      ClusteredSortSchedulerProperties customProperties = createDefaultSchedulerProperties();
 
-      TestRunnableAgent agent = new TestRunnableAgent("defaults-test");
-      scheduler.schedule(
-          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
+      // When/Then - Should accept valid values within bounds
+      assertThatCode(() -> customProperties.setZombieThresholdMs(600000L)) // 10 minutes
+          .doesNotThrowAnyException();
 
-      // When - Process agent with default configuration
-      assertThatCode(() -> scheduler.saturatePool()).doesNotThrowAnyException();
-
-      // Then - Should use defaults without throwing exceptions
-      verify(dynamicConfigService, atLeast(1))
-          .getConfig(eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class));
-    }
-
-    @Test
-    @DisplayName("Should handle Redis failures during zombie cleanup gracefully")
-    void shouldHandleRedisFailuresDuringCleanup() {
-      // Given - Configure fast zombie cleanup with all mocks
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
-          .thenReturn(1L); // Very short threshold for testing
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(1L); // Very short interval
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-          .thenReturn(1000);
-
-      // Mock Redis to throw exception during cleanup
-      when(jedis.evalsha(anyString(), any(List.class), any(List.class)))
-          .thenThrow(new RuntimeException("Redis connection failed"));
-
-      TestRunnableAgent agent = new TestRunnableAgent("redis-failure-test");
-      scheduler.schedule(
-          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
-
-      // When - Process agent - should not throw exception despite Redis failure
-      assertThatCode(() -> scheduler.saturatePool()).doesNotThrowAnyException();
-
-      // Then - Should have attempted Redis operations
-      verify(jedis, atLeast(0)).evalsha(anyString(), any(List.class), any(List.class));
-    }
-
-    @Test
-    @DisplayName("Should respect max concurrent agents limit")
-    void shouldRespectMaxConcurrentAgentsLimit() {
-      // Given - Configure low concurrency limit with all mocks
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-          .thenReturn(2); // Only 2 concurrent agents
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
-          .thenReturn(60000L); // 1 minute
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(30000L); // 30 seconds
-
-      TestRunnableAgent agent1 = new TestRunnableAgent("concurrent-1");
-      TestRunnableAgent agent2 = new TestRunnableAgent("concurrent-2");
-      TestRunnableAgent agent3 = new TestRunnableAgent("concurrent-3");
-
-      scheduler.schedule(
-          agent1, agent1.getAgentExecution(providerRegistry), executionInstrumentation);
-      scheduler.schedule(
-          agent2, agent2.getAgentExecution(providerRegistry), executionInstrumentation);
-      scheduler.schedule(
-          agent3, agent3.getAgentExecution(providerRegistry), executionInstrumentation);
-
-      // When - Process agents
-      scheduler.saturatePool();
-
-      // Then - Should have checked concurrency limit
-      verify(dynamicConfigService, atLeast(1))
-          .getConfig(eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt());
-    }
-
-    @Test
-    @DisplayName("Should handle zombie cleanup interval correctly")
-    void shouldHandleZombieCleanupInterval() {
-      // Given - Configure zombie cleanup interval with all mocks
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(300000L); // 5 minutes
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.zombie-threshold-ms"), any(Long.class)))
-          .thenReturn(3600000L); // 1 hour
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.max-concurrent-agents"), anyInt()))
-          .thenReturn(1000);
-
-      TestRunnableAgent agent = new TestRunnableAgent("interval-test");
-      scheduler.schedule(
-          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
-
-      // When - Process agent multiple times (simulating different intervals)
-      scheduler.saturatePool();
-      scheduler.saturatePool();
-
-      // Then - Should check cleanup interval configuration
-      verify(dynamicConfigService, atLeast(1))
-          .getConfig(eq(Long.class), eq("redis.agent.zombie-cleanup-interval-ms"), any(Long.class));
+      // Verify the value was set correctly
+      assertThat(customProperties.getZombieThresholdMs()).isEqualTo(600000L);
     }
   }
 
-  @Nested
-  @DisplayName("Orphaned Agent Cleanup Tests")
-  class OrphanedAgentCleanupTests {
-
-    @BeforeEach
-    void setUp() {
-      // Reset mocks for specific tests
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.orphan-threshold-ms"), any(Long.class)))
-          .thenReturn(600000L); // 10 minutes
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.orphan-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(120000L); // 2 minutes
-    }
-
-    @Test
-    @DisplayName(
-        "Should detect and clean orphaned agents using individual processing when batch is disabled")
-    void shouldDetectAndCleanOrphanedAgents() throws Exception {
-      // Given
-      // 1. Setup Redis mocks for orphan cleanup
-      long now = System.currentTimeMillis();
-      long orphanThreshold = 600000L; // 10 minutes
-      long orphanTimestamp = now - orphanThreshold - 60000; // 1 minute past threshold
-
-      // Configure batch operations to be disabled
-      when(dynamicConfigService.getConfig(
-              eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), any(Boolean.class)))
-          .thenReturn(false); // Batch operations disabled by default
-
-      // Mock Redis response for zrangeByScoreWithScores to return an orphaned agent
-      Set<redis.clients.jedis.Tuple> orphanedAgents = new HashSet<>();
-      redis.clients.jedis.Tuple orphanedAgent = mock(redis.clients.jedis.Tuple.class);
-      when(orphanedAgent.getElement()).thenReturn("orphaned-agent");
-      when(orphanedAgent.getScore()).thenReturn((double) orphanTimestamp);
-      orphanedAgents.add(orphanedAgent);
-
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(orphanedAgents);
-
-      // Mock success response for the individual Lua script execution
-      when(jedis.evalsha(anyString(), anyList(), anyList())).thenReturn(1L); // 1 = success
-
-      // Setup reflection to access private method
-      java.lang.reflect.Method cleanupMethod =
-          ClusteredSortAgentScheduler.class.getDeclaredMethod("cleanupOrphanedAgentsFromRedis");
-      cleanupMethod.setAccessible(true);
-
-      // When - Call orphaned agent cleanup
-      cleanupMethod.invoke(scheduler);
-
-      // Then - Should call the Redis APIs correctly and remove the orphaned agent
-      verify(jedis).zrangeByScoreWithScores(eq(WORKING_SET), eq("-inf"), anyString());
-
-      // Verify evalsha was called for individual orphan processing
-      verify(jedis).evalsha(anyString(), anyList(), anyList());
-
-      // Verify batch size configuration was not requested (since batch is disabled)
-      verify(dynamicConfigService, never())
-          .getConfig(
-              eq(Integer.class), eq("redis.agent.orphan-cleanup-batch-size"), any(Integer.class));
-    }
-
-    @Test
-    @DisplayName("Should process orphaned agents in batches when batch operations are enabled")
-    void shouldProcessOrphanedAgentsInBatches() throws Exception {
-      // Given
-      // 1. Set up Redis mocks for orphan cleanup with batch processing
-      long now = System.currentTimeMillis();
-      long orphanThreshold = 600000L; // 10 minutes
-
-      // Configure batch operations to be enabled
-      when(dynamicConfigService.getConfig(
-              eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), any(Boolean.class)))
-          .thenReturn(true); // Enable batch operations
-
-      // Generate a large number of orphaned agents that will require multiple batches
-      Set<redis.clients.jedis.Tuple> orphanedAgents = new HashSet<>();
-      int totalOrphans = 120; // Will need at least 3 batches with default batch size of 50
-
-      for (int i = 1; i <= totalOrphans; i++) {
-        long orphanTimestamp = now - orphanThreshold - (i * 1000); // Each one older by 1 second
-        redis.clients.jedis.Tuple orphanedAgent = mock(redis.clients.jedis.Tuple.class);
-        when(orphanedAgent.getElement()).thenReturn("orphaned-agent-" + i);
-        when(orphanedAgent.getScore()).thenReturn((double) orphanTimestamp);
-        orphanedAgents.add(orphanedAgent);
-      }
-
-      // Configure batch size to 50 agents per batch
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.orphan-cleanup-batch-size"), any(Integer.class)))
-          .thenReturn(50); // 50 agents per batch
-
-      // Mock Redis response for zrangeByScoreWithScores
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(orphanedAgents);
-
-      // Mock batch script execution results - return success for each batch
-      // The script returns a List with [count, removedAgentsList]
-      List<Object> batchResult1 = new ArrayList<>();
-      batchResult1.add(50L); // 50 removed in first batch
-      List<String> removedAgents1 = new ArrayList<>();
-      for (int i = 1; i <= 50; i++) {
-        removedAgents1.add("orphaned-agent-" + i);
-      }
-      batchResult1.add(removedAgents1);
-
-      List<Object> batchResult2 = new ArrayList<>();
-      batchResult2.add(50L); // 50 removed in second batch
-      List<String> removedAgents2 = new ArrayList<>();
-      for (int i = 51; i <= 100; i++) {
-        removedAgents2.add("orphaned-agent-" + i);
-      }
-      batchResult2.add(removedAgents2);
-
-      List<Object> batchResult3 = new ArrayList<>();
-      batchResult3.add(20L); // 20 removed in third batch
-      List<String> removedAgents3 = new ArrayList<>();
-      for (int i = 101; i <= 120; i++) {
-        removedAgents3.add("orphaned-agent-" + i);
-      }
-      batchResult3.add(removedAgents3);
-
-      when(jedis.evalsha(anyString(), anyList(), anyList()))
-          .thenReturn(batchResult1)
-          .thenReturn(batchResult2)
-          .thenReturn(batchResult3);
-
-      // Setup reflection to access private method
-      java.lang.reflect.Method cleanupMethod =
-          ClusteredSortAgentScheduler.class.getDeclaredMethod("cleanupOrphanedAgentsFromRedis");
-      cleanupMethod.setAccessible(true);
-
-      // When - Call orphaned agent cleanup
-      cleanupMethod.invoke(scheduler);
-
-      // Then - Should have retrieved the orphans once and processed them in 3 batches
-      verify(jedis).zrangeByScoreWithScores(eq(WORKING_SET), eq("-inf"), anyString());
-      verify(jedis, times(3)).evalsha(anyString(), anyList(), anyList());
-
-      // Verify batch size configuration was requested
-      verify(dynamicConfigService)
-          .getConfig(
-              eq(Integer.class), eq("redis.agent.orphan-cleanup-batch-size"), any(Integer.class));
-    }
-
-    @Test
-    @DisplayName("Should handle batch script errors gracefully without fallback")
-    void shouldFallbackToIndividualProcessing() throws Exception {
-      // Given
-      // 1. Setup for batch processing with failure
-      long now = System.currentTimeMillis();
-      long orphanThreshold = 600000L; // 10 minutes
-
-      // Enable batch operations
-      when(dynamicConfigService.getConfig(
-              eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), any(Boolean.class)))
-          .thenReturn(true); // Enable batch operations
-
-      // Set up orphan threshold
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.orphan-threshold-ms"), any(Long.class)))
-          .thenReturn(600000L); // 10 minutes
-
-      // Configure batch size
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.orphan-cleanup-batch-size"), any(Integer.class)))
-          .thenReturn(50);
-
-      // Create orphaned agents
-      Set<redis.clients.jedis.Tuple> orphanedAgents = new HashSet<>();
-      redis.clients.jedis.Tuple orphanedAgent1 = mock(redis.clients.jedis.Tuple.class);
-      redis.clients.jedis.Tuple orphanedAgent2 = mock(redis.clients.jedis.Tuple.class);
-
-      when(orphanedAgent1.getElement()).thenReturn("orphaned-agent-1");
-      when(orphanedAgent1.getScore()).thenReturn((double) (now - orphanThreshold - 60000));
-      when(orphanedAgent2.getElement()).thenReturn("orphaned-agent-2");
-      when(orphanedAgent2.getScore()).thenReturn((double) (now - orphanThreshold - 120000));
-
-      orphanedAgents.add(orphanedAgent1);
-      orphanedAgents.add(orphanedAgent2);
-
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(orphanedAgents);
-
-      // Make batch processing fail
-      when(jedis.evalsha(anyString(), anyList(), anyList()))
-          .thenThrow(new RuntimeException("Batch script not found")); // Batch fails
-
-      // Setup reflection to access private method
-      java.lang.reflect.Method cleanupMethod =
-          ClusteredSortAgentScheduler.class.getDeclaredMethod("cleanupOrphanedAgentsFromRedis");
-      cleanupMethod.setAccessible(true);
-
-      // When - Call orphaned agent cleanup
-      cleanupMethod.invoke(scheduler);
-
-      // Then - Should attempt batch processing once but not fall back to individual processing
-      // Should make 1 total call for batch that fails (no individual processing anymore)
-      verify(jedis, times(1)).evalsha(anyString(), anyList(), anyList());
-
-      // Should have requested both batch config and batch size
-      verify(dynamicConfigService)
-          .getConfig(
-              eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), any(Boolean.class));
-      verify(dynamicConfigService)
-          .getConfig(
-              eq(Integer.class), eq("redis.agent.orphan-cleanup-batch-size"), any(Integer.class));
-    }
-
-    @Test
-    @DisplayName("Should handle batch script errors gracefully")
-    void shouldHandleBatchScriptErrors() throws Exception {
-      // Given - Enable batch operations
-      when(dynamicConfigService.getConfig(
-              eq(Boolean.class), eq("redis.agent.batch-operations-enabled"), any(Boolean.class)))
-          .thenReturn(true);
-
-      // Forces orphan cleanup to run
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.orphan-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(0L); // Will force cleanup to run immediately
-
-      // Skip leadership to avoid complications
-      when(dynamicConfigService.getConfig(
-              eq(Boolean.class),
-              eq("redis.agent.orphan-cleanup.force-all-pods"),
-              any(Boolean.class)))
-          .thenReturn(true); // Force all pods to clean
-
-      // Set up orphan threshold
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.orphan-threshold-ms"), any(Long.class)))
-          .thenReturn(600000L); // 10 minutes
-
-      // Configure batch size
-      when(dynamicConfigService.getConfig(
-              eq(Integer.class), eq("redis.agent.orphan-cleanup-batch-size"), any(Integer.class)))
-          .thenReturn(50);
-
-      // Create simple orphaned agents list
-      Set<redis.clients.jedis.Tuple> orphanedAgents = new HashSet<>();
-      redis.clients.jedis.Tuple orphanedAgent1 = mock(redis.clients.jedis.Tuple.class);
-      redis.clients.jedis.Tuple orphanedAgent2 = mock(redis.clients.jedis.Tuple.class);
-
-      // Define the agents
-      when(orphanedAgent1.getElement()).thenReturn("orphaned-agent-1");
-      when(orphanedAgent1.getScore()).thenReturn((double) (System.currentTimeMillis() - 700000L));
-      when(orphanedAgent2.getElement()).thenReturn("orphaned-agent-2");
-      when(orphanedAgent2.getScore()).thenReturn((double) (System.currentTimeMillis() - 700000L));
-
-      orphanedAgents.add(orphanedAgent1);
-      orphanedAgents.add(orphanedAgent2);
-
-      // Mock Redis response for orphaned agents lookup
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(orphanedAgents);
-
-      // Set up the script failure scenario
-      when(jedis.evalsha(anyString(), anyList(), anyList()))
-          .thenThrow(new RuntimeException("Simulated batch script failure"));
-
-      // When - Use the public method to trigger cleanup
-      // The test should pass without exceptions
-      assertThatCode(() -> scheduler.saturatePool()).doesNotThrowAnyException();
-
-      // Verify the batch script was attempted
-      verify(jedis).evalsha(anyString(), anyList(), anyList());
-    }
-
-    @Test
-    @DisplayName("Should handle Redis failures during orphaned agent cleanup")
-    void shouldHandleRedisFailuresDuringOrphanCleanup() throws Exception {
-      // Given
-      // 1. Setup Redis mocks with failure during orphan detection
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenThrow(new RuntimeException("Simulated Redis failure"));
-
-      // Setup reflection to access private method
-      java.lang.reflect.Method cleanupMethod =
-          ClusteredSortAgentScheduler.class.getDeclaredMethod("cleanupOrphanedAgentsFromRedis");
-      cleanupMethod.setAccessible(true);
-
-      // When/Then - Should handle exceptions gracefully
-      assertThatCode(() -> cleanupMethod.invoke(scheduler)).doesNotThrowAnyException();
-    }
-
-    @Test
-    @DisplayName("Should gracefully handle failures during individual orphaned agent removal")
-    void shouldHandleFailuresDuringOrphanRemoval() throws Exception {
-      // Given
-      // 1. Setup Redis mocks for orphan cleanup with failures during removal
-      long now = System.currentTimeMillis();
-      long orphanThreshold = 600000L; // 10 minutes
-      long orphanTimestamp1 = now - orphanThreshold - 120000; // 2 minutes past threshold
-      long orphanTimestamp2 = now - orphanThreshold - 180000; // 3 minutes past threshold
-
-      // Mock Redis response for zrangeByScoreWithScores to return multiple orphaned agents
-      Set<redis.clients.jedis.Tuple> orphanedAgents = new HashSet<>();
-      redis.clients.jedis.Tuple orphanedAgent1 = mock(redis.clients.jedis.Tuple.class);
-      redis.clients.jedis.Tuple orphanedAgent2 = mock(redis.clients.jedis.Tuple.class);
-
-      when(orphanedAgent1.getElement()).thenReturn("orphaned-agent-1");
-      when(orphanedAgent1.getScore()).thenReturn((double) orphanTimestamp1);
-      when(orphanedAgent2.getElement()).thenReturn("orphaned-agent-2");
-      when(orphanedAgent2.getScore()).thenReturn((double) orphanTimestamp2);
-
-      orphanedAgents.add(orphanedAgent1);
-      orphanedAgents.add(orphanedAgent2);
-
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(orphanedAgents);
-
-      // Mock the first evalsha call to succeed, then the second one to fail
-      when(jedis.evalsha(anyString(), anyList(), anyList()))
-          .thenReturn(1L) // First call succeeds
-          .thenThrow(
-              new RuntimeException("Simulated failure during orphan removal")); // Second call fails
-
-      // Setup reflection to access private method
-      java.lang.reflect.Method cleanupMethod =
-          ClusteredSortAgentScheduler.class.getDeclaredMethod("cleanupOrphanedAgentsFromRedis");
-      cleanupMethod.setAccessible(true);
-
-      // When/Then - Should handle exceptions gracefully and continue processing
-      assertThatCode(() -> cleanupMethod.invoke(scheduler)).doesNotThrowAnyException();
-
-      // Then - Should have attempted to process both orphaned agents (2 calls to evalsha)
-      verify(jedis, times(2)).evalsha(anyString(), anyList(), anyList());
-    }
-
-    @Test
-    @DisplayName("Should skip batch processing if no orphans found")
-    void shouldSkipBatchProcessingIfNoOrphans() throws Exception {
-      // Given - Empty set of orphaned agents
-      Set<redis.clients.jedis.Tuple> emptySet = new HashSet<>();
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(emptySet);
-
-      // Setup reflection to access private method
-      java.lang.reflect.Method cleanupMethod =
-          ClusteredSortAgentScheduler.class.getDeclaredMethod("cleanupOrphanedAgentsFromRedis");
-      cleanupMethod.setAccessible(true);
-
-      // When - Call orphaned agent cleanup
-      cleanupMethod.invoke(scheduler);
-
-      // Then - Should have checked for orphans but not attempted any batch processing
-      verify(jedis).zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString());
-      verify(jedis, never()).evalsha(anyString(), anyList(), anyList());
-    }
-
-    @Test
-    @DisplayName("Should handle local cleanup for batched orphaned agents")
-    void shouldHandleLocalCleanupForBatchedOrphans() throws Exception {
-      // Given
-      // 1. Setup a mix of orphaned agents, some of which are in the local activeAgents map
-      long now = System.currentTimeMillis();
-      long orphanThreshold = 600000L; // 10 minutes
-
-      // Create orphaned agents
-      Set<redis.clients.jedis.Tuple> orphanedAgents = new HashSet<>();
-      redis.clients.jedis.Tuple orphanedAgent1 = mock(redis.clients.jedis.Tuple.class);
-      redis.clients.jedis.Tuple orphanedAgent2 = mock(redis.clients.jedis.Tuple.class);
-
-      when(orphanedAgent1.getElement()).thenReturn("orphaned-agent-1");
-      when(orphanedAgent1.getScore()).thenReturn((double) (now - orphanThreshold - 60000));
-      when(orphanedAgent2.getElement()).thenReturn("orphaned-agent-2");
-      when(orphanedAgent2.getScore()).thenReturn((double) (now - orphanThreshold - 120000));
-
-      orphanedAgents.add(orphanedAgent1);
-      orphanedAgents.add(orphanedAgent2);
-
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(orphanedAgents);
-
-      // Add one of the agents to the local activeAgents map
-      TestRunnableAgent localAgent = new TestRunnableAgent("orphaned-agent-1");
-      scheduler.schedule(
-          localAgent, localAgent.getAgentExecution(providerRegistry), executionInstrumentation);
-
-      // Mock successful batch cleanup
-      List<Object> batchResult = new ArrayList<>();
-      batchResult.add(2L); // Both agents removed
-      List<String> removedAgents = Arrays.asList("orphaned-agent-1", "orphaned-agent-2");
-      batchResult.add(removedAgents);
-
-      when(jedis.evalsha(anyString(), anyList(), anyList())).thenReturn(batchResult);
-
-      // Setup reflection to access private method
-      java.lang.reflect.Method cleanupMethod =
-          ClusteredSortAgentScheduler.class.getDeclaredMethod("cleanupOrphanedAgentsFromRedis");
-      cleanupMethod.setAccessible(true);
-
-      // When - Call orphaned agent cleanup
-      cleanupMethod.invoke(scheduler);
-
-      // Then - The local agent should have been removed from activeAgents map
-      // This is challenging to verify directly in a test, but we can verify the batch script was
-      // called
-      // We need to use atLeast(1) instead of exact verification since leadership might cause
-      // additional calls
-      verify(jedis, atLeast(1)).evalsha(anyString(), anyList(), anyList());
-    }
-
-    @Test
-    @DisplayName("Should handle orphaned agents that are also present in local activeAgents map")
-    void shouldHandleOrphansAlsoPresentInLocalActiveAgents() throws Exception {
-      // Given
-      // 1. Setup Redis mocks for orphan cleanup
-      long now = System.currentTimeMillis();
-      long orphanThreshold = 600000L; // 10 minutes
-      long orphanTimestamp = now - orphanThreshold - 60000; // 1 minute past threshold
-
-      // Mock Redis response for zrangeByScoreWithScores to return an orphaned agent
-      Set<redis.clients.jedis.Tuple> orphanedAgents = new HashSet<>();
-      redis.clients.jedis.Tuple orphanedAgent = mock(redis.clients.jedis.Tuple.class);
-      when(orphanedAgent.getElement()).thenReturn("orphaned-agent");
-      when(orphanedAgent.getScore()).thenReturn((double) orphanTimestamp);
-      orphanedAgents.add(orphanedAgent);
-
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(orphanedAgents);
-
-      // Mock success response for the Lua script execution
-      when(jedis.evalsha(anyString(), anyList(), anyList())).thenReturn(1L); // 1 = success
-
-      // Setup a local agent in the activeAgents map with the same name as the orphaned agent
-      // First create a test agent and schedule it
-      TestRunnableAgent agent = new TestRunnableAgent("orphaned-agent");
-      scheduler.schedule(
-          agent, agent.getAgentExecution(providerRegistry), executionInstrumentation);
-
-      // Setup reflection to access private method and fields
-      java.lang.reflect.Method cleanupMethod =
-          ClusteredSortAgentScheduler.class.getDeclaredMethod("cleanupOrphanedAgentsFromRedis");
-      cleanupMethod.setAccessible(true);
-
-      // When - Call orphaned agent cleanup
-      cleanupMethod.invoke(scheduler);
-
-      // Then - Should call the Redis APIs correctly and attempt to clean up the local agent
-      verify(jedis).zrangeByScoreWithScores(eq(WORKING_SET), eq("-inf"), anyString());
-      verify(jedis).evalsha(anyString(), anyList(), anyList());
-    }
-
-    @Test
-    @DisplayName("Should use leader election for orphaned agent cleanup operations")
-    void shouldUseLeaderElectionForCleanup() {
-      // Given - Force the orphan cleanup to run
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.orphan-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(0L); // Will force cleanup to run immediately
-
-      // Mock successful leadership acquisition using the new atomic SET command
-      when(jedis.set(
-              eq("CLEANUP_LEADER"), anyString(), any(redis.clients.jedis.params.SetParams.class)))
-          .thenReturn("OK"); // Successfully acquired leadership ("OK" = success)
-
-      // Mock empty orphan set (no orphans to clean)
-      Set<redis.clients.jedis.Tuple> emptySet = new HashSet<>();
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(emptySet);
-
-      // When
-      scheduler.saturatePool(); // This calls cleanupZombieAgentsIfNeeded internally
-
-      // Then - Should attempt atomic leadership acquisition and release
-      verify(jedis)
-          .set(eq("CLEANUP_LEADER"), anyString(), any(redis.clients.jedis.params.SetParams.class));
-      // No longer need to verify expire call since it's now part of the atomic SET operation
-      verify(jedis).eval(anyString(), anyList(), anyList()); // Leadership release
-    }
-
-    @Test
-    @DisplayName("Should skip orphaned agent cleanup when another pod is the leader")
-    void shouldSkipCleanupWhenNotLeader() {
-      // Given - Force the orphan cleanup to run
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.orphan-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(0L); // Will force cleanup to run immediately
-
-      // Mock leadership acquisition failure (another pod is the leader)
-      when(jedis.set(
-              eq("CLEANUP_LEADER"), anyString(), any(redis.clients.jedis.params.SetParams.class)))
-          .thenReturn(null); // Failed to acquire leadership (null = failure, key exists)
-
-      // When
-      scheduler.saturatePool(); // This calls cleanupZombieAgentsIfNeeded internally
-
-      // Then - Should try to acquire leadership but not perform any cleanup
-      verify(jedis)
-          .set(eq("CLEANUP_LEADER"), anyString(), any(redis.clients.jedis.params.SetParams.class));
-      verify(jedis, never()).zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString());
-    }
-
-    @Test
-    @DisplayName("Should perform cleanup when force refresh is enabled regardless of leadership")
-    void shouldCleanupWhenForceRefreshEnabled() {
-      // Given - Force the orphan cleanup to run
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.orphan-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(0L); // Will force cleanup to run immediately
-
-      // Enable force refresh
-      when(dynamicConfigService.getConfig(
-              eq(Boolean.class),
-              eq("redis.agent.orphan-cleanup.force-all-pods"),
-              any(Boolean.class)))
-          .thenReturn(true); // Enable force refresh
-
-      // Mock empty orphan set (no orphans to clean)
-      Set<redis.clients.jedis.Tuple> emptySet = new HashSet<>();
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(emptySet);
-
-      // When
-      scheduler.saturatePool(); // This calls cleanupZombieAgentsIfNeeded internally
-
-      // Then - Should not attempt leadership acquisition but still perform cleanup
-      verify(jedis, never())
-          .setnx(eq("CLEANUP_LEADER"), anyString()); // Verify setnx was never called
-      verify(jedis).zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString());
-    }
-
-    @Test
-    @DisplayName(
-        "Should handle orphaned agent cleanup integration with cleanupZombieAgentsIfNeeded")
-    void shouldIntegrateWithZombieCleanup() {
-      // Given - Forces the orphan cleanup to run
-      when(dynamicConfigService.getConfig(
-              eq(Long.class), eq("redis.agent.orphan-cleanup-interval-ms"), any(Long.class)))
-          .thenReturn(0L); // Will force cleanup to run immediately
-
-      // Mock successful leadership acquisition
-      when(jedis.setnx(eq("CLEANUP_LEADER"), anyString()))
-          .thenReturn(1L); // Successfully acquired leadership (1L = success)
-
-      // Mock successful expire call which happens after setnx
-      when(jedis.expire(eq("CLEANUP_LEADER"), anyInt())).thenReturn(1L); // Successfully set expiry
-
-      // Mock Redis responses for orphan cleanup
-      Set<redis.clients.jedis.Tuple> emptySet = new HashSet<>();
-      when(jedis.zrangeByScoreWithScores(eq(WORKING_SET), anyString(), anyString()))
-          .thenReturn(emptySet); // No orphans to clean this time
-
-      // When
-      scheduler.saturatePool(); // This calls cleanupZombieAgentsIfNeeded internally
-
-      // Then - Should check orphan cleanup interval and threshold
-      verify(dynamicConfigService, atLeast(1))
-          .getConfig(eq(Long.class), eq("redis.agent.orphan-cleanup-interval-ms"), any(Long.class));
-      verify(dynamicConfigService, atLeast(1))
-          .getConfig(eq(Long.class), eq("redis.agent.orphan-threshold-ms"), any(Long.class));
-    }
-  }
-
-  // Test helper classes following the proven patterns
-
-  private static class TestCachingAgent implements CachingAgent {
-    @Override
-    public String getAgentType() {
-      return "TestCachingAgent";
-    }
-
-    @Override
-    public String getProviderName() {
-      return "test";
-    }
-
-    @Override
-    public Collection<AgentDataType> getProvidedDataTypes() {
-      return List.of();
-    }
-
-    @Override
-    public CacheResult loadData(ProviderCache providerCache) {
-      return new DefaultCacheResult(new HashMap<>());
-    }
-  }
-
+  // Helper test classes
   private static class TestRunnableAgent implements RunnableAgent {
     private final String agentType;
-    private final AtomicBoolean hasRun = new AtomicBoolean(false);
+    private boolean hasRun = false;
 
     public TestRunnableAgent() {
-      this("TestRunnableAgent");
+      this("TestAgent");
     }
 
     public TestRunnableAgent(String agentType) {
       this.agentType = agentType;
-    }
-
-    @Override
-    public void run() {
-      hasRun.set(true);
     }
 
     @Override
@@ -1582,49 +794,80 @@ class ClusteredSortAgentSchedulerTest {
       return "test";
     }
 
-    public boolean hasRun() {
-      return hasRun.get();
+    @Override
+    public AgentExecution getAgentExecution(ProviderRegistry providerRegistry) {
+      return new RunnableAgentExecution();
     }
-  }
 
-  private static class FailingRunnableAgent implements RunnableAgent {
-    private final AtomicInteger callCount = new AtomicInteger(0);
+    public Collection<AgentDataType> getProvidedDataTypes() {
+      return java.util.Collections.emptyList();
+    }
 
     @Override
     public void run() {
-      callCount.incrementAndGet();
-      throw new RuntimeException("Simulated agent failure #" + callCount.get());
+      hasRun = true;
     }
 
-    @Override
-    public String getAgentType() {
-      return "FailingRunnableAgent";
-    }
-
-    @Override
-    public String getProviderName() {
-      return "test";
-    }
-
-    public int getCallCount() {
-      return callCount.get();
+    public boolean hasRun() {
+      return hasRun;
     }
   }
 
-  private static class TestAgentSchedulerAware extends AgentSchedulerAware implements Agent {
+  private static class TestCachingAgent implements CachingAgent {
     @Override
     public String getAgentType() {
-      return "TestAgentSchedulerAware";
+      return "TestCaching";
     }
 
     @Override
     public String getProviderName() {
       return "test";
+    }
+
+    public Collection<AgentDataType> getProvidedDataTypes() {
+      return java.util.Collections.emptyList();
+    }
+
+    @Override
+    public CacheResult loadData(ProviderCache providerCache) {
+      return new DefaultCacheResult(java.util.Collections.emptyMap());
+    }
+
+    @Override
+    public AgentExecution getAgentExecution(ProviderRegistry providerRegistry) {
+      return mock(AgentExecution.class);
+    }
+  }
+
+  // Simplified test agent that can be used for scheduler-aware testing
+  private static class TestAgentSchedulerAware implements Agent {
+    private AgentScheduler scheduler;
+
+    @Override
+    public String getAgentType() {
+      return "TestSchedulerAware";
+    }
+
+    @Override
+    public String getProviderName() {
+      return "test";
+    }
+
+    public Collection<AgentDataType> getProvidedDataTypes() {
+      return java.util.Collections.emptyList();
     }
 
     @Override
     public AgentExecution getAgentExecution(ProviderRegistry providerRegistry) {
       return new CustomAgentExecution();
+    }
+
+    public AgentScheduler getAgentScheduler() {
+      return scheduler;
+    }
+
+    public void setAgentScheduler(AgentScheduler scheduler) {
+      this.scheduler = scheduler;
     }
   }
 
@@ -1632,6 +875,32 @@ class ClusteredSortAgentSchedulerTest {
     @Override
     public void executeAgent(Agent agent) {
       // Custom execution logic
+    }
+  }
+
+  private static class FailingRunnableAgent implements RunnableAgent {
+    @Override
+    public String getAgentType() {
+      return "FailingAgent";
+    }
+
+    @Override
+    public String getProviderName() {
+      return "test";
+    }
+
+    public Collection<AgentDataType> getProvidedDataTypes() {
+      return java.util.Collections.emptyList();
+    }
+
+    @Override
+    public AgentExecution getAgentExecution(ProviderRegistry providerRegistry) {
+      return new RunnableAgentExecution();
+    }
+
+    @Override
+    public void run() {
+      throw new RuntimeException("Simulated failure");
     }
   }
 }

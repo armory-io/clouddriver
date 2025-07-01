@@ -29,7 +29,6 @@ import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.module.CatsModuleAware;
-import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -81,7 +80,7 @@ import redis.clients.jedis.params.SetParams;
  *   <li>Priority scheduling using Redis sorted sets with timestamp scores
  *   <li>Atomic operations via Lua scripts for multi-instance coordination
  *   <li>ShardingFilter integration for distributed agent execution
- *   <li>DynamicConfigService support for runtime configuration changes
+ *   <li>Cached @ConfigurationProperties for high-performance configuration access
  *   <li>Comprehensive timeout handling and recovery mechanisms
  * </ul>
  *
@@ -107,10 +106,21 @@ import redis.clients.jedis.params.SetParams;
  * <p><strong>Default Configuration (recommended for most deployments):</strong>
  *
  * <pre>
- * redis.agent.scheduler-interval-ms: 1000        # 1 sec pickup cycles
- * redis.agent.refresh-period-seconds: 30         # 30 sec Redis sync
- * redis.agent.zombie-threshold-ms: 1800000       # 30 min zombie detection
- * redis.agent.zombie-cleanup-interval-ms: 300000 # 5 min cleanup cycles
+ * redis:
+ *   agent:
+ *     maxConcurrentAgents: 100
+ *     enabledPattern: ".*"
+ *     disabledAgents: []
+ *   scheduler:
+ *     intervalMs: 1000                    # 1 sec pickup cycles
+ *     refreshPeriodSeconds: 30            # 30 sec Redis sync
+ *     zombieThresholdMs: 1800000          # 30 min zombie detection
+ *     zombieCleanupIntervalMs: 300000     # 5 min cleanup cycles
+ *     batchOperationsEnabled: false
+ *     orphanCleanupBatchSize: 50
+ *     pool:
+ *       coreSize: 10
+ *       maxSize: 50
  * </pre>
  *
  * <p><strong>Suitable for:</strong> Standard deployments with moderate cache agent load, normal
@@ -122,10 +132,21 @@ import redis.clients.jedis.params.SetParams;
  * <p><strong>High-Load Configuration (for enterprise-scale deployments):</strong>
  *
  * <pre>
- * redis.agent.scheduler-interval-ms: 500         # 0.5 sec pickup cycles - very fast
- * redis.agent.refresh-period-seconds: 15         # 15 sec Redis sync - frequent updates
- * redis.agent.zombie-threshold-ms: 2100000       # 35 min zombie detection - allows 30min + buffer
- * redis.agent.zombie-cleanup-interval-ms: 120000 # 2 min cleanup cycles - very frequent
+ * redis:
+ *   agent:
+ *     maxConcurrentAgents: 1000          # Higher concurrency for enterprise scale
+ *     enabledPattern: ".*"
+ *     disabledAgents: []
+ *   scheduler:
+ *     intervalMs: 500                    # 0.5 sec pickup cycles - very fast
+ *     refreshPeriodSeconds: 15           # 15 sec Redis sync - frequent updates
+ *     zombieThresholdMs: 2100000         # 35 min zombie detection - allows 30min + buffer
+ *     zombieCleanupIntervalMs: 120000    # 2 min cleanup cycles - very frequent
+ *     batchOperationsEnabled: true       # Enable batch operations for performance
+ *     orphanCleanupBatchSize: 100        # Larger batch size for enterprise scale
+ *     pool:
+ *       coreSize: 50
+ *       maxSize: 1000
  * </pre>
  *
  * <p><strong>Suitable for:</strong> Large-scale deployments with higher cache agent load, frequent
@@ -165,7 +186,9 @@ import redis.clients.jedis.params.SetParams;
  * a single feature flag:
  *
  * <pre>
- * redis.agent.batch-operations-enabled: false      # All batch operations (disabled by default for safety)
+ * redis:
+ *   scheduler:
+ *     batchOperationsEnabled: false      # All batch operations (disabled by default for safety)
  * </pre>
  *
  * @see ClusteredAgentScheduler for the default Redis scheduler implementation
@@ -203,7 +226,10 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   // Agent execution tracking
   private final Optional<Semaphore> runningAgents;
   private final ShardingFilter shardingFilter;
-  private final DynamicConfigService dynamicConfigService;
+
+  // Cached configuration properties to avoid dynamic config calls
+  private final ClusteredSortAgentProperties agentProperties;
+  private final ClusteredSortSchedulerProperties schedulerProperties;
 
   // Zombie agent cleanup - simplified tracking
   static class ActiveAgent {
@@ -227,7 +253,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   // Use AtomicLong for thread-safe timing operations
   private final AtomicLong lastZombieCleanup = new AtomicLong(System.currentTimeMillis());
   @VisibleForTesting final AtomicLong zombiesCleanedUp = new AtomicLong(0);
-  private final AtomicLong lastConfigRefresh = new AtomicLong(System.currentTimeMillis());
 
   private final Logger log = LoggerFactory.getLogger(ClusteredSortAgentScheduler.class);
 
@@ -274,12 +299,10 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * @param nodeStatusProvider Provides node health status for scheduling decisions
    * @param intervalProvider Provides agent-specific execution intervals and timeouts
    * @param enabledAgentPattern Regex pattern for filtering which agents to schedule
-   * @param parallelism Maximum concurrent agents (0 = unlimited)
    * @param shardingFilter Distributes agents across multiple clouddriver instances for HA
    *     deployments. Each instance only processes agents assigned to it, preventing duplicate work.
-   * @param dynamicConfigService Enables runtime configuration changes without restarts. Critical
-   *     for large deployments where different pods may need different limits based on available
-   *     resources, load patterns, or operational requirements.
+   * @param agentProperties Cached agent configuration properties for high-performance access
+   * @param schedulerProperties Cached scheduler configuration properties for optimal performance
    * @param disabledAgents List of specific agent types to explicitly disable, regardless of the
    *     enabledAgentPattern. This allows for quickly disabling problematic agents without changing
    *     regex patterns.
@@ -290,22 +313,20 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       NodeStatusProvider nodeStatusProvider,
       AgentIntervalProvider intervalProvider,
       String enabledAgentPattern,
-      Integer parallelism,
       ShardingFilter shardingFilter,
-      DynamicConfigService dynamicConfigService,
+      ClusteredSortAgentProperties agentProperties,
+      ClusteredSortSchedulerProperties schedulerProperties,
       List<String> disabledAgents) {
     this(
         jedisPool,
         nodeStatusProvider,
         intervalProvider,
         enabledAgentPattern,
-        parallelism,
-        dynamicConfigService.getConfig(
-            Integer.class, "redis.agent.refresh-period-seconds", DEFAULT_REDIS_REFRESH_PERIOD),
-        dynamicConfigService.getConfig(
-            Long.class, "redis.agent.scheduler-interval-ms", DEFAULT_SCHEDULER_INTERVAL_MS),
+        schedulerProperties.getRefreshPeriodSeconds(),
+        schedulerProperties.getIntervalMs(),
         shardingFilter,
-        dynamicConfigService,
+        agentProperties,
+        schedulerProperties,
         disabledAgents);
   }
 
@@ -313,34 +334,37 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * Create scheduler with custom timing configuration. Follows the same pattern as
    * ClusteredAgentScheduler.
    *
-   * <p><b>Note:</b> Runtime configuration via DynamicConfigService takes precedence over
-   * constructor parameters. Constructor parameters serve as fallback defaults if dynamic
-   * configuration is unavailable.
+   * <p><b>Note:</b> Configuration is provided via cached @ConfigurationProperties which take
+   * precedence over constructor parameters. Constructor parameters serve as fallback defaults if
+   * dynamic configuration is unavailable.
    *
    * @param jedisPool Redis connection pool for coordinated operations
    * @param nodeStatusProvider Provides node health status for scheduling decisions
    * @param intervalProvider Provides agent-specific execution intervals and timeouts
    * @param enabledAgentPattern Default regex pattern for filtering which agents to schedule
-   *     (overridden by redis.agent.enabled-pattern)
-   * @param parallelism Maximum concurrent agents (0 = unlimited)
+   *     (overridden by redis.agent.enabledPattern)
+   * @param parallelism Maximum concurrent agents (0 = unlimited) - DEPRECATED: Use
+   *     redis.agent.maxConcurrentAgents
    * @param redisRefreshPeriod Default refresh period in cycles (overridden by
-   *     redis.agent.refresh-period-seconds)
+   *     redis.scheduler.refreshPeriodSeconds)
    * @param schedulerIntervalMs Default scheduler interval in milliseconds (overridden by
-   *     redis.agent.scheduler-interval-ms)
+   *     redis.scheduler.intervalMs)
    * @param shardingFilter Distributes agents across multiple clouddriver instances for HA
    *     deployments. Prevents duplicate work and enables horizontal scaling. Essential for
    *     deployments with higher cache agent load.
-   * @param dynamicConfigService Enables runtime configuration changes without restarts. Allows
-   *     operational tuning of concurrent limits, timeouts, and other parameters based on real-time
-   *     load and resource availability.
-   *     <p><b>Other Dynamic Configuration Keys:</b>
+   * @param agentProperties Cached agent configuration properties for high-performance access
+   * @param schedulerProperties Cached scheduler configuration properties for optimal performance
+   *     <p><b>Configuration Properties:</b>
    *     <ul>
-   *       <li><code>redis.agent.enabled-pattern</code> - Regex pattern for filtering agents
-   *       <li><code>redis.agent.refresh-period-seconds</code> - How often to repopulate Redis
+   *       <li><code>redis.agent.enabledPattern</code> - Regex pattern for filtering agents
+   *       <li><code>redis.agent.maxConcurrentAgents</code> - Maximum concurrent agents
+   *       <li><code>redis.scheduler.refreshPeriodSeconds</code> - How often to repopulate Redis
    *           agents
-   *       <li><code>redis.agent.scheduler-interval-ms</code> - How often scheduler runs
-   *       <li><code>redis.agent.zombie-threshold-ms</code> - Zombie agent detection threshold
-   *       <li><code>redis.agent.zombie-cleanup-interval-ms</code> - Zombie cleanup frequency
+   *       <li><code>redis.scheduler.intervalMs</code> - How often scheduler runs
+   *       <li><code>redis.scheduler.zombieThresholdMs</code> - Zombie agent detection threshold
+   *       <li><code>redis.scheduler.zombieCleanupIntervalMs</code> - Zombie cleanup frequency
+   *       <li><code>redis.scheduler.batchOperationsEnabled</code> - Enable batch operations
+   *       <li><code>redis.scheduler.orphanCleanupBatchSize</code> - Orphan cleanup batch size
    *     </ul>
    *
    * @param disabledAgents List of specific agent types to explicitly disable, regardless of the
@@ -353,70 +377,51 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       NodeStatusProvider nodeStatusProvider,
       AgentIntervalProvider intervalProvider,
       String enabledAgentPattern,
-      Integer parallelism,
       Integer redisRefreshPeriod,
       Long schedulerIntervalMs,
       ShardingFilter shardingFilter,
-      DynamicConfigService dynamicConfigService,
+      ClusteredSortAgentProperties agentProperties,
+      ClusteredSortSchedulerProperties schedulerProperties,
       List<String> disabledAgents) {
 
     this.jedisPool = jedisPool;
     this.nodeStatusProvider = nodeStatusProvider;
     this.intervalProvider = intervalProvider;
+    this.agentProperties = agentProperties;
+    this.schedulerProperties = schedulerProperties;
 
     // Apply configuration following ClusteredAgentScheduler pattern
+    // Use cached properties instead of provided parameters when available
     this.enabledAgentPattern =
         Pattern.compile(
-            enabledAgentPattern != null ? enabledAgentPattern : ".*", Pattern.CASE_INSENSITIVE);
+            enabledAgentPattern != null ? enabledAgentPattern : agentProperties.getEnabledPattern(),
+            Pattern.CASE_INSENSITIVE);
 
     this.disabledAgents =
         disabledAgents != null
             ? disabledAgents.stream().map(String::toLowerCase).collect(Collectors.toList())
-            : Collections.emptyList();
+            : agentProperties.getDisabledAgents().stream()
+                .map(String::toLowerCase)
+                .collect(Collectors.toList());
     this.redisRefreshPeriod =
-        redisRefreshPeriod != null ? redisRefreshPeriod : DEFAULT_REDIS_REFRESH_PERIOD;
+        redisRefreshPeriod != null
+            ? redisRefreshPeriod
+            : schedulerProperties.getRefreshPeriodSeconds();
     this.schedulerIntervalMs =
-        schedulerIntervalMs != null ? schedulerIntervalMs : DEFAULT_SCHEDULER_INTERVAL_MS;
+        schedulerIntervalMs != null ? schedulerIntervalMs : schedulerProperties.getIntervalMs();
 
-    if (parallelism > 0) {
-      this.runningAgents = Optional.of(new Semaphore(parallelism));
+    int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
+    if (maxConcurrentAgents > 0) {
+      this.runningAgents = Optional.of(new Semaphore(maxConcurrentAgents));
     } else {
       this.runningAgents = Optional.empty();
     }
 
-    // Create a bounded thread pool with proper rejection handling instead of unbounded cached pool
-
-    // First determine maximum pool size based on config or available processors
-    int maximumPoolSize =
-        dynamicConfigService.getConfig(
-            Integer.class,
-            "redis.agent.thread-pool-size",
-            Math.max(
-                Runtime.getRuntime().availableProcessors() * 2,
-                20)); // Scale with available processors
-
-    // Use percentage of max size for core size (default 50%)
-    int corePoolPercentage =
-        dynamicConfigService.getConfig(
-            Integer.class,
-            "redis.agent.thread-pool-core-size-percentage",
-            50); // Default to 50% of max size
-
-    // Ensure percentage is valid (between 10% and 100%)
-    corePoolPercentage = Math.min(Math.max(corePoolPercentage, 10), 100);
-
-    // Calculate core pool size based on percentage, ensuring at least 1 thread
-    int corePoolSize = Math.max(1, (maximumPoolSize * corePoolPercentage) / 100);
-
-    // Configurable keep-alive time
-    long keepAliveTime =
-        dynamicConfigService.getConfig(
-            Long.class, "redis.agent.thread-pool-keep-alive-seconds", 60L); // Default 60 seconds
-
-    // Use bounded queue to prevent resource exhaustion
-    int queueCapacity =
-        dynamicConfigService.getConfig(
-            Integer.class, "redis.agent.thread-pool-queue-size", 1000); // Default queue size
+    // Create thread pool with explicit configuration (aligned with other schedulers)
+    // Redis WAITING_SET provides queuing, so ThreadPool uses unbounded queue like SQL scheduler
+    int corePoolSize = schedulerProperties.getThreadPoolCoreSize();
+    int maximumPoolSize = schedulerProperties.getThreadPoolMaxSize();
+    long keepAliveTime = schedulerProperties.getThreadPoolKeepAliveSeconds();
 
     this.agentWorkPool =
         new ThreadPoolExecutor(
@@ -424,7 +429,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
             maximumPoolSize,
             keepAliveTime,
             TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(queueCapacity),
+            new LinkedBlockingQueue<>(), // Unbounded queue like SQL scheduler
             new ThreadFactoryBuilder()
                 .setNameFormat(AgentWorker.class.getSimpleName() + "-%d")
                 .build(),
@@ -439,7 +444,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
             }); // Throttle when queue is full
 
     this.shardingFilter = shardingFilter;
-    this.dynamicConfigService = dynamicConfigService;
 
     this.schedulerExecutorService =
         Executors.newSingleThreadScheduledExecutor(
@@ -934,8 +938,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     long lastCheck = lastTimeCheck.get();
 
     // Get time cache duration from dynamic config (default 10 seconds)
-    long timeCacheDurationMs =
-        dynamicConfigService.getConfig(Long.class, "redis.agent.time-cache-duration-ms", 10000L);
+    long timeCacheDurationMs = schedulerProperties.getTimeCacheDurationMs();
 
     // Refresh the server-client offset if needed
     if (now - lastCheck > timeCacheDurationMs) {
@@ -1054,14 +1057,13 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    */
   void saturatePool() {
     cleanupZombieAgentsIfNeeded();
-    refreshConfigurationIfNeeded();
+    // Configuration refresh removed - @ConfigurationProperties handles caching automatically
 
     log.debug("Starting saturatePool cycle {}, known agents: {}", runCount, agents.size());
 
     try (Jedis jedis = jedisPool.getResource()) {
       // Check concurrent agent limits before processing
-      int maxConcurrentAgents =
-          dynamicConfigService.getConfig(Integer.class, "redis.agent.max-concurrent-agents", 1000);
+      int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
       int currentlyRunning = (int) activeAgentMapSize.get();
 
       if (currentlyRunning >= maxConcurrentAgents) {
@@ -1296,9 +1298,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     int orphansRemoved = cleanupOrphanedAgentsFromWaitz(jedis);
 
     // Check if batch operations are enabled (disabled by default for safety)
-    boolean batchOperationsEnabled =
-        dynamicConfigService.getConfig(
-            Boolean.class, "redis.agent.batch-operations-enabled", false);
+    boolean batchOperationsEnabled = schedulerProperties.isBatchOperationsEnabled();
 
     if (!batchOperationsEnabled) {
       log.debug("Batch repopulation disabled, using individual operations");
@@ -1526,11 +1526,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * @return true if leadership was acquired, false otherwise
    */
   private boolean tryAcquireCleanupLeadership() {
-    Long leadershipTtlMsObj =
-        dynamicConfigService.getConfig(
-            Long.class,
-            "redis.agent.orphan-cleanup-leadership-ttl-ms",
-            120000L); // Default 2 minutes
+    Long leadershipTtlMsObj = schedulerProperties.getOrphanCleanupLeadershipTtlMs();
     long leadershipTtlMs = leadershipTtlMsObj != null ? leadershipTtlMsObj : 120000L;
 
     try (Jedis jedis = jedisPool.getResource()) {
@@ -1604,16 +1600,16 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    *
    * <p>1. "Zombie" agents: Agents running for too long on THIS instance, tracked in the {@code
    * activeAgents} map. These can occur due to rate limits, excessive processing time, or other
-   * performance issues. Configuration: {@code redis.agent.zombie-threshold-ms} (default: 30
-   * minutes), {@code redis.agent.zombie-cleanup-interval-ms} (default: 5 minutes). This threshold
+   * performance issues. Configuration: {@code redis.scheduler.zombieThresholdMs} (default: 30
+   * minutes), {@code redis.scheduler.zombieCleanupIntervalMs} (default: 5 minutes). This threshold
    * is optimized to allow long-running but legitimate operations to complete without interruption,
    * while still catching actual zombie agents that may be stuck.
    *
    * <p>2. "Orphaned" agents: Agents abandoned in the Redis {@code WORKZ} set because their
    * executing instance crashed or terminated unexpectedly. Since no instance is tracking them
    * anymore, they remain "stuck" in the WORKZ set and prevent proper scheduling. Configuration:
-   * {@code redis.agent.orphan-threshold-ms} (default: 10 minutes), {@code
-   * redis.agent.orphan-cleanup-interval-ms} (default: 2 minutes). Thresholds are intentionally
+   * {@code redis.scheduler.orphanThresholdMs} (default: 10 minutes), {@code
+   * redis.scheduler.orphanCleanupIntervalMs} (default: 2 minutes). Thresholds are intentionally
    * aggressive to minimize stale data exposure, while staying under the on-demand agent circuit
    * breaker (12 minutes) to prevent cascading failures.
    *
@@ -1624,9 +1620,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   void cleanupZombieAgentsIfNeeded() {
     // Standard zombie cleanup based on local activeAgents map
     long now = System.currentTimeMillis();
-    long zombieCleanupIntervalMs =
-        dynamicConfigService.getConfig(
-            Long.class, "redis.agent.zombie-cleanup-interval-ms", 300000L); // Default 5 minutes
+    long zombieCleanupIntervalMs = schedulerProperties.getZombieCleanupIntervalMs();
 
     long lastCleanup = lastZombieCleanup.get();
     if (now - lastCleanup > zombieCleanupIntervalMs
@@ -1638,29 +1632,15 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     }
 
     // Comprehensive orphaned agent cleanup - scan both WORKZ and WAITZ sets for abandoned agents
-    // Default cleanup interval: 2 minutes (aggressive to minimize time stale data persists)
-    long orphanCleanupIntervalMs =
-        dynamicConfigService.getConfig(
-            Long.class, "redis.agent.orphan-cleanup-interval-ms", 120000L); // Default 2 minutes
-
-    // Check if this pod should participate in orphan cleanup
-    Boolean orphanCleanupEnabledObj =
-        dynamicConfigService.getConfig(
-            Boolean.class, "redis.agent.orphan-cleanup-enabled", true); // Default enabled
-    boolean orphanCleanupEnabled = orphanCleanupEnabledObj != null ? orphanCleanupEnabledObj : true;
+    // Use cached configuration properties
+    long orphanCleanupIntervalMs = schedulerProperties.getOrphanCleanupIntervalMs();
+    boolean orphanCleanupEnabled = schedulerProperties.isOrphanCleanupEnabled();
 
     // Only proceed if cleanup is enabled for this pod
     if (orphanCleanupEnabled && now - lastOrphanCleanup.get() > orphanCleanupIntervalMs) {
-      // Get the orphan threshold for cleanup - this is the proper place to check this configuration
-      // since we're deciding whether to run orphan cleanup here
-      Long orphanThresholdMsObj =
-          dynamicConfigService.getConfig(
-              Long.class, "redis.agent.orphan-threshold-ms", 10 * 60 * 1000L); // Default 10 minutes
-      // Only attempt cleanup if we become the leader or if force refresh is enabled
-      Boolean forceRefreshObj =
-          dynamicConfigService.getConfig(
-              Boolean.class, "redis.agent.orphan-cleanup.force-all-pods", false);
-      boolean forceRefresh = forceRefreshObj != null ? forceRefreshObj : false;
+      // Use cached orphan threshold and force refresh setting
+      long orphanThresholdMs = schedulerProperties.getOrphanThresholdMs();
+      boolean forceRefresh = schedulerProperties.isForceOrphanCleanupAllPods();
 
       if (forceRefresh || tryAcquireCleanupLeadership()) {
         try {
@@ -1694,23 +1674,22 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * indefinitely.
    *
    * <p>The detection works by scanning the Redis WORKZ set for agent timeouts older than a
-   * configurable threshold ({@code redis.agent.orphan-threshold-ms}), and uses an atomic Lua script
-   * for conditional removal in batches to efficiently process large numbers of orphans in high-load
-   * environments. If orphaned agents are also found in the local activeAgents map, they are cleaned
-   * up as well.
+   * configurable threshold ({@code redis.scheduler.orphanThresholdMs}), and uses an atomic Lua
+   * script for conditional removal in batches to efficiently process large numbers of orphans in
+   * high-load environments. If orphaned agents are also found in the local activeAgents map, they
+   * are cleaned up as well.
    *
    * <p>Configuration:
    *
    * <ul>
-   *   <li>{@code redis.agent.orphan-threshold-ms} - How old (in ms) a WORKZ agent must be to be
-   *       considered orphaned (default: 10min). Balances cleanup speed vs. risk of false positives.
-   *   <li>{@code redis.agent.orphan-cleanup-interval-ms} - How often this cleanup process runs
-   *       (default: 2min). Frequent scanning minimizes the time stale data persists.
-   *   <li>{@code redis.agent.orphan-cleanup-enabled} - Whether this pod participates in orphaned
-   *       agent cleanup (default: true). Useful in complex deployments where some pods have
-   *       different agent filtering than others, allowing only pods with the most complete agent
-   *       configuration to perform cleanup.
-   *   <li>{@code redis.agent.orphan-cleanup-batch-size} - Number of orphans to clean in a single
+   *   <li>{@code redis.scheduler.orphanThresholdMs} - How old (in ms) a WORKZ agent must be to be
+   *       considered orphaned (default: 10 minutes, minimum: 5 minutes)
+   *   <li>{@code redis.scheduler.orphanCleanupIntervalMs} - How often this cleanup process runs
+   *       (default: 2 minutes, minimum: 30 seconds)
+   *   <li>{@code redis.scheduler.orphanCleanupEnabled} - Whether this pod participates in orphaned
+   *       agent cleanup (default: true). Can be disabled for debugging or rolling deployments where
+   *       only some pods should clean up orphans to avoid conflicts
+   *   <li>{@code redis.scheduler.orphanCleanupBatchSize} - Number of orphans to clean in a single
    *       Redis operation (default: 50). This optimizes Redis performance in high-load
    *       environments.
    * </ul>
@@ -1780,9 +1759,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
   private int cleanupOrphanedAgentsFromWorkz(Jedis jedis) {
     // Get orphan threshold from configuration
-    Long orphanThresholdMsObj =
-        dynamicConfigService.getConfig(
-            Long.class, "redis.agent.orphan-threshold-ms", 10 * 60 * 1000L); // Default 10 minutes
+    Long orphanThresholdMsObj = schedulerProperties.getOrphanThresholdMs();
     long orphanThresholdMs = orphanThresholdMsObj != null ? orphanThresholdMsObj : 10 * 60 * 1000L;
     // Start timestamp for timing the WORKZ cleanup process
     long orphanCleanupStartTime = System.currentTimeMillis();
@@ -1790,20 +1767,13 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     // The orphan threshold is used to determine which agents in WORKZ have been abandoned
 
     // Check if batch operations are enabled and configure batch size accordingly
-    Boolean batchOperationsEnabledObj =
-        dynamicConfigService.getConfig(
-            Boolean.class, "redis.agent.batch-operations-enabled", false);
+    Boolean batchOperationsEnabledObj = schedulerProperties.isBatchOperationsEnabled();
     boolean batchOperationsEnabled =
         batchOperationsEnabledObj != null ? batchOperationsEnabledObj : false;
 
-    int maxOrphanBatchSize = 50; // Default to 50 agents per batch
-
-    if (batchOperationsEnabled) {
-      Integer maxOrphanBatchSizeObj =
-          dynamicConfigService.getConfig(
-              Integer.class, "redis.agent.orphan-cleanup-batch-size", 50);
-      maxOrphanBatchSize = maxOrphanBatchSizeObj != null ? maxOrphanBatchSizeObj : 50;
-    }
+    // Use cached property value instead of dynamic config call
+    int maxOrphanBatchSize =
+        batchOperationsEnabled ? schedulerProperties.getOrphanCleanupBatchSize() : 50;
 
     // Calculate the score cutoff for querying Redis. Agents with scores (timeout timestamps)
     // less than this cutoff are considered for cleanup
@@ -2175,22 +2145,20 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    *
    * <p>This cleanup mechanism is important for preventing resource exhaustion on the local
    * instance. It works by checking the local {@code activeAgents} map for agents that have been
-   * running longer than a configurable threshold ({@code redis.agent.zombie-threshold-ms}).
+   * running longer than a configurable threshold ({@code redis.scheduler.zombieThresholdMs}).
    *
    * <p>Configuration:
    *
    * <ul>
-   *   <li>{@code redis.agent.zombie-threshold-ms} - Time after which a running agent is considered
-   *       a zombie (default: 30min). This balanced threshold allows time for rate-limited
-   *       operations while catching truly stuck agents before they consume excessive resources.
-   *   <li>{@code redis.agent.zombie-cleanup-interval-ms} - How often this cleanup process runs
+   *   <li>{@code redis.scheduler.zombieThresholdMs} - Time after which a running agent is
+   *       considered a zombie (default: 30 minutes). Set this 15-20% above your typical agent
+   *       execution times.
+   *   <li>{@code redis.scheduler.zombieCleanupIntervalMs} - How often this cleanup process runs
    *       (default: 5min)
    * </ul>
    */
   private void cleanupZombieAgents() {
-    long zombieThreshold =
-        dynamicConfigService.getConfig(
-            Long.class, "redis.agent.zombie-threshold-ms", 1800000L); // 30 minutes
+    long zombieThreshold = schedulerProperties.getZombieThresholdMs();
     long currentTime = System.currentTimeMillis();
     List<String> zombieAgents = new ArrayList<>();
 
@@ -2214,9 +2182,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         zombieAgents.stream().limit(5).collect(Collectors.toList()));
 
     // Check if batch zombie cleanup is enabled (disabled by default for safety)
-    boolean batchOperationsEnabled =
-        dynamicConfigService.getConfig(
-            Boolean.class, "redis.agent.batch-operations-enabled", false);
+    boolean batchOperationsEnabled = schedulerProperties.isBatchOperationsEnabled();
 
     if (!batchOperationsEnabled) {
       log.debug("Batch zombie cleanup disabled, using individual operations");
@@ -2324,43 +2290,11 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     runningAgents.ifPresent(Semaphore::release);
   }
 
-  /** Refresh dynamic configuration periodically. */
-  private void refreshConfigurationIfNeeded() {
-    long now = System.currentTimeMillis();
-    long lastRefresh = lastConfigRefresh.get();
-    long refreshIntervalMs = this.redisRefreshPeriod * 1000L; // Convert seconds to milliseconds
-    if (now - lastRefresh > refreshIntervalMs
-        && lastConfigRefresh.compareAndSet(lastRefresh, now)) {
-      refreshConfiguration();
-    }
-  }
+  // refreshConfigurationIfNeeded method removed - @ConfigurationProperties handles caching
+  // automatically
 
-  private void refreshConfiguration() {
-    try {
-      // Refresh enabled agent pattern
-      String enabledPattern =
-          dynamicConfigService.getConfig(String.class, "redis.agent.enabled-pattern", ".*");
-      this.enabledAgentPattern = Pattern.compile(enabledPattern, Pattern.CASE_INSENSITIVE);
-
-      // Refresh Redis refresh period
-      this.redisRefreshPeriod =
-          dynamicConfigService.getConfig(
-              Integer.class, "redis.agent.refresh-period-seconds", DEFAULT_REDIS_REFRESH_PERIOD);
-
-      // Refresh scheduler interval
-      this.schedulerIntervalMs =
-          dynamicConfigService.getConfig(
-              Long.class, "redis.agent.scheduler-interval-ms", DEFAULT_SCHEDULER_INTERVAL_MS);
-
-      log.debug(
-          "Refreshed agent configuration - enabled pattern: {}, refresh period: {}s, scheduler interval: {}ms",
-          enabledPattern,
-          redisRefreshPeriod,
-          schedulerIntervalMs);
-    } catch (Exception e) {
-      log.warn("Failed to refresh agent configuration: {}", e.getMessage());
-    }
-  }
+  // refreshConfiguration method removed - configuration is now cached in
+  // ClusteredSortAgentSchedulerProperties
 
   /** Schedule an agent in Redis using atomic operations (fallback for batch failures). */
   private void scheduleAgentInRedis(Jedis jedis, Agent agent) {
