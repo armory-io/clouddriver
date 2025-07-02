@@ -210,6 +210,14 @@ public class ZombieCleanupService {
           // Second element: list of agent names that were successfully cleaned
           List<String> cleanedAgents = (List<String>) resultList.get(1);
 
+          // Log batch-level summary at INFO for operational visibility
+          if (cleaned > 0) {
+            log.info(
+                "Zombie cleanup batch processed: {} agents cleaned from {} candidates",
+                cleaned,
+                zombieBatch.size());
+          }
+
           // Synchronize local Java state with Redis cleanup results
           // Only clean up local state for agents that were actually removed from Redis
           for (String agentType : cleanedAgents) {
@@ -224,7 +232,7 @@ public class ZombieCleanupService {
               log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
             }
 
-            log.info("Cleaned up zombie agent: {}", agentType);
+            log.debug("Cleaned up zombie agent: {}", agentType);
           }
         } else {
           log.warn("Unexpected Lua script result format: expected [count, list], got: {}", result);

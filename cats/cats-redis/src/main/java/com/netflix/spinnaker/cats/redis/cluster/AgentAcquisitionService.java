@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
@@ -321,12 +322,21 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Get the active agents futures map for zombie cleanup.
+   * Get active agents futures for cleanup services.
    *
-   * @return map of active agent futures
+   * @return Map of active agent futures
    */
-  public Map<String, java.util.concurrent.Future<?>> getActiveAgentsFutures() {
+  public Map<String, Future<?>> getActiveAgentsFutures() {
     return activeAgentsFutures;
+  }
+
+  /**
+   * Get the current size of the agent futures map.
+   *
+   * @return Current number of agent futures being tracked
+   */
+  public int getFuturesMapSize() {
+    return activeAgentsFutures.size();
   }
 
   private boolean isAgentEnabled(Agent agent) {

@@ -26,6 +26,7 @@ import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.module.CatsModuleAware;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
@@ -193,7 +194,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
   // Runtime state
   private final AtomicLong runCount = new AtomicLong(0);
-  private volatile boolean running = false;
+  private final AtomicBoolean running = new AtomicBoolean(false);
 
   public ClusteredSortAgentScheduler(
       JedisPool jedisPool,
@@ -235,12 +236,12 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
       // Start the scheduler
       startScheduler();
-      running = true;
+      running.set(true);
 
       log.info("ClusteredSortAgentScheduler started successfully");
     } catch (Exception e) {
       log.error("Failed to initialize ClusteredSortAgentScheduler", e);
-      throw new RuntimeException("Scheduler initialization failed", e);
+      throw new AgentSchedulingException("Scheduler initialization failed", e);
     }
   }
 
@@ -279,6 +280,20 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       if (agentsAcquired > 0) {
         log.debug(
             "Scheduler run cycle {} completed: {} agents acquired", currentRun, agentsAcquired);
+      }
+
+      // Log periodic operational health summary (every 10 minutes)
+      if (currentRun % 600 == 0) {
+        SchedulerStats stats = getStats();
+        log.info(
+            "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={}",
+            stats.getRegisteredAgents(),
+            stats.getActiveAgents(),
+            acquisitionService.getFuturesMapSize(),
+            scriptManager.getScriptCount(),
+            stats.getZombiesCleanedUp(),
+            stats.getOrphansCleanedUp(),
+            stats.isRunning());
       }
 
     } catch (Throwable t) {
@@ -330,12 +345,9 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   /** Shutdown the scheduler and clean up resources. */
   @PreDestroy
   public void shutdown() {
-    if (!running) {
-      return;
-    }
-
     log.info("Shutting down ClusteredSortAgentScheduler");
-    running = false;
+
+    running.set(false);
 
     try {
       // Stop the scheduler
@@ -365,7 +377,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         acquisitionService.getActiveAgentCount(),
         zombieService.getZombiesCleanedUp(),
         orphanService.getOrphansCleanedUp(),
-        running);
+        running.get());
   }
 
   private void startScheduler() {

@@ -18,6 +18,7 @@ package com.netflix.spinnaker.cats.redis.cluster;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -56,7 +57,7 @@ public class RedisScriptManager {
 
   private final JedisPool jedisPool;
   private final Map<String, String> scriptShas = new ConcurrentHashMap<>();
-  private volatile boolean initialized = false;
+  private final AtomicBoolean initialized = new AtomicBoolean(false);
 
   public RedisScriptManager(JedisPool jedisPool) {
     this.jedisPool = jedisPool;
@@ -67,22 +68,22 @@ public class RedisScriptManager {
    * is thread-safe and will only load scripts once.
    */
   public void initializeScripts() {
-    if (initialized) {
+    if (initialized.get()) {
       return;
     }
 
     synchronized (this) {
-      if (initialized) {
+      if (initialized.get()) {
         return;
       }
 
       try (Jedis jedis = jedisPool.getResource()) {
         loadAllScripts(jedis);
-        initialized = true;
+        initialized.set(true);
         log.info("Loaded {} Redis Lua scripts for ClusteredSortAgentScheduler", scriptShas.size());
       } catch (Exception e) {
         log.error("Failed to initialize Redis scripts", e);
-        throw new RuntimeException("Failed to initialize Redis scripts", e);
+        throw new AgentSchedulingException("Failed to initialize Redis scripts", e);
       }
     }
   }
@@ -95,7 +96,7 @@ public class RedisScriptManager {
    * @throws IllegalStateException if scripts are not initialized or script not found
    */
   public String getScriptSha(String scriptName) {
-    if (!initialized) {
+    if (!initialized.get()) {
       throw new IllegalStateException("Scripts not initialized. Call initializeScripts() first.");
     }
 
@@ -107,21 +108,21 @@ public class RedisScriptManager {
   }
 
   /**
+   * Get the number of loaded Redis Lua scripts.
+   *
+   * @return Number of scripts currently loaded and cached
+   */
+  public int getScriptCount() {
+    return scriptShas.size();
+  }
+
+  /**
    * Check if scripts are initialized.
    *
    * @return true if all scripts are loaded and ready for use
    */
   public boolean isInitialized() {
-    return initialized;
-  }
-
-  /**
-   * Get the number of loaded scripts.
-   *
-   * @return number of scripts cached
-   */
-  public int getScriptCount() {
-    return scriptShas.size();
+    return initialized.get();
   }
 
   private void loadAllScripts(Jedis jedis) {
