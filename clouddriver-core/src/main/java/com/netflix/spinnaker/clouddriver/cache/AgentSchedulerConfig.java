@@ -90,6 +90,15 @@ public class AgentSchedulerConfig {
             agentProperties.getMaxConcurrentAgents());
       }
 
+      // Always warn if disabledAgents list is configured since sort scheduler ignores it
+      if (!redisConfigurationProperties.getAgent().getDisabledAgents().isEmpty()) {
+        log.warn(
+            "redis.agent.disabledAgents ({} agents) is ignored by ClusteredSortAgentScheduler. "
+                + "Use redis.agent.disabledPattern instead (current: '{}')",
+            redisConfigurationProperties.getAgent().getDisabledAgents().size(),
+            agentProperties.getDisabledPattern());
+      }
+
       return new ClusteredSortAgentScheduler(
           jedisPool,
           nodeStatusProvider,

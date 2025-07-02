@@ -34,6 +34,7 @@ class RedisConfigurationProperties {
   @Canonical
   static class AgentConfiguration {
     String enabledPattern = ".*"
+    String disabledPattern = ""
     Integer maxConcurrentAgents
     Integer agentLockAcquisitionIntervalSeconds
     List<String> disabledAgents = []
