@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Armory, Inc.
+ * Copyright 2025 Harness, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,11 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
-import java.util.Collections;
-import java.util.List;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 /**
- * Agent filtering configuration properties for Redis scheduler. Follows SQL scheduler pattern with
- * redis.agent.* prefix.
+ * Agent filtering configuration properties for Redis scheduler.
  *
  * <p>This class caches agent-related configuration values to avoid dynamic config calls.
  * Configuration changes are applied through Spring Boot's configuration refresh mechanism.
@@ -32,19 +29,17 @@ import org.springframework.stereotype.Component;
 @ConfigurationProperties(prefix = "redis.agent")
 public class ClusteredSortAgentProperties {
 
-  /**
-   * Regex pattern for enabled agents. Only agents matching this pattern will be scheduled. Aligns
-   * with SQL scheduler pattern.
-   */
+  /** Regex pattern for enabled agents. Only agents matching this pattern will be scheduled. */
   private String enabledPattern = ".*";
 
-  /** List of specific agent types to explicitly disable. Aligns with SQL scheduler pattern. */
-  private List<String> disabledAgents = Collections.emptyList();
-
   /**
-   * Maximum number of agents that can run concurrently. Aligns with SQL scheduler
-   * maxConcurrentAgents (default 100).
+   * Regex pattern for disabled agents. Agents matching this pattern will be disabled. More flexible
+   * than disabledAgents list for complex filtering rules. Example: "(aws|gcp)-(test|dev)-.*"
+   * disables all test/dev agents across clouds. Empty string means no pattern-based disabling.
    */
+  private String disabledPattern = "";
+
+  /** Maximum number of agents that can run concurrently. */
   private int maxConcurrentAgents = 100;
 
   // Getters and setters
@@ -57,12 +52,12 @@ public class ClusteredSortAgentProperties {
     this.enabledPattern = enabledPattern;
   }
 
-  public List<String> getDisabledAgents() {
-    return disabledAgents;
+  public String getDisabledPattern() {
+    return disabledPattern;
   }
 
-  public void setDisabledAgents(List<String> disabledAgents) {
-    this.disabledAgents = disabledAgents;
+  public void setDisabledPattern(String disabledPattern) {
+    this.disabledPattern = disabledPattern;
   }
 
   public int getMaxConcurrentAgents() {

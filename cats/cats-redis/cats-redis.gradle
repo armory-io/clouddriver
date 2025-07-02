@@ -16,4 +16,6 @@ dependencies {
   testImplementation "org.mockito:mockito-core"
   testImplementation "org.spockframework:spock-core"
   testImplementation "org.junit.jupiter:junit-jupiter-api"
+  testImplementation "org.testcontainers:junit-jupiter"
+  testImplementation "org.testcontainers:testcontainers"
 }

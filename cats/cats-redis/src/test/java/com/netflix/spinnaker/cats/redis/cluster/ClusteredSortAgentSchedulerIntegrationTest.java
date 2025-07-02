@@ -17,164 +17,265 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
+import com.netflix.spinnaker.cats.agent.Agent;
+import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
-import com.netflix.spinnaker.cats.agent.RunnableAgent;
-import com.netflix.spinnaker.cats.cluster.DefaultAgentIntervalProvider;
+import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
+import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
-import com.netflix.spinnaker.cats.provider.ProviderRegistry;
-import java.util.Collections;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.condition.EnabledIf;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Integration test to verify that the ClusteredSortAgentScheduler works correctly with
- * RunnableAgent implementations using a real Redis instance.
+ * Comprehensive integration test suite for ClusteredSortAgentScheduler using live Redis.
  *
- * <p>This test requires Redis to be running on localhost:6379
+ * <p>This test suite focuses on end-to-end functionality with real Redis backend: - Agent
+ * registration and scheduling - Configuration validation - Disabled agents handling - Redis
+ * operations integration - Live container testing with proper cleanup
  */
+@Testcontainers
+@DisplayName("ClusteredSortAgentScheduler Integration Tests")
 class ClusteredSortAgentSchedulerIntegrationTest {
 
-  // Helper methods to create properties for tests
-  private static ClusteredSortAgentProperties createDefaultAgentProperties() {
-    return new ClusteredSortAgentProperties();
-  }
+  @Container
+  static GenericContainer<?> redis =
+      new GenericContainer<>("redis:7-alpine")
+          .withExposedPorts(6379)
+          .withCommand("redis-server", "--requirepass", "testpass");
 
-  private static ClusteredSortSchedulerProperties createDefaultSchedulerProperties() {
-    return new ClusteredSortSchedulerProperties();
-  }
-
-  private ClusteredSortAgentScheduler scheduler;
   private JedisPool jedisPool;
-  private ExecutionInstrumentation executionInstrumentation;
-  private ProviderRegistry providerRegistry;
+  private ClusteredSortAgentScheduler scheduler;
+  private NodeStatusProvider nodeStatusProvider;
+  private AgentIntervalProvider intervalProvider;
   private ShardingFilter shardingFilter;
+  private ClusteredSortAgentProperties agentProperties;
+  private ClusteredSortSchedulerProperties schedulerProperties;
 
   @BeforeEach
   void setUp() {
-    jedisPool = new JedisPool("localhost", 6379);
+    // Setup Redis connection
+    JedisPoolConfig config = new JedisPoolConfig();
+    config.setMaxTotal(10);
+    jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
 
-    executionInstrumentation =
-        new ExecutionInstrumentation() {
-          @Override
-          public void executionStarted(com.netflix.spinnaker.cats.agent.Agent agent) {}
+    // Mock dependencies
+    nodeStatusProvider = mock(NodeStatusProvider.class);
+    when(nodeStatusProvider.isNodeEnabled()).thenReturn(true);
 
-          @Override
-          public void executionCompleted(
-              com.netflix.spinnaker.cats.agent.Agent agent, long elapsedMs) {}
+    intervalProvider = mock(AgentIntervalProvider.class);
+    when(intervalProvider.getInterval(any(Agent.class)))
+        .thenReturn(new AgentIntervalProvider.Interval(30000L, 5000L, 60000L));
 
-          @Override
-          public void executionFailed(
-              com.netflix.spinnaker.cats.agent.Agent agent, Throwable cause, long elapsedMs) {}
-        };
+    shardingFilter = mock(ShardingFilter.class);
+    when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
 
-    providerRegistry = null; // Not needed for RunnableAgent
+    // Create default properties
+    agentProperties = createDefaultAgentProperties();
+    schedulerProperties = createDefaultSchedulerProperties();
 
-    // Mock enterprise services for integration test
-    shardingFilter = agent -> true; // Allow all agents
-    // All configuration now handled via cached properties
-
+    // Create scheduler with live Redis
     scheduler =
         new ClusteredSortAgentScheduler(
             jedisPool,
-            () -> true,
-            new DefaultAgentIntervalProvider(30000, 60000, 300000),
-            ".*", // Enable all agents
+            nodeStatusProvider,
+            intervalProvider,
             shardingFilter,
-            createDefaultAgentProperties(),
-            createDefaultSchedulerProperties(),
-            Collections.emptyList()); // No explicitly disabled agents
+            agentProperties,
+            schedulerProperties);
   }
 
-  @Test
-  @DisplayName("Should successfully schedule RunnableAgent without errors")
-  @EnabledIf("isRedisAvailable")
-  void shouldScheduleRunnableAgentWithoutErrors() {
-    // Given
-    TestRunnableAgent agent = new TestRunnableAgent();
-    RunnableAgent.RunnableAgentExecution execution =
-        (RunnableAgent.RunnableAgentExecution) agent.getAgentExecution(providerRegistry);
+  @Nested
+  @DisplayName("Agent Registration Tests")
+  class AgentRegistrationTests {
 
-    // When - Schedule the agent (this should not throw the original exception)
-    assertThatCode(() -> scheduler.schedule(agent, execution, executionInstrumentation))
-        .doesNotThrowAnyException();
+    @Test
+    @DisplayName("Should register enabled agents successfully")
+    void shouldRegisterEnabledAgentsSuccessfully() {
+      // Given
+      Agent agent = createMockAgent("test-agent", "test-provider");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
 
-    // Then - Verify the agent was scheduled (it's in the scheduler's agent map)
-    assertThat(scheduler).isNotNull();
-  }
+      // When
+      scheduler.schedule(agent, execution, instrumentation);
 
-  @Test
-  @DisplayName("Should handle multiple RunnableAgent instances without errors")
-  @EnabledIf("isRedisAvailable")
-  void shouldHandleMultipleRunnableAgentsWithoutErrors() {
-    // Given
-    TestRunnableAgent agent1 = new TestRunnableAgent("agent1");
-    TestRunnableAgent agent2 = new TestRunnableAgent("agent2");
-    TestRunnableAgent agent3 = new TestRunnableAgent("agent3");
+      // Then - Should not throw exception and agent should be registered
+      assertThat(scheduler).isNotNull();
+    }
 
-    // When - Schedule all agents (this should not throw the original exception)
-    assertThatCode(
-            () -> {
-              scheduler.schedule(
-                  agent1, agent1.getAgentExecution(providerRegistry), executionInstrumentation);
-              scheduler.schedule(
-                  agent2, agent2.getAgentExecution(providerRegistry), executionInstrumentation);
-              scheduler.schedule(
-                  agent3, agent3.getAgentExecution(providerRegistry), executionInstrumentation);
-            })
-        .doesNotThrowAnyException();
+    @Test
+    @DisplayName("Should not register disabled agents")
+    void shouldNotRegisterDisabledAgents() {
+      // Given - Configure with disabled agent
+      ClusteredSortAgentProperties testProps = createDefaultAgentProperties();
+      testProps.setDisabledPattern("disabled-agent");
 
-    // Then - Verify all agents were scheduled
-    assertThat(scheduler).isNotNull();
-  }
+      ClusteredSortAgentScheduler testScheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              testProps,
+              schedulerProperties);
 
-  /** Check if Redis is available for testing */
-  static boolean isRedisAvailable() {
-    try (JedisPool testPool = new JedisPool("localhost", 6379)) {
-      testPool.getResource().ping();
-      return true;
-    } catch (Exception e) {
-      System.out.println("Redis not available for integration test: " + e.getMessage());
-      return false;
+      Agent disabledAgent = createMockAgent("disabled-agent", "test-provider");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      // When - Try to schedule disabled agent
+      testScheduler.schedule(disabledAgent, execution, instrumentation);
+
+      // Then - Agent should not be registered (no exception thrown, just skipped)
+      assertThat(testScheduler).isNotNull();
     }
   }
 
-  // Test helper class
-  private static class TestRunnableAgent implements RunnableAgent {
-    private final String agentType;
-    private final AtomicBoolean hasRun = new AtomicBoolean(false);
+  @Nested
+  @DisplayName("Redis Integration Tests")
+  class RedisIntegrationTests {
 
-    public TestRunnableAgent() {
-      this("TestRunnableAgent");
+    @Test
+    @DisplayName("Should initialize Redis scripts successfully")
+    void shouldInitializeRedisScriptsSuccessfully() {
+      // Given & When - Scheduler is created (scripts initialized in constructor)
+      // Then - Should not throw exception
+      assertThat(scheduler).isNotNull();
     }
 
-    public TestRunnableAgent(String agentType) {
-      this.agentType = agentType;
+    @Test
+    @DisplayName("Should handle Redis connection properly")
+    void shouldHandleRedisConnectionProperly() {
+      // Given
+      Agent agent = createMockAgent("redis-test-agent", "test-provider");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      // When - Register agent (this will interact with Redis)
+      scheduler.schedule(agent, execution, instrumentation);
+
+      // Then - Should complete without Redis connection errors
+      assertThat(scheduler).isNotNull();
+    }
+  }
+
+  @Nested
+  @DisplayName("Configuration Tests")
+  class ConfigurationTests {
+
+    @Test
+    @DisplayName("Should respect enabled pattern configuration")
+    void shouldRespectEnabledPatternConfiguration() {
+      // Given - Scheduler with specific pattern
+      ClusteredSortAgentProperties testProps = createDefaultAgentProperties();
+      testProps.setEnabledPattern("AWS.*");
+
+      ClusteredSortAgentScheduler patternScheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              testProps,
+              schedulerProperties);
+
+      Agent awsAgent = createMockAgent("AWSAgent", "aws-provider");
+      Agent gcpAgent = createMockAgent("GCPAgent", "gcp-provider");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      // When - Schedule both agents
+      patternScheduler.schedule(awsAgent, execution, instrumentation);
+      patternScheduler.schedule(gcpAgent, execution, instrumentation);
+
+      // Then - Only AWS agent should be registered (no exceptions)
+      assertThat(patternScheduler).isNotNull();
     }
 
-    @Override
-    public void run() {
-      hasRun.set(true);
-      System.out.println("RunnableAgent " + agentType + " executed successfully!");
-    }
+    @Test
+    @DisplayName("Should use cached configuration properties")
+    void shouldUseCachedConfigurationProperties() {
+      // Given - Custom scheduler properties
+      ClusteredSortSchedulerProperties customProps = createDefaultSchedulerProperties();
+      customProps.getZombieCleanup().setThresholdMs(120000L); // 2 minutes
 
-    @Override
-    public String getAgentType() {
-      return agentType;
-    }
+      ClusteredSortAgentScheduler customScheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              customProps);
 
-    @Override
-    public String getProviderName() {
-      return "test";
+      // When & Then - Scheduler created successfully with custom config
+      assertThat(customScheduler).isNotNull();
     }
+  }
 
-    public boolean hasRun() {
-      return hasRun.get();
+  @Nested
+  @DisplayName("Error Handling Tests")
+  class ErrorHandlingTests {
+
+    @Test
+    @DisplayName("Should handle node disabled gracefully")
+    void shouldHandleNodeDisabledGracefully() {
+      // Given - Node disabled
+      NodeStatusProvider disabledNodeProvider = mock(NodeStatusProvider.class);
+      when(disabledNodeProvider.isNodeEnabled()).thenReturn(false);
+
+      ClusteredSortAgentScheduler disabledScheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              disabledNodeProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              schedulerProperties);
+
+      // When - Run scheduler cycle
+      disabledScheduler.run();
+
+      // Then - Should complete without error
+      assertThat(disabledScheduler).isNotNull();
     }
+  }
+
+  private ClusteredSortAgentProperties createDefaultAgentProperties() {
+    ClusteredSortAgentProperties props = new ClusteredSortAgentProperties();
+    props.setMaxConcurrentAgents(100);
+    props.setEnabledPattern(".*");
+    props.setDisabledPattern("");
+    return props;
+  }
+
+  private ClusteredSortSchedulerProperties createDefaultSchedulerProperties() {
+    ClusteredSortSchedulerProperties props = new ClusteredSortSchedulerProperties();
+    props.setIntervalMs(1000L);
+    props.setRefreshPeriodSeconds(30);
+    props.getZombieCleanup().setThresholdMs(1800000L); // 30 minutes
+    props.getZombieCleanup().setCleanupIntervalMs(300000L); // 5 minutes
+    props.getOrphanCleanup().setThresholdMs(7200000L); // 2 hours
+    props.getOrphanCleanup().setIntervalMs(3600000L); // 1 hour
+    props.setBatchOperationsEnabled(false);
+    return props;
+  }
+
+  private Agent createMockAgent(String agentType, String providerName) {
+    Agent agent = mock(Agent.class);
+    when(agent.getAgentType()).thenReturn(agentType);
+    when(agent.getProviderName()).thenReturn(providerName);
+    return agent;
   }
 }

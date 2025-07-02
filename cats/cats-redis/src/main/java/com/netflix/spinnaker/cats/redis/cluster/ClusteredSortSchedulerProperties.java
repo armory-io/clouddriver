@@ -20,8 +20,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 /**
- * Scheduler execution configuration properties for Redis scheduler. Follows SQL scheduler pattern
- * with redis.scheduler.* prefix.
+ * Scheduler execution configuration properties for Redis scheduler.
  *
  * <p>This class caches scheduler-related configuration values to avoid dynamic config calls.
  * Configuration changes are applied through Spring Boot's configuration refresh mechanism.
@@ -42,28 +41,11 @@ public class ClusteredSortSchedulerProperties {
    */
   private int refreshPeriodSeconds = 30;
 
-  /**
-   * How long an agent can run before being considered a zombie (milliseconds). Zombies are forcibly
-   * terminated to prevent resource leaks.
-   */
-  private long zombieThresholdMs = 1800000L; // 30 minutes
+  /** Zombie cleanup configuration for stuck agents. */
+  private ZombieCleanupProperties zombieCleanup = new ZombieCleanupProperties();
 
-  /** How often to check for and clean up zombie agents (milliseconds). */
-  private long zombieCleanupIntervalMs = 300000L; // 5 minutes
-
-  /**
-   * How long an agent can be stuck in WORKING state before cleanup (milliseconds). This handles
-   * orphaned agents from crashed instances.
-   */
-  private long orphanThresholdMs = 600000L; // 10 minutes
-
-  /** How often to check for and clean up orphaned agents (milliseconds). */
-  private long orphanCleanupIntervalMs = 300000L; // 5 minutes
-
-  /**
-   * Whether to enable orphaned agent cleanup. Can be disabled for debugging or during maintenance.
-   */
-  private boolean orphanCleanupEnabled = true;
+  /** Orphan cleanup configuration for agents from crashed instances. */
+  private OrphanCleanupProperties orphanCleanup = new OrphanCleanupProperties();
 
   /**
    * Whether to enable batch operations for performance. Batch operations reduce Redis round trips
@@ -72,30 +54,12 @@ public class ClusteredSortSchedulerProperties {
   private boolean batchOperationsEnabled = false;
 
   /**
-   * Force all pods to participate in orphan cleanup (not just leader). Disabled by default for
-   * safety.
-   */
-  private boolean forceOrphanCleanupAllPods = false;
-
-  /**
    * How long to cache Redis server time to reduce TIME command calls (milliseconds). Higher values
    * reduce Redis calls but may drift from server time.
    */
   private long timeCacheDurationMs = 10000L; // 10 seconds
 
-  /**
-   * TTL for distributed cleanup leadership lock (milliseconds). Only one pod gets cleanup
-   * leadership at a time.
-   */
-  private long orphanCleanupLeadershipTtlMs = 120000; // 2 minutes
-
-  /** Batch size for orphan cleanup. Defaults to 50, which handles typical bursts. */
-  private int orphanCleanupBatchSize = 50;
-
-  /**
-   * Thread pool configuration for agent execution. Similar to SQL scheduler's connectionPools
-   * pattern.
-   */
+  /** Thread pool configuration for agent execution. */
   private RedisThreadPoolProperties pool = new RedisThreadPoolProperties();
 
   // Getters and setters
@@ -116,44 +80,20 @@ public class ClusteredSortSchedulerProperties {
     this.refreshPeriodSeconds = refreshPeriodSeconds;
   }
 
-  public long getZombieThresholdMs() {
-    return zombieThresholdMs;
+  public ZombieCleanupProperties getZombieCleanup() {
+    return zombieCleanup;
   }
 
-  public void setZombieThresholdMs(long zombieThresholdMs) {
-    this.zombieThresholdMs = zombieThresholdMs;
+  public void setZombieCleanup(ZombieCleanupProperties zombieCleanup) {
+    this.zombieCleanup = zombieCleanup;
   }
 
-  public long getZombieCleanupIntervalMs() {
-    return zombieCleanupIntervalMs;
+  public OrphanCleanupProperties getOrphanCleanup() {
+    return orphanCleanup;
   }
 
-  public void setZombieCleanupIntervalMs(long zombieCleanupIntervalMs) {
-    this.zombieCleanupIntervalMs = zombieCleanupIntervalMs;
-  }
-
-  public long getOrphanThresholdMs() {
-    return orphanThresholdMs;
-  }
-
-  public void setOrphanThresholdMs(long orphanThresholdMs) {
-    this.orphanThresholdMs = orphanThresholdMs;
-  }
-
-  public long getOrphanCleanupIntervalMs() {
-    return orphanCleanupIntervalMs;
-  }
-
-  public void setOrphanCleanupIntervalMs(long orphanCleanupIntervalMs) {
-    this.orphanCleanupIntervalMs = orphanCleanupIntervalMs;
-  }
-
-  public boolean isOrphanCleanupEnabled() {
-    return orphanCleanupEnabled;
-  }
-
-  public void setOrphanCleanupEnabled(boolean orphanCleanupEnabled) {
-    this.orphanCleanupEnabled = orphanCleanupEnabled;
+  public void setOrphanCleanup(OrphanCleanupProperties orphanCleanup) {
+    this.orphanCleanup = orphanCleanup;
   }
 
   public boolean isBatchOperationsEnabled() {
@@ -164,36 +104,12 @@ public class ClusteredSortSchedulerProperties {
     this.batchOperationsEnabled = batchOperationsEnabled;
   }
 
-  public boolean isForceOrphanCleanupAllPods() {
-    return forceOrphanCleanupAllPods;
-  }
-
-  public void setForceOrphanCleanupAllPods(boolean forceOrphanCleanupAllPods) {
-    this.forceOrphanCleanupAllPods = forceOrphanCleanupAllPods;
-  }
-
   public long getTimeCacheDurationMs() {
     return timeCacheDurationMs;
   }
 
   public void setTimeCacheDurationMs(long timeCacheDurationMs) {
     this.timeCacheDurationMs = timeCacheDurationMs;
-  }
-
-  public long getOrphanCleanupLeadershipTtlMs() {
-    return orphanCleanupLeadershipTtlMs;
-  }
-
-  public void setOrphanCleanupLeadershipTtlMs(long orphanCleanupLeadershipTtlMs) {
-    this.orphanCleanupLeadershipTtlMs = orphanCleanupLeadershipTtlMs;
-  }
-
-  public int getOrphanCleanupBatchSize() {
-    return orphanCleanupBatchSize;
-  }
-
-  public void setOrphanCleanupBatchSize(int orphanCleanupBatchSize) {
-    this.orphanCleanupBatchSize = orphanCleanupBatchSize;
   }
 
   public RedisThreadPoolProperties getPool() {
@@ -218,9 +134,137 @@ public class ClusteredSortSchedulerProperties {
   }
 }
 
-/**
- * Thread pool configuration properties for Redis scheduler. Similar to SQL connectionPools pattern.
- */
+/** Zombie cleanup configuration properties for stuck agents. */
+class ZombieCleanupProperties {
+
+  /** Whether zombie cleanup is enabled. */
+  private boolean enabled = true;
+
+  /**
+   * How long an agent can run before being considered a zombie (milliseconds). Zombies are forcibly
+   * terminated to prevent resource leaks.
+   */
+  private long thresholdMs = 1800000L; // 30 minutes
+
+  /** How often to check for and clean up zombie agents (milliseconds). */
+  private long cleanupIntervalMs = 300000L; // 5 minutes
+
+  /** Batch size for zombie cleanup. Defaults to 50, which handles typical bursts. */
+  private int batchSize = 50;
+
+  public boolean isEnabled() {
+    return enabled;
+  }
+
+  public void setEnabled(boolean enabled) {
+    this.enabled = enabled;
+  }
+
+  public long getThresholdMs() {
+    return thresholdMs;
+  }
+
+  public void setThresholdMs(long thresholdMs) {
+    this.thresholdMs = thresholdMs;
+  }
+
+  public long getCleanupIntervalMs() {
+    return cleanupIntervalMs;
+  }
+
+  public void setCleanupIntervalMs(long cleanupIntervalMs) {
+    this.cleanupIntervalMs = cleanupIntervalMs;
+  }
+
+  public int getBatchSize() {
+    return batchSize;
+  }
+
+  public void setBatchSize(int batchSize) {
+    this.batchSize = batchSize;
+  }
+}
+
+/** Orphan cleanup configuration properties for agents from crashed instances. */
+class OrphanCleanupProperties {
+
+  /** Whether orphan cleanup is enabled. Can be disabled for debugging or during maintenance. */
+  private boolean enabled = true;
+
+  /**
+   * How long an agent can be stuck in WORKING state before cleanup (milliseconds). This handles
+   * orphaned agents from crashed instances.
+   */
+  private long thresholdMs = 600000L; // 10 minutes
+
+  /** How often to check for and clean up orphaned agents (milliseconds). */
+  private long intervalMs = 300000L; // 5 minutes
+
+  /** Batch size for orphan cleanup. Defaults to 50, which handles typical bursts. */
+  private int batchSize = 50;
+
+  /**
+   * TTL for distributed cleanup leadership lock (milliseconds). Only one pod gets cleanup
+   * leadership at a time.
+   */
+  private long leadershipTtlMs = 120000L; // 2 minutes
+
+  /**
+   * Force all pods to participate in orphan cleanup (not just leader). Disabled by default for
+   * safety.
+   */
+  private boolean forceAllPods = false;
+
+  public boolean isEnabled() {
+    return enabled;
+  }
+
+  public void setEnabled(boolean enabled) {
+    this.enabled = enabled;
+  }
+
+  public long getThresholdMs() {
+    return thresholdMs;
+  }
+
+  public void setThresholdMs(long thresholdMs) {
+    this.thresholdMs = thresholdMs;
+  }
+
+  public long getIntervalMs() {
+    return intervalMs;
+  }
+
+  public void setIntervalMs(long intervalMs) {
+    this.intervalMs = intervalMs;
+  }
+
+  public int getBatchSize() {
+    return batchSize;
+  }
+
+  public void setBatchSize(int batchSize) {
+    this.batchSize = batchSize;
+  }
+
+  public long getLeadershipTtlMs() {
+    return leadershipTtlMs;
+  }
+
+  public void setLeadershipTtlMs(long leadershipTtlMs) {
+    this.leadershipTtlMs = leadershipTtlMs;
+  }
+
+  public boolean isForceAllPods() {
+    return forceAllPods;
+  }
+
+  public void setForceAllPods(boolean forceAllPods) {
+    this.forceAllPods = forceAllPods;
+  }
+}
+
+/** Thread pool configuration properties for Redis scheduler. */
 class RedisThreadPoolProperties {
 
   /**

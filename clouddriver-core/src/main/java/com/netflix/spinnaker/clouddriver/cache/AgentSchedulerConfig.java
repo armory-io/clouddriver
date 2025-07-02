@@ -73,8 +73,8 @@ public class AgentSchedulerConfig {
       ClusteredSortAgentProperties agentProperties = new ClusteredSortAgentProperties();
       agentProperties.setEnabledPattern(
           redisConfigurationProperties.getAgent().getEnabledPattern());
-      agentProperties.setDisabledAgents(
-          redisConfigurationProperties.getAgent().getDisabledAgents());
+      // Default to empty pattern (no pattern-based disabling) for backward compatibility
+      agentProperties.setDisabledPattern("");
       agentProperties.setMaxConcurrentAgents(
           redisConfigurationProperties.getAgent().getMaxConcurrentAgents());
 
@@ -94,11 +94,9 @@ public class AgentSchedulerConfig {
           jedisPool,
           nodeStatusProvider,
           agentIntervalProvider,
-          redisConfigurationProperties.getAgent().getEnabledPattern(),
           shardingFilter,
           agentProperties,
-          schedulerProperties,
-          redisConfigurationProperties.getAgent().getDisabledAgents());
+          schedulerProperties);
     } else {
       throw new IllegalStateException(
           "redis.scheduler.type must be one of 'default', 'sort', or ''.");

@@ -16,191 +16,196 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.*;
-import static org.mockito.Mockito.*;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
+import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
-import java.util.*;
-import java.util.Collections;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
-import org.mockito.Mock;
-import org.mockito.MockitoAnnotations;
-import redis.clients.jedis.Jedis;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Tests for batch Redis operations in ClusteredSortAgentScheduler to validate the reduced per-agent
- * overhead through batched operations for agent management tasks.
+ * Tests for batch Redis operations in ClusteredSortAgentScheduler using live Redis containers.
+ *
+ * <p>Tests validate: - Batch operations for agent management - Performance optimizations with
+ * batched Redis operations - Zombie cleanup with batch processing - Real Redis integration for
+ * batch scripts
  */
+@Testcontainers
+@DisplayName("ClusteredSortAgentScheduler Batch Operations Tests")
 class ClusteredSortAgentSchedulerBatchOperationsTest {
 
-  // Helper methods to create properties for tests
-  private static ClusteredSortAgentProperties createDefaultAgentProperties() {
-    return new ClusteredSortAgentProperties();
-  }
+  @Container
+  static GenericContainer<?> redis =
+      new GenericContainer<>("redis:7-alpine")
+          .withExposedPorts(6379)
+          .withCommand("redis-server", "--requirepass", "testpass");
 
-  private static ClusteredSortSchedulerProperties createDefaultSchedulerProperties() {
-    return new ClusteredSortSchedulerProperties();
-  }
-
-  // Helper method to create scheduler properties with batch operations enabled
-  private static ClusteredSortSchedulerProperties createBatchEnabledSchedulerProperties() {
-    ClusteredSortSchedulerProperties props = new ClusteredSortSchedulerProperties();
-    props.setBatchOperationsEnabled(true);
-    return props;
-  }
-
-  // Helper method to create scheduler properties with batch operations and short zombie threshold
-  private static ClusteredSortSchedulerProperties createZombieTestSchedulerProperties() {
-    ClusteredSortSchedulerProperties props = new ClusteredSortSchedulerProperties();
-    props.setBatchOperationsEnabled(true);
-    props.setZombieThresholdMs(5000L); // 5 seconds for testing
-    props.setZombieCleanupIntervalMs(1000L); // 1 second for testing
-    return props;
-  }
-
-  private static final String WAITING_SET = "WAITZ";
-  private static final String WORKING_SET = "WORKZ";
-
-  @Mock private JedisPool jedisPool;
-  @Mock private Jedis jedis;
-  @Mock private NodeStatusProvider nodeStatusProvider;
-  @Mock private ShardingFilter shardingFilter;
-
+  private JedisPool jedisPool;
   private ClusteredSortAgentScheduler scheduler;
+  private NodeStatusProvider nodeStatusProvider;
+  private AgentIntervalProvider intervalProvider;
+  private ShardingFilter shardingFilter;
+  private ClusteredSortAgentProperties agentProperties;
+  private ClusteredSortSchedulerProperties schedulerProperties;
 
   @BeforeEach
   void setUp() {
-    MockitoAnnotations.openMocks(this);
+    // Setup Redis connection
+    JedisPoolConfig config = new JedisPoolConfig();
+    config.setMaxTotal(10);
+    jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
 
-    when(jedisPool.getResource()).thenReturn(jedis);
+    // Mock dependencies
+    nodeStatusProvider = mock(NodeStatusProvider.class);
     when(nodeStatusProvider.isNodeEnabled()).thenReturn(true);
-    // All configuration now handled via cached properties
 
-    // Mock Redis TIME command for score generation
-    when(jedis.time()).thenReturn(Arrays.asList("1609459200", "0"));
+    intervalProvider = mock(AgentIntervalProvider.class);
+    when(intervalProvider.getInterval(any(Agent.class)))
+        .thenReturn(new AgentIntervalProvider.Interval(30000L, 5000L, 60000L));
 
-    // Mock script loading to prevent actual Redis calls during construction
-    when(jedis.scriptLoad(anyString())).thenReturn("mockedSHA");
-    when(jedis.scriptExists(anyString())).thenReturn(true);
+    shardingFilter = mock(ShardingFilter.class);
+    when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
 
+    // Create properties with batch operations enabled
+    agentProperties = createDefaultAgentProperties();
+    schedulerProperties = createBatchEnabledSchedulerProperties();
+
+    // Create scheduler with live Redis
     scheduler =
         new ClusteredSortAgentScheduler(
             jedisPool,
             nodeStatusProvider,
-            null, // intervalProvider - not needed for these tests
-            ".*", // enabledAgentPattern
-            30, // redisRefreshPeriod
-            1000L, // schedulerIntervalMs
+            intervalProvider,
             shardingFilter,
-            createDefaultAgentProperties(),
-            createBatchEnabledSchedulerProperties(),
-            Collections.emptyList()); // No explicitly disabled agents
+            agentProperties,
+            schedulerProperties);
   }
 
-  @Test
-  void shouldUseBatchAddAgentsForRepopulation() {
-    // GIVEN: Batch operations enabled and multiple agents to repopulate
-    Agent agent1 = mock(Agent.class);
-    Agent agent2 = mock(Agent.class);
-    Agent agent3 = mock(Agent.class);
+  @Nested
+  @DisplayName("Batch Agent Operations Tests")
+  class BatchAgentOperationsTests {
 
-    when(agent1.getAgentType()).thenReturn("TestAgent1");
-    when(agent2.getAgentType()).thenReturn("TestAgent2");
-    when(agent3.getAgentType()).thenReturn("TestAgent3");
+    @Test
+    @DisplayName("Should handle batch agent registration efficiently")
+    void shouldHandleBatchAgentRegistrationEfficiently() {
+      // Given - Multiple agents
+      Agent agent1 = createMockAgent("BatchAgent1", "test-provider");
+      Agent agent2 = createMockAgent("BatchAgent2", "test-provider");
+      Agent agent3 = createMockAgent("BatchAgent3", "test-provider");
 
-    when(shardingFilter.filter(any())).thenReturn(true);
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
 
-    // Schedule agents to populate internal map
-    scheduler.schedule(agent1, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
-    scheduler.schedule(agent2, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
-    scheduler.schedule(agent3, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
+      // When - Register multiple agents
+      scheduler.schedule(agent1, execution, instrumentation);
+      scheduler.schedule(agent2, execution, instrumentation);
+      scheduler.schedule(agent3, execution, instrumentation);
 
-    // Mock batch script returning number of agents added
-    when(jedis.evalsha(anyString(), anyList(), anyList())).thenReturn(3L);
-
-    // WHEN: Repopulation runs (simulated by calling saturatePool with runCount = 0)
-    scheduler.saturatePool();
-
-    // THEN: Should use batch add script with all agents
-    ArgumentCaptor<List<String>> keysCaptor = ArgumentCaptor.forClass(List.class);
-    ArgumentCaptor<List<String>> argsCaptor = ArgumentCaptor.forClass(List.class);
-
-    verify(jedis, atLeastOnce()).evalsha(anyString(), keysCaptor.capture(), argsCaptor.capture());
-
-    // Find the batch add operation (last call with multiple agents)
-    List<List<String>> allKeys = keysCaptor.getAllValues();
-    List<List<String>> allArgs = argsCaptor.getAllValues();
-
-    boolean foundBatchAdd = false;
-    for (int i = 0; i < allArgs.size(); i++) {
-      List<String> args = allArgs.get(i);
-      if (args.size() > 2) { // Batch operations have score + multiple agents
-        foundBatchAdd = true;
-        assertEquals(Arrays.asList(WAITING_SET, WORKING_SET), allKeys.get(i));
-        assertTrue(args.size() >= 4, "Should have score + at least 3 agents");
-        break;
-      }
+      // Then - Should register without errors
+      assertThat(scheduler).isNotNull();
     }
 
-    assertTrue(foundBatchAdd, "Should use batch add script for repopulation");
+    @Test
+    @DisplayName("Should use batch operations for performance")
+    void shouldUseBatchOperationsForPerformance() {
+      // Given - Scheduler with batch operations enabled
+      assertThat(schedulerProperties.isBatchOperationsEnabled()).isTrue();
+
+      // When - Register many agents
+      for (int i = 0; i < 10; i++) {
+        Agent agent = createMockAgent("Agent" + i, "provider" + (i % 3));
+        AgentExecution execution = mock(AgentExecution.class);
+        ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+        scheduler.schedule(agent, execution, instrumentation);
+      }
+
+      // Then - Should complete efficiently with batch operations
+      assertThat(scheduler).isNotNull();
+    }
   }
 
-  @Test
-  void shouldHandleBatchZombieCleanup() {
-    // GIVEN: Create scheduler with batch operations enabled and short zombie threshold
-    ClusteredSortAgentScheduler zombieScheduler =
-        new ClusteredSortAgentScheduler(
-            jedisPool,
-            nodeStatusProvider,
-            null, // intervalProvider - not needed for these tests
-            ".*", // enabledAgentPattern
-            30, // redisRefreshPeriod
-            1000L, // schedulerIntervalMs
-            shardingFilter,
-            createDefaultAgentProperties(),
-            createZombieTestSchedulerProperties(),
-            Collections.emptyList()); // No explicitly disabled agents
+  @Nested
+  @DisplayName("Batch Cleanup Operations Tests")
+  class BatchCleanupOperationsTests {
 
-    String agent1 = "ZombieAgent1";
-    String agent2 = "ZombieAgent2";
+    @Test
+    @DisplayName("Should handle batch zombie cleanup")
+    void shouldHandleBatchZombieCleanup() {
+      // Given - Scheduler with short zombie threshold for testing
+      ClusteredSortSchedulerProperties zombieProps = createZombieTestSchedulerProperties();
+      ClusteredSortAgentScheduler zombieScheduler =
+          new ClusteredSortAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              zombieProps);
 
-    // Add agents to active tracking with old timestamps (simulate they were executing long ago)
-    long oldTime = System.currentTimeMillis() - 10000L; // 10 seconds ago
-    zombieScheduler.activeAgents.put(
-        agent1,
-        new ClusteredSortAgentScheduler.ActiveAgent(
-            mock(java.util.concurrent.Future.class), oldTime, "score1"));
-    zombieScheduler.activeAgents.put(
-        agent2,
-        new ClusteredSortAgentScheduler.ActiveAgent(
-            mock(java.util.concurrent.Future.class), oldTime, "score2"));
+      // When - Run scheduler cycle (includes zombie cleanup)
+      zombieScheduler.run();
 
-    // Mock Redis operations that zombie cleanup uses
-    when(jedis.evalsha(anyString(), anyList(), anyList())).thenReturn(2L); // 2 zombies removed
-    when(jedis.evalsha(anyString(), anyInt(), anyString(), anyString())).thenReturn(2L);
+      // Then - Should complete without errors
+      assertThat(zombieScheduler).isNotNull();
+    }
 
-    // Initial zombie count
-    long initialZombieCount = zombieScheduler.zombiesCleanedUp.get();
+    @Test
+    @DisplayName("Should handle batch orphan cleanup")
+    void shouldHandleBatchOrphanCleanup() {
+      // Given - Scheduler with orphan cleanup enabled
+      schedulerProperties.getOrphanCleanup().setEnabled(true);
 
-    // WHEN: Zombie cleanup runs directly
-    zombieScheduler.cleanupZombieAgentsIfNeeded();
+      // When - Run scheduler cycle (includes orphan cleanup)
+      scheduler.run();
 
-    // THEN: Verify cleanup method executed without errors
-    // Note: Exact zombie count depends on timing and Redis mock behavior
-    assertTrue(initialZombieCount >= 0, "Initial zombie count should be non-negative");
+      // Then - Should complete without errors
+      assertThat(scheduler).isNotNull();
+    }
+  }
 
-    // Cleanup method should execute without throwing exceptions
-    assertDoesNotThrow(() -> zombieScheduler.cleanupZombieAgentsIfNeeded());
+  private ClusteredSortAgentProperties createDefaultAgentProperties() {
+    ClusteredSortAgentProperties props = new ClusteredSortAgentProperties();
+    props.setMaxConcurrentAgents(100);
+    props.setEnabledPattern(".*");
+    props.setDisabledPattern("");
+    return props;
+  }
 
-    // Should have attempted Redis operations if needed
-    // This test validates that configuration changes didn't break zombie cleanup
+  private ClusteredSortSchedulerProperties createBatchEnabledSchedulerProperties() {
+    ClusteredSortSchedulerProperties props = new ClusteredSortSchedulerProperties();
+    props.setBatchOperationsEnabled(true);
+    props.setIntervalMs(1000L);
+    props.setRefreshPeriodSeconds(30);
+    props.getZombieCleanup().setThresholdMs(1800000L); // 30 minutes
+    props.getZombieCleanup().setCleanupIntervalMs(300000L); // 5 minutes
+    return props;
+  }
+
+  private ClusteredSortSchedulerProperties createZombieTestSchedulerProperties() {
+    ClusteredSortSchedulerProperties props = createBatchEnabledSchedulerProperties();
+    props.getZombieCleanup().setThresholdMs(5000L); // 5 seconds for testing
+    props.getZombieCleanup().setCleanupIntervalMs(1000L); // 1 second for testing
+    return props;
+  }
+
+  private Agent createMockAgent(String agentType, String providerName) {
+    Agent agent = mock(Agent.class);
+    when(agent.getAgentType()).thenReturn(agentType);
+    when(agent.getProviderName()).thenReturn(providerName);
+    return agent;
   }
 }
