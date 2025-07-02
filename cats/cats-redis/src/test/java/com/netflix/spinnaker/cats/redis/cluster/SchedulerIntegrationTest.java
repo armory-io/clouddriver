@@ -46,7 +46,7 @@ import redis.clients.jedis.JedisPoolConfig;
  */
 @Testcontainers
 @DisplayName("ClusteredSortAgentScheduler Integration Tests")
-class ClusteredSortAgentSchedulerIntegrationTest {
+class SchedulerIntegrationTest {
 
   @Container
   static GenericContainer<?> redis =

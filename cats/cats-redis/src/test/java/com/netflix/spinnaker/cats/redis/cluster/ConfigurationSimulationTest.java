@@ -25,7 +25,7 @@ import org.junit.jupiter.api.Test;
  * Simulates and validates the configuration recommendations in ClusteredSortAgentScheduler to
  * ensure they are mathematically sound and operationally viable.
  */
-class ClusteredSortAgentSchedulerConfigurationSimulationTest {
+class ConfigurationSimulationTest {
 
   @Test
   void shouldValidateDefaultConfigurationMathematics() {
