@@ -50,6 +50,7 @@ public class ZombieCleanupService {
   private static final Logger log = LoggerFactory.getLogger(ZombieCleanupService.class);
 
   private static final String WORKING_SET = "WORKZ";
+  private static final String WAITING_SET = "WAITZ";
 
   private final JedisPool jedisPool;
   private final RedisScriptManager scriptManager;
@@ -365,12 +366,11 @@ public class ZombieCleanupService {
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_SCRIPT),
-                java.util.Collections.singletonList(WORKING_SET), // Redis set key
-                java.util.Arrays.asList(
-                    agentType, String.valueOf(score)) // Agent name and score for verification
+                java.util.Arrays.asList(WORKING_SET, WAITING_SET), // Script needs both keys
+                java.util.Collections.singletonList(agentType) // Only agent name needed for removal
                 );
 
-        if ("removed".equals(result)) {
+        if (result != null && ((Long) result).intValue() == 1) {
           cleaned++;
 
           // Clean up local state

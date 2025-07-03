@@ -89,6 +89,12 @@ public class AgentAcquisitionService {
   private final AtomicLong agentsExecuted = new AtomicLong(0);
   private final AtomicLong agentsFailed = new AtomicLong(0);
 
+  // Performance optimization: Reusable collections to reduce GC pressure in high-load scenarios.
+  // ThreadLocal is safe here because saturatePool() runs in single-threaded scheduler executor.
+  // This avoids creating new HashSet instances on every scheduler cycle (every 1-2 seconds).
+  private static final ThreadLocal<Set<AgentWorker>> REUSABLE_WORKERS_SET =
+      ThreadLocal.withInitial(HashSet::new);
+
   // Runtime configuration
   private volatile Pattern enabledAgentPattern;
   private volatile Pattern disabledAgentPattern;
@@ -167,7 +173,9 @@ public class AgentAcquisitionService {
       }
 
       // PHASE 3: Agent Acquisition and Execution
-      Set<AgentWorker> workersToSubmit = new HashSet<>();
+      // Performance optimization: Reuse thread-local collection to reduce GC pressure
+      Set<AgentWorker> workersToSubmit = REUSABLE_WORKERS_SET.get();
+      workersToSubmit.clear(); // Clear any previous contents
       int agentsAcquiredThisCycle = 0;
 
       // Calculate how many new agents this pod can try to acquire
@@ -319,9 +327,9 @@ public class AgentAcquisitionService {
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.evalsha(
             scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_SCRIPT),
-            java.util.Collections.singletonList(WORKING_SET),
+            java.util.Arrays.asList(WORKING_SET, WAITING_SET), // Script needs both keys
             java.util.Collections.singletonList(agentType));
-        log.debug("Removed agent {} from active tracking and Redis WORKZ set", agentType);
+        log.debug("Removed agent {} from active tracking and Redis sets", agentType);
       } catch (Exception e) {
         log.error("Failed to remove agent {} from Redis WORKZ set", agentType, e);
       }
