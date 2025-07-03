@@ -31,6 +31,7 @@ import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -38,6 +39,7 @@ import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
@@ -100,6 +102,29 @@ class AgentAcquisitionServiceTest {
             shardingFilter,
             agentProperties,
             schedulerProperties);
+  }
+
+  @AfterEach
+  void tearDown() {
+    // Clean up Redis state to prevent test pollution
+    try (Jedis jedis = jedisPool.getResource()) {
+      jedis.flushAll(); // Clear all Redis data
+    } catch (Exception e) {
+      // Ignore cleanup errors
+    }
+
+    // Clean up AgentAcquisitionService state
+    if (acquisitionService != null) {
+      // Clear accessible maps to prevent state leakage
+      acquisitionService.getActiveAgentsMap().clear();
+      acquisitionService.getActiveAgentsFutures().clear();
+      acquisitionService.resetExecutionStats();
+    }
+
+    // Clean up executor service
+    if (executorService != null) {
+      executorService.shutdownNow();
+    }
   }
 
   /**
@@ -216,25 +241,32 @@ class AgentAcquisitionServiceTest {
 
     @Test
     @DisplayName("Should acquire ready agents from Redis")
-    void shouldAcquireReadyAgentsFromRedis() {
+    void shouldAcquireReadyAgentsFromRedis() throws Exception {
       // Given
       Agent agent = createMockAgent("ready-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
       ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
 
+      // Use slower execution to allow validation of active agent tracking
+      doAnswer(
+              invocation -> {
+                Thread.sleep(100); // Enough delay to verify active tracking
+                return null;
+              })
+          .when(execution)
+          .executeAgent(any());
+
       acquisitionService.registerAgent(agent, execution, instrumentation);
 
-      // Add agent to Redis WAITING set with past score (ready for execution)
-      // Redis scores are stored as seconds since epoch, not milliseconds
-      try (redis.clients.jedis.Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WAITZ", (System.currentTimeMillis() - 1000) / 1000, "ready-agent");
-      }
+      // When - Use runCount=0 to trigger Redis repopulation, which will add registered agents to
+      // Redis
+      int acquired = acquisitionService.saturatePool(0L, null, executorService);
 
-      // When
-      int acquired = acquisitionService.saturatePool(1L, null, executorService);
-
-      // Then
+      // Then - Verify both acquisition and active tracking
       assertThat(acquired).isEqualTo(1);
+
+      // Give a moment for agents to start executing
+      Thread.sleep(50);
       assertThat(acquisitionService.getActiveAgentCount()).isEqualTo(1);
     }
 
@@ -267,17 +299,8 @@ class AgentAcquisitionServiceTest {
       acquisitionService.registerAgent(agent2, execution, instrumentation);
       acquisitionService.registerAgent(agent3, execution, instrumentation);
 
-      // Add all agents to Redis as ready
-      // Redis scores are stored as seconds since epoch, not milliseconds
-      try (redis.clients.jedis.Jedis jedis = jedisPool.getResource()) {
-        long readyScoreSeconds = (System.currentTimeMillis() - 1000) / 1000;
-        jedis.zadd("WAITZ", readyScoreSeconds, "agent-1");
-        jedis.zadd("WAITZ", readyScoreSeconds, "agent-2");
-        jedis.zadd("WAITZ", readyScoreSeconds, "agent-3");
-      }
-
-      // When - First acquisition should get 2 agents
-      int firstAcquired = acquisitionService.saturatePool(1L, null, executorService);
+      // When - First acquisition should get 2 agents (use runCount=0 to populate Redis)
+      int firstAcquired = acquisitionService.saturatePool(0L, null, executorService);
 
       // Wait a bit to let first agents start executing
       try {
@@ -288,7 +311,7 @@ class AgentAcquisitionServiceTest {
 
       // Simulate agents still running by not removing them from active tracking
       // Second acquisition should get 0 more agents due to limit
-      int secondAcquired = acquisitionService.saturatePool(2L, null, executorService);
+      int secondAcquired = acquisitionService.saturatePool(1L, null, executorService);
 
       // Then
       assertThat(firstAcquired).isEqualTo(2);
@@ -298,7 +321,7 @@ class AgentAcquisitionServiceTest {
 
     @Test
     @DisplayName("Should handle semaphore-based concurrency control")
-    void shouldHandleSemaphoreBasedConcurrencyControl() {
+    void shouldHandleSemaphoreBasedConcurrencyControl() throws Exception {
       // Given
       Semaphore semaphore = new Semaphore(1); // Only 1 permit
       Agent agent1 = createMockAgent("agent-1", "test-provider");
@@ -307,23 +330,33 @@ class AgentAcquisitionServiceTest {
       AgentExecution execution = mock(AgentExecution.class);
       ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
 
+      // Use execution with reasonable delay to verify semaphore behavior and active tracking
+      doAnswer(
+              invocation -> {
+                Thread.sleep(100); // Enough delay to verify active tracking and semaphore behavior
+                return null;
+              })
+          .when(execution)
+          .executeAgent(any());
+
       acquisitionService.registerAgent(agent1, execution, instrumentation);
       acquisitionService.registerAgent(agent2, execution, instrumentation);
 
-      // Add agents to Redis as ready
-      // Redis scores are stored as seconds since epoch, not milliseconds
-      try (redis.clients.jedis.Jedis jedis = jedisPool.getResource()) {
-        long readyScoreSeconds = (System.currentTimeMillis() - 1000) / 1000;
-        jedis.zadd("WAITZ", readyScoreSeconds, "agent-1");
-        jedis.zadd("WAITZ", readyScoreSeconds, "agent-2");
-      }
+      // When - Use runCount=0 to trigger Redis repopulation with registered agents
+      int acquired = acquisitionService.saturatePool(0L, semaphore, executorService);
 
-      // When
-      int acquired = acquisitionService.saturatePool(1L, semaphore, executorService);
+      // Then - Comprehensive validation of semaphore behavior
+      assertThat(acquired).isEqualTo(1); // Only 1 agent acquired due to semaphore limit
+      assertThat(semaphore.availablePermits()).isEqualTo(0); // Semaphore permit used
 
-      // Then - Should only acquire 1 agent due to semaphore limit
-      assertThat(acquired).isEqualTo(1);
-      assertThat(semaphore.availablePermits()).isEqualTo(0);
+      // Give a moment for agent to start executing
+      Thread.sleep(50);
+      assertThat(acquisitionService.getActiveAgentCount()).isEqualTo(1); // Agent is active
+
+      // Wait for execution to complete and verify permit is released
+      Thread.sleep(100); // Wait for execution to finish (100ms + 50ms = 150ms total)
+      assertThat(semaphore.availablePermits()).isEqualTo(1); // Permit should be released
+      assertThat(acquisitionService.getActiveAgentCount()).isEqualTo(0); // Agent should be done
     }
 
     @Test

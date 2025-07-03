@@ -249,6 +249,8 @@ public class AgentAcquisitionService {
 
       // PHASE 4: Submit all acquired agents for execution
       for (AgentWorker worker : workersToSubmit) {
+        // CRITICAL: Set semaphore before execution so it can be released when done
+        worker.setRunningAgents(runningAgents);
         java.util.concurrent.Future<?> future = agentWorkPool.submit(worker);
         activeAgentsFutures.put(worker.getAgent().getAgentType(), future);
         log.debug("Submitted agent {} for execution", worker.getAgent().getAgentType());
@@ -724,6 +726,7 @@ public class AgentAcquisitionService {
     private final AgentExecution agentExecution;
     private final ExecutionInstrumentation executionInstrumentation;
     private final AgentAcquisitionService acquisitionService;
+    private Semaphore runningAgents; // Semaphore to release when execution completes
 
     // Set by acquisition service when agent is acquired
     String acquireScore;
@@ -737,6 +740,7 @@ public class AgentAcquisitionService {
       this.agentExecution = agentExecution;
       this.executionInstrumentation = executionInstrumentation;
       this.acquisitionService = acquisitionService;
+      this.runningAgents = null; // Will be set before execution
     }
 
     @Override
@@ -776,6 +780,12 @@ public class AgentAcquisitionService {
         // Handle conditional agent release (re-queuing on failure/shutdown)
         acquisitionService.conditionalReleaseAgent(agent, acquireScore, success);
 
+        // CRITICAL: Release semaphore permit to allow new agent acquisitions
+        if (runningAgents != null) {
+          runningAgents.release();
+          log.debug("Released semaphore permit for agent {}", agentType);
+        }
+
         log.debug("Agent {} execution cleanup completed", agentType);
       }
     }
@@ -786,6 +796,11 @@ public class AgentAcquisitionService {
 
     public String getAcquireScore() {
       return acquireScore;
+    }
+
+    // Set the semaphore before execution (called from saturatePool)
+    void setRunningAgents(Semaphore runningAgents) {
+      this.runningAgents = runningAgents;
     }
   }
 
