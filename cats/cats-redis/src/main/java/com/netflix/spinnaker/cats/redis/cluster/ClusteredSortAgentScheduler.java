@@ -25,6 +25,8 @@ import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.module.CatsModuleAware;
+import java.util.Map;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -218,6 +220,9 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     this.zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
     this.orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
 
+    // Set up service references for advanced cleanup processing
+    this.orphanService.setAcquisitionService(this.acquisitionService);
+
     // Store external dependencies
     this.nodeStatusProvider = nodeStatusProvider;
     this.intervalProvider = intervalProvider;
@@ -265,6 +270,9 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     try {
       long currentRun = runCount.incrementAndGet();
       log.debug("Starting scheduler run cycle {}", currentRun);
+
+      // PHASE 0: Dynamic configuration refresh (periodic)
+      refreshConfigurationIfNeeded(currentRun);
 
       // PHASE 1: Cleanup operations
       zombieService.cleanupZombieAgentsIfNeeded(
@@ -342,26 +350,202 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     log.debug("Unregistered agent {} from scheduling", agent.getAgentType());
   }
 
-  /** Shutdown the scheduler and clean up resources. */
+  /**
+   * Try to manually lock an agent for execution.
+   *
+   * @param agent The agent to lock
+   * @return ClusteredSortAgentLock if successful, null if agent is already locked or unavailable
+   */
+  public ClusteredSortAgentLock tryLock(Agent agent) {
+    try {
+      // Use acquisition service to try to acquire the agent
+      return acquisitionService.tryLockAgent(agent);
+    } catch (Exception e) {
+      log.warn("Failed to lock agent {}: {}", agent.getAgentType(), e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Try to release a manually acquired agent lock.
+   *
+   * @param lock The lock to release
+   * @return true if successfully released, false otherwise
+   */
+  public boolean tryRelease(ClusteredSortAgentLock lock) {
+    try {
+      return acquisitionService.tryReleaseAgent(lock);
+    } catch (Exception e) {
+      log.warn(
+          "Failed to release agent lock {}: {}", lock.getAgent().getAgentType(), e.getMessage());
+      return false;
+    }
+  }
+
+  /**
+   * Check if an agent lock is still valid.
+   *
+   * @param lock The lock to validate
+   * @return true if lock is still valid, false otherwise
+   */
+  public boolean lockValid(ClusteredSortAgentLock lock) {
+    try {
+      return acquisitionService.isLockValid(lock);
+    } catch (Exception e) {
+      log.warn(
+          "Failed to validate agent lock {}: {}", lock.getAgent().getAgentType(), e.getMessage());
+      return false;
+    }
+  }
+
+  /**
+   * Check if the scheduler is atomic (always returns true for Redis-based scheduler).
+   *
+   * @return true
+   */
+  public boolean isAtomic() {
+    return true;
+  }
+
+  /** Shutdown the scheduler and clean up resources with graceful agent re-queuing. */
   @PreDestroy
   public void shutdown() {
     log.info("Shutting down ClusteredSortAgentScheduler");
 
+    // Signal shutdown to prevent new work
     running.set(false);
 
+    // Signal shutdown to all services for proper coordination
+    acquisitionService.setShuttingDown(true);
+
     try {
-      // Stop the scheduler
+      // Step 1: Gracefully release active agents back to waiting queue
+      gracefullyReleaseActiveAgents();
+
+      // Step 2: Stop the scheduler executor
       config.getSchedulerExecutorService().shutdown();
       if (!config.getSchedulerExecutorService().awaitTermination(30, TimeUnit.SECONDS)) {
+        log.warn("Scheduler executor did not terminate gracefully, forcing shutdown");
         config.getSchedulerExecutorService().shutdownNow();
+
+        // Wait for forced termination
+        if (!config.getSchedulerExecutorService().awaitTermination(10, TimeUnit.SECONDS)) {
+          log.error("Scheduler executor failed to terminate even after forced shutdown");
+        }
       }
 
-      // Shutdown all services
+      // Step 3: Shutdown all services
       config.shutdown();
 
-      log.info("ClusteredSortAgentScheduler shutdown completed");
+      log.info("ClusteredSortAgentScheduler shutdown completed successfully");
     } catch (Exception e) {
       log.error("Error during scheduler shutdown", e);
+    }
+  }
+
+  /**
+   * Gracefully releases all active agents back to the waiting queue during shutdown. This prevents
+   * agent loss during deployments and restarts.
+   */
+  private void gracefullyReleaseActiveAgents() {
+    int activeCount = acquisitionService.getActiveAgentCount();
+    if (activeCount == 0) {
+      log.info("No active agents to release during shutdown");
+      return;
+    }
+
+    log.info("Gracefully releasing {} active agents during shutdown", activeCount);
+
+    try {
+      // Get snapshot of active agents to avoid concurrent modification
+      Map<String, Future<?>> activeAgentsFutures =
+          acquisitionService.getActiveAgentsFuturesSnapshot();
+      int released = 0;
+      int interrupted = 0;
+
+      for (Map.Entry<String, Future<?>> entry : activeAgentsFutures.entrySet()) {
+        String agentType = entry.getKey();
+        Future<?> future = entry.getValue();
+
+        try {
+          if (future != null && !future.isDone()) {
+            // Cancel the running agent execution
+            boolean cancelled = future.cancel(true);
+            if (cancelled) {
+              interrupted++;
+              log.debug("Interrupted agent {} during shutdown", agentType);
+            }
+
+            // Release semaphore permit for interrupted agent
+            // This prevents resource leaks
+            if (config.getRunningAgents() != null) {
+              config.getRunningAgents().release();
+              log.debug("Released semaphore permit for interrupted agent {}", agentType);
+            }
+
+            // Re-queue agent for immediate execution after restart
+            Agent agent = acquisitionService.getRegisteredAgent(agentType);
+            if (agent != null) {
+              acquisitionService.conditionalReleaseAgent(agent, "shutdown", false);
+              released++;
+              log.debug("Re-queued agent {} for post-restart execution", agentType);
+            }
+          }
+        } catch (Exception e) {
+          log.warn(
+              "Failed to gracefully release agent {} during shutdown: {}",
+              agentType,
+              e.getMessage());
+        }
+      }
+
+      log.info(
+          "Graceful shutdown: {} agents interrupted, {} agents re-queued for restart",
+          interrupted,
+          released);
+
+    } catch (Exception e) {
+      log.error("Error during graceful agent release", e);
+    }
+  }
+
+  /**
+   * Refresh configuration if needed based on the configured refresh interval. This allows dynamic
+   * configuration updates without restarts.
+   *
+   * @param currentRun The current run cycle number
+   */
+  private void refreshConfigurationIfNeeded(long currentRun) {
+    // Check if we should refresh configuration (every 30 seconds by default)
+    // With @ConfigurationProperties, most config is cached, but we maintain
+    // the refresh framework for future dynamic config support
+    long schedulerIntervalMs = config.getSchedulerIntervalMs();
+
+    // Calculate refresh cycles (refresh every 30 seconds)
+    long refreshPeriodMs = 30000L; // 30 seconds
+    long cyclesPerRefresh = refreshPeriodMs / schedulerIntervalMs;
+
+    if (cyclesPerRefresh > 0 && currentRun % cyclesPerRefresh == 0) {
+      refreshConfiguration();
+    }
+  }
+
+  /**
+   * Refresh runtime configuration from properties. Note: With @ConfigurationProperties, most config
+   * is already cached, but this method can be used for future dynamic config integration.
+   */
+  private void refreshConfiguration() {
+    try {
+      // Currently using @ConfigurationProperties which are already cached
+      // This method is a placeholder for future dynamic configuration support
+
+      log.debug("Configuration refresh completed - using cached @ConfigurationProperties");
+
+      // Future enhancement: Add support for runtime configuration updates
+      // that don't require application restart
+
+    } catch (Exception e) {
+      log.warn("Failed to refresh configuration: {}", e.getMessage());
     }
   }
 

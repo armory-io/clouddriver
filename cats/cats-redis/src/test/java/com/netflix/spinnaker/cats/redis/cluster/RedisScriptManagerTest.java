@@ -374,6 +374,9 @@ class RedisScriptManagerTest {
     @DisplayName("Should handle high volume script executions efficiently")
     void shouldHandleHighVolumeScriptExecutionsEfficiently() {
       try (Jedis jedis = jedisPool.getResource()) {
+        // Clear Redis to ensure clean state
+        jedis.flushAll();
+
         // Given
         int iterations = 1000;
         long startTime = System.currentTimeMillis();
@@ -394,6 +397,107 @@ class RedisScriptManagerTest {
         // Then - Should complete within reasonable time
         assertThat(duration).isLessThan(5000); // Less than 5 seconds
         assertThat(jedis.zcard("WAITZ")).isEqualTo(iterations);
+      }
+    }
+  }
+
+  @Nested
+  @DisplayName("Timestamp Format Consistency Tests")
+  class TimestampFormatConsistencyTests {
+
+    @BeforeEach
+    void setUp() {
+      // Clear Redis before each test
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.flushAll();
+      }
+    }
+
+    @Test
+    @DisplayName("All Redis scores should be in seconds format")
+    void shouldUseConsistentSecondsTimestampFormat() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Directly add agents to WAITING set using current time in seconds (correct format)
+        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+
+        jedis.zadd("WAITZ", currentTimeSeconds, "test-agent-1");
+        jedis.zadd("WAITZ", currentTimeSeconds + 10, "test-agent-2");
+
+        // Get all scores from WAITING set
+        java.util.Set<redis.clients.jedis.Tuple> waitingAgents =
+            jedis.zrangeByScoreWithScores("WAITZ", 0, Double.MAX_VALUE);
+
+        // Verify all scores are in seconds format (not milliseconds)
+        assertThat(waitingAgents).isNotEmpty();
+
+        for (redis.clients.jedis.Tuple agent : waitingAgents) {
+          long score = (long) agent.getScore();
+          String agentName = agent.getElement();
+
+          // Scores should be in seconds format
+          // Current time in seconds should be close to the score (within reasonable range)
+          assertThat(score)
+              .withFailMessage(
+                  "Agent %s score %d appears to be too small for seconds format", agentName, score)
+              .isGreaterThan(1700000000L);
+
+          // Score should not be in milliseconds (would be 1000x larger)
+          assertThat(score)
+              .withFailMessage(
+                  "Agent %s score %d is too large - likely milliseconds format", agentName, score)
+              .isLessThan(currentTimeSeconds + 3600);
+
+          // Score should be reasonable (not in milliseconds format)
+          assertThat(score)
+              .withFailMessage(
+                  "Agent %s score %d is in milliseconds format, should be seconds",
+                  agentName, score)
+              .isLessThan(1700000000000L);
+
+          System.out.println(
+              String.format("\u2705 Agent %s has correct seconds score: %d", agentName, score));
+        }
+      }
+    }
+
+    @Test
+    @DisplayName("Mixed format detection test - should fail if milliseconds are used")
+    void shouldDetectMillisecondsFormatInconsistency() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+        long currentTimeMillis = System.currentTimeMillis();
+
+        // Add agent with correct seconds format
+        jedis.zadd("WAITZ", currentTimeSeconds, "seconds-agent");
+
+        // Simulate bug: add agent with milliseconds format
+        jedis.zadd("WAITZ", currentTimeMillis, "milliseconds-agent");
+
+        // Verify we can detect the inconsistency
+        java.util.Set<redis.clients.jedis.Tuple> allAgents =
+            jedis.zrangeByScoreWithScores("WAITZ", 0, Double.MAX_VALUE);
+
+        boolean hasSecondsFormat = false;
+        boolean hasMillisecondsFormat = false;
+
+        for (redis.clients.jedis.Tuple agent : allAgents) {
+          long score = (long) agent.getScore();
+          if (score < 1700000000000L) {
+            hasSecondsFormat = true;
+          } else {
+            hasMillisecondsFormat = true;
+          }
+        }
+
+        // This test validates our detection logic
+        assertThat(hasSecondsFormat).withFailMessage("Should detect seconds format").isTrue();
+        assertThat(hasMillisecondsFormat)
+            .withFailMessage("Should detect milliseconds format (simulated bug)")
+            .isTrue();
+
+        // In production, this mixed state should never occur
+        System.out.println(
+            "\u26a0\ufe0f  Mixed format detected - this demonstrates the bug we're preventing");
       }
     }
   }

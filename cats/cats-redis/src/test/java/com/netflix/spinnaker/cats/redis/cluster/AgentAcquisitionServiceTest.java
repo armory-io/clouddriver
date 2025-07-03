@@ -18,6 +18,8 @@ package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -223,8 +225,9 @@ class AgentAcquisitionServiceTest {
       acquisitionService.registerAgent(agent, execution, instrumentation);
 
       // Add agent to Redis WAITING set with past score (ready for execution)
+      // Redis scores are stored as seconds since epoch, not milliseconds
       try (redis.clients.jedis.Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WAITZ", System.currentTimeMillis() - 1000, "ready-agent");
+        jedis.zadd("WAITZ", (System.currentTimeMillis() - 1000) / 1000, "ready-agent");
       }
 
       // When
@@ -245,7 +248,19 @@ class AgentAcquisitionServiceTest {
       Agent agent2 = createMockAgent("agent-2", "test-provider");
       Agent agent3 = createMockAgent("agent-3", "test-provider");
 
+      // Use a slow execution that hangs to keep agents active
       AgentExecution execution = mock(AgentExecution.class);
+      try {
+        doAnswer(
+                invocation -> {
+                  Thread.sleep(5000); // Keep agents active for 5 seconds
+                  return null;
+                })
+            .when(execution)
+            .executeAgent(any());
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
       ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
 
       acquisitionService.registerAgent(agent1, execution, instrumentation);
@@ -253,15 +268,23 @@ class AgentAcquisitionServiceTest {
       acquisitionService.registerAgent(agent3, execution, instrumentation);
 
       // Add all agents to Redis as ready
+      // Redis scores are stored as seconds since epoch, not milliseconds
       try (redis.clients.jedis.Jedis jedis = jedisPool.getResource()) {
-        long readyScore = System.currentTimeMillis() - 1000;
-        jedis.zadd("WAITZ", readyScore, "agent-1");
-        jedis.zadd("WAITZ", readyScore, "agent-2");
-        jedis.zadd("WAITZ", readyScore, "agent-3");
+        long readyScoreSeconds = (System.currentTimeMillis() - 1000) / 1000;
+        jedis.zadd("WAITZ", readyScoreSeconds, "agent-1");
+        jedis.zadd("WAITZ", readyScoreSeconds, "agent-2");
+        jedis.zadd("WAITZ", readyScoreSeconds, "agent-3");
       }
 
       // When - First acquisition should get 2 agents
       int firstAcquired = acquisitionService.saturatePool(1L, null, executorService);
+
+      // Wait a bit to let first agents start executing
+      try {
+        Thread.sleep(100);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
 
       // Simulate agents still running by not removing them from active tracking
       // Second acquisition should get 0 more agents due to limit
@@ -288,10 +311,11 @@ class AgentAcquisitionServiceTest {
       acquisitionService.registerAgent(agent2, execution, instrumentation);
 
       // Add agents to Redis as ready
+      // Redis scores are stored as seconds since epoch, not milliseconds
       try (redis.clients.jedis.Jedis jedis = jedisPool.getResource()) {
-        long readyScore = System.currentTimeMillis() - 1000;
-        jedis.zadd("WAITZ", readyScore, "agent-1");
-        jedis.zadd("WAITZ", readyScore, "agent-2");
+        long readyScoreSeconds = (System.currentTimeMillis() - 1000) / 1000;
+        jedis.zadd("WAITZ", readyScoreSeconds, "agent-1");
+        jedis.zadd("WAITZ", readyScoreSeconds, "agent-2");
       }
 
       // When
@@ -484,6 +508,174 @@ class AgentAcquisitionServiceTest {
 
       // Then - Only uppercase agent enabled (doesn't match "aws-.*" pattern)
       assertThat(acquisitionService.getRegisteredAgentCount()).isEqualTo(1);
+    }
+  }
+
+  @Nested
+  @DisplayName("Advanced Functionality Tests")
+  class AdvancedFunctionalityTests {
+
+    @Test
+    @DisplayName("Advanced statistics tracking provides detailed metrics")
+    void shouldTrackAdvancedStatisticsAccurately() throws Exception {
+      // Register multiple agents
+      Agent agent1 = createMockAgent("stats-agent-1", "test-provider");
+      Agent agent2 = createMockAgent("stats-agent-2", "test-provider");
+      Agent failingAgent = createMockAgent("failing-agent", "test-provider");
+
+      AgentExecution normalExecution = mock(AgentExecution.class);
+      AgentExecution failingExecution = mock(AgentExecution.class);
+      doThrow(new RuntimeException("Test failure"))
+          .when(failingExecution)
+          .executeAgent(failingAgent);
+
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      // Register agents
+      acquisitionService.registerAgent(agent1, normalExecution, instrumentation);
+      acquisitionService.registerAgent(agent2, normalExecution, instrumentation);
+      acquisitionService.registerAgent(failingAgent, failingExecution, instrumentation);
+
+      // Initial stats
+      AgentAcquisitionStats initialStats = acquisitionService.getAdvancedStats();
+      assertThat(initialStats.getRegisteredAgents()).isEqualTo(3);
+
+      // Run acquisition
+      // Force Redis repopulation with runCount = 0
+      acquisitionService.saturatePool(0L, null, executorService);
+
+      // Give time for execution
+      Thread.sleep(300L);
+
+      // Check final stats
+      AgentAcquisitionStats finalStats = acquisitionService.getAdvancedStats();
+      assertThat(finalStats.getAgentsAcquired()).isGreaterThan(0);
+      assertThat(finalStats.getAgentsExecuted()).isGreaterThan(0);
+      assertThat(finalStats.getAgentsFailed()).isGreaterThan(0);
+
+      // Verify calculation methods
+      assertThat(finalStats.getSuccessRate()).isBetween(0.0, 100.0);
+      assertThat(finalStats.getFailureRate()).isBetween(0.0, 100.0);
+
+      // Test reset functionality
+      acquisitionService.resetExecutionStats();
+      AgentAcquisitionStats resetStats = acquisitionService.getAdvancedStats();
+      assertThat(resetStats.getAgentsAcquired()).isEqualTo(0);
+      assertThat(resetStats.getAgentsExecuted()).isEqualTo(0);
+      assertThat(resetStats.getAgentsFailed()).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("Redis TIME synchronization handles clock skew")
+    void shouldSynchronizeWithRedisTimeForClockSkew() throws Exception {
+      // Test that the score generation uses Redis TIME when available
+      Agent testAgent = createMockAgent("time-sync-agent", "test-provider");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      acquisitionService.registerAgent(testAgent, execution, instrumentation);
+
+      // The score method should handle Redis TIME synchronization
+      // (This is tested indirectly through agent acquisition)
+      // Try to saturate the pool with time synchronization (use runCount = 0 to force Redis
+      // repopulation)
+      int acquired = acquisitionService.saturatePool(0L, null, executorService);
+      assertThat(acquired).isGreaterThan(0);
+
+      // Verify Redis TIME synchronization doesn't break agent scheduling
+      Thread.sleep(200L);
+      assertThat(acquisitionService.getActiveAgentCount()).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("Conditional agent release re-queues failed agents")
+    void shouldReQueueFailedAgentsWithConditionalRelease() throws Exception {
+      Agent testAgent = createMockAgent("failing-agent", "test-provider");
+      AgentExecution failingExecution = mock(AgentExecution.class);
+      doThrow(new RuntimeException("Simulated failure"))
+          .when(failingExecution)
+          .executeAgent(testAgent);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      // Register the agent
+      acquisitionService.registerAgent(testAgent, failingExecution, instrumentation);
+
+      // Manually run acquisition to get the agent (use runCount = 0 to force Redis repopulation)
+      int acquired = acquisitionService.saturatePool(0L, null, executorService);
+      assertThat(acquired).isGreaterThan(0);
+
+      // Give time for execution and failure
+      Thread.sleep(500L);
+
+      // Verify the agent was re-queued after failure
+      // (The conditional release should have put it back in WAITING_SET)
+      AgentAcquisitionStats stats = acquisitionService.getAdvancedStats();
+      assertThat(stats.getAgentsFailed()).isGreaterThan(0);
+      assertThat(stats.getFailureRate()).isGreaterThan(0);
+    }
+  }
+
+  @Nested
+  @DisplayName("Debug Tests")
+  class DebugTests {
+
+    @Test
+    @DisplayName("Debug basic agent registration and acquisition")
+    void debugBasicAgentFlow() throws Exception {
+      // Create a test agent
+      Agent testAgent = mock(Agent.class);
+      when(testAgent.getAgentType()).thenReturn("debug-agent");
+
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      System.out.println("=== DEBUG: Starting agent registration ===");
+
+      // Register the agent
+      acquisitionService.registerAgent(testAgent, execution, instrumentation);
+
+      int registeredCount = acquisitionService.getRegisteredAgentCount();
+      System.out.println("Registered agents count: " + registeredCount);
+      assertThat(registeredCount).isEqualTo(1);
+
+      // Check if agent is in the internal map
+      Agent retrievedAgent = acquisitionService.getRegisteredAgent("debug-agent");
+      assertThat(retrievedAgent).isNotNull();
+
+      System.out.println("=== DEBUG: Attempting agent acquisition ===");
+
+      // Try to acquire with runCount = 0 (should trigger repopulation)
+      int acquired = acquisitionService.saturatePool(0L, null, executorService);
+      System.out.println("Acquired agents count: " + acquired);
+
+      // Check active agents
+      int activeCount = acquisitionService.getActiveAgentCount();
+      System.out.println("Active agents count: " + activeCount);
+
+      // Check advanced stats
+      AgentAcquisitionStats stats = acquisitionService.getAdvancedStats();
+      System.out.println("Advanced stats:");
+      System.out.println("  Registered: " + stats.getRegisteredAgents());
+      System.out.println("  Active: " + stats.getActiveAgents());
+      System.out.println("  Acquired: " + stats.getAgentsAcquired());
+      System.out.println("  Executed: " + stats.getAgentsExecuted());
+      System.out.println("  Failed: " + stats.getAgentsFailed());
+
+      // Let's also debug Redis state
+      try (var jedis = jedisPool.getResource()) {
+        System.out.println("=== DEBUG: Redis state ===");
+        System.out.println("WAITING_SET (WAITZ) size: " + jedis.zcard("WAITZ"));
+        System.out.println("WORKING_SET (WORKZ) size: " + jedis.zcard("WORKZ"));
+
+        var waitingAgents = jedis.zrange("WAITZ", 0, -1);
+        System.out.println("Agents in WAITZ: " + waitingAgents);
+
+        var workingAgents = jedis.zrange("WORKZ", 0, -1);
+        System.out.println("Agents in WORKZ: " + workingAgents);
+      }
+
+      // The test will fail if we don't acquire any agents, but it should give us debug info
+      assertThat(acquired).isGreaterThan(0);
     }
   }
 

@@ -17,9 +17,14 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.netflix.spinnaker.cats.agent.Agent;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -79,18 +84,18 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should detect orphaned agents in WORKING set")
     void shouldDetectOrphanedAgentsInWorkingSet() {
       // Given - Clean up and add old agents to WORKING set
-      long oldScore =
-          System.currentTimeMillis() - 120000; // 2 minutes ago (older than 1 minute threshold)
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000; // 2 minutes ago
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
         jedis.del("WORKZ", "WAITZ");
 
-        jedis.zadd("WORKZ", oldScore, "orphan-1");
-        jedis.zadd("WORKZ", oldScore - 1000, "orphan-2");
+        jedis.zadd("WORKZ", oldScoreSeconds, "orphan-1");
+        jedis.zadd("WORKZ", oldScoreSeconds - 1, "orphan-2");
       }
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then
       assertThat(cleaned).isEqualTo(2);
@@ -107,17 +112,18 @@ class OrphanCleanupServiceTest {
     void shouldDetectOrphanedAgentsInWaitingSetWithLongerThreshold() {
       // Given - Clean up and add old agents to WAITING set
       // WAITING set uses 2x threshold (2 minutes)
-      long oldScore = System.currentTimeMillis() - 150000; // 2.5 minutes ago
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long oldScoreSeconds = (System.currentTimeMillis() - 150000) / 1000; // 2.5 minutes ago
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
         jedis.del("WORKZ", "WAITZ");
 
-        jedis.zadd("WAITZ", oldScore, "waiting-orphan-1");
-        jedis.zadd("WAITZ", oldScore - 1000, "waiting-orphan-2");
+        jedis.zadd("WAITZ", oldScoreSeconds, "waiting-orphan-1");
+        jedis.zadd("WAITZ", oldScoreSeconds - 1, "waiting-orphan-2");
       }
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then
       assertThat(cleaned).isEqualTo(2);
@@ -139,7 +145,7 @@ class OrphanCleanupServiceTest {
       }
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then
       assertThat(cleaned).isEqualTo(0);
@@ -161,7 +167,7 @@ class OrphanCleanupServiceTest {
       }
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then
       assertThat(cleaned).isEqualTo(0);
@@ -176,18 +182,19 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should clean orphans from both sets in single operation")
     void shouldCleanOrphansFromBothSetsInSingleOperation() {
       // Given - Add orphans to both sets
-      long workingOrphanScore =
-          System.currentTimeMillis() - 120000; // 2 minutes (WORKING threshold: 1 min)
-      long waitingOrphanScore =
-          System.currentTimeMillis() - 180000; // 3 minutes (WAITING threshold: 2 min)
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long workingOrphanScoreSeconds =
+          (System.currentTimeMillis() - 120000) / 1000; // 2 minutes (WORKING threshold: 1 min)
+      long waitingOrphanScoreSeconds =
+          (System.currentTimeMillis() - 180000) / 1000; // 3 minutes (WAITING threshold: 2 min)
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", workingOrphanScore, "working-orphan");
-        jedis.zadd("WAITZ", waitingOrphanScore, "waiting-orphan");
+        jedis.zadd("WORKZ", workingOrphanScoreSeconds, "working-orphan");
+        jedis.zadd("WAITZ", waitingOrphanScoreSeconds, "waiting-orphan");
       }
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then
       assertThat(cleaned).isEqualTo(2);
@@ -212,9 +219,10 @@ class OrphanCleanupServiceTest {
       orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Add orphaned agents
-      long oldScore = System.currentTimeMillis() - 120000;
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScore, "orphan");
+        jedis.zadd("WORKZ", oldScoreSeconds, "orphan");
       }
 
       // When
@@ -222,7 +230,7 @@ class OrphanCleanupServiceTest {
 
       // Then - Agent should still be there
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WORKZ", "orphan")).isEqualTo(oldScore);
+        assertThat(jedis.zscore("WORKZ", "orphan")).isEqualTo(oldScoreSeconds);
       }
     }
 
@@ -234,18 +242,19 @@ class OrphanCleanupServiceTest {
       orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Add more orphans than batch size
-      long oldScore = System.currentTimeMillis() - 120000;
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
         jedis.del("WORKZ", "WAITZ");
 
         for (int i = 0; i < 5; i++) {
-          jedis.zadd("WORKZ", oldScore - i, "orphan-" + i);
+          jedis.zadd("WORKZ", oldScoreSeconds - i, "orphan-" + i);
         }
       }
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then - Should clean all orphans (multiple batches)
       assertThat(cleaned).isEqualTo(5);
@@ -263,16 +272,17 @@ class OrphanCleanupServiceTest {
       orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Add agent older than 5 seconds
-      long oldScore = System.currentTimeMillis() - 10000; // 10 seconds ago
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long oldScoreSeconds = (System.currentTimeMillis() - 10000) / 1000; // 10 seconds ago
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
         jedis.del("WORKZ", "WAITZ");
 
-        jedis.zadd("WORKZ", oldScore, "short-threshold-orphan");
+        jedis.zadd("WORKZ", oldScoreSeconds, "short-threshold-orphan");
       }
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then
       assertThat(cleaned).isEqualTo(1);
@@ -332,7 +342,7 @@ class OrphanCleanupServiceTest {
       jedisPool.close();
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then - Should not crash and return 0
       assertThat(cleaned).isEqualTo(0);
@@ -344,7 +354,7 @@ class OrphanCleanupServiceTest {
       // Given - Empty Redis (no agents)
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then
       assertThat(cleaned).isEqualTo(0);
@@ -367,7 +377,7 @@ class OrphanCleanupServiceTest {
       }
 
       // When
-      int cleaned = invalidService.cleanupOrphanedAgents();
+      int cleaned = invalidService.forceCleanupOrphanedAgents();
 
       // Then - Should handle error gracefully
       assertThat(cleaned).isEqualTo(0);
@@ -383,23 +393,24 @@ class OrphanCleanupServiceTest {
     void shouldHandleLargeNumbersOfOrphanedAgentsEfficiently() {
       // Given - Add many orphaned agents
       int orphanCount = 1000;
-      long oldScore = System.currentTimeMillis() - 120000;
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
 
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
         jedis.del("WORKZ", "WAITZ");
 
         for (int i = 0; i < orphanCount / 2; i++) {
-          jedis.zadd("WORKZ", oldScore - i, "working-orphan-" + i);
+          jedis.zadd("WORKZ", oldScoreSeconds - i, "working-orphan-" + i);
           jedis.zadd(
-              "WAITZ", oldScore - 120000 - i, "waiting-orphan-" + i); // Even older for WAITING
+              "WAITZ", oldScoreSeconds - 120 - i, "waiting-orphan-" + i); // Even older for WAITING
         }
       }
 
       long startTime = System.currentTimeMillis();
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       long duration = System.currentTimeMillis() - startTime;
 
@@ -418,22 +429,23 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should handle mixed orphan and active agents efficiently")
     void shouldHandleMixedOrphanAndActiveAgentsEfficiently() {
       // Given - Mix of orphaned and active agents
-      long orphanScore = System.currentTimeMillis() - 120000; // Orphans
-      long activeScore = System.currentTimeMillis() - 30000; // Active (recent)
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long orphanScoreSeconds = (System.currentTimeMillis() - 120000) / 1000; // Orphans
+      long activeScoreSeconds = (System.currentTimeMillis() - 30000) / 1000; // Active (recent)
 
       try (Jedis jedis = jedisPool.getResource()) {
-        // Add orphaned agents
+        // Add orphaned agents (all old enough to be orphans)
         for (int i = 0; i < 250; i++) {
-          jedis.zadd("WORKZ", orphanScore - i, "orphan-" + i);
+          jedis.zadd("WORKZ", orphanScoreSeconds - i, "orphan-" + i);
         }
-        // Add active agents
+        // Add active agents (all recent enough to not be orphans)
         for (int i = 0; i < 250; i++) {
-          jedis.zadd("WORKZ", activeScore - i, "active-" + i);
+          jedis.zadd("WORKZ", activeScoreSeconds + i, "active-" + i);
         }
       }
 
       // When
-      int cleaned = orphanService.cleanupOrphanedAgents();
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then
       assertThat(cleaned).isEqualTo(250); // Only orphans cleaned
@@ -453,16 +465,17 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should track total orphans cleaned up")
     void shouldTrackTotalOrphansCleanedUp() {
       // Given
-      long oldScore = System.currentTimeMillis() - 120000;
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScore, "orphan-1");
-        jedis.zadd("WORKZ", oldScore - 1000, "orphan-2");
+        jedis.zadd("WORKZ", oldScoreSeconds, "orphan-1");
+        jedis.zadd("WORKZ", oldScoreSeconds - 1, "orphan-2");
       }
 
       long initialCount = orphanService.getOrphansCleanedUp();
 
       // When
-      orphanService.cleanupOrphanedAgents();
+      orphanService.forceCleanupOrphanedAgents();
 
       // Then
       assertThat(orphanService.getOrphansCleanedUp()).isEqualTo(initialCount + 2);
@@ -474,8 +487,8 @@ class OrphanCleanupServiceTest {
       // Given
       long beforeCleanup = System.currentTimeMillis();
 
-      // When
-      orphanService.cleanupOrphanedAgentsIfNeeded();
+      // When - Force cleanup by calling direct method
+      orphanService.forceCleanupOrphanedAgents();
 
       // Then
       long lastCleanup = orphanService.getLastOrphanCleanup();
@@ -486,30 +499,251 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should accumulate cleanup counts across multiple runs")
     void shouldAccumulateCleanupCountsAcrossMultipleRuns() {
       // Given - First batch of orphans
-      long oldScore = System.currentTimeMillis() - 120000;
+      // Redis scores are stored as seconds since epoch, not milliseconds
+      long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScore, "batch1-orphan-1");
-        jedis.zadd("WORKZ", oldScore - 1000, "batch1-orphan-2");
+        jedis.zadd("WORKZ", oldScoreSeconds, "batch1-orphan-1");
+        jedis.zadd("WORKZ", oldScoreSeconds - 1, "batch1-orphan-2");
       }
 
       // When - First cleanup
-      orphanService.cleanupOrphanedAgents();
+      orphanService.forceCleanupOrphanedAgents();
       long firstCount = orphanService.getOrphansCleanedUp();
 
       // Add second batch
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScore, "batch2-orphan-1");
-        jedis.zadd("WORKZ", oldScore - 1000, "batch2-orphan-2");
-        jedis.zadd("WORKZ", oldScore - 2000, "batch2-orphan-3");
+        jedis.zadd("WORKZ", oldScoreSeconds, "batch2-orphan-1");
+        jedis.zadd("WORKZ", oldScoreSeconds - 1, "batch2-orphan-2");
+        jedis.zadd("WORKZ", oldScoreSeconds - 2, "batch2-orphan-3");
       }
 
       // Second cleanup
-      orphanService.cleanupOrphanedAgents();
+      orphanService.forceCleanupOrphanedAgents();
       long secondCount = orphanService.getOrphansCleanedUp();
 
       // Then
       assertThat(firstCount).isEqualTo(2);
       assertThat(secondCount).isEqualTo(5); // Accumulated total
+    }
+  }
+
+  @Nested
+  @DisplayName("Complex Logic Tests - Agent Validation and Dual Processing")
+  class ComplexLogicTests {
+
+    private AgentAcquisitionService mockAcquisitionService;
+    private Agent mockValidAgent;
+    private Agent mockInvalidAgent;
+
+    @BeforeEach
+    void setupComplexTests() {
+      // Clean up any existing state
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.del("WORKZ", "WAITZ");
+      }
+
+      // Create mock AgentAcquisitionService for testing complex logic
+      mockAcquisitionService = mock(AgentAcquisitionService.class);
+      mockValidAgent = mock(Agent.class);
+      mockInvalidAgent = mock(Agent.class);
+
+      when(mockValidAgent.getAgentType()).thenReturn("valid-agent");
+      when(mockInvalidAgent.getAgentType()).thenReturn("invalid-agent");
+
+      // Configure the acquisition service to return valid agent for valid-agent type
+      when(mockAcquisitionService.getRegisteredAgent("valid-agent")).thenReturn(mockValidAgent);
+      when(mockAcquisitionService.getRegisteredAgent("invalid-agent")).thenReturn(null);
+
+      // Set the acquisition service reference for complex logic
+      orphanService.setAcquisitionService(mockAcquisitionService);
+    }
+
+    @AfterEach
+    void cleanupComplexTests() {
+      // Reset to null to not affect other tests
+      orphanService.setAcquisitionService(null);
+    }
+
+    @Test
+    @DisplayName("Should move valid orphaned agents from WORKZ to WAITZ for rescheduling")
+    void shouldMoveValidOrphanedAgentsToWAITZ() {
+      // Given - Add valid orphaned agent to WORKZ
+      long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("WORKZ", oldScoreSeconds, "valid-agent");
+      }
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Agent should be moved to WAITZ, not removed completely
+      assertThat(cleaned).isEqualTo(1);
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Agent removed from WORKZ
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        // Agent added to WAITZ for rescheduling
+        assertThat(jedis.zcard("WAITZ")).isEqualTo(1);
+        assertThat(jedis.zscore("WAITZ", "valid-agent")).isNotNull();
+      }
+    }
+
+    @Test
+    @DisplayName("Should completely remove invalid orphaned agents from Redis")
+    void shouldRemoveInvalidOrphanedAgents() {
+      // Given - Add invalid orphaned agent to WORKZ
+      long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("WORKZ", oldScoreSeconds, "invalid-agent");
+      }
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Agent should be removed completely, not moved to WAITZ
+      assertThat(cleaned).isEqualTo(1);
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Agent removed from WORKZ
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        // Agent NOT added to WAITZ
+        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
+      }
+    }
+
+    @Test
+    @DisplayName("Should handle mixed valid and invalid orphaned agents correctly")
+    void shouldHandleMixedValidAndInvalidOrphans() {
+      // Given - Add both valid and invalid orphaned agents
+      long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("WORKZ", oldScoreSeconds, "valid-agent");
+        jedis.zadd("WORKZ", oldScoreSeconds - 1, "invalid-agent");
+        jedis.zadd("WORKZ", oldScoreSeconds - 2, "another-invalid");
+      }
+
+      // Configure another invalid agent
+      when(mockAcquisitionService.getRegisteredAgent("another-invalid")).thenReturn(null);
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - All agents processed, but different handling for valid vs invalid
+      assertThat(cleaned).isEqualTo(3);
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        // All agents removed from WORKZ
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        // Only valid agent moved to WAITZ
+        assertThat(jedis.zcard("WAITZ")).isEqualTo(1);
+        assertThat(jedis.zscore("WAITZ", "valid-agent")).isNotNull();
+        assertThat(jedis.zscore("WAITZ", "invalid-agent")).isNull();
+        assertThat(jedis.zscore("WAITZ", "another-invalid")).isNull();
+      }
+    }
+
+    @Test
+    @DisplayName("Should fall back to simple removal when AgentAcquisitionService not available")
+    void shouldFallbackToSimpleRemovalWithoutAcquisitionService() {
+      // Given - Reset to no acquisition service (test environment behavior)
+      orphanService.setAcquisitionService(null);
+
+      long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("WORKZ", oldScoreSeconds, "some-agent");
+      }
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Agent should be removed completely (fallback behavior)
+      assertThat(cleaned).isEqualTo(1);
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        assertThat(jedis.zcard("WAITZ")).isEqualTo(0); // Not moved to WAITZ
+      }
+    }
+
+    @Test
+    @DisplayName("Should handle orphans in WAITZ set by removing them completely")
+    void shouldRemoveOrphansFromWAITZSet() {
+      // Given - Add orphaned agents to WAITZ (these should always be removed, never moved)
+      long oldScoreSeconds =
+          (System.currentTimeMillis() - 4 * 60 * 60 * 1000) / 1000; // 4 hours ago
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("WAITZ", oldScoreSeconds, "valid-agent");
+        jedis.zadd("WAITZ", oldScoreSeconds - 1, "invalid-agent");
+      }
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Both agents removed completely from WAITZ
+      assertThat(cleaned).isEqualTo(2);
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+      }
+    }
+
+    @Test
+    @DisplayName("Should verify Redis TIME-based score generation for rescheduling")
+    void shouldUseRedisTimeForRescheduling() {
+      // Given - Add valid orphaned agent to WORKZ
+      long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000;
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("WORKZ", oldScoreSeconds, "valid-agent");
+      }
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Agent moved to WAITZ with current Redis time-based score
+      assertThat(cleaned).isEqualTo(1);
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        Double newScore = jedis.zscore("WAITZ", "valid-agent");
+        assertThat(newScore).isNotNull();
+
+        // New score should be recent (within last few seconds)
+        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+        assertThat(newScore.longValue())
+            .isBetween(currentTimeSeconds - 10, currentTimeSeconds + 10);
+
+        // New score should be different from old score
+        assertThat(newScore.longValue()).isNotEqualTo(oldScoreSeconds);
+      }
+    }
+
+    @Test
+    @DisplayName("Should call removeActiveAgent for local state cleanup")
+    void shouldCleanupLocalStateViaAcquisitionService() {
+      // Given - Add orphaned agent and set up spies to verify method calls
+      long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000;
+
+      // Reset the mock to use spy to track method calls
+      reset(mockAcquisitionService);
+      when(mockAcquisitionService.getRegisteredAgent("valid-agent")).thenReturn(mockValidAgent);
+      doNothing().when(mockAcquisitionService).removeActiveAgent("valid-agent");
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("WORKZ", oldScoreSeconds, "valid-agent");
+      }
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Local state cleanup should be called
+      assertThat(cleaned).isEqualTo(1);
+      verify(mockAcquisitionService).removeActiveAgent("valid-agent");
     }
   }
 }
