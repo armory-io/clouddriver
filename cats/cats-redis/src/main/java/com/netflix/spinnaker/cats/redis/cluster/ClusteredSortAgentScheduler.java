@@ -459,6 +459,9 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     log.info("Gracefully releasing {} active agents during shutdown", activeCount);
 
     try {
+      // Set graceful shutdown flag to prevent race condition with normal agent completion
+      acquisitionService.setGracefulShutdown(true);
+
       // Get snapshot of active agents to avoid concurrent modification
       Map<String, Future<?>> activeAgentsFutures =
           acquisitionService.getActiveAgentsFuturesSnapshot();

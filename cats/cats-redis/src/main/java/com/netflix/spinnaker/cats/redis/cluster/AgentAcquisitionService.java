@@ -102,6 +102,7 @@ public class AgentAcquisitionService {
 
   // Shutdown coordination
   private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
+  private final AtomicBoolean gracefulShutdown = new AtomicBoolean(false);
 
   public AgentAcquisitionService(
       JedisPool jedisPool,
@@ -597,6 +598,56 @@ public class AgentAcquisitionService {
   }
 
   /**
+   * Calculate a score for agent scheduling during shutdown with jitter to prevent thundering herd.
+   *
+   * <p>For high-scale environments, this method:
+   *
+   * <ul>
+   *   <li>Uses Redis TIME for consistency across pods
+   *   <li>Adds controlled jitter (0-30 seconds) to spread restart load
+   *   <li>Handles Redis TIME sync failures gracefully
+   *   <li>Ensures no agent gets scheduled in the far future
+   * </ul>
+   *
+   * @param jedis Redis connection for TIME command
+   * @param agentType Agent type for consistent jitter calculation
+   * @return Score string for immediate-ish execution with jitter
+   */
+  private String calculateShutdownScore(Jedis jedis, String agentType) {
+    long baseTimeSeconds;
+
+    try {
+      // Try to get Redis server time for consistency across pods
+      List<String> times = jedis.time();
+      if (times != null && times.size() == 2) {
+        baseTimeSeconds = Long.parseLong(times.get(0));
+        log.debug("Using Redis TIME for shutdown scheduling: {}", baseTimeSeconds);
+      } else {
+        baseTimeSeconds = System.currentTimeMillis() / 1000;
+        log.debug("Redis TIME unavailable, using client time: {}", baseTimeSeconds);
+      }
+    } catch (Exception e) {
+      // Fallback to client time if Redis TIME fails
+      baseTimeSeconds = System.currentTimeMillis() / 1000;
+      log.debug("Redis TIME failed, using client time: {} - {}", baseTimeSeconds, e.getMessage());
+    }
+
+    // Add deterministic jitter based on agent type hash to spread restart load
+    // This prevents all agents from executing simultaneously after restart
+    int jitterSeconds = Math.abs(agentType.hashCode()) % 30; // 0-29 seconds
+    long scheduledTimeSeconds = baseTimeSeconds + jitterSeconds;
+
+    log.debug(
+        "Shutdown scheduling for {}: base={}, jitter={}s, scheduled={}",
+        agentType,
+        baseTimeSeconds,
+        jitterSeconds,
+        scheduledTimeSeconds);
+
+    return String.valueOf(scheduledTimeSeconds);
+  }
+
+  /**
    * Conditionally releases an agent back to the waiting queue based on execution status. This is
    * critical for handling failures and shutdown scenarios properly.
    *
@@ -611,7 +662,12 @@ public class AgentAcquisitionService {
     try {
       // During shutdown, always re-queue agents immediately regardless of success status
       // This ensures agents don't get lost during deployments/restarts
+      // BUT: Skip re-queuing if graceful shutdown is handling it to prevent race condition
       if (shuttingDown.get()) {
+        if (gracefulShutdown.get()) {
+          log.debug("Skipping re-queue for agent {} - graceful shutdown will handle it", agentType);
+          return;
+        }
         log.debug("Re-queuing agent {} due to shutdown in progress", agentType);
         scheduleAgentInRedis(agent, 0L); // Schedule for immediate pickup after restart
         return;
@@ -646,7 +702,15 @@ public class AgentAcquisitionService {
 
     while (retryCount < maxRetries) {
       try (Jedis jedis = jedisPool.getResource()) {
-        String nextScore = score(jedis, offsetMs);
+        String nextScore;
+
+        // For immediate scheduling during shutdown, add jitter to prevent thundering herd
+        // and use a more robust approach for high-scale environments
+        if (offsetMs == 0L && shuttingDown.get()) {
+          nextScore = calculateShutdownScore(jedis, agentType);
+        } else {
+          nextScore = score(jedis, offsetMs);
+        }
 
         log.debug(
             "Scheduling agent {} in Redis with score: {} (attempt {})",
@@ -700,6 +764,17 @@ public class AgentAcquisitionService {
   /** Check if shutdown is in progress. */
   public boolean isShuttingDown() {
     return shuttingDown.get();
+  }
+
+  /** Set graceful shutdown flag to coordinate re-queuing during shutdown. */
+  public void setGracefulShutdown(boolean gracefulShutdown) {
+    this.gracefulShutdown.set(gracefulShutdown);
+    log.debug("AgentAcquisitionService graceful shutdown flag set to: {}", gracefulShutdown);
+  }
+
+  /** Check if graceful shutdown is in progress. */
+  public boolean isGracefulShutdown() {
+    return gracefulShutdown.get();
   }
 
   /**
