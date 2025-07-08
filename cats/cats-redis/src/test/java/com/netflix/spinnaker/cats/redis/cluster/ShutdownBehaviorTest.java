@@ -286,6 +286,121 @@ class ShutdownBehaviorTest {
   }
 
   @Nested
+  @DisplayName("Graceful Shutdown Comprehensive Coverage")
+  class GracefulShutdownTests {
+
+    @Test
+    @DisplayName("Should re-queue ALL registered agents during graceful shutdown")
+    void shouldReQueueAllRegisteredAgentsDuringGracefulShutdown() throws Exception {
+      // Given - Multiple registered agents, some running, some completed
+      String[] agentTypes = {"agent-1", "agent-2", "agent-3", "agent-completed", "agent-idle"};
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      // Register all agents
+      for (String agentType : agentTypes) {
+        Agent agent = createMockAgent(agentType);
+        acquisitionService.registerAgent(agent, execution, instrumentation);
+      }
+
+      // Simulate some agents are in WORKZ (running), some completed and removed
+      try (Jedis jedis = jedisPool.getResource()) {
+        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+        long completionDeadline = currentTimeSeconds + 300; // 5 minutes from now
+
+        // Add some agents to WORKZ (simulating they're running)
+        jedis.zadd("WORKZ", completionDeadline, "agent-1");
+        jedis.zadd("WORKZ", completionDeadline, "agent-2");
+
+        // Some agents already completed and not in Redis (but still registered)
+        // agent-3, agent-completed, agent-idle are registered but not in Redis
+
+        // Verify initial state
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(2);
+        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
+      }
+
+      // When - Perform graceful shutdown
+      acquisitionService.setGracefulShutdown(true);
+
+      // Call the method that graceful shutdown would call to re-queue ALL agents
+      for (String agentType : agentTypes) {
+        Agent agent = acquisitionService.getAgentByType(agentType);
+        if (agent != null) {
+          acquisitionService.forceRequeueAgentForShutdown(
+              agent); // Force requeue regardless of state
+        }
+      }
+
+      // Then - ALL registered agents should be in WAITZ for restart
+      try (Jedis jedis = jedisPool.getResource()) {
+        Set<String> agentsInWaitz = jedis.zrange("WAITZ", 0, -1);
+
+        // CRITICAL: All 5 registered agents should be re-queued
+        assertThat(agentsInWaitz)
+            .describedAs("All registered agents should be re-queued in WAITZ")
+            .containsExactlyInAnyOrder(agentTypes);
+
+        // Verify they have immediate execution scores (current time or very close)
+        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+        for (String agentType : agentTypes) {
+          Double score = jedis.zscore("WAITZ", agentType);
+          assertThat(score)
+              .describedAs("Agent %s should have immediate execution score", agentType)
+              .isNotNull()
+              .isLessThanOrEqualTo(currentTimeSeconds + 60.0); // Within 1 minute
+        }
+
+        // Previously running agents should now be in WAITZ (moved from WORKZ)
+        assertThat(jedis.zcard("WORKZ"))
+            .describedAs("WORKZ should be empty after graceful shutdown")
+            .isEqualTo(0);
+      }
+    }
+
+    @Test
+    @DisplayName("Should prevent agent loss during shutdown race conditions")
+    void shouldPreventAgentLossDuringShutdownRaceConditions() throws Exception {
+      // Given - Agent completing during shutdown window
+      Agent agent = createMockAgent("racing-agent");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      acquisitionService.registerAgent(agent, execution, instrumentation);
+
+      // Simulate agent was running (in WORKZ)
+      try (Jedis jedis = jedisPool.getResource()) {
+        long completionDeadline = System.currentTimeMillis() / 1000 + 300;
+        jedis.zadd("WORKZ", completionDeadline, "racing-agent");
+      }
+
+      // When - Agent completes normally during graceful shutdown
+      acquisitionService.setGracefulShutdown(true);
+
+      // Simulate agent worker completion (removes from WORKZ, skips re-queue)
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zrem("WORKZ", "racing-agent");
+      }
+
+      // But graceful shutdown still re-queues ALL registered agents
+      Agent registeredAgent = acquisitionService.getAgentByType("racing-agent");
+      assertThat(registeredAgent).isNotNull();
+      acquisitionService.forceRequeueAgentForShutdown(registeredAgent);
+
+      // Then - Agent should be safely re-queued, not lost
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zscore("WAITZ", "racing-agent"))
+            .describedAs("Racing agent should be re-queued in WAITZ")
+            .isNotNull();
+
+        assertThat(jedis.zscore("WORKZ", "racing-agent"))
+            .describedAs("Racing agent should not be in WORKZ")
+            .isNull();
+      }
+    }
+  }
+
+  @Nested
   @DisplayName("Redis State Consistency")
   class RedisConsistencyTests {
 

@@ -26,6 +26,7 @@ import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.module.CatsModuleAware;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -450,22 +451,22 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    * agent loss during deployments and restarts.
    */
   private void gracefullyReleaseActiveAgents() {
-    int activeCount = acquisitionService.getActiveAgentCount();
-    if (activeCount == 0) {
-      log.info("No active agents to release during shutdown");
+    // Get ALL registered agents - this is the complete list that needs re-queuing
+    int registeredCount = acquisitionService.getRegisteredAgentCount();
+    if (registeredCount == 0) {
+      log.info("No registered agents to release during shutdown");
       return;
     }
 
-    log.info("Gracefully releasing {} active agents during shutdown", activeCount);
+    log.info("Gracefully releasing {} registered agents during shutdown", registeredCount);
 
     try {
       // Set graceful shutdown flag to prevent race condition with normal agent completion
       acquisitionService.setGracefulShutdown(true);
 
-      // Get snapshot of active agents to avoid concurrent modification
+      // PHASE 1: Interrupt any running futures
       Map<String, Future<?>> activeAgentsFutures =
           acquisitionService.getActiveAgentsFuturesSnapshot();
-      int released = 0;
       int interrupted = 0;
 
       for (Map.Entry<String, Future<?>> entry : activeAgentsFutures.entrySet()) {
@@ -474,7 +475,6 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
         try {
           if (future != null && !future.isDone()) {
-            // Cancel the running agent execution
             boolean cancelled = future.cancel(true);
             if (cancelled) {
               interrupted++;
@@ -482,19 +482,34 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
             }
 
             // Release semaphore permit for interrupted agent
-            // This prevents resource leaks
             if (config.getRunningAgents() != null) {
               config.getRunningAgents().release();
               log.debug("Released semaphore permit for interrupted agent {}", agentType);
             }
+          }
+        } catch (Exception e) {
+          log.debug("Failed to interrupt agent {}: {}", agentType, e.getMessage());
+        }
+      }
 
-            // Re-queue agent for immediate execution after restart
-            Agent agent = acquisitionService.getRegisteredAgent(agentType);
-            if (agent != null) {
-              acquisitionService.conditionalReleaseAgent(agent, "shutdown", false);
-              released++;
-              log.debug("Re-queued agent {} for post-restart execution", agentType);
-            }
+      // Brief wait for interrupted agents to complete their cleanup
+      if (interrupted > 0) {
+        Thread.sleep(100);
+      }
+
+      // PHASE 2: Re-queue ALL registered agents
+      // This ensures no agents are lost, regardless of their completion timing
+      Set<String> allRegisteredAgents = acquisitionService.getAllRegisteredAgentTypes();
+      int released = 0;
+
+      for (String agentType : allRegisteredAgents) {
+        try {
+          Agent agent = acquisitionService.getAgentByType(agentType);
+          if (agent != null) {
+            // Force re-queue for shutdown - moves from any state to WAITZ
+            acquisitionService.forceRequeueAgentForShutdown(agent);
+            released++;
+            log.debug("Re-queued agent {} for post-restart execution", agentType);
           }
         } catch (Exception e) {
           log.warn(

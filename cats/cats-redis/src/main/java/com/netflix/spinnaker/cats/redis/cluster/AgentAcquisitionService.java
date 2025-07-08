@@ -61,7 +61,7 @@ import redis.clients.jedis.Response;
 public class AgentAcquisitionService {
   private static final Logger log = LoggerFactory.getLogger(AgentAcquisitionService.class);
 
-  // Redis set names - must match original exactly
+  // Redis set names
   private static final String WAITING_SET = "WAITZ";
   private static final String WORKING_SET = "WORKZ";
 
@@ -409,6 +409,43 @@ public class AgentAcquisitionService {
     return activeAgentsFutures.size();
   }
 
+  /** Get agent by type from registered agents (needed for graceful shutdown). */
+  public Agent getAgentByType(String agentType) {
+    AgentWorker worker = agents.get(agentType);
+    return worker != null ? worker.getAgent() : null;
+  }
+
+  /** Get all registered agent types for comprehensive graceful shutdown. */
+  public Set<String> getAllRegisteredAgentTypes() {
+    return new HashSet<>(agents.keySet());
+  }
+
+  /**
+   * Force re-queue an agent during graceful shutdown, regardless of current state. This ensures
+   * agents are moved from any state to WAITZ for restart pickup. Uses RedisScriptManager's
+   * UNCONDITIONAL_SWAP_SET_SCRIPT for consistency.
+   */
+  public void forceRequeueAgentForShutdown(Agent agent) {
+    String agentType = agent.getAgentType();
+
+    try (Jedis jedis = jedisPool.getResource()) {
+      // Calculate immediate execution score with jitter
+      String nextScore = calculateShutdownScore(jedis, agentType);
+
+      // Use RedisScriptManager's unconditional swap script
+      Object result =
+          jedis.evalsha(
+              scriptManager.getScriptSha(RedisScriptManager.UNCONDITIONAL_SWAP_SET_SCRIPT),
+              java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+              java.util.Arrays.asList(agentType, nextScore));
+
+      log.debug("Force re-queued agent {} for shutdown, result: {}", agentType, result);
+
+    } catch (Exception e) {
+      log.error("Failed to force re-queue agent {} during shutdown", agentType, e);
+    }
+  }
+
   /**
    * Get advanced scheduling statistics.
    *
@@ -695,7 +732,7 @@ public class AgentAcquisitionService {
    * @param agent The agent to schedule
    * @param offsetMs Offset from current time in milliseconds
    */
-  private void scheduleAgentInRedis(Agent agent, long offsetMs) {
+  public void scheduleAgentInRedis(Agent agent, long offsetMs) {
     String agentType = agent.getAgentType();
     int retryCount = 0;
     int maxRetries = 3;
