@@ -26,7 +26,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.Tuple;
 
 /**
  * Service responsible for detecting and cleaning up zombie agents.
@@ -112,10 +111,7 @@ public class ZombieCleanupService {
 
     // Find zombie agents by checking local tracking for agents that have been running too long
     // This is the correct zombie detection logic - scan LOCAL activeAgents, not Redis
-    log.debug(
-        "Checking {} local active agents for zombies with threshold {}ms",
-        activeAgents.size(),
-        zombieThreshold);
+    int validAgentsScanned = 0;
 
     for (Map.Entry<String, String> entry : activeAgents.entrySet()) {
       String agentType = entry.getKey();
@@ -125,19 +121,12 @@ public class ZombieCleanupService {
         // Convert acquire score (seconds) back to milliseconds to compare with current time
         long startTimeMs = Long.parseLong(acquireScore) * 1000;
         long runTime = currentTime - startTimeMs;
-
-        log.debug(
-            "Agent {}: acquireScore={}, startTime={}ms, runtime={}ms, threshold={}ms",
-            agentType,
-            acquireScore,
-            startTimeMs,
-            runTime,
-            zombieThreshold);
+        validAgentsScanned++;
 
         if (runTime > zombieThreshold) {
           zombieAgentTypes.add(agentType);
-          log.debug(
-              "Agent {} identified as zombie (runtime {} > threshold {})",
+          log.warn(
+              "Zombie agent detected: {} (runtime: {}ms > threshold: {}ms)",
               agentType,
               runTime,
               zombieThreshold);
@@ -147,12 +136,15 @@ public class ZombieCleanupService {
       }
     }
 
+    // Log scanning summary
     if (zombieAgentTypes.isEmpty()) {
+      log.debug("Zombie scan completed: {} agents analyzed, 0 zombies found", validAgentsScanned);
       return 0;
     }
 
     log.warn(
-        "Found {} zombie agents, cleaning up: {}",
+        "Zombie scan completed: {} agents analyzed, {} zombies found - cleaning up: {}",
+        validAgentsScanned,
         zombieAgentTypes.size(),
         zombieAgentTypes.stream().limit(5).collect(java.util.stream.Collectors.toList()));
 
@@ -191,16 +183,14 @@ public class ZombieCleanupService {
 
           if (zombieBatch.size() >= batchSize) {
             totalCleaned +=
-                cleanupZombieBatchWithFallback(
-                    jedis, zombieBatch, activeAgents, activeAgentsFutures);
+                cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures);
             zombieBatch.clear();
           }
         }
 
         // Process remaining zombies
         if (!zombieBatch.isEmpty()) {
-          totalCleaned +=
-              cleanupZombieBatchWithFallback(jedis, zombieBatch, activeAgents, activeAgentsFutures);
+          totalCleaned += cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures);
         }
       }
 
@@ -232,219 +222,62 @@ public class ZombieCleanupService {
     return lastZombieCleanup;
   }
 
+  /**
+   * Clean up zombie batch with built-in fallback mechanism. Attempts batch cleanup first, falls
+   * back to individual cleanup if batch fails.
+   */
   private int cleanupZombieBatch(
       Jedis jedis,
-      List<Tuple> zombieBatch,
+      List<String> zombieAgentTypes,
       Map<String, String> activeAgents,
       Map<String, Future<?>> activeAgentsFutures) {
 
-    if (zombieBatch.isEmpty()) {
+    if (zombieAgentTypes.isEmpty()) {
       return 0;
     }
 
-    try {
-      // Build arguments for batch cleanup: [agent1, score1, agent2, score2, ...]
-      List<String> batchArgs = new ArrayList<>(zombieBatch.size() * 2);
-
-      for (Tuple zombie : zombieBatch) {
-        batchArgs.add(zombie.getElement());
-        batchArgs.add(String.valueOf(zombie.getScore()));
-      }
-
-      // Execute Lua script to batch cleanup zombie agents from Redis WORKING set
-      // Script removes agents that match the provided agent names and scores
-      Object result =
-          jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.BATCH_CLEANUP_AGENTS_SCRIPT),
-              java.util.Collections.singletonList(WORKING_SET), // Redis key (WORKZ)
-              batchArgs); // [agent1, score1, agent2, score2, ...]
-
-      // Parse Lua script return value: [numCleaned, [cleanedAgent1, cleanedAgent2, ...]]
-      // Lua script returns a table with count + list of successfully cleaned agent names
-      int cleaned = 0;
-      if (result instanceof List) {
-        List<Object> resultList = (List<Object>) result;
-        // Lua script returns: [count, [agent_names]] format
-        if (resultList.size() >= 2) {
-          // First element: number of agents actually cleaned from Redis
-          cleaned = ((Long) resultList.get(0)).intValue();
-          // Second element: list of agent names that were successfully cleaned
-          List<String> cleanedAgents = (List<String>) resultList.get(1);
-
-          // Log batch-level summary at INFO for operational visibility
-          if (cleaned > 0) {
-            log.info(
-                "Zombie cleanup batch processed: {} agents cleaned from {} candidates",
-                cleaned,
-                zombieBatch.size());
-          }
-
-          // Synchronize local Java state with Redis cleanup results
-          // Only clean up local state for agents that were actually removed from Redis
-          for (String agentType : cleanedAgents) {
-            // Remove from in-memory active agent tracking map
-            activeAgents.remove(agentType);
-
-            // Cancel the Java Future to stop any running agent execution
-            Future<?> future = activeAgentsFutures.remove(agentType);
-            if (future != null && !future.isDone()) {
-              // Interrupt the thread executing this agent (force cleanup)
-              boolean cancelled = future.cancel(true);
-              log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
-            }
-
-            log.debug("Cleaned up zombie agent: {}", agentType);
-          }
-        } else {
-          log.warn("Unexpected Lua script result format: expected [count, list], got: {}", result);
-        }
-      } else {
-        log.warn(
-            "Unexpected Lua script result type: expected List, got: {}",
-            result != null ? result.getClass().getSimpleName() : "null");
-      }
-
-      return cleaned;
-
-    } catch (Exception e) {
-      log.error("Error cleaning up zombie batch", e);
-      return 0;
-    }
-  }
-
-  /**
-   * Clean up zombie batch with fallback mechanism. Uses batch operations when enabled and
-   * available, falls back to individual cleanup when disabled or failed.
-   */
-  private int cleanupZombieBatchWithFallback(
-      Jedis jedis,
-      List<Tuple> zombieBatch,
-      Map<String, String> activeAgents,
-      Map<String, Future<?>> activeAgentsFutures,
-      boolean batchOperationsEnabled) {
-
-    if (zombieBatch.isEmpty()) {
-      return 0;
-    }
-
-    if (batchOperationsEnabled && zombieBatch.size() > 1) {
-      // Try batch operation first
-      int batchCleaned = cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures);
-      if (batchCleaned > 0) {
-        return batchCleaned;
-      } else {
-        // Batch operation failed, fall back to individual cleanup
-        log.warn(
-            "Batch zombie cleanup failed for {} agents, falling back to individual cleanup",
-            zombieBatch.size());
-        return cleanupIndividualZombies(jedis, zombieBatch, activeAgents, activeAgentsFutures);
-      }
-    } else {
-      // Use individual cleanup (batch disabled or single agent)
-      return cleanupIndividualZombies(jedis, zombieBatch, activeAgents, activeAgentsFutures);
-    }
-  }
-
-  /**
-   * Fallback method to clean up zombie agents individually when batch operations fail or are
-   * disabled.
-   */
-  private int cleanupIndividualZombies(
-      Jedis jedis,
-      List<Tuple> zombies,
-      Map<String, String> activeAgents,
-      Map<String, Future<?>> activeAgentsFutures) {
-
-    int cleaned = 0;
-
-    for (Tuple zombie : zombies) {
+    // Try batch operation first if there are multiple agents
+    if (zombieAgentTypes.size() > 1) {
       try {
-        String agentType = zombie.getElement();
-        double score = zombie.getScore();
+        // Build arguments for batch cleanup: [agent1, score1, agent2, score2, ...]
+        List<String> batchArgs = new ArrayList<>(zombieAgentTypes.size() * 2);
 
-        // Use individual REMOVE_AGENT_SCRIPT for each zombie
-        Object result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_SCRIPT),
-                java.util.Arrays.asList(WORKING_SET, WAITING_SET), // Script needs both keys
-                java.util.Collections.singletonList(agentType) // Only agent name needed for removal
-                );
-
-        if (result != null && ((Long) result).intValue() == 1) {
-          cleaned++;
-
-          // Clean up local state
-          activeAgents.remove(agentType);
-          Future<?> future = activeAgentsFutures.remove(agentType);
-          if (future != null && !future.isDone()) {
-            boolean cancelled = future.cancel(true);
-            log.debug("Cancelled individual zombie agent {} future: {}", agentType, cancelled);
+        for (String agentType : zombieAgentTypes) {
+          String acquireScore = activeAgents.get(agentType);
+          if (acquireScore != null) {
+            batchArgs.add(agentType);
+            batchArgs.add(acquireScore);
           }
-
-          log.debug("Individually cleaned zombie agent: {}", agentType);
-        } else {
-          log.debug(
-              "Zombie agent {} was not cleaned (may have been updated): {}", agentType, result);
         }
 
+        if (!batchArgs.isEmpty()) {
+          // Execute Lua script to batch cleanup zombie agents from Redis WORKING set
+          Object result =
+              jedis.evalsha(
+                  scriptManager.getScriptSha(RedisScriptManager.BATCH_CLEANUP_AGENTS_SCRIPT),
+                  java.util.Collections.singletonList(WORKING_SET), // Redis key (WORKZ)
+                  batchArgs); // [agent1, score1, agent2, score2, ...]
+
+          // Parse Lua script return value: [numCleaned, [cleanedAgent1, cleanedAgent2, ...]]
+          int cleaned =
+              parseBatchCleanupResult(
+                  result, zombieAgentTypes.size(), activeAgents, activeAgentsFutures);
+          if (cleaned > 0) {
+            return cleaned;
+          }
+        }
       } catch (Exception e) {
-        log.warn("Error cleaning individual zombie {}: {}", zombie.getElement(), e.getMessage());
+        log.warn(
+            "Batch zombie cleanup failed for {} agents, falling back to individual cleanup: {}",
+            zombieAgentTypes.size(),
+            e.getMessage());
       }
     }
 
-    if (cleaned > 0) {
-      log.info("Individually cleaned {} zombie agents", cleaned);
-    }
-
-    return cleaned;
-  }
-
-  /**
-   * Clean up zombie batch with fallback mechanism. Tries batch operations first, falls back to
-   * individual cleanup if batch fails.
-   */
-  private int cleanupZombieBatchWithFallback(
-      Jedis jedis,
-      List<String> zombieBatch,
-      Map<String, String> activeAgents,
-      Map<String, Future<?>> activeAgentsFutures) {
-
-    if (zombieBatch.isEmpty()) {
-      return 0;
-    }
-
-    try {
-      // Try batch operation first - convert to original format expected by existing batch method
-      List<Tuple> zombieTuples = new ArrayList<>();
-      for (String agentType : zombieBatch) {
-        String acquireScore = activeAgents.get(agentType);
-        if (acquireScore != null) {
-          // Create Tuple with agentType and score for batch cleanup
-          zombieTuples.add(
-              new redis.clients.jedis.Tuple(agentType, Double.parseDouble(acquireScore)));
-        }
-      }
-
-      if (!zombieTuples.isEmpty()) {
-        int batchCleaned =
-            cleanupZombieBatch(jedis, zombieTuples, activeAgents, activeAgentsFutures);
-        if (batchCleaned > 0) {
-          return batchCleaned;
-        }
-      }
-    } catch (Exception e) {
-      log.error(
-          "Batch zombie cleanup failed for {} agents, falling back to individual operations: {}",
-          zombieBatch.size(),
-          e.getMessage());
-    }
-
-    // Batch operation failed or returned 0, fall back to individual cleanup
-    log.warn(
-        "Batch zombie cleanup failed for {} agents, falling back to individual cleanup",
-        zombieBatch.size());
+    // Batch operation failed, disabled, or single agent - fall back to individual cleanup
+    log.debug("Using individual cleanup for {} zombie agents", zombieAgentTypes.size());
     int totalCleaned = 0;
-    for (String agentType : zombieBatch) {
+    for (String agentType : zombieAgentTypes) {
       try {
         if (cleanupIndividualZombieAgent(jedis, agentType, activeAgents, activeAgentsFutures)) {
           totalCleaned++;
@@ -454,6 +287,59 @@ public class ZombieCleanupService {
       }
     }
     return totalCleaned;
+  }
+
+  /** Parse the result from batch cleanup Lua script and update local state. */
+  private int parseBatchCleanupResult(
+      Object result,
+      int candidateCount,
+      Map<String, String> activeAgents,
+      Map<String, Future<?>> activeAgentsFutures) {
+
+    int cleaned = 0;
+    if (result instanceof List) {
+      List<Object> resultList = (List<Object>) result;
+      // Lua script returns: [count, [agent_names]] format
+      if (resultList.size() >= 2) {
+        // First element: number of agents actually cleaned from Redis
+        cleaned = ((Long) resultList.get(0)).intValue();
+        // Second element: list of agent names that were successfully cleaned
+        List<String> cleanedAgents = (List<String>) resultList.get(1);
+
+        // Log batch-level summary at INFO for operational visibility
+        if (cleaned > 0) {
+          log.info(
+              "Zombie cleanup batch processed: {} agents cleaned from {} candidates",
+              cleaned,
+              candidateCount);
+        }
+
+        // Synchronize local Java state with Redis cleanup results
+        // Only clean up local state for agents that were actually removed from Redis
+        for (String agentType : cleanedAgents) {
+          // Remove from in-memory active agent tracking map
+          activeAgents.remove(agentType);
+
+          // Cancel the Java Future to stop any running agent execution
+          Future<?> future = activeAgentsFutures.remove(agentType);
+          if (future != null && !future.isDone()) {
+            // Interrupt the thread executing this agent (force cleanup)
+            boolean cancelled = future.cancel(true);
+            log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
+          }
+
+          log.debug("Cleaned up zombie agent: {}", agentType);
+        }
+      } else {
+        log.warn("Unexpected Lua script result format: expected [count, list], got: {}", result);
+      }
+    } else {
+      log.warn(
+          "Unexpected Lua script result type: expected List, got: {}",
+          result != null ? result.getClass().getSimpleName() : "null");
+    }
+
+    return cleaned;
   }
 
   /** Clean up a single zombie agent individually. */

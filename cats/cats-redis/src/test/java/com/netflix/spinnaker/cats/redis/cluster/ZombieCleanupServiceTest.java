@@ -65,6 +65,11 @@ class ZombieCleanupServiceTest {
     config.setMaxTotal(10);
     jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
 
+    // Clear Redis data to ensure clean state for each test
+    try (Jedis jedis = jedisPool.getResource()) {
+      jedis.flushAll();
+    }
+
     scriptManager = new RedisScriptManager(jedisPool);
     scriptManager.initializeScripts();
 
@@ -437,6 +442,45 @@ class ZombieCleanupServiceTest {
         assertThat(jedis.zcard("WORKZ")).isEqualTo(500);
       }
     }
+
+    @Test
+    @DisplayName("Should respect batch size configuration for large zombie counts")
+    void shouldRespectBatchSizeConfiguration() {
+      // Enable batch operations with specific batch size
+      schedulerProperties.setBatchOperationsEnabled(true);
+      schedulerProperties.getZombieCleanup().setBatchSize(5);
+      zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
+
+      // Given - More zombies than batch size
+      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
+      int totalZombies = 12; // More than batch size of 5, requires multiple batches
+
+      Map<String, String> activeAgents = new HashMap<>();
+      Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        for (int i = 1; i <= totalZombies; i++) {
+          String agentType = "batch-size-zombie-" + i;
+          jedis.zadd("WORKZ", oldScoreSeconds, agentType);
+
+          activeAgents.put(agentType, String.valueOf(oldScoreSeconds));
+          activeAgentsFutures.put(agentType, mock(Future.class));
+        }
+      }
+
+      // When - Run zombie cleanup
+      int cleaned = zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+      // Then - All zombies cleaned despite exceeding batch size
+      assertThat(cleaned).isEqualTo(totalZombies);
+      assertThat(activeAgents).isEmpty();
+      assertThat(activeAgentsFutures).isEmpty();
+
+      // Verify Redis cleanup
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+      }
+    }
   }
 
   @Nested
@@ -730,6 +774,83 @@ class ZombieCleanupServiceTest {
       // Agent under threshold preserved
       assertThat(activeAgents).containsKey("just-under-threshold");
       assertThat(activeAgentsFutures).containsKey("just-under-threshold");
+    }
+
+    @Test
+    @DisplayName("Should use batch cleanup when enabled and multiple zombies exist")
+    void shouldUseBatchCleanupWhenEnabled() {
+      // Update scheduler properties to enable batch operations for this test
+      schedulerProperties.setBatchOperationsEnabled(true);
+      schedulerProperties.getZombieCleanup().setBatchSize(5);
+      zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
+
+      // Given - Multiple zombie agents
+      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000; // 1 minute ago
+
+      Map<String, String> activeAgents = new HashMap<>();
+      Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+      // Add multiple zombie agents to Redis and local tracking
+      try (Jedis jedis = jedisPool.getResource()) {
+        for (int i = 1; i <= 3; i++) {
+          String agentType = "batch-zombie-" + i;
+          jedis.zadd("WORKZ", oldScoreSeconds, agentType);
+
+          activeAgents.put(agentType, String.valueOf(oldScoreSeconds));
+          activeAgentsFutures.put(agentType, mock(Future.class));
+        }
+      }
+
+      // When - Run zombie cleanup (batch operations enabled)
+      int cleaned = zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+      // Then - All zombies cleaned up
+      assertThat(cleaned).isEqualTo(3);
+      assertThat(activeAgents).isEmpty();
+      assertThat(activeAgentsFutures).isEmpty();
+
+      // Verify Redis cleanup
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+      }
+    }
+
+    @Test
+    @DisplayName("Should fallback to individual cleanup when batch operations disabled")
+    void shouldFallbackToIndividualWhenBatchDisabled() {
+      // Ensure batch operations are disabled (default)
+      schedulerProperties.setBatchOperationsEnabled(false);
+      zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
+
+      // Given - Multiple zombie agents
+      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
+
+      Map<String, String> activeAgents = new HashMap<>();
+      Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+      // Add agents to both Redis and local tracking
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("WORKZ", oldScoreSeconds, "individual-zombie-1");
+        jedis.zadd("WORKZ", oldScoreSeconds, "individual-zombie-2");
+      }
+
+      activeAgents.put("individual-zombie-1", String.valueOf(oldScoreSeconds));
+      activeAgents.put("individual-zombie-2", String.valueOf(oldScoreSeconds));
+      activeAgentsFutures.put("individual-zombie-1", mock(Future.class));
+      activeAgentsFutures.put("individual-zombie-2", mock(Future.class));
+
+      // When - Run zombie cleanup (will use individual cleanup)
+      int cleaned = zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+      // Then - Should clean up successfully using individual operations
+      assertThat(cleaned).isEqualTo(2);
+      assertThat(activeAgents).isEmpty();
+      assertThat(activeAgentsFutures).isEmpty();
+
+      // Verify Redis cleanup
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+      }
     }
 
     @Test
