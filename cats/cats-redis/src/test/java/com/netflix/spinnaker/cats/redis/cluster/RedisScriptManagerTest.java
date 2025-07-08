@@ -298,6 +298,60 @@ class RedisScriptManagerTest {
     }
 
     @Test
+    @DisplayName("Should handle numeric score conversion correctly in conditional swap")
+    void shouldHandleNumericScoreConversionInConditionalSwap() {
+      // Given - Agent in WORKING set with numeric score
+      String agentType = "test-agent";
+      long workingScore = 12345L; // Redis will store this as 12345.0 (double)
+      long newScore = 67890L;
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Add agent to WORKING set
+        jedis.zadd("WORKZ", workingScore, agentType);
+
+        // Verify Redis stores it as double but we can retrieve as long
+        Double retrievedScore = jedis.zscore("WORKZ", agentType);
+        assertThat(retrievedScore).isEqualTo(12345.0); // Redis returns double
+
+        // When - Execute conditional swap with string representation (how Java passes it)
+        Object result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.CONDITIONAL_SWAP_SET_SCRIPT),
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList(
+                    agentType,
+                    String.valueOf(workingScore), // "12345" - Java passes as string
+                    String.valueOf(newScore) // "67890" - new score as string
+                    ));
+
+        // Then - Should succeed thanks to tonumber() conversion
+        assertThat(result).isEqualTo("swapped");
+        assertThat(jedis.zscore("WORKZ", agentType)).isNull();
+        assertThat(jedis.zscore("WAITZ", agentType)).isEqualTo(newScore);
+
+        // Cleanup for next test
+        jedis.zrem("WAITZ", agentType);
+
+        // Test failure case - wrong score
+        jedis.zadd("WORKZ", workingScore, agentType);
+
+        result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.CONDITIONAL_SWAP_SET_SCRIPT),
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList(
+                    agentType,
+                    String.valueOf(99999L), // Wrong expected score
+                    String.valueOf(newScore)));
+
+        // Should fail - ownership verification failed
+        assertThat(result).isNull();
+        assertThat(jedis.zscore("WORKZ", agentType)).isEqualTo(workingScore); // Still in WORKZ
+        assertThat(jedis.zscore("WAITZ", agentType)).isNull();
+      }
+    }
+
+    @Test
     @DisplayName("Should unconditionally move agent to WAITING set (graceful shutdown)")
     void shouldUnconditionallyMoveAgentToWaitingSet() {
       // Given - Agent in different possible states

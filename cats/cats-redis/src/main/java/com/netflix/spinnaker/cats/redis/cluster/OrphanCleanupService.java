@@ -315,7 +315,9 @@ public class OrphanCleanupService {
         // Agent name (e.g., "aws-ec2-agent")
         batchArgs.add(orphan.getElement());
         // Agent's last activity timestamp as score (used for verification)
-        batchArgs.add(String.valueOf(orphan.getScore()));
+        batchArgs.add(
+            String.valueOf(
+                (long) orphan.getScore())); // Convert to long to match score() method format
       }
 
       // Execute atomic Lua script to remove orphaned agents from Redis set
@@ -442,7 +444,8 @@ public class OrphanCleanupService {
       try {
         String agentName = orphan.getElement();
         double score = orphan.getScore();
-        String scoreInSet = String.valueOf(score);
+        String scoreInSet =
+            String.valueOf((long) score); // Convert to long to match score() method format
 
         // Determine if this is a valid agent or an agent for a removed account
         boolean isStillValid = isAgentStillValid(agentName);
