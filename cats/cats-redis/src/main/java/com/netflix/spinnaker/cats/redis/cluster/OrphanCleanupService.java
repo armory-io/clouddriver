@@ -119,8 +119,8 @@ public class OrphanCleanupService {
     }
 
     try (Jedis jedis = jedisPool.getResource()) {
-      int workzCleaned = cleanupOrphanedAgentsFromWorkingSet(jedis);
-      int waitzCleaned = cleanupOrphanedAgentsFromWaitingSet(jedis);
+      int workzCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, 1L);
+      int waitzCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, 2L);
       int totalCleaned = workzCleaned + waitzCleaned;
 
       if (totalCleaned > 0) {
@@ -155,8 +155,8 @@ public class OrphanCleanupService {
     }
 
     try (Jedis jedis = jedisPool.getResource()) {
-      int workzCleaned = cleanupOrphanedAgentsFromWorkingSet(jedis);
-      int waitzCleaned = cleanupOrphanedAgentsFromWaitingSet(jedis);
+      int workzCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, 1L);
+      int waitzCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, 2L);
       int totalCleaned = workzCleaned + waitzCleaned;
 
       if (totalCleaned > 0) {
@@ -194,92 +194,64 @@ public class OrphanCleanupService {
     return lastOrphanCleanup;
   }
 
-  private int cleanupOrphanedAgentsFromWorkingSet(Jedis jedis) {
-    long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
+  /**
+   * Clean up orphaned agents from the specified Redis set with built-in batch processing and
+   * fallback mechanism.
+   */
+  private int cleanupOrphanedAgentsFromSet(Jedis jedis, String setName, long thresholdMultiplier) {
+    long baseThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
+    long orphanThreshold = baseThreshold * thresholdMultiplier;
     // Convert to seconds to match Redis score format (scores are stored as seconds since epoch)
     long cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
 
-    log.debug(
-        "Cleaning orphaned agents from WORKING set with threshold {}ms (cutoff: {})",
-        orphanThreshold,
-        cutoffScore);
-
     try {
-      // Find all agents in WORKING set older than threshold
-      Set<Tuple> potentialOrphans = jedis.zrangeByScoreWithScores(WORKING_SET, 0, cutoffScore);
-
-      log.debug("Found {} potential orphans in WORKING set", potentialOrphans.size());
+      // Find all agents in set older than threshold
+      Set<Tuple> potentialOrphans = jedis.zrangeByScoreWithScores(setName, 0, cutoffScore);
 
       if (potentialOrphans.isEmpty()) {
-        log.debug("No orphaned agents found in WORKING set");
+        log.debug("Orphan scan completed: {} set analyzed, 0 orphans found", setName);
         return 0;
       }
 
-      log.info(
-          "Found {} potential orphaned agents in WORKING set older than {}ms",
+      log.warn(
+          "Orphan scan completed: {} set analyzed, {} orphans found (older than {}ms) - cleaning up: {}",
+          setName,
           potentialOrphans.size(),
-          orphanThreshold);
+          orphanThreshold,
+          potentialOrphans.stream().map(Tuple::getElement).limit(5).toArray());
 
-      // Clean up orphans in batches
-      return cleanupOrphanBatch(jedis, WORKING_SET, new ArrayList<>(potentialOrphans));
+      // Process orphans with batch operations and fallback
+      List<Tuple> orphanList = new ArrayList<>(potentialOrphans);
+      return processOrphanBatch(jedis, setName, orphanList);
 
     } catch (Exception e) {
-      log.error("Error cleaning orphaned agents from WORKING set", e);
+      log.error("Error cleaning orphaned agents from {} set", setName, e);
       return 0;
     }
   }
 
-  private int cleanupOrphanedAgentsFromWaitingSet(Jedis jedis) {
-    // Use longer threshold for WAITING set as these are legitimate pending work
-    long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs() * 2;
-    // Convert to seconds to match Redis score format (scores are stored as seconds since epoch)
-    long cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
-
-    log.debug(
-        "Cleaning orphaned agents from WAITING set with threshold {}ms (cutoff: {})",
-        orphanThreshold,
-        cutoffScore);
-
-    try {
-      // Find all agents in WAITING set older than threshold
-      Set<Tuple> potentialOrphans = jedis.zrangeByScoreWithScores(WAITING_SET, 0, cutoffScore);
-
-      if (potentialOrphans.isEmpty()) {
-        log.debug("No orphaned agents found in WAITING set");
-        return 0;
-      }
-
-      log.info(
-          "Found {} potential orphaned agents in WAITING set older than {}ms",
-          potentialOrphans.size(),
-          orphanThreshold);
-
-      // Clean up orphans in batches
-      return cleanupOrphanBatch(jedis, WAITING_SET, new ArrayList<>(potentialOrphans));
-
-    } catch (Exception e) {
-      log.error("Error cleaning orphaned agents from WAITING set", e);
-      return 0;
-    }
-  }
-
-  private int cleanupOrphanBatch(Jedis jedis, String setName, List<Tuple> orphans) {
+  /** Process orphaned agents with batch operations and built-in fallback to individual cleanup. */
+  private int processOrphanBatch(Jedis jedis, String setName, List<Tuple> orphans) {
     if (orphans.isEmpty()) {
       return 0;
     }
 
     int batchSize = schedulerProperties.getOrphanCleanup().getBatchSize();
+    boolean batchOperationsEnabled = schedulerProperties.isBatchOperationsEnabled();
     int totalCleaned = 0;
 
-    // Check if batch operations are enabled
-    boolean batchOperationsEnabled = schedulerProperties.isBatchOperationsEnabled();
-
-    log.debug(
-        "Cleaning {} orphans from {}, batch operations: {}, batchSize: {}",
-        orphans.size(),
-        setName,
-        batchOperationsEnabled ? "enabled" : "disabled",
-        batchSize);
+    if (batchOperationsEnabled) {
+      log.debug(
+          "Processing {} orphans from {} in batches of {} with fallback",
+          orphans.size(),
+          setName,
+          batchSize);
+    } else {
+      log.debug(
+          "Batch orphan cleanup disabled, using individual operations for {} agents from {}",
+          orphans.size(),
+          setName);
+    }
 
     // Process orphans in batches
     for (int i = 0; i < orphans.size(); i += batchSize) {
@@ -294,16 +266,14 @@ public class OrphanCleanupService {
         } else {
           // Batch operation failed, fall back to individual cleanup
           log.warn(
-              "Batch cleanup failed for {} agents, falling back to individual cleanup",
-              batch.size());
+              "Batch cleanup failed for {} agents from {}, falling back to individual cleanup",
+              batch.size(),
+              setName);
           totalCleaned += cleanupIndividualOrphans(jedis, setName, batch);
         }
       } else {
         // Use individual cleanup (batch disabled or single agent)
-        log.debug("Using individual cleanup for {} agents", batch.size());
-        int individualCleaned = cleanupIndividualOrphans(jedis, setName, batch);
-        log.debug("Individual cleanup returned: {}", individualCleaned);
-        totalCleaned += individualCleaned;
+        totalCleaned += cleanupIndividualOrphans(jedis, setName, batch);
       }
     }
 
