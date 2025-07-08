@@ -48,9 +48,11 @@ import redis.clients.jedis.JedisPool;
  *
  * <ul>
  *   <li><strong>WAITING_SET (WAITZ):</strong> Agents ready for execution, scored by next run time
- *   <li><strong>WORKING_SET (WORKZ):</strong> Agents currently executing, scored by start time
+ *   <li><strong>WORKING_SET (WORKZ):</strong> Agents currently executing, scored by completion
+ *       deadline (current_time + agent_timeout)
  *   <li><strong>Atomic Operations:</strong> Lua scripts ensure race-free state transitions
  *   <li><strong>Priority Scheduling:</strong> Lower scores = higher priority execution
+ *   <li><strong>Agent-Specific Timeouts:</strong> Each agent type gets appropriate timeout handling
  * </ul>
  *
  * <h2>Configuration Properties & Performance Tuning</h2>
@@ -115,13 +117,12 @@ import redis.clients.jedis.JedisPool;
  *
  * <ul>
  *   <li><strong>enabled:</strong> Master switch for zombie detection. Disable only for debugging.
- *   <li><strong>thresholdMs:</strong> Maximum agent execution time before considered stuck.
- *       <em>Critical:</em> Must exceed longest legitimate agent runtime (typically AWS=30min). Set
- *       to P99 agent execution time + 20% buffer. Too low kills valid agents, too high allows
- *       resource leaks.
- *   <li><strong>cleanupIntervalMs:</strong> Zombie scan frequency. Should be 6-12x more frequent
- *       than threshold to prevent accumulation. High-load environments benefit from 2-3 minute
- *       intervals.
+ *   <li><strong>thresholdMs:</strong> Additional time buffer beyond agent completion deadline
+ *       before considering an agent zombie. Zombies are agents that have exceeded their specific
+ *       timeout + this buffer. Typical: 30-60 seconds for operational safety (Redis delays, clock
+ *       skew). Too low kills valid agents, too high allows resource leaks.
+ *   <li><strong>cleanupIntervalMs:</strong> Zombie scan frequency. Should be frequent enough to
+ *       prevent accumulation but not cause excessive load. Recommended: 2-5 minutes.
  *   <li><strong>batchSize:</strong> Zombies processed per cleanup cycle. Higher values = fewer
  *       Redis round-trips but larger memory usage. Optimal: 25-100 based on typical zombie count.
  * </ul>
@@ -143,9 +144,10 @@ import redis.clients.jedis.JedisPool;
  * <ul>
  *   <li><strong>enabled:</strong> Controls cleanup of agents from crashed instances. Essential for
  *       preventing Redis memory bloat in multi-instance deployments.
- *   <li><strong>thresholdMs:</strong> Age threshold for orphan detection. WORKING set uses this
- *       value, WAITING set uses 2x this value. Balance between quick cleanup and startup grace
- *       period. Decrease for faster cleanup, increase for slower instance starts.
+ *   <li><strong>thresholdMs:</strong> Time buffer for orphan detection with context-aware logic.
+ *       WORKZ orphans: agents past completion deadline + buffer. WAITZ orphans: agents with
+ *       execution times older than current time - buffer. Accounts for network partitions and Redis
+ *       latency. Typical: 5-10 minutes.
  *   <li><strong>intervalMs:</strong> Cleanup frequency. More frequent = cleaner Redis but higher
  *       overhead. Less frequent = potential memory bloat but lower load. Optimal: 5-10 minutes.
  *   <li><strong>batchSize:</strong> Orphans processed per cycle. Scale with typical orphan count

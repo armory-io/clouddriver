@@ -119,8 +119,8 @@ public class OrphanCleanupService {
     }
 
     try (Jedis jedis = jedisPool.getResource()) {
-      int workzCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, 1L);
-      int waitzCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, 2L);
+      int workzCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET);
+      int waitzCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET);
       int totalCleaned = workzCleaned + waitzCleaned;
 
       if (totalCleaned > 0) {
@@ -155,8 +155,8 @@ public class OrphanCleanupService {
     }
 
     try (Jedis jedis = jedisPool.getResource()) {
-      int workzCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, 1L);
-      int waitzCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, 2L);
+      int workzCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET);
+      int waitzCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET);
       int totalCleaned = workzCleaned + waitzCleaned;
 
       if (totalCleaned > 0) {
@@ -198,11 +198,24 @@ public class OrphanCleanupService {
    * Clean up orphaned agents from the specified Redis set with built-in batch processing and
    * fallback mechanism.
    */
-  private int cleanupOrphanedAgentsFromSet(Jedis jedis, String setName, long thresholdMultiplier) {
-    long baseThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
-    long orphanThreshold = baseThreshold * thresholdMultiplier;
-    // Convert to seconds to match Redis score format (scores are stored as seconds since epoch)
-    long cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
+  private int cleanupOrphanedAgentsFromSet(Jedis jedis, String setName) {
+    long cutoffScore;
+    long thresholdForLogging;
+
+    if (WAITING_SET.equals(setName)) {
+      // For WAITZ: agents scheduled with score = next_execution_time
+      // Consider orphaned if: score < current_time - orphan_threshold
+      long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
+      cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
+      thresholdForLogging = orphanThreshold;
+    } else {
+      // For WORKZ: agents have score = current_time + agent_timeout (completion deadline)
+      // Consider orphaned if: current_time > score + orphan_threshold
+      // Rearranging: score < current_time - orphan_threshold
+      long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
+      cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
+      thresholdForLogging = orphanThreshold;
+    }
 
     try {
       // Find all agents in set older than threshold
@@ -217,7 +230,7 @@ public class OrphanCleanupService {
           "Orphan scan completed: {} set analyzed, {} orphans found (older than {}ms) - cleaning up: {}",
           setName,
           potentialOrphans.size(),
-          orphanThreshold,
+          thresholdForLogging,
           potentialOrphans.stream().map(Tuple::getElement).limit(5).toArray());
 
       // Process orphans with batch operations and fallback
@@ -441,7 +454,7 @@ public class OrphanCleanupService {
 
         if (isStillValid && WORKING_SET.equals(setName)) {
           // For valid agents in WORKZ (truly orphaned due to crashes), move them to WAITZ for
-          // rescheduling
+          // immediate rescheduling
           String newScore = score(jedis, 0L); // Schedule for immediate execution
           Object result =
               jedis.evalsha(

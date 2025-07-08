@@ -141,10 +141,12 @@ class ZombieCleanupProperties {
   private boolean enabled = true;
 
   /**
-   * How long an agent can run before being considered a zombie (milliseconds). Zombies are forcibly
-   * terminated to prevent resource leaks.
+   * Additional time buffer beyond agent completion deadline before considering an agent a zombie
+   * (milliseconds). Zombies are agents that have exceeded their completion deadline + this buffer
+   * and are forcibly terminated. This buffer provides operational safety for Redis delays and clock
+   * skew.
    */
-  private long thresholdMs = 1800000L; // 30 minutes
+  private long thresholdMs = 30000L; // 30 seconds
 
   /** How often to check for and clean up zombie agents (milliseconds). */
   private long cleanupIntervalMs = 300000L; // 5 minutes
@@ -192,8 +194,10 @@ class OrphanCleanupProperties {
   private boolean enabled = true;
 
   /**
-   * How long an agent can be stuck in WORKING state before cleanup (milliseconds). This handles
-   * orphaned agents from crashed instances.
+   * Additional time buffer beyond completion deadlines (WORKZ) or execution times (WAITZ) before
+   * considering an agent orphaned (milliseconds). WORKZ orphans are agents past completion deadline
+   * + buffer. WAITZ orphans are agents with execution times older than current time - buffer. This
+   * buffer accounts for network partitions and Redis latency.
    */
   private long thresholdMs = 600000L; // 10 minutes
 

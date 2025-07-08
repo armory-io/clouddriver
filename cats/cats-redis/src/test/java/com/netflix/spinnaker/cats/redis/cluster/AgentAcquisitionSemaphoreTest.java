@@ -67,6 +67,11 @@ public class AgentAcquisitionSemaphoreTest {
     when(agentProperties.getDisabledPattern()).thenReturn("");
     when(schedulerProperties.getRefreshPeriodSeconds()).thenReturn(10);
 
+    // Mock interval provider to return proper timeout values
+    AgentIntervalProvider.Interval testInterval =
+        new AgentIntervalProvider.Interval(60000L, 120000L); // 1min interval, 2min timeout
+    when(intervalProvider.getInterval(any(Agent.class))).thenReturn(testInterval);
+
     // Create service
     service =
         new AgentAcquisitionService(

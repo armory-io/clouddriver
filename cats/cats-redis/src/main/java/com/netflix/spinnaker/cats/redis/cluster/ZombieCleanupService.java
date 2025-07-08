@@ -96,10 +96,10 @@ public class ZombieCleanupService {
    * exceeded their expected runtime.
    *
    * <p>This cleanup mechanism is important for preventing resource exhaustion on the local
-   * instance. It works by checking the local activeAgents map for agents that have been running
-   * longer than a configurable threshold.
+   * instance. It works by checking the local activeAgents map for agents that have exceeded their
+   * completion deadline (current_time + agent_timeout).
    *
-   * @param activeAgents Map of active agents (agentType -> acquireScore)
+   * @param activeAgents Map of active agents (agentType -> completionDeadline)
    * @param activeAgentsFutures Map of agent futures for cancellation
    * @return Number of zombie agents cleaned up
    */
@@ -118,17 +118,19 @@ public class ZombieCleanupService {
       String acquireScore = entry.getValue();
 
       try {
-        // Convert acquire score (seconds) back to milliseconds to compare with current time
-        long startTimeMs = Long.parseLong(acquireScore) * 1000;
-        long runTime = currentTime - startTimeMs;
+        // acquireScore is completion deadline (current_time + agent_timeout)
+        // Convert acquire score from seconds to milliseconds for comparison
+        long completionDeadlineMs = Long.parseLong(acquireScore) * 1000;
         validAgentsScanned++;
 
-        if (runTime > zombieThreshold) {
+        // Agent is zombie if current time exceeds completion deadline + zombie threshold buffer
+        if (currentTime > completionDeadlineMs + zombieThreshold) {
           zombieAgentTypes.add(agentType);
+          long overdueMs = currentTime - completionDeadlineMs;
           log.warn(
-              "Zombie agent detected: {} (runtime: {}ms > threshold: {}ms)",
+              "Zombie agent detected: {} ({}ms overdue past completion deadline, {}ms buffer exceeded)",
               agentType,
-              runTime,
+              overdueMs,
               zombieThreshold);
         }
       } catch (NumberFormatException e) {

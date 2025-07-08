@@ -225,7 +225,7 @@ public class AgentAcquisitionService {
         }
 
         // Try to acquire this agent from Redis
-        String agentAcquireScore = tryAcquireAgent(jedis, agentType);
+        String agentAcquireScore = tryAcquireAgent(jedis, worker.getAgent());
         if (agentAcquireScore != null) {
           // Successfully acquired agent, prepare for execution
           worker.acquireScore = agentAcquireScore;
@@ -384,7 +384,7 @@ public class AgentAcquisitionService {
   /**
    * Get the active agents map for zombie cleanup.
    *
-   * @return map of active agents (agentType -> acquireScore)
+   * @return map of active agents (agentType -> completionDeadline)
    */
   public Map<String, String> getActiveAgentsMap() {
     return activeAgents;
@@ -487,10 +487,12 @@ public class AgentAcquisitionService {
     log.debug("Repopulated Redis with {} agents", addedCount);
   }
 
-  private String tryAcquireAgent(Jedis jedis, String agentType) {
+  private String tryAcquireAgent(Jedis jedis, Agent agent) {
     try {
-      // Generate timestamp score for this acquisition attempt
-      String acquireScore = score(jedis, 0L);
+      String agentType = agent.getAgentType();
+      // Generate completion deadline: current_time + agent_timeout
+      long agentTimeout = intervalProvider.getInterval(agent).getTimeout();
+      String acquireScore = score(jedis, agentTimeout);
 
       // Atomically try to move agent from WAITING → WORKING using Lua script
       // Script ensures only one instance can successfully acquire each agent
@@ -502,7 +504,7 @@ public class AgentAcquisitionService {
               WORKING_SET, // Destination set for acquired agents
               WAITING_SET, // Source set of agents ready for execution
               agentType, // Agent name to acquire
-              acquireScore); // Timestamp score for tracking acquisition time
+              acquireScore); // Completion deadline: current_time + timeout
 
       // Lua script returns the score if successful, null if agent was already taken
       if (result != null) {
@@ -510,7 +512,7 @@ public class AgentAcquisitionService {
       }
       return null; // Agent was acquired by another instance
     } catch (Exception e) {
-      log.warn("Failed to acquire agent {}", agentType, e);
+      log.warn("Failed to acquire agent {}", agent.getAgentType(), e);
       return null;
     }
   }
@@ -599,7 +601,8 @@ public class AgentAcquisitionService {
    * critical for handling failures and shutdown scenarios properly.
    *
    * @param agent The agent that finished execution
-   * @param acquireScore The score when the agent was acquired
+   * @param acquireScore The completion deadline when the agent was acquired (current_time +
+   *     timeout)
    * @param success Whether the agent execution was successful
    */
   public void conditionalReleaseAgent(Agent agent, String acquireScore, boolean success) {

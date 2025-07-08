@@ -397,19 +397,22 @@ class ZombieCleanupServiceTest {
     @Test
     @DisplayName("Should handle mixed zombie and active agents efficiently")
     void shouldHandleMixedZombieAndActiveAgentsEfficiently() {
-      // Given - Mix of zombie (old) and active (recent) agents
-      // Redis scores are stored as seconds since epoch, not milliseconds
-      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000; // Zombies
-      long recentScoreSeconds = (System.currentTimeMillis() - 10000) / 1000; // Active
+      // Given - Mix of zombie and active agents with completion deadline logic
+      long currentTimeSeconds = System.currentTimeMillis() / 1000;
+
+      // Scores are completion deadlines
+      long zombieDeadlineSeconds = currentTimeSeconds - 60; // Deadlines were 1 minute ago (zombies)
+      long activeDeadlineSeconds =
+          currentTimeSeconds + 60; // Deadlines are 1 minute in future (active)
 
       try (Jedis jedis = jedisPool.getResource()) {
-        // Add zombie agents (all old enough to be zombies)
+        // Add zombie agents (past completion deadlines)
         for (int i = 0; i < 500; i++) {
-          jedis.zadd("WORKZ", oldScoreSeconds - i, "zombie-" + i);
+          jedis.zadd("WORKZ", zombieDeadlineSeconds - i, "zombie-" + i);
         }
-        // Add active agents (all recent enough to not be zombies)
+        // Add active agents (future completion deadlines)
         for (int i = 0; i < 500; i++) {
-          jedis.zadd("WORKZ", recentScoreSeconds + i, "active-" + i);
+          jedis.zadd("WORKZ", activeDeadlineSeconds + i, "active-" + i);
         }
       }
 
@@ -417,17 +420,17 @@ class ZombieCleanupServiceTest {
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
 
-      // Add zombie agents to local tracking (only these should be cleaned)
+      // Add zombie agents to local tracking (past deadlines - should be cleaned)
       for (int i = 0; i < 500; i++) {
         String zombieName = "zombie-" + i;
-        activeAgents.put(zombieName, String.valueOf(oldScoreSeconds - i));
+        activeAgents.put(zombieName, String.valueOf(zombieDeadlineSeconds - i));
         activeAgentsFutures.put(zombieName, mock(Future.class));
       }
 
-      // Add active agents to local tracking (these should NOT be cleaned)
+      // Add active agents to local tracking (future deadlines - should NOT be cleaned)
       for (int i = 0; i < 500; i++) {
         String activeName = "active-" + i;
-        activeAgents.put(activeName, String.valueOf(recentScoreSeconds + i));
+        activeAgents.put(activeName, String.valueOf(activeDeadlineSeconds + i));
         activeAgentsFutures.put(activeName, mock(Future.class));
       }
 
@@ -659,32 +662,35 @@ class ZombieCleanupServiceTest {
     @Test
     @DisplayName("Should handle mixed zombie and active agents correctly")
     void shouldHandleMixedZombieAndActiveAgents() {
-      // Given - Mix of zombie and active agents
+      // Given - Mix of zombie and active agents using completion deadline logic
       long currentTimeSeconds = System.currentTimeMillis() / 1000;
-      long zombieTimeSeconds = currentTimeSeconds - 60; // 1 minute ago (zombie)
-      long activeTimeSeconds = currentTimeSeconds - 5; // 5 seconds ago (active)
+
+      // Scores are completion deadlines
+      long zombieDeadlineSeconds = currentTimeSeconds - 60; // Deadline was 1 minute ago (zombie)
+      long activeDeadlineSeconds =
+          currentTimeSeconds + 60; // Deadline is 1 minute in future (active)
 
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
 
-      // Add zombie agents (old timestamp)
-      activeAgents.put("zombie-1", String.valueOf(zombieTimeSeconds));
-      activeAgents.put("zombie-2", String.valueOf(zombieTimeSeconds - 5));
+      // Add zombie agents (past completion deadline)
+      activeAgents.put("zombie-1", String.valueOf(zombieDeadlineSeconds));
+      activeAgents.put("zombie-2", String.valueOf(zombieDeadlineSeconds - 5));
       activeAgentsFutures.put("zombie-1", mock(Future.class));
       activeAgentsFutures.put("zombie-2", mock(Future.class));
 
-      // Add active agents (recent timestamp)
-      activeAgents.put("active-1", String.valueOf(activeTimeSeconds));
-      activeAgents.put("active-2", String.valueOf(activeTimeSeconds - 2));
+      // Add active agents (future completion deadline)
+      activeAgents.put("active-1", String.valueOf(activeDeadlineSeconds));
+      activeAgents.put("active-2", String.valueOf(activeDeadlineSeconds + 10));
       activeAgentsFutures.put("active-1", mock(Future.class));
       activeAgentsFutures.put("active-2", mock(Future.class));
 
-      // Add all to Redis
+      // Add all to Redis with completion deadlines
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", zombieTimeSeconds, "zombie-1");
-        jedis.zadd("WORKZ", zombieTimeSeconds - 5, "zombie-2");
-        jedis.zadd("WORKZ", activeTimeSeconds, "active-1");
-        jedis.zadd("WORKZ", activeTimeSeconds - 2, "active-2");
+        jedis.zadd("WORKZ", zombieDeadlineSeconds, "zombie-1");
+        jedis.zadd("WORKZ", zombieDeadlineSeconds - 5, "zombie-2");
+        jedis.zadd("WORKZ", activeDeadlineSeconds, "active-1");
+        jedis.zadd("WORKZ", activeDeadlineSeconds + 10, "active-2");
       }
 
       // When - Run zombie cleanup
@@ -747,17 +753,23 @@ class ZombieCleanupServiceTest {
     @Test
     @DisplayName("Should verify zombie detection uses configurable threshold")
     void shouldUseConfigurableThresholdForZombieDetection() {
-      // Given - Agents with different ages
+      // Given - Test the zombie threshold buffer (30s) with completion deadlines
       long currentTimeSeconds = System.currentTimeMillis() / 1000;
-      long justOverThresholdSeconds = currentTimeSeconds - 31; // 31 seconds ago
-      long justUnderThresholdSeconds = currentTimeSeconds - 29; // 29 seconds ago
+
+      // Logic: current_time > completion_deadline + zombie_threshold (30s)
+      // For zombie: deadline should be >30s ago so current_time > deadline + 30s
+      long justOverDeadlineSeconds =
+          currentTimeSeconds - 31; // Deadline 31s ago: current > (deadline + 30s) = zombie
+      // For not zombie: deadline should be <30s ago so current_time <= deadline + 30s
+      long justUnderDeadlineSeconds =
+          currentTimeSeconds - 29; // Deadline 29s ago: current <= (deadline + 30s) = not zombie
 
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
 
-      // Add agents with different ages
-      activeAgents.put("just-over-threshold", String.valueOf(justOverThresholdSeconds));
-      activeAgents.put("just-under-threshold", String.valueOf(justUnderThresholdSeconds));
+      // Add agents with different completion deadlines
+      activeAgents.put("just-over-threshold", String.valueOf(justOverDeadlineSeconds));
+      activeAgents.put("just-under-threshold", String.valueOf(justUnderDeadlineSeconds));
       activeAgentsFutures.put("just-over-threshold", mock(Future.class));
       activeAgentsFutures.put("just-under-threshold", mock(Future.class));
 
