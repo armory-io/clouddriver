@@ -406,14 +406,9 @@ public class OrphanCleanupService {
 
     try (Jedis jedis = jedisPool.getResource()) {
       // Only delete the key if we own it (atomic check-and-delete)
-      String script =
-          "if redis.call('get', KEYS[1]) == ARGV[1] then "
-              + "return redis.call('del', KEYS[1]) "
-              + "else return 0 end";
-
       Object result =
-          jedis.eval(
-              script,
+          jedis.evalsha(
+              scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP_SCRIPT),
               java.util.Collections.singletonList(CLEANUP_LEADER_KEY),
               java.util.Collections.singletonList(currentLeadershipId));
 

@@ -76,7 +76,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(9);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
     }
 
     @Test
@@ -113,7 +113,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(firstSha).isEqualTo(secondSha);
-      assertThat(scriptManager.getScriptCount()).isEqualTo(9);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
     }
   }
 
@@ -150,7 +150,7 @@ class RedisScriptManagerTest {
       // Then
       assertThat(threadException[0]).isNull();
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(9);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
     }
   }
 
@@ -357,6 +357,52 @@ class RedisScriptManagerTest {
         // Verify agents were removed
         assertThat(jedis.zscore("WORKZ", "orphan1")).isNull();
         assertThat(jedis.zscore("WORKZ", "orphan2")).isNull();
+      }
+    }
+
+    @Test
+    @DisplayName("Should execute RELEASE_LEADERSHIP_SCRIPT correctly")
+    void shouldExecuteReleaseLeadershipScriptCorrectly() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Given - Set leadership key with owner ID
+        String leadershipKey = "cleanup:leadership";
+        String ownershipId = "node-123";
+        jedis.set(leadershipKey, ownershipId);
+
+        // When - Release leadership with correct ownership ID
+        Object result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP_SCRIPT),
+                java.util.Collections.singletonList(leadershipKey),
+                java.util.Collections.singletonList(ownershipId));
+
+        // Then - Should successfully delete the key
+        assertThat(result).isEqualTo(1L); // Successful deletion
+        assertThat(jedis.exists(leadershipKey)).isFalse();
+      }
+    }
+
+    @Test
+    @DisplayName("Should not release leadership with wrong ownership ID")
+    void shouldNotReleaseLeadershipWithWrongOwnershipId() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Given - Set leadership key with owner ID
+        String leadershipKey = "cleanup:leadership";
+        String correctOwnerId = "node-123";
+        String wrongOwnerId = "node-456";
+        jedis.set(leadershipKey, correctOwnerId);
+
+        // When - Try to release leadership with wrong ownership ID
+        Object result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP_SCRIPT),
+                java.util.Collections.singletonList(leadershipKey),
+                java.util.Collections.singletonList(wrongOwnerId));
+
+        // Then - Should not delete the key
+        assertThat(result).isEqualTo(0L); // Failed deletion
+        assertThat(jedis.exists(leadershipKey)).isTrue();
+        assertThat(jedis.get(leadershipKey)).isEqualTo(correctOwnerId);
       }
     }
   }

@@ -38,6 +38,7 @@ import redis.clients.jedis.JedisPool;
  *   <li><strong>Basic Operations:</strong> Add/remove agents from Redis sets
  *   <li><strong>State Transitions:</strong> Move agents between WAITING and WORKING sets
  *   <li><strong>Optimization Scripts:</strong> Batch operations for performance
+ *   <li><strong>Leadership Management:</strong> Distributed leadership coordination
  * </ul>
  */
 @Component
@@ -54,6 +55,9 @@ public class RedisScriptManager {
   public static final String BATCH_ORPHAN_REMOVE_SCRIPT = "batchOrphanRemove";
   public static final String BATCH_ADD_AGENTS_SCRIPT = "batchAddAgents";
   public static final String BATCH_CLEANUP_AGENTS_SCRIPT = "batchCleanupAgents";
+
+  // Leadership management script for OrphanCleanupService
+  public static final String RELEASE_LEADERSHIP_SCRIPT = "releaseLeadership";
 
   private final JedisPool jedisPool;
   private final Map<String, String> scriptShas = new ConcurrentHashMap<>();
@@ -244,6 +248,18 @@ public class RedisScriptManager {
                 + "  end\n"
                 + "end\n"
                 + "return {count, cleaned}\n")); // Return count and list of cleaned agents
+
+    // --- LEADERSHIP MANAGEMENT ---
+
+    // Release leadership only if we own it (atomic check-and-delete)
+    scriptShas.put(
+        RELEASE_LEADERSHIP_SCRIPT,
+        jedis.scriptLoad(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then\n"
+                + "  return redis.call('del', KEYS[1])\n"
+                + "else\n"
+                + "  return 0\n"
+                + "end\n"));
 
     log.debug("Loaded Redis Lua scripts: {}", scriptShas.keySet());
   }
