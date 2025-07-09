@@ -326,15 +326,25 @@ public class AgentAcquisitionService {
       // Remove future tracking - this cleanup is non-critical if it fails
       activeAgentsFutures.remove(agentType);
 
-      // CRITICAL: Also remove from Redis WORKZ set
+      // CRITICAL: Remove from Redis sets - behavior depends on shutdown state
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.evalsha(
-            scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_SCRIPT),
-            java.util.Arrays.asList(WORKING_SET, WAITING_SET), // Script needs both keys
-            java.util.Collections.singletonList(agentType));
-        log.debug("Removed agent {} from active tracking and Redis sets", agentType);
+        if (shuttingDown.get()) {
+          // During shutdown: Only remove from WORKZ to preserve WAITZ entries
+          // Agents in WAITZ were put there by graceful shutdown for restart
+          jedis.zrem(WORKING_SET, agentType);
+          log.debug(
+              "Removed agent {} from active tracking and WORKZ (preserving WAITZ during shutdown)",
+              agentType);
+        } else {
+          // Normal operation: Remove from both sets
+          jedis.evalsha(
+              scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_SCRIPT),
+              java.util.Arrays.asList(WORKING_SET, WAITING_SET), // Script needs both keys
+              java.util.Collections.singletonList(agentType));
+          log.debug("Removed agent {} from active tracking and Redis sets", agentType);
+        }
       } catch (Exception e) {
-        log.error("Failed to remove agent {} from Redis WORKZ set", agentType, e);
+        log.error("Failed to remove agent {} from Redis", agentType, e);
       }
     }
   }
@@ -648,12 +658,7 @@ public class AgentAcquisitionService {
     try {
       // During shutdown, always re-queue agents immediately regardless of success status
       // This ensures agents don't get lost during deployments/restarts
-      // BUT: Skip re-queuing if graceful shutdown is handling it to prevent race condition
       if (shuttingDown.get()) {
-        if (gracefulShutdown.get()) {
-          log.debug("Skipping re-queue for agent {} - graceful shutdown will handle it", agentType);
-          return;
-        }
         log.debug("Re-queuing agent {} due to shutdown in progress", agentType);
         scheduleAgentInRedis(agent, 0L); // Schedule for immediate pickup after restart
         return;

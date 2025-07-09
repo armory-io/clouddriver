@@ -127,12 +127,12 @@ class ShutdownBehaviorTest {
   }
 
   @Nested
-  @DisplayName("Race Condition Prevention")
+  @DisplayName("Shutdown Agent Preservation")
   class RaceConditionTests {
 
     @Test
-    @DisplayName("Should prevent duplicate re-queuing during graceful shutdown")
-    void shouldPreventDuplicateReQueuing() throws Exception {
+    @DisplayName("Should always re-queue agents during shutdown for reliability")
+    void shouldAlwaysReQueueDuringShutdown() throws Exception {
       // Given - Agent that will take time to execute
       Agent slowAgent = createMockAgent("slow-agent");
       CountDownLatch executionStarted = new CountDownLatch(1);
@@ -179,17 +179,16 @@ class ShutdownBehaviorTest {
 
         long afterWaitzSize = jedis.zcard("WAITZ");
 
-        // Then - With our race condition fix, the agent should NOT be re-queued
-        // because graceful shutdown flag prevents duplicate re-queuing
+        // Then - we always re-queue during shutdown
         System.out.println("WAITZ before: " + beforeWaitzSize + ", after: " + afterWaitzSize);
         assertThat(afterWaitzSize - beforeWaitzSize)
-            .isEqualTo(0); // No re-queuing due to race prevention
+            .isEqualTo(1); // Agent re-queued during shutdown
 
-        // Verify our race condition prevention is working
+        // Verify the agent is successfully preserved for restart
         Set<String> waitingAgents = jedis.zrange("WAITZ", 0, -1);
         boolean slowAgentFound = waitingAgents.contains("slow-agent");
         System.out.println("Agents in WAITZ: " + waitingAgents);
-        assertThat(slowAgentFound).isFalse(); // Agent not re-queued due to race prevention
+        assertThat(slowAgentFound).isTrue(); // Agent preserved for restart
       }
     }
   }
