@@ -26,7 +26,6 @@ import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.module.CatsModuleAware;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -448,17 +447,18 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
   /**
    * Gracefully releases all active agents back to the waiting queue during shutdown. This prevents
-   * agent loss during deployments and restarts.
+   * agent loss during deployments and restarts. Only re-queues agents this instance was actively
+   * working on to prevent conflicts in multi-instance non-sharded environments.
    */
   private void gracefullyReleaseActiveAgents() {
-    // Get ALL registered agents - this is the complete list that needs re-queuing
-    int registeredCount = acquisitionService.getRegisteredAgentCount();
-    if (registeredCount == 0) {
-      log.info("No registered agents to release during shutdown");
+    // Get count of agents this instance is actively working on
+    int activeCount = acquisitionService.getActiveAgentCount();
+    if (activeCount == 0) {
+      log.info("No active agents to release during shutdown");
       return;
     }
 
-    log.info("Gracefully releasing {} registered agents during shutdown", registeredCount);
+    log.info("Gracefully releasing {} active agents during shutdown", activeCount);
 
     try {
       // Set graceful shutdown flag to prevent race condition with normal agent completion
@@ -497,30 +497,34 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
         Thread.sleep(100);
       }
 
-      // PHASE 2: Re-queue ALL registered agents
-      // This ensures no agents are lost, regardless of their completion timing
-      Set<String> allRegisteredAgents = acquisitionService.getAllRegisteredAgentTypes();
+      // PHASE 2: Re-queue ONLY agents this instance was actively working on
+      // This prevents duplicate re-queuing in non-sharded multi-instance environments
+      Map<String, String> activeAgentsSnapshot = acquisitionService.getActiveAgentsMap();
       int released = 0;
 
-      for (String agentType : allRegisteredAgents) {
+      for (Map.Entry<String, String> entry : activeAgentsSnapshot.entrySet()) {
+        String agentType = entry.getKey();
+        String expectedScore = entry.getValue(); // Score when we acquired the agent
+
         try {
           Agent agent = acquisitionService.getAgentByType(agentType);
           if (agent != null) {
-            // Force re-queue for shutdown - moves from any state to WAITZ
-            acquisitionService.forceRequeueAgentForShutdown(agent);
+            // Conditionally re-queue - only if agent still in WORKZ with expected score
+            acquisitionService.forceRequeueAgentForShutdown(agent, expectedScore);
             released++;
-            log.debug("Re-queued agent {} for post-restart execution", agentType);
+            log.debug(
+                "Attempted re-queue of active agent {} for post-restart execution", agentType);
           }
         } catch (Exception e) {
           log.warn(
-              "Failed to gracefully release agent {} during shutdown: {}",
+              "Failed to gracefully release active agent {} during shutdown: {}",
               agentType,
               e.getMessage());
         }
       }
 
       log.info(
-          "Graceful shutdown: {} agents interrupted, {} agents re-queued for restart",
+          "Graceful shutdown: {} agents interrupted, {} active agents re-queued for restart",
           interrupted,
           released);
 

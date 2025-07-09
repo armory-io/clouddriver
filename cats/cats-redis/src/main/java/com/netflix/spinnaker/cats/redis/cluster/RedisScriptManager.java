@@ -56,7 +56,6 @@ public class RedisScriptManager {
   public static final String BATCH_ADD_AGENTS_SCRIPT = "batchAddAgents";
   public static final String BATCH_CLEANUP_AGENTS_SCRIPT = "batchCleanupAgents";
   public static final String RELEASE_LEADERSHIP_SCRIPT = "releaseLeadership";
-  public static final String UNCONDITIONAL_SWAP_SET_SCRIPT = "unconditionalSwapSet";
 
   private final JedisPool jedisPool;
   private final Map<String, String> scriptShas = new ConcurrentHashMap<>();
@@ -169,15 +168,6 @@ public class RedisScriptManager {
                 + "  redis.call('zadd', KEYS[2], ARGV[3], ARGV[1])\n" // Add to WAITING_SET
                 + "  return 'swapped'\n" // Success
                 + "else return nil end\n")); // Failed - score mismatch or agent missing
-
-    // Unconditionally move agent from any state to WAITING set (used for graceful shutdown)
-    scriptShas.put(
-        UNCONDITIONAL_SWAP_SET_SCRIPT,
-        jedis.scriptLoad(
-            "redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from WORKING set (if present)
-                + "redis.call('zrem', KEYS[2], ARGV[1])\n" // Remove from WAITING set (if present)
-                + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[1])\n" // Add to WAITING with new score
-                + "return 'moved'\n"));
 
     // Check if we still own the agent lock (score validation)
     scriptShas.put(

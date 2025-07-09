@@ -76,7 +76,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(11);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
     }
 
     @Test
@@ -113,7 +113,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(firstSha).isEqualTo(secondSha);
-      assertThat(scriptManager.getScriptCount()).isEqualTo(11);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
     }
   }
 
@@ -150,7 +150,7 @@ class RedisScriptManagerTest {
       // Then
       assertThat(threadException[0]).isNull();
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(11);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
     }
   }
 
@@ -348,67 +348,6 @@ class RedisScriptManagerTest {
         assertThat(result).isNull();
         assertThat(jedis.zscore("WORKZ", agentType)).isEqualTo(workingScore); // Still in WORKZ
         assertThat(jedis.zscore("WAITZ", agentType)).isNull();
-      }
-    }
-
-    @Test
-    @DisplayName("Should unconditionally move agent to WAITING set (graceful shutdown)")
-    void shouldUnconditionallyMoveAgentToWaitingSet() {
-      // Given - Agent in different possible states
-      String agentType = "test-agent";
-      double workingScore = 12345.0;
-      double waitingScore = 67890.0;
-      double newScore = 99999.0;
-
-      try (Jedis jedis = jedisPool.getResource()) {
-        // Test 1: Agent in WORKING set
-        jedis.zadd("WORKZ", workingScore, agentType);
-
-        // When - Execute unconditional swap
-        Object result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.UNCONDITIONAL_SWAP_SET_SCRIPT),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
-                java.util.Arrays.asList(agentType, String.valueOf(newScore)));
-
-        // Then - Agent moved to WAITING with new score
-        assertThat(result).isEqualTo("moved");
-        assertThat(jedis.zscore("WORKZ", agentType)).isNull();
-        assertThat(jedis.zscore("WAITZ", agentType)).isEqualTo(newScore);
-
-        // Cleanup
-        jedis.zrem("WAITZ", agentType);
-
-        // Test 2: Agent in WAITING set
-        jedis.zadd("WAITZ", waitingScore, agentType);
-
-        // When - Execute unconditional swap (should update score)
-        result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.UNCONDITIONAL_SWAP_SET_SCRIPT),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
-                java.util.Arrays.asList(agentType, String.valueOf(newScore)));
-
-        // Then - Agent remains in WAITING but with new score
-        assertThat(result).isEqualTo("moved");
-        assertThat(jedis.zscore("WORKZ", agentType)).isNull();
-        assertThat(jedis.zscore("WAITZ", agentType)).isEqualTo(newScore);
-
-        // Cleanup
-        jedis.zrem("WAITZ", agentType);
-
-        // Test 3: Agent in neither set
-        // When - Execute unconditional swap
-        result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.UNCONDITIONAL_SWAP_SET_SCRIPT),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
-                java.util.Arrays.asList(agentType, String.valueOf(newScore)));
-
-        // Then - Agent added to WAITING with new score
-        assertThat(result).isEqualTo("moved");
-        assertThat(jedis.zscore("WORKZ", agentType)).isNull();
-        assertThat(jedis.zscore("WAITZ", agentType)).isEqualTo(newScore);
       }
     }
   }

@@ -349,6 +349,15 @@ public class AgentAcquisitionService {
   }
 
   /**
+   * Get the total number of registered agents (for stats).
+   *
+   * @return number of registered agents
+   */
+  public int getRegisteredAgentCount() {
+    return agents.size();
+  }
+
+  /**
    * Get a snapshot of active agent futures for graceful shutdown. Returns a copy to avoid
    * concurrent modification issues.
    *
@@ -371,15 +380,6 @@ public class AgentAcquisitionService {
   public Agent getRegisteredAgent(String agentType) {
     AgentWorker worker = agents.get(agentType);
     return worker != null ? worker.getAgent() : null;
-  }
-
-  /**
-   * Get the total number of registered agents.
-   *
-   * @return number of registered agents
-   */
-  public int getRegisteredAgentCount() {
-    return agents.size();
   }
 
   /**
@@ -415,34 +415,33 @@ public class AgentAcquisitionService {
     return worker != null ? worker.getAgent() : null;
   }
 
-  /** Get all registered agent types for comprehensive graceful shutdown. */
-  public Set<String> getAllRegisteredAgentTypes() {
-    return new HashSet<>(agents.keySet());
-  }
-
   /**
-   * Force re-queue an agent during graceful shutdown, regardless of current state. This ensures
-   * agents are moved from any state to WAITZ for restart pickup. Uses RedisScriptManager's
-   * UNCONDITIONAL_SWAP_SET_SCRIPT for consistency.
+   * Conditionally re-queue an agent during graceful shutdown if it's still in WORKZ. This approach
+   * respects agents that completed during shutdown and avoids race conditions. Uses ownership
+   * verification to ensure we only move agents this instance actually owns.
    */
-  public void forceRequeueAgentForShutdown(Agent agent) {
+  public void forceRequeueAgentForShutdown(Agent agent, String expectedScore) {
     String agentType = agent.getAgentType();
 
     try (Jedis jedis = jedisPool.getResource()) {
-      // Calculate immediate execution score with jitter
-      String nextScore = calculateShutdownScore(jedis, agentType);
+      // Calculate immediate execution score for restart
+      String nextScore = score(jedis, 0L); // Immediate execution
 
-      // Use RedisScriptManager's unconditional swap script
+      // Use CONDITIONAL_SWAP_SET_SCRIPT - only moves if agent is in WORKZ with expected score
       Object result =
           jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.UNCONDITIONAL_SWAP_SET_SCRIPT),
+              scriptManager.getScriptSha(RedisScriptManager.CONDITIONAL_SWAP_SET_SCRIPT),
               java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-              java.util.Arrays.asList(agentType, nextScore));
+              java.util.Arrays.asList(agentType, expectedScore, nextScore));
 
-      log.debug("Force re-queued agent {} for shutdown, result: {}", agentType, result);
+      if (result != null && "swapped".equals(result)) {
+        log.debug("Successfully re-queued agent {} for shutdown restart", agentType);
+      } else {
+        log.debug("Agent {} not re-queued (already completed or moved during shutdown)", agentType);
+      }
 
     } catch (Exception e) {
-      log.error("Failed to force re-queue agent {} during shutdown", agentType, e);
+      log.error("Failed to conditionally re-queue agent {} during shutdown", agentType, e);
     }
   }
 
@@ -635,56 +634,6 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Calculate a score for agent scheduling during shutdown with jitter to prevent thundering herd.
-   *
-   * <p>For high-scale environments, this method:
-   *
-   * <ul>
-   *   <li>Uses Redis TIME for consistency across pods
-   *   <li>Adds controlled jitter (0-30 seconds) to spread restart load
-   *   <li>Handles Redis TIME sync failures gracefully
-   *   <li>Ensures no agent gets scheduled in the far future
-   * </ul>
-   *
-   * @param jedis Redis connection for TIME command
-   * @param agentType Agent type for consistent jitter calculation
-   * @return Score string for immediate-ish execution with jitter
-   */
-  private String calculateShutdownScore(Jedis jedis, String agentType) {
-    long baseTimeSeconds;
-
-    try {
-      // Try to get Redis server time for consistency across pods
-      List<String> times = jedis.time();
-      if (times != null && times.size() == 2) {
-        baseTimeSeconds = Long.parseLong(times.get(0));
-        log.debug("Using Redis TIME for shutdown scheduling: {}", baseTimeSeconds);
-      } else {
-        baseTimeSeconds = System.currentTimeMillis() / 1000;
-        log.debug("Redis TIME unavailable, using client time: {}", baseTimeSeconds);
-      }
-    } catch (Exception e) {
-      // Fallback to client time if Redis TIME fails
-      baseTimeSeconds = System.currentTimeMillis() / 1000;
-      log.debug("Redis TIME failed, using client time: {} - {}", baseTimeSeconds, e.getMessage());
-    }
-
-    // Add deterministic jitter based on agent type hash to spread restart load
-    // This prevents all agents from executing simultaneously after restart
-    int jitterSeconds = Math.abs(agentType.hashCode()) % 30; // 0-29 seconds
-    long scheduledTimeSeconds = baseTimeSeconds + jitterSeconds;
-
-    log.debug(
-        "Shutdown scheduling for {}: base={}, jitter={}s, scheduled={}",
-        agentType,
-        baseTimeSeconds,
-        jitterSeconds,
-        scheduledTimeSeconds);
-
-    return String.valueOf(scheduledTimeSeconds);
-  }
-
-  /**
    * Conditionally releases an agent back to the waiting queue based on execution status. This is
    * critical for handling failures and shutdown scenarios properly.
    *
@@ -741,13 +690,8 @@ public class AgentAcquisitionService {
       try (Jedis jedis = jedisPool.getResource()) {
         String nextScore;
 
-        // For immediate scheduling during shutdown, add jitter to prevent thundering herd
-        // and use a more robust approach for high-scale environments
-        if (offsetMs == 0L && shuttingDown.get()) {
-          nextScore = calculateShutdownScore(jedis, agentType);
-        } else {
-          nextScore = score(jedis, offsetMs);
-        }
+        // Use standard score calculation for all cases
+        nextScore = score(jedis, offsetMs);
 
         log.debug(
             "Scheduling agent {} in Redis with score: {} (attempt {})",

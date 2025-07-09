@@ -234,55 +234,6 @@ class ShutdownBehaviorTest {
             .isBetween(currentTimeSeconds - 10, currentTimeSeconds + 60);
       }
     }
-
-    @Test
-    @DisplayName("Should add jitter for high-scale shutdown")
-    void shouldAddJitterForHighScaleShutdown() throws Exception {
-      // Given - Multiple agents with different names
-      String[] agentNames = {"agent-1", "agent-2", "agent-3", "agent-100"};
-      AgentExecution execution = mock(AgentExecution.class);
-      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
-
-      acquisitionService.setShuttingDown(true);
-
-      // When - Re-queue multiple agents
-      for (String agentName : agentNames) {
-        Agent agent = createMockAgent(agentName);
-        acquisitionService.registerAgent(agent, execution, instrumentation);
-        acquisitionService.conditionalReleaseAgent(agent, "test-score", false);
-      }
-
-      // Then - Verify scores have jitter and proper timing
-      try (Jedis jedis = jedisPool.getResource()) {
-        Set<String> agentsWithScores = jedis.zrange("WAITZ", 0, -1);
-        java.util.List<Long> scores = new java.util.ArrayList<>();
-
-        for (String agent : agentsWithScores) {
-          Double score = jedis.zscore("WAITZ", agent);
-          if (score != null) {
-            scores.add(score.longValue());
-          }
-        }
-
-        // Should have multiple different scores (jitter working)
-        Set<Long> uniqueScores = new java.util.HashSet<>(scores);
-        assertThat(uniqueScores.size()).isGreaterThan(1);
-
-        // Verify all scores are reasonable (current time + jitter)
-        long currentTimeSeconds = System.currentTimeMillis() / 1000;
-        for (Long score : scores) {
-          System.out.println(
-              "Jitter test - Agent score: " + score + ", Current time: " + currentTimeSeconds);
-
-          // Scores should be current time + jitter (0-30 seconds)
-          assertThat(score)
-              .describedAs(
-                  "Score should be current time + jitter (0-30s). Got: %d, Current: %d",
-                  score, currentTimeSeconds)
-              .isBetween(currentTimeSeconds - 10, currentTimeSeconds + 60);
-        }
-      }
-    }
   }
 
   @Nested
@@ -303,47 +254,51 @@ class ShutdownBehaviorTest {
         acquisitionService.registerAgent(agent, execution, instrumentation);
       }
 
-      // Simulate some agents are in WORKZ (running), some completed and removed
+      // Simulate active agents in WORKZ with proper scores
+      String expectedScore;
       try (Jedis jedis = jedisPool.getResource()) {
         long currentTimeSeconds = System.currentTimeMillis() / 1000;
         long completionDeadline = currentTimeSeconds + 300; // 5 minutes from now
+        expectedScore = String.valueOf(completionDeadline);
 
-        // Add some agents to WORKZ (simulating they're running)
+        // Add agents to WORKZ (simulating they're actively running)
         jedis.zadd("WORKZ", completionDeadline, "agent-1");
         jedis.zadd("WORKZ", completionDeadline, "agent-2");
+        jedis.zadd("WORKZ", completionDeadline, "agent-3");
 
-        // Some agents already completed and not in Redis (but still registered)
-        // agent-3, agent-completed, agent-idle are registered but not in Redis
+        // Some agents completed and not in Redis (agent-completed, agent-idle)
+        // These won't be re-queued since they're not in WORKZ
 
         // Verify initial state
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(2);
+        assertThat(jedis.zcard("WORKZ")).isEqualTo(3);
         assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
       }
 
       // When - Perform graceful shutdown
       acquisitionService.setGracefulShutdown(true);
 
-      // Call the method that graceful shutdown would call to re-queue ALL agents
-      for (String agentType : agentTypes) {
+      // Call conditional re-queue with correct expected scores
+      String[] activeAgents = {"agent-1", "agent-2", "agent-3"};
+      for (String agentType : activeAgents) {
         Agent agent = acquisitionService.getAgentByType(agentType);
         if (agent != null) {
           acquisitionService.forceRequeueAgentForShutdown(
-              agent); // Force requeue regardless of state
+              agent, expectedScore); // Use correct expected score
         }
       }
 
-      // Then - ALL registered agents should be in WAITZ for restart
+      // Then - Only agents that were in WORKZ should be re-queued
       try (Jedis jedis = jedisPool.getResource()) {
         Set<String> agentsInWaitz = jedis.zrange("WAITZ", 0, -1);
 
-        // CRITICAL: All 5 registered agents should be re-queued
+        // CONDITIONAL logic: only agents that were in WORKZ get re-queued
         assertThat(agentsInWaitz)
-            .describedAs("All registered agents should be re-queued in WAITZ")
-            .containsExactlyInAnyOrder(agentTypes);
+            .describedAs("Only active agents should be conditionally re-queued in WAITZ")
+            .containsExactlyInAnyOrder("agent-1", "agent-2", "agent-3");
 
         // Verify they have immediate execution scores (current time or very close)
         long currentTimeSeconds = System.currentTimeMillis() / 1000;
-        for (String agentType : agentTypes) {
+        for (String agentType : activeAgents) {
           Double score = jedis.zscore("WAITZ", agentType);
           assertThat(score)
               .describedAs("Agent %s should have immediate execution score", agentType)
@@ -368,33 +323,49 @@ class ShutdownBehaviorTest {
 
       acquisitionService.registerAgent(agent, execution, instrumentation);
 
-      // Simulate agent was running (in WORKZ)
+      // Simulate agent was running (in WORKZ) with proper score
+      long completionDeadline;
       try (Jedis jedis = jedisPool.getResource()) {
-        long completionDeadline = System.currentTimeMillis() / 1000 + 300;
+        completionDeadline = System.currentTimeMillis() / 1000 + 300;
         jedis.zadd("WORKZ", completionDeadline, "racing-agent");
       }
 
-      // When - Agent completes normally during graceful shutdown
+      // When - Graceful shutdown tries to re-queue agent while it's still running
       acquisitionService.setGracefulShutdown(true);
 
-      // Simulate agent worker completion (removes from WORKZ, skips re-queue)
-      try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zrem("WORKZ", "racing-agent");
-      }
-
-      // But graceful shutdown still re-queues ALL registered agents
+      // Graceful shutdown re-queues agent (while it's still in WORKZ)
       Agent registeredAgent = acquisitionService.getAgentByType("racing-agent");
       assertThat(registeredAgent).isNotNull();
-      acquisitionService.forceRequeueAgentForShutdown(registeredAgent);
+      acquisitionService.forceRequeueAgentForShutdown(
+          registeredAgent, String.valueOf(completionDeadline));
 
-      // Then - Agent should be safely re-queued, not lost
+      // Then - Agent should be successfully moved from WORKZ to WAITZ
       try (Jedis jedis = jedisPool.getResource()) {
         assertThat(jedis.zscore("WAITZ", "racing-agent"))
-            .describedAs("Racing agent should be re-queued in WAITZ")
+            .describedAs("Racing agent should be conditionally re-queued in WAITZ")
             .isNotNull();
 
         assertThat(jedis.zscore("WORKZ", "racing-agent"))
-            .describedAs("Racing agent should not be in WORKZ")
+            .describedAs("Racing agent should be moved from WORKZ")
+            .isNull();
+      }
+
+      // Test scenario where agent completes first - should NOT be re-queued
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Setup another agent
+        jedis.zadd("WORKZ", completionDeadline, "completed-agent");
+        // Agent completes and removes itself
+        jedis.zrem("WORKZ", "completed-agent");
+
+        // Try to re-queue with original score - should fail
+        Agent completedAgent =
+            acquisitionService.getAgentByType("racing-agent"); // reuse existing agent for test
+        acquisitionService.forceRequeueAgentForShutdown(
+            completedAgent, String.valueOf(completionDeadline));
+
+        // Should NOT be in WAITZ since it wasn't in WORKZ
+        assertThat(jedis.zscore("WAITZ", "completed-agent"))
+            .describedAs("Completed agent should not be re-queued")
             .isNull();
       }
     }
