@@ -104,6 +104,9 @@ public class AgentAcquisitionService {
   private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
   private final AtomicBoolean gracefulShutdown = new AtomicBoolean(false);
 
+  // Track initial registration completion to prevent premature orphan cleanup
+  private final AtomicBoolean initialRegistrationComplete = new AtomicBoolean(false);
+
   public AgentAcquisitionService(
       JedisPool jedisPool,
       RedisScriptManager scriptManager,
@@ -158,6 +161,10 @@ public class AgentAcquisitionService {
       // PHASE 1: Agent Repopulation (Redis Recovery, periodic)
       if (runCount % redisRefreshPeriod == 0) {
         repopulateRedisAgents(jedis);
+        // Mark initial registration as complete after first Redis repopulation
+        if (!initialRegistrationComplete.get()) {
+          markInitialRegistrationComplete();
+        }
       }
 
       // PHASE 2: Find ready agents in priority order
@@ -756,6 +763,24 @@ public class AgentAcquisitionService {
   public void setGracefulShutdown(boolean gracefulShutdown) {
     this.gracefulShutdown.set(gracefulShutdown);
     log.debug("AgentAcquisitionService graceful shutdown flag set to: {}", gracefulShutdown);
+  }
+
+  /**
+   * Mark that initial agent registration is complete. This prevents orphan cleanup from running
+   * prematurely during startup before all agents are registered.
+   */
+  public void markInitialRegistrationComplete() {
+    if (initialRegistrationComplete.compareAndSet(false, true)) {
+      log.info("Initial agent registration completed - orphan cleanup can now safely run");
+    }
+  }
+
+  /**
+   * Check if initial agent registration is complete. Used by orphan cleanup to avoid false
+   * positives during startup.
+   */
+  public boolean isInitialRegistrationComplete() {
+    return initialRegistrationComplete.get();
   }
 
   /** Check if graceful shutdown is in progress. */

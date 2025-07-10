@@ -101,6 +101,13 @@ public class OrphanCleanupService {
       return;
     }
 
+    // Skip cleanup if initial agent registration hasn't completed yet
+    // This prevents false positives during startup when agents aren't registered yet
+    if (acquisitionService != null && !acquisitionService.isInitialRegistrationComplete()) {
+      log.debug("Skipping orphan cleanup - initial agent registration not yet complete");
+      return;
+    }
+
     // Check if enough time has passed since last cleanup
     long currentTime = System.currentTimeMillis();
     long intervalMs = schedulerProperties.getOrphanCleanup().getIntervalMs();
