@@ -1,8 +1,11 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.*;
-import static org.mockito.Mockito.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
@@ -14,23 +17,33 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.Pipeline;
-import redis.clients.jedis.Response;
+import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Tests for semaphore management in AgentAcquisitionService.
+ * Tests for semaphore management in AgentAcquisitionService using TestContainers.
  *
  * <p>Verifies that semaphore permits are properly acquired and released during agent execution,
- * preventing the semaphore leak bug that was causing agent acquisition to stop working.
+ * preventing the semaphore leak bug that was causing agent acquisition to stop working. Uses real
+ * Redis to test actual pipeline operations and Redis behavior.
  */
+@Testcontainers
+@DisplayName("AgentAcquisitionService Semaphore Tests")
 public class AgentAcquisitionSemaphoreTest {
 
+  @Container
+  static GenericContainer<?> redis =
+      new GenericContainer<>("redis:7-alpine")
+          .withExposedPorts(6379)
+          .withCommand("redis-server", "--requirepass", "testpass");
+
   private JedisPool jedisPool;
-  private Jedis jedis;
-  private Pipeline pipeline;
   private RedisScriptManager scriptManager;
   private AgentIntervalProvider intervalProvider;
   private ShardingFilter shardingFilter;
@@ -50,37 +63,41 @@ public class AgentAcquisitionSemaphoreTest {
     testSemaphore = new Semaphore(2); // Allow max 2 concurrent agents
     testExecutor = Executors.newFixedThreadPool(5);
 
-    // Mock basic dependencies
-    jedisPool = mock(JedisPool.class);
-    jedis = mock(Jedis.class);
-    pipeline = mock(Pipeline.class);
-    scriptManager = mock(RedisScriptManager.class);
+    // Set up real Redis connection
+    JedisPoolConfig config = new JedisPoolConfig();
+    config.setMaxTotal(10);
+    jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
+
+    // Clear Redis to ensure clean state
+    try (Jedis jedis = jedisPool.getResource()) {
+      jedis.flushAll();
+    }
+
+    // Initialize script manager with real Redis
+    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager.initializeScripts();
+
+    // Mock other dependencies
     intervalProvider = mock(AgentIntervalProvider.class);
     shardingFilter = mock(ShardingFilter.class);
-    agentProperties = mock(ClusteredSortAgentProperties.class);
-    schedulerProperties = mock(ClusteredSortSchedulerProperties.class);
     agentExecution = mock(AgentExecution.class);
     executionInstrumentation = mock(ExecutionInstrumentation.class);
 
-    when(jedisPool.getResource()).thenReturn(jedis);
-    when(jedis.time()).thenReturn(Arrays.asList("1751564649", "0"));
-    when(jedis.zrangeByScore(anyString(), anyDouble(), anyDouble())).thenReturn(new HashSet<>());
     when(shardingFilter.filter(any())).thenReturn(true);
-    when(agentProperties.getMaxConcurrentAgents()).thenReturn(10);
-    when(agentProperties.getEnabledPattern()).thenReturn(".*");
-    when(agentProperties.getDisabledPattern()).thenReturn("");
-    when(schedulerProperties.getRefreshPeriodSeconds()).thenReturn(10);
-
-    // Mock Pipeline operations
-    when(jedis.pipelined()).thenReturn(pipeline);
-    Response<Double> mockResponse = mock(Response.class);
-    when(mockResponse.get()).thenReturn(null); // Simulate agent not found in any set
-    when(pipeline.zscore(anyString(), anyString())).thenReturn(mockResponse);
 
     // Mock interval provider to return proper timeout values
     AgentIntervalProvider.Interval testInterval =
         new AgentIntervalProvider.Interval(60000L, 120000L); // 1min interval, 2min timeout
     when(intervalProvider.getInterval(any(Agent.class))).thenReturn(testInterval);
+
+    // Create properties with test values
+    agentProperties = new ClusteredSortAgentProperties();
+    agentProperties.setMaxConcurrentAgents(10);
+    agentProperties.setEnabledPattern(".*");
+    agentProperties.setDisabledPattern("");
+
+    schedulerProperties = new ClusteredSortSchedulerProperties();
+    schedulerProperties.setRefreshPeriodSeconds(10);
 
     // Create service
     service =
@@ -99,18 +116,16 @@ public class AgentAcquisitionSemaphoreTest {
 
   @Test
   void shouldAcquireSemaphorePermitWhenAgentIsScheduled() throws Exception {
-    // Given: Mock Redis to return ready agents
-    when(jedis.zrangeByScore(anyString(), anyDouble(), anyDouble()))
-        .thenReturn(Set.of("test-agent"));
-    when(scriptManager.getScriptSha(anyString())).thenReturn("script-sha");
-    when(jedis.evalsha(anyString(), anyInt(), anyString(), anyString(), anyString(), anyString()))
-        .thenReturn("1751564649"); // Successful acquisition
+    // Given: Add agent to Redis WAITING set (ready for acquisition)
+    try (Jedis jedis = jedisPool.getResource()) {
+      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent"); // Ready now
+    }
 
     // Initial semaphore state
     assertThat(testSemaphore.availablePermits()).isEqualTo(2);
 
-    // When: Saturate pool with semaphore
-    int acquired = service.saturatePool(1L, testSemaphore, testExecutor);
+    // When: Saturate pool with semaphore (runCount=0 forces Redis scan)
+    int acquired = service.saturatePool(0L, testSemaphore, testExecutor);
 
     // Then: Semaphore permit should be acquired
     assertThat(acquired).isEqualTo(1);
@@ -119,18 +134,29 @@ public class AgentAcquisitionSemaphoreTest {
 
   @Test
   void shouldNotAcquireAgentWhenSemaphoreIsExhausted() throws Exception {
-    // Given: Mock Redis to return ready agents
-    when(jedis.zrangeByScore(anyString(), anyDouble(), anyDouble()))
-        .thenReturn(Set.of("test-agent-1", "test-agent-2", "test-agent-3"));
+    // Given: Add multiple agents to Redis WAITING set
+    try (Jedis jedis = jedisPool.getResource()) {
+      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent-1");
+      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent-2");
+      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent-3");
+    }
 
-    // Exhaust semaphore permits
+    // Register additional agents
+    service.registerAgent(
+        createMockAgent("test-agent-1", "test-provider"), agentExecution, executionInstrumentation);
+    service.registerAgent(
+        createMockAgent("test-agent-2", "test-provider"), agentExecution, executionInstrumentation);
+    service.registerAgent(
+        createMockAgent("test-agent-3", "test-provider"), agentExecution, executionInstrumentation);
+
+    // Given: Exhaust semaphore permits
     testSemaphore.acquire(2); // Take all permits
     assertThat(testSemaphore.availablePermits()).isEqualTo(0);
 
-    // When: Try to saturate pool with no permits
-    int acquired = service.saturatePool(1L, testSemaphore, testExecutor);
+    // When: Try to saturate pool with no available permits
+    int acquired = service.saturatePool(0L, testSemaphore, testExecutor);
 
-    // Then: No agents should be acquired
+    // Then: No agents should be acquired due to semaphore exhaustion
     assertThat(acquired).isEqualTo(0);
     assertThat(testSemaphore.availablePermits()).isEqualTo(0);
   }
@@ -242,7 +268,7 @@ public class AgentAcquisitionSemaphoreTest {
 
   @Test
   void shouldHandleMultipleConcurrentAgentsWithSemaphoreCorrectly() throws Exception {
-    // Given: Register multiple agents and mock Redis responses
+    // Given: Register multiple agents
     Agent agent1 = createMockAgent("agent-1", "test-provider");
     Agent agent2 = createMockAgent("agent-2", "test-provider");
     Agent agent3 = createMockAgent("agent-3", "test-provider");
@@ -251,11 +277,12 @@ public class AgentAcquisitionSemaphoreTest {
     service.registerAgent(agent2, agentExecution, executionInstrumentation);
     service.registerAgent(agent3, agentExecution, executionInstrumentation);
 
-    when(jedis.zrangeByScore(anyString(), anyDouble(), anyDouble()))
-        .thenReturn(Set.of("agent-1", "agent-2", "agent-3"));
-    when(scriptManager.getScriptSha(anyString())).thenReturn("script-sha");
-    when(jedis.evalsha(anyString(), anyInt(), anyString(), anyString(), anyString(), anyString()))
-        .thenReturn("1751564649"); // All acquisitions succeed
+    // Add agents to Redis WAITING set
+    try (Jedis jedis = jedisPool.getResource()) {
+      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "agent-1");
+      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "agent-2");
+      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "agent-3");
+    }
 
     // Setup execution to complete quickly
     AtomicInteger completedCount = new AtomicInteger(0);
@@ -271,7 +298,7 @@ public class AgentAcquisitionSemaphoreTest {
     assertThat(testSemaphore.availablePermits()).isEqualTo(2);
 
     // When: Saturate pool (should acquire max 2 agents due to semaphore limit)
-    int acquired = service.saturatePool(1L, testSemaphore, testExecutor);
+    int acquired = service.saturatePool(0L, testSemaphore, testExecutor);
 
     // Then: Should acquire exactly 2 agents (semaphore limit)
     assertThat(acquired).isEqualTo(2);
@@ -287,15 +314,13 @@ public class AgentAcquisitionSemaphoreTest {
 
   @Test
   void shouldHandleNullSemaphoreGracefully() throws Exception {
-    // Given: Mock Redis to return ready agents
-    when(jedis.zrangeByScore(anyString(), anyDouble(), anyDouble()))
-        .thenReturn(Set.of("test-agent"));
-    when(scriptManager.getScriptSha(anyString())).thenReturn("script-sha");
-    when(jedis.evalsha(anyString(), anyInt(), anyString(), anyString(), anyString(), anyString()))
-        .thenReturn("1751564649");
+    // Given: Add agent to Redis WAITING set
+    try (Jedis jedis = jedisPool.getResource()) {
+      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent");
+    }
 
     // When: Saturate pool with null semaphore (no concurrency control)
-    int acquired = service.saturatePool(1L, null, testExecutor);
+    int acquired = service.saturatePool(0L, null, testExecutor);
 
     // Then: Should still work without semaphore
     assertThat(acquired).isEqualTo(1);
