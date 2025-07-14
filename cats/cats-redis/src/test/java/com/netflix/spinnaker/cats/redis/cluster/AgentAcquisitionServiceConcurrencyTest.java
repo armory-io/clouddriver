@@ -32,6 +32,8 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Pipeline;
+import redis.clients.jedis.Response;
 
 /**
  * Comprehensive concurrency and race condition tests for AgentAcquisitionService.
@@ -46,6 +48,7 @@ class AgentAcquisitionServiceConcurrencyTest {
 
   @Mock private JedisPool mockJedisPool;
   @Mock private Jedis mockJedis;
+  @Mock private Pipeline mockPipeline;
   @Mock private RedisScriptManager mockScriptManager;
   @Mock private AgentIntervalProvider mockIntervalProvider;
   @Mock private ShardingFilter mockShardingFilter;
@@ -68,6 +71,17 @@ class AgentAcquisitionServiceConcurrencyTest {
     when(mockSchedulerProperties.getRefreshPeriodSeconds()).thenReturn(30);
     when(mockScriptManager.getScriptSha(anyString())).thenReturn("mock-sha");
     when(mockScriptManager.isInitialized()).thenReturn(true);
+
+    // Mock Pipeline operations to prevent null pointer exceptions
+    when(mockJedis.pipelined()).thenReturn(mockPipeline);
+    Response<Double> mockResponse = mock(Response.class);
+    when(mockResponse.get()).thenReturn(null); // Simulate agent not found in any set
+    when(mockPipeline.zscore(anyString(), anyString())).thenReturn(mockResponse);
+
+    // Mock interval provider
+    AgentIntervalProvider.Interval testInterval =
+        new AgentIntervalProvider.Interval(60000L, 120000L);
+    when(mockIntervalProvider.getInterval(any(Agent.class))).thenReturn(testInterval);
 
     acquisitionService =
         new AgentAcquisitionService(

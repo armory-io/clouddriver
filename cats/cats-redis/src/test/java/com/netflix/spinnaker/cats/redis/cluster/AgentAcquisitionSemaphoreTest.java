@@ -17,6 +17,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Pipeline;
+import redis.clients.jedis.Response;
 
 /**
  * Tests for semaphore management in AgentAcquisitionService.
@@ -28,6 +30,7 @@ public class AgentAcquisitionSemaphoreTest {
 
   private JedisPool jedisPool;
   private Jedis jedis;
+  private Pipeline pipeline;
   private RedisScriptManager scriptManager;
   private AgentIntervalProvider intervalProvider;
   private ShardingFilter shardingFilter;
@@ -50,6 +53,7 @@ public class AgentAcquisitionSemaphoreTest {
     // Mock basic dependencies
     jedisPool = mock(JedisPool.class);
     jedis = mock(Jedis.class);
+    pipeline = mock(Pipeline.class);
     scriptManager = mock(RedisScriptManager.class);
     intervalProvider = mock(AgentIntervalProvider.class);
     shardingFilter = mock(ShardingFilter.class);
@@ -66,6 +70,12 @@ public class AgentAcquisitionSemaphoreTest {
     when(agentProperties.getEnabledPattern()).thenReturn(".*");
     when(agentProperties.getDisabledPattern()).thenReturn("");
     when(schedulerProperties.getRefreshPeriodSeconds()).thenReturn(10);
+
+    // Mock Pipeline operations
+    when(jedis.pipelined()).thenReturn(pipeline);
+    Response<Double> mockResponse = mock(Response.class);
+    when(mockResponse.get()).thenReturn(null); // Simulate agent not found in any set
+    when(pipeline.zscore(anyString(), anyString())).thenReturn(mockResponse);
 
     // Mock interval provider to return proper timeout values
     AgentIntervalProvider.Interval testInterval =

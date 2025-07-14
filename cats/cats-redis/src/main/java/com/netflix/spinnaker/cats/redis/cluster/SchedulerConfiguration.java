@@ -58,6 +58,12 @@ public class SchedulerConfiguration {
   private volatile ScheduledExecutorService schedulerExecutorService;
   private volatile Semaphore runningAgents;
 
+  /**
+   * Constructs a new SchedulerConfiguration instance with the provided properties.
+   *
+   * @param agentProperties Configuration properties for agent management
+   * @param schedulerProperties Configuration properties for scheduler behavior
+   */
   public SchedulerConfiguration(
       ClusteredSortAgentProperties agentProperties,
       ClusteredSortSchedulerProperties schedulerProperties) {
@@ -296,6 +302,7 @@ public class SchedulerConfiguration {
     log.info("Scheduler configuration shutdown completed");
   }
 
+  /** Creates the agent work pool with the specified configuration. */
   private void createAgentWorkPool() {
     // Create thread pool with explicit configuration (aligned with other schedulers)
     // Redis WAITING_SET provides queuing, so ThreadPool uses unbounded queue like other schedulers
@@ -320,6 +327,7 @@ public class SchedulerConfiguration {
             new ThreadPoolExecutor.CallerRunsPolicy()); // Execute in caller thread as fallback
   }
 
+  /** Creates the scheduler executor service. */
   private void createSchedulerExecutorService() {
     this.schedulerExecutorService =
         java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
@@ -328,6 +336,9 @@ public class SchedulerConfiguration {
     log.info("Created scheduler executor service");
   }
 
+  /**
+   * Creates the concurrency control semaphore based on the configured maximum concurrent agents.
+   */
   private void createConcurrencyControl() {
     int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
 
@@ -336,7 +347,7 @@ public class SchedulerConfiguration {
       log.info("Created concurrency semaphore with {} permits", maxConcurrentAgents);
     } else {
       this.runningAgents = null;
-      log.info("Concurrency control disabled (unlimited agents)");
+      log.info("Concurrency control disabled - running unlimited agents");
     }
   }
 }

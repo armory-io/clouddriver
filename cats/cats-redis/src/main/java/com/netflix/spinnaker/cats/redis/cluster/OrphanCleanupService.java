@@ -204,6 +204,10 @@ public class OrphanCleanupService {
   /**
    * Clean up orphaned agents from the specified Redis set with built-in batch processing and
    * fallback mechanism.
+   *
+   * @param jedis The Jedis connection to the Redis server
+   * @param setName The name of the Redis set to clean up
+   * @return The number of orphaned agents cleaned up
    */
   private int cleanupOrphanedAgentsFromSet(Jedis jedis, String setName) {
     long cutoffScore;
@@ -250,7 +254,14 @@ public class OrphanCleanupService {
     }
   }
 
-  /** Process orphaned agents with batch operations and built-in fallback to individual cleanup. */
+  /**
+   * Process orphaned agents with batch operations and built-in fallback to individual cleanup.
+   *
+   * @param jedis The Jedis connection to the Redis server
+   * @param setName The name of the Redis set to clean up
+   * @param orphans List of orphaned agents to process
+   * @return The number of orphaned agents cleaned up
+   */
   private int processOrphanBatch(Jedis jedis, String setName, List<Tuple> orphans) {
     if (orphans.isEmpty()) {
       return 0;

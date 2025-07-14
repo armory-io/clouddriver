@@ -181,7 +181,7 @@ public class AgentAcquisitionService {
       }
 
       // PHASE 3: Agent Acquisition and Execution
-      // Performance optimization: Reuse thread-local collection to reduce GC pressure
+      // Performance optimization: Reusing thread-local collection to reduce GC pressure
       Set<AgentWorker> workersToSubmit = REUSABLE_WORKERS_SET.get();
       workersToSubmit.clear(); // Clear any previous contents
       int agentsAcquiredThisCycle = 0;
@@ -299,7 +299,18 @@ public class AgentAcquisitionService {
     AgentWorker worker = new AgentWorker(agent, agentExecution, executionInstrumentation, this);
     agents.put(agent.getAgentType(), worker);
     agentMapSize.set(agents.size()); // Update statistics
-    log.debug("Registered agent {} for scheduling", agent.getAgentType());
+
+    // Log enhanced registration info with operational details
+    AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
+    String initialScore = agentScore(agent);
+
+    log.debug(
+        "Registered agent {} (interval {}s/timeout {}s) for scheduling [score {}/total agents {}]",
+        agent.getAgentType(),
+        interval.getInterval() / 1000,
+        interval.getTimeout() / 1000,
+        initialScore,
+        agents.size());
   }
 
   /**
@@ -442,7 +453,22 @@ public class AgentAcquisitionService {
 
     try (Jedis jedis = jedisPool.getResource()) {
       // Calculate immediate execution score for restart
-      String nextScore = score(jedis, 0L); // Immediate execution
+      String nextScore = score(jedis, 0L);
+
+      log.debug(
+          "Shutdown re-queue attempt: {} expected_score={} next_score={}",
+          agentType,
+          expectedScore,
+          nextScore);
+
+      // Check current state in Redis before attempting swap
+      Double currentWorkzScore = jedis.zscore(WORKING_SET, agentType);
+      Double currentWaitzScore = jedis.zscore(WAITING_SET, agentType);
+      log.debug(
+          "Redis state before swap: {} WORKZ={} WAITZ={}",
+          agentType,
+          currentWorkzScore,
+          currentWaitzScore);
 
       // Use CONDITIONAL_SWAP_SET_SCRIPT - only moves if agent is in WORKZ with expected score
       Object result =
@@ -451,10 +477,25 @@ public class AgentAcquisitionService {
               java.util.Arrays.asList(WORKING_SET, WAITING_SET),
               java.util.Arrays.asList(agentType, expectedScore, nextScore));
 
+      // Check final state
+      Double finalWorkzScore = jedis.zscore(WORKING_SET, agentType);
+      Double finalWaitzScore = jedis.zscore(WAITING_SET, agentType);
+      log.debug(
+          "Redis state after swap: {} WORKZ={} WAITZ={} result={}",
+          agentType,
+          finalWorkzScore,
+          finalWaitzScore,
+          result);
+
       if (result != null && "swapped".equals(result)) {
-        log.debug("Successfully re-queued agent {} for shutdown restart", agentType);
+        log.info("Successfully re-queued agent {} for shutdown restart", agentType);
       } else {
-        log.debug("Agent {} not re-queued (already completed or moved during shutdown)", agentType);
+        log.warn(
+            "Agent {} not re-queued (already completed or moved during shutdown) (expected={}, current={}, result={})",
+            agentType,
+            expectedScore,
+            currentWorkzScore,
+            result);
       }
 
     } catch (Exception e) {
@@ -516,6 +557,11 @@ public class AgentAcquisitionService {
     return disabledAgentPattern != null && disabledAgentPattern.matcher(agentType).matches();
   }
 
+  /**
+   * Repopulate Redis with known agents from the local agents map.
+   *
+   * @param jedis Jedis connection to Redis
+   */
   private void repopulateRedisAgents(Jedis jedis) {
     log.debug("Repopulating Redis with {} known agents", agents.size());
 
@@ -541,6 +587,13 @@ public class AgentAcquisitionService {
     log.debug("Repopulated Redis with {} agents", addedCount);
   }
 
+  /**
+   * Attempt to acquire an agent for execution.
+   *
+   * @param jedis Jedis connection to Redis
+   * @param agent The agent to acquire
+   * @return The acquire score if successful, null otherwise
+   */
   private String tryAcquireAgent(Jedis jedis, Agent agent) {
     try {
       String agentType = agent.getAgentType();
@@ -571,6 +624,12 @@ public class AgentAcquisitionService {
     }
   }
 
+  /**
+   * Get the current score of an agent in the working or waiting set.
+   *
+   * @param agent The agent to check
+   * @return The current score of the agent, or "unknown" if Redis is unavailable
+   */
   private String agentScore(Agent agent) {
     try (Jedis jedis = jedisPool.getResource()) {
       Pipeline pipeline = jedis.pipelined();
@@ -599,6 +658,10 @@ public class AgentAcquisitionService {
 
       // New agent or overdue - execute immediately
       return score(jedis, 0L);
+    } catch (Exception e) {
+      log.debug(
+          "Could not get agent score from Redis for {}: {}", agent.getAgentType(), e.getMessage());
+      return "unknown";
     }
   }
 
@@ -747,7 +810,6 @@ public class AgentAcquisitionService {
     }
   }
 
-  /** Inner class representing an agent worker that can be executed. */
   /** Set the shutdown flag to coordinate graceful shutdown across all operations. */
   public void setShuttingDown(boolean shuttingDown) {
     this.shuttingDown.set(shuttingDown);
@@ -771,7 +833,7 @@ public class AgentAcquisitionService {
    */
   public void markInitialRegistrationComplete() {
     if (initialRegistrationComplete.compareAndSet(false, true)) {
-      log.info("Initial agent registration completed - orphan cleanup can now safely run");
+      log.info("Initial agent registration completed");
     }
   }
 
@@ -810,6 +872,7 @@ public class AgentAcquisitionService {
     }
   }
 
+  /** Runnable wrapper for agent execution that handles resource management and monitoring. */
   public static class AgentWorker implements Runnable {
     private final Agent agent;
     private final AgentExecution agentExecution;
@@ -879,22 +942,33 @@ public class AgentAcquisitionService {
       }
     }
 
+    /**
+     * Get the agent associated with this worker.
+     *
+     * @return The agent
+     */
     public Agent getAgent() {
       return agent;
     }
 
+    /**
+     * Get the acquire score for this agent.
+     *
+     * @return The acquire score
+     */
     public String getAcquireScore() {
       return acquireScore;
     }
 
-    // Set the semaphore before execution (called from saturatePool)
+    /**
+     * Set the semaphore before execution (called from saturatePool)
+     *
+     * @param runningAgents The semaphore to use for resource management
+     */
     void setRunningAgents(Semaphore runningAgents) {
       this.runningAgents = runningAgents;
     }
   }
-
-  // === MANUAL LOCK MANAGEMENT METHODS ===
-  // These methods support the public API for manual agent locking
 
   /**
    * Try to manually acquire a lock on an agent.

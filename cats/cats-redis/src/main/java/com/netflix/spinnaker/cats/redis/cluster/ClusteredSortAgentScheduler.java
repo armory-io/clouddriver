@@ -230,7 +230,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
     this.intervalProvider = intervalProvider;
     this.shardingFilter = shardingFilter;
 
-    log.info("ClusteredSortAgentScheduler initialized successfully with extracted services");
+    log.info("ClusteredSortAgentScheduler initialized successfully");
   }
 
   /** Initialize the scheduler and start the periodic execution. */
@@ -335,7 +335,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
       ((AgentSchedulerAware) agent).setAgentScheduler(this);
     }
 
-    // Register with acquisition service
+    // Register with acquisition service (it will log registration details)
     acquisitionService.registerAgent(agent, agentExecution, executionInstrumentation);
 
     log.debug("Registered agent {} for scheduling", agent.getAgentType());
@@ -542,7 +542,7 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
   private void refreshConfigurationIfNeeded(long currentRun) {
     // Check if we should refresh configuration (every 30 seconds by default)
     // With @ConfigurationProperties, most config is cached, but we maintain
-    // the refresh framework for future dynamic config support
+    // the refresh framework for dynamic config support
     long schedulerIntervalMs = config.getSchedulerIntervalMs();
 
     // Calculate refresh cycles (refresh every 30 seconds)
@@ -556,16 +556,16 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
 
   /**
    * Refresh runtime configuration from properties. Note: With @ConfigurationProperties, most config
-   * is already cached, but this method can be used for future dynamic config integration.
+   * is already cached, but this method can be used for dynamic config integration.
    */
   private void refreshConfiguration() {
     try {
       // Currently using @ConfigurationProperties which are already cached
-      // This method is a placeholder for future dynamic configuration support
+      // This method is a placeholder for dynamic configuration support
 
       log.debug("Configuration refresh completed - using cached @ConfigurationProperties");
 
-      // Future enhancement: Add support for runtime configuration updates
+      // Possible enhancement: Add support for runtime configuration updates
       // that don't require application restart
 
     } catch (Exception e) {

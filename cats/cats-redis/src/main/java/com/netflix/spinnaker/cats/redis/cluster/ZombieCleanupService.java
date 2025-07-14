@@ -59,6 +59,13 @@ public class ZombieCleanupService {
   private final AtomicLong zombiesCleanedUp = new AtomicLong(0);
   private volatile long lastZombieCleanup = 0;
 
+  /**
+   * Constructs a new ZombieCleanupService instance with the provided properties.
+   *
+   * @param jedisPool Jedis connection pool for Redis operations
+   * @param scriptManager Redis script manager for batch operations
+   * @param schedulerProperties Configuration properties for scheduler behavior
+   */
   public ZombieCleanupService(
       JedisPool jedisPool,
       RedisScriptManager scriptManager,
@@ -71,6 +78,9 @@ public class ZombieCleanupService {
   /**
    * Clean up zombie agents if the cleanup interval has elapsed. This method is called periodically
    * by the main scheduler.
+   *
+   * @param activeAgents Map of active agents (agentType -> completionDeadline)
+   * @param activeAgentsFutures Map of agent futures for cancellation
    */
   public void cleanupZombieAgentsIfNeeded(
       Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
@@ -123,7 +133,8 @@ public class ZombieCleanupService {
         long completionDeadlineMs = Long.parseLong(acquireScore) * 1000;
         validAgentsScanned++;
 
-        // Agent is zombie if current time exceeds completion deadline + zombie threshold buffer
+        // The agent is considered a zombie if current time exceeds completion deadline + zombie
+        // threshold buffer
         if (currentTime > completionDeadlineMs + zombieThreshold) {
           zombieAgentTypes.add(agentType);
           long overdueMs = currentTime - completionDeadlineMs;
@@ -227,6 +238,12 @@ public class ZombieCleanupService {
   /**
    * Clean up zombie batch with built-in fallback mechanism. Attempts batch cleanup first, falls
    * back to individual cleanup if batch fails.
+   *
+   * @param jedis Jedis connection for Redis operations
+   * @param zombieAgentTypes List of zombie agent types
+   * @param activeAgents Map of active agents (agentType -> completionDeadline)
+   * @param activeAgentsFutures Map of agent futures for cancellation
+   * @return Number of agents cleaned up
    */
   private int cleanupZombieBatch(
       Jedis jedis,
@@ -291,7 +308,15 @@ public class ZombieCleanupService {
     return totalCleaned;
   }
 
-  /** Parse the result from batch cleanup Lua script and update local state. */
+  /**
+   * Parse the result from batch cleanup Lua script and update local state.
+   *
+   * @param result Result from batch cleanup Lua script
+   * @param candidateCount Number of candidates processed
+   * @param activeAgents Map of active agents (agentType -> completionDeadline)
+   * @param activeAgentsFutures Map of agent futures for cancellation
+   * @return Number of agents cleaned up
+   */
   private int parseBatchCleanupResult(
       Object result,
       int candidateCount,
@@ -344,7 +369,15 @@ public class ZombieCleanupService {
     return cleaned;
   }
 
-  /** Clean up a single zombie agent individually. */
+  /**
+   * Clean up a single zombie agent individually.
+   *
+   * @param jedis Jedis connection for Redis operations
+   * @param agentType Type of the zombie agent
+   * @param activeAgents Map of active agents (agentType -> completionDeadline)
+   * @param activeAgentsFutures Map of agent futures for cancellation
+   * @return true if the agent was successfully cleaned up
+   */
   private boolean cleanupIndividualZombieAgent(
       Jedis jedis,
       String agentType,

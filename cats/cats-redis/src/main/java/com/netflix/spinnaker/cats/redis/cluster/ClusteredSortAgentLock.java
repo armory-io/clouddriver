@@ -26,16 +26,33 @@ public class ClusteredSortAgentLock extends AgentLock {
   // WAITING set with the right score).
   private final String releaseScore;
 
+  /**
+   * Constructor for ClusteredSortAgentLock.
+   *
+   * @param agent The agent associated with this lock
+   * @param acquireScore The score the agent was acquired with
+   * @param releaseScore The score the agent was released from the WAITING set with
+   */
   public ClusteredSortAgentLock(Agent agent, String acquireScore, String releaseScore) {
     super(agent);
     this.acquireScore = acquireScore;
     this.releaseScore = releaseScore;
   }
 
+  /**
+   * Get the acquire score for this agent.
+   *
+   * @return The acquire score
+   */
   public String getAcquireScore() {
     return acquireScore;
   }
 
+  /**
+   * Get the release score for this agent.
+   *
+   * @return The release score
+   */
   public String getReleaseScore() {
     return releaseScore;
   }

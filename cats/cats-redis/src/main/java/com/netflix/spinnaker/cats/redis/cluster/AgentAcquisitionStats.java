@@ -45,26 +45,56 @@ public class AgentAcquisitionStats {
     this.futuresTracked = futuresTracked;
   }
 
+  /**
+   * Get the number of registered agents.
+   *
+   * @return The number of registered agents
+   */
   public long getRegisteredAgents() {
     return registeredAgents;
   }
 
+  /**
+   * Get the number of active agents.
+   *
+   * @return The number of active agents
+   */
   public long getActiveAgents() {
     return activeAgents;
   }
 
+  /**
+   * Get the number of agents acquired.
+   *
+   * @return The number of agents acquired
+   */
   public long getAgentsAcquired() {
     return agentsAcquired;
   }
 
+  /**
+   * Get the number of agents executed.
+   *
+   * @return The number of agents executed
+   */
   public long getAgentsExecuted() {
     return agentsExecuted;
   }
 
+  /**
+   * Get the number of agents failed.
+   *
+   * @return The number of agents failed
+   */
   public long getAgentsFailed() {
     return agentsFailed;
   }
 
+  /**
+   * Get the number of futures tracked.
+   *
+   * @return The number of futures tracked
+   */
   public long getFuturesTracked() {
     return futuresTracked;
   }
@@ -95,6 +125,11 @@ public class AgentAcquisitionStats {
     return (double) agentsFailed / totalExecutions * 100.0;
   }
 
+  /**
+   * Get a string representation of the statistics.
+   *
+   * @return String representation of the statistics
+   */
   @Override
   public String toString() {
     return String.format(

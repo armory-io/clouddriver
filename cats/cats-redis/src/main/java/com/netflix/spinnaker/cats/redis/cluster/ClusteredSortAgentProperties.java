@@ -42,28 +42,56 @@ public class ClusteredSortAgentProperties {
   /** Maximum number of agents that can run concurrently. */
   private int maxConcurrentAgents = 100;
 
-  // Getters and setters
-
+  /**
+   * Get the enabled pattern for agents.
+   *
+   * @return The enabled pattern
+   */
   public String getEnabledPattern() {
     return enabledPattern;
   }
 
+  /**
+   * Set the enabled pattern for agents.
+   *
+   * @param enabledPattern The enabled pattern
+   */
   public void setEnabledPattern(String enabledPattern) {
     this.enabledPattern = enabledPattern;
   }
 
+  /**
+   * Get the disabled pattern for agents.
+   *
+   * @return The disabled pattern
+   */
   public String getDisabledPattern() {
     return disabledPattern;
   }
 
+  /**
+   * Set the disabled pattern for agents.
+   *
+   * @param disabledPattern The disabled pattern
+   */
   public void setDisabledPattern(String disabledPattern) {
     this.disabledPattern = disabledPattern;
   }
 
+  /**
+   * Get the maximum number of concurrent agents.
+   *
+   * @return The maximum number of concurrent agents
+   */
   public int getMaxConcurrentAgents() {
     return maxConcurrentAgents;
   }
 
+  /**
+   * Set the maximum number of concurrent agents.
+   *
+   * @param maxConcurrentAgents The maximum number of concurrent agents
+   */
   public void setMaxConcurrentAgents(int maxConcurrentAgents) {
     this.maxConcurrentAgents = maxConcurrentAgents;
   }
