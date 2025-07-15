@@ -41,7 +41,7 @@ import redis.clients.jedis.JedisPool;
  * Priority-based Redis agent scheduler using sorted sets for coordinated execution across multiple
  * clouddriver instances.
  *
- * <p>This scheduler provides distributed agent coordination with priority-based scheduling, zombie
+ * <p>This scheduler provides distributed agent coordination with deadline-aware scheduling, zombie
  * detection, orphan cleanup, and atomic operations via Lua scripts.
  *
  * <p>Core Architecture:
@@ -262,6 +262,16 @@ public class ClusteredSortAgentScheduler extends CatsModuleAware
    *   <li>Performs cleanup operations (zombies and orphans)
    *   <li>Acquires ready agents and submits them for execution
    * </ol>
+   *
+   * <p>Key Scheduling Decisions:
+   *
+   * <ul>
+   *   <li>Agents are acquired from WAITZ set based on their next execution time
+   *   <li>When acquired, agents are moved to WORKZ set with a completion deadline (current_time +
+   *       agent_timeout)
+   *   <li>Agent timeouts are agent-specific
+   *   <li>Completion deadlines are used for zombie detection and orphan cleanup
+   * </ul>
    */
   @Override
   public void run() {

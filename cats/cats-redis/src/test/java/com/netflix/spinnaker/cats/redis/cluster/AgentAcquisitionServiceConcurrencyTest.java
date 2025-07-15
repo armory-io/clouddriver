@@ -36,12 +36,18 @@ import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.Response;
 
 /**
- * Comprehensive concurrency and race condition tests for AgentAcquisitionService.
+ * Test suite for concurrency and race condition tests for AgentAcquisitionService.
  *
- * <p>These tests focus on edge cases and "gotchas" that could occur in high-concurrency production
- * environments with 200K+ agents, including: - Race conditions in agent tracking - Counter
- * consistency under concurrent operations - Memory leaks in futures map - Thread safety of
- * statistics collection - Concurrent agent acquisition and removal
+ * <p>These tests focus on edge cases and "gotchas" that could occur in high-concurrency
+ * environments with a large number of agents, including:
+ *
+ * <ul>
+ *   <li>Race conditions in agent tracking
+ *   <li>Counter consistency under concurrent operations
+ *   <li>Memory leaks in futures map
+ *   <li>Thread safety of statistics collection
+ *   <li>Concurrent agent acquisition and removal
+ * </ul>
  */
 @DisplayName("AgentAcquisitionService Concurrency Tests")
 class AgentAcquisitionServiceConcurrencyTest {

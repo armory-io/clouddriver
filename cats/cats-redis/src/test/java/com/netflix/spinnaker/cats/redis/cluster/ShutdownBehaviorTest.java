@@ -46,16 +46,16 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Comprehensive tests for shutdown behavior that validates our fixes.
+ * Test suite for shutdown behavior.
  *
  * <p>These tests validate that critical shutdown issues have been resolved:
  *
  * <ul>
- *   <li>✅ Race condition prevention between graceful shutdown and agent completion
- *   <li>✅ Agent re-queuing without duplicate Redis script failures
- *   <li>✅ Proper immediate scheduling scores with jitter
- *   <li>✅ High-scale behavior to prevent thundering herd
- *   <li>✅ Redis state consistency during concurrent shutdown operations
+ *   <li>Race condition prevention between graceful shutdown and agent completion
+ *   <li>Agent re-queuing without duplicate Redis script failures
+ *   <li>Proper immediate scheduling scores
+ *   <li>High-scale behavior to prevent thundering herd
+ *   <li>Redis state consistency during concurrent shutdown operations
  * </ul>
  */
 @Testcontainers
@@ -198,7 +198,7 @@ class ShutdownBehaviorTest {
   class SchedulingScoreTests {
 
     @Test
-    @DisplayName("Should use immediate scores during shutdown (not far future)")
+    @DisplayName("Should use immediate scores during shutdown")
     void shouldUseImmediateScoresDuringShutdown() throws Exception {
       // Given
       Agent agent = createMockAgent("test-agent");
@@ -219,16 +219,10 @@ class ShutdownBehaviorTest {
         long scoreValue = scoreDouble.longValue();
         long currentTimeSeconds = System.currentTimeMillis() / 1000;
 
-        // VALIDATION: Verify shutdown scheduling works correctly after our fixes
-        // Scores should be current time + jitter (0-30 seconds)
-        System.out.println(
-            "Shutdown score: " + scoreValue + ", Current time: " + currentTimeSeconds);
-
-        // Score should be within reasonable range (current time + jitter)
-        // Our fix ensures proper immediate scheduling with jitter
+        // Score should be current time
         assertThat(scoreValue)
             .describedAs(
-                "Score should be current time + jitter (0-30s). Got: %d, Current: %d",
+                "Score should be current time. Got: %d, Current: %d",
                 scoreValue, currentTimeSeconds)
             .isBetween(currentTimeSeconds - 10, currentTimeSeconds + 60);
       }
@@ -236,7 +230,7 @@ class ShutdownBehaviorTest {
   }
 
   @Nested
-  @DisplayName("Graceful Shutdown Comprehensive Coverage")
+  @DisplayName("Graceful Shutdown")
   class GracefulShutdownTests {
 
     @Test

@@ -44,11 +44,18 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Comprehensive test suite for AgentAcquisitionService using testcontainers.
+ * Test suite for AgentAcquisitionService using testcontainers.
  *
- * <p>Tests cover: - Agent registration and unregistration - Agent acquisition and scheduling logic
- * - Concurrency control and semaphore handling - Redis integration for agent state management -
- * Error handling and edge cases - Performance under load
+ * <p>Tests cover:
+ *
+ * <ul>
+ *   <li>Agent registration and unregistration
+ *   <li>Agent acquisition and scheduling logic
+ *   <li>Concurrency control and semaphore handling
+ *   <li>Redis integration for agent state management
+ *   <li>Error handling and edge cases
+ *   <li>Performance under load
+ * </ul>
  */
 @Testcontainers
 @DisplayName("AgentAcquisitionService Tests")
@@ -350,7 +357,7 @@ class AgentAcquisitionServiceTest {
       // When - Use runCount=0 to trigger Redis repopulation with registered agents
       int acquired = acquisitionService.saturatePool(0L, semaphore, executorService);
 
-      // Then - Comprehensive validation of semaphore behavior
+      // Then - Validation of semaphore behavior
       assertThat(acquired).isEqualTo(1); // Only 1 agent acquired due to semaphore limit
       assertThat(semaphore.availablePermits()).isEqualTo(0); // Semaphore permit used
 

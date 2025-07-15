@@ -31,10 +31,17 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Comprehensive test suite for RedisScriptManager using testcontainers.
+ * Test suite for RedisScriptManager using testcontainers.
  *
- * <p>Tests cover: - Script initialization and caching - Thread safety of script loading - Error
- * handling for Redis failures - Performance characteristics - All script constants and operations
+ * <p>Tests cover:
+ *
+ * <ul>
+ *   <li>Script initialization and caching
+ *   <li>Thread safety of script loading
+ *   <li>Error handling for Redis failures
+ *   <li>Performance characteristics
+ *   <li>All script constants and operations
+ * </ul>
  */
 @Testcontainers
 @DisplayName("RedisScriptManager Tests")
@@ -595,7 +602,7 @@ class RedisScriptManagerTest {
             .withFailMessage("Should detect milliseconds format (simulated bug)")
             .isTrue();
 
-        // In production, this mixed state should never occur
+        // In a live environment, this mixed state should never occur
         System.out.println(
             "\u26a0\ufe0f  Mixed format detected - this demonstrates the bug we're preventing");
       }

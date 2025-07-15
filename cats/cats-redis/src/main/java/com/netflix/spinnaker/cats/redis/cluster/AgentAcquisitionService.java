@@ -460,7 +460,7 @@ public class AgentAcquisitionService {
           agentType,
           expectedScore,
           nextScore);
-
+      // TODO: fix score format to be s vs ms
       // Check current state in Redis before attempting swap
       Double currentWorkzScore = jedis.zscore(WORKING_SET, agentType);
       Double currentWaitzScore = jedis.zscore(WAITING_SET, agentType);

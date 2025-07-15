@@ -44,11 +44,18 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Comprehensive test suite for OrphanCleanupService using testcontainers.
+ * Test suite for OrphanCleanupService using testcontainers.
  *
- * <p>Tests cover: - Orphaned agent detection in both WORKING and WAITING sets - Different threshold
- * handling for each set - Batch processing of orphaned agents - Configuration-driven cleanup
- * enabling/disabling - Error handling and edge cases - Performance under various load conditions
+ * <p>Tests cover:
+ *
+ * <ul>
+ *   <li>Orphaned agent detection in both WORKING and WAITING sets
+ *   <li>Different threshold handling for each set
+ *   <li>Batch processing of orphaned agents
+ *   <li>Configuration-driven cleanup enabling/disabling
+ *   <li>Error handling and edge cases
+ *   <li>Performance under various load conditions
+ * </ul>
  */
 @Testcontainers
 @DisplayName("OrphanCleanupService Tests")
@@ -118,7 +125,6 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should detect orphaned agents in WAITING set with longer threshold")
     void shouldDetectOrphanedAgentsInWaitingSetWithLongerThreshold() {
       // Given - Clean up and add old agents to WAITING set
-      // WAITING set uses 2x threshold (2 minutes)
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 150000) / 1000; // 2.5 minutes ago
       try (Jedis jedis = jedisPool.getResource()) {
@@ -145,8 +151,7 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should not clean agents within threshold in WORKING set")
     void shouldNotCleanAgentsWithinThresholdInWorkingSet() {
       // Given - Add recent agents to WORKING set
-      long recentScore =
-          System.currentTimeMillis() - 30000; // 30 seconds ago (within 1 minute threshold)
+      long recentScore = System.currentTimeMillis() - 30000; // 30 seconds ago
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.zadd("WORKZ", recentScore, "recent-agent");
       }
@@ -166,9 +171,8 @@ class OrphanCleanupServiceTest {
     @Test
     @DisplayName("Should not clean agents within threshold in WAITING set")
     void shouldNotCleanAgentsWithinThresholdInWaitingSet() {
-      // Given - Add agents within WAITING threshold (2 minutes)
-      long recentScore =
-          System.currentTimeMillis() - 90000; // 1.5 minutes ago (within 2 minute threshold)
+      // Given - Add agents to WAITING set
+      long recentScore = System.currentTimeMillis() - 90000; // 1.5 minutes ago
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.zadd("WAITZ", recentScore, "waiting-recent");
       }
@@ -190,10 +194,8 @@ class OrphanCleanupServiceTest {
     void shouldCleanOrphansFromBothSetsInSingleOperation() {
       // Given - Add orphans to both sets
       // Redis scores are stored as seconds since epoch, not milliseconds
-      long workingOrphanScoreSeconds =
-          (System.currentTimeMillis() - 120000) / 1000; // 2 minutes (WORKING threshold: 1 min)
-      long waitingOrphanScoreSeconds =
-          (System.currentTimeMillis() - 180000) / 1000; // 3 minutes (WAITING threshold: 2 min)
+      long workingOrphanScoreSeconds = (System.currentTimeMillis() - 120000) / 1000; // 2 minutes
+      long waitingOrphanScoreSeconds = (System.currentTimeMillis() - 180000) / 1000; // 3 minutes
 
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.zadd("WORKZ", workingOrphanScoreSeconds, "working-orphan");
@@ -319,7 +321,7 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should perform cleanup after interval has elapsed")
     void shouldPerformCleanupAfterIntervalHasElapsed() throws InterruptedException {
       // Given - Set very short interval for testing
-      schedulerProperties.getOrphanCleanup().setIntervalMs(100L); // 100ms
+      schedulerProperties.getOrphanCleanup().setIntervalMs(100L); // 100 ms
       orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // First cleanup
@@ -399,7 +401,7 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should handle large numbers of orphaned agents efficiently")
     void shouldHandleLargeNumbersOfOrphanedAgentsEfficiently() {
       // Given - Add many orphaned agents
-      int orphanCount = 1000;
+      int orphanCount = 10000;
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
 
@@ -884,9 +886,9 @@ class OrphanCleanupServiceTest {
     }
 
     @Test
-    @DisplayName("Should handle production startup scenario correctly")
-    void shouldHandleProductionStartupScenario() throws Exception {
-      // GIVEN: Simulate realistic production scenario with many agents
+    @DisplayName("Should handle startup scenario correctly")
+    void shouldHandleStartupScenario() throws Exception {
+      // GIVEN: Simulate scenario with many agents
       try (var jedis = jedisPool.getResource()) {
         jedis.del("WAITZ", "WORKZ"); // Clean slate
 
@@ -894,14 +896,14 @@ class OrphanCleanupServiceTest {
         long oldTimestamp = System.currentTimeMillis() / 1000 - 2;
         // Simulate 10 agents from previous shutdown
         for (int i = 1; i <= 10; i++) {
-          jedis.zadd("WAITZ", oldTimestamp, "production-agent-" + i);
+          jedis.zadd("WAITZ", oldTimestamp, "agent-" + i);
         }
       }
 
       // WHEN: Startup sequence begins
       assertThat(acquisitionService.isInitialRegistrationComplete()).isFalse();
 
-      // Early orphan cleanup (happens immediately during startup)
+      // Early orphan cleanup (happens during startup)
       orphanService.cleanupOrphanedAgentsIfNeeded();
 
       // THEN: All agents preserved (not cleaned due to startup protection)
@@ -913,7 +915,7 @@ class OrphanCleanupServiceTest {
 
       // WHEN: Agent registration starts (simulate 5 agents being re-registered)
       for (int i = 1; i <= 5; i++) {
-        Agent agent = createMockAgent("production-agent-" + i);
+        Agent agent = createMockAgent("agent-" + i);
         acquisitionService.registerAgent(
             agent, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
       }

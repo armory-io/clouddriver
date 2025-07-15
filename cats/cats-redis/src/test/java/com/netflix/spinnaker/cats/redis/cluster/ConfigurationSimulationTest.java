@@ -70,10 +70,10 @@ class ConfigurationSimulationTest {
         maxZombieLifetimeMs <= TimeUnit.MINUTES.toMillis(35),
         "Zombies should be cleaned within 35 minutes maximum");
 
-    System.out.printf("✅ Default Config Simulation:\n");
-    System.out.printf("   Agent pickup latency: %dms\n", agentPickupLatencyMs);
-    System.out.printf("   Boost capacity: %.0f/minute\n", boostCapacityPerMinute);
-    System.out.printf("   Max zombie lifetime: %d minutes\n", maxZombieLifetimeMs / 60000);
+    System.out.printf("Default Config Simulation:\n");
+    System.out.printf(" Agent pickup latency: %dms\n", agentPickupLatencyMs);
+    System.out.printf(" Boost capacity: %.0f/minute\n", boostCapacityPerMinute);
+    System.out.printf(" Max zombie lifetime: %d minutes\n", maxZombieLifetimeMs / 60000);
   }
 
   @Test
@@ -128,12 +128,12 @@ class ConfigurationSimulationTest {
     assertTrue(
         refreshCyclesRatio >= 10, "Refresh should be at least 10x less frequent than scheduler");
 
-    System.out.printf("✅ High-Load Config Simulation:\n");
-    System.out.printf("   Agent pickup latency: %dms\n", agentPickupLatencyMs);
-    System.out.printf("   Boost capacity: %.0f/minute\n", boostCapacityPerMinute);
-    System.out.printf("   Max zombie lifetime: %d minutes\n", maxZombieLifetimeMs / 60000);
-    System.out.printf("   Scheduler cycles/minute: %.0f\n", schedulerCyclesPerMinute);
-    System.out.printf("   Refresh:scheduler ratio: 1:%.0f\n", refreshCyclesRatio);
+    System.out.printf("High-Load Config Simulation:\n");
+    System.out.printf(" Agent pickup latency: %dms\n", agentPickupLatencyMs);
+    System.out.printf(" Boost capacity: %.0f/minute\n", boostCapacityPerMinute);
+    System.out.printf(" Max zombie lifetime: %d minutes\n", maxZombieLifetimeMs / 60000);
+    System.out.printf(" Scheduler cycles/minute: %.0f\n", schedulerCyclesPerMinute);
+    System.out.printf(" Refresh:scheduler ratio: 1:%.0f\n", refreshCyclesRatio);
   }
 
   @Test
@@ -164,12 +164,12 @@ class ConfigurationSimulationTest {
         highLoadBoostRate >= maxConcurrentDeployments / 2,
         "Should handle worst-case concurrent deployment burst");
 
-    System.out.printf("✅ OnDemand Boost Scenarios:\n");
+    System.out.printf("OnDemand Boost Scenarios:\n");
     System.out.printf(
-        "   Normal demand: %.2f boosts/sec (capacity: %.0fx)\n",
+        " Normal demand: %.2f boosts/sec (capacity: %.0fx)\n",
         normalBoostDemand, defaultBoostRate / normalBoostDemand);
     System.out.printf(
-        "   Busy demand: %.2f boosts/sec (capacity: %.0fx)\n",
+        " Busy demand: %.2f boosts/sec (capacity: %.0fx)\n",
         busyBoostDemand, highLoadBoostRate / busyBoostDemand);
     System.out.printf("   Burst capacity: %d concurrent deployments\n", maxConcurrentDeployments);
   }
@@ -214,10 +214,10 @@ class ConfigurationSimulationTest {
         loadIncrease >= 1.5 && loadIncrease <= 4.0,
         "High-load should be 1.5-4x more Redis operations than default");
 
-    System.out.printf("✅ Redis Load Analysis:\n");
-    System.out.printf("   Default config: %.1f ops/minute\n", defaultTotalOpsPerMinute);
+    System.out.printf("Redis Load Analysis:\n");
+    System.out.printf(" Default config: %.1f ops/minute\n", defaultTotalOpsPerMinute);
     System.out.printf(
-        "   High-load config: %.1f ops/minute (%.1fx increase)\n",
+        " High-load config: %.1f ops/minute (%.1fx increase)\n",
         highLoadTotalOpsPerMinute, loadIncrease);
   }
 }

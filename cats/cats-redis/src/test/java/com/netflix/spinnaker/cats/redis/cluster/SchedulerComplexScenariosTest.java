@@ -33,12 +33,18 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 
 /**
- * Tests for complex scenarios and "gotchas" that could occur in production scheduler operations.
+ * Tests for complex scenarios and "gotchas" that could occur in scheduler operations.
  *
- * <p>These tests focus on real-world edge cases discovered through production experience: - Race
- * conditions during shutdown sequences - Complex cleanup interactions between services - Memory
- * consistency during high-throughput operations - Redis connection failures during critical
- * operations - Agent execution cancellation and cleanup timing - Cross-service interaction bugs
+ * <p>These tests focus on real-world edge cases discovered through experience:
+ *
+ * <ul>
+ *   <li>Race conditions during shutdown sequences
+ *   <li>Complex cleanup interactions between services
+ *   <li>Memory consistency during high-throughput operations
+ *   <li>Redis connection failures during critical operations
+ *   <li>Agent execution cancellation and cleanup timing
+ *   <li>Cross-service interaction bugs
+ * </ul>
  */
 @DisplayName("Scheduler Complex Scenarios Tests")
 class SchedulerComplexScenariosTest {

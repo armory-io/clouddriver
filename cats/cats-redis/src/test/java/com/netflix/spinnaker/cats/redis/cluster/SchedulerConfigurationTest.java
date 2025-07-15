@@ -30,11 +30,18 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 /**
- * Comprehensive test suite for SchedulerConfiguration.
+ * Test suite for SchedulerConfiguration.
  *
- * <p>Tests cover: - Thread pool configuration and creation - Semaphore setup for concurrency
- * control - Pattern compilation for agent filtering - Configuration validation and defaults -
- * Resource management and cleanup - Performance characteristics
+ * <p>Tests cover:
+ *
+ * <ul>
+ *   <li>Thread pool configuration and creation
+ *   <li>Semaphore setup for concurrency control
+ *   <li>Pattern compilation for agent filtering
+ *   <li>Configuration validation and defaults
+ *   <li>Resource management and cleanup
+ *   <li>Performance characteristics
+ * </ul>
  */
 @DisplayName("SchedulerConfiguration Tests")
 class SchedulerConfigurationTest {

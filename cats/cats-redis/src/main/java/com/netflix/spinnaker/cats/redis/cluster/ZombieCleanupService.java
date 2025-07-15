@@ -38,10 +38,11 @@ import redis.clients.jedis.JedisPool;
  * <p>The cleanup process:
  *
  * <ul>
- *   <li>Scans the Redis WORKING set for agents older than zombieThresholdMs
- *   <li>Uses batch removal scripts for efficient cleanup of multiple zombies
+ *   <li>Scans the local activeAgents map for agents exceeding their completion deadline
+ *   <li>Uses batch removal scripts for efficient cleanup if enabled (otherwise falls back to
+ *       individual cleanup)
  *   <li>Cancels any local Future references to zombie executions
- *   <li>Updates metrics and logs for monitoring
+ *   <li>Updates both Redis WORKING and WAITING sets to reflect cleanup
  * </ul>
  */
 @Component
@@ -107,7 +108,8 @@ public class ZombieCleanupService {
    *
    * <p>This cleanup mechanism is important for preventing resource exhaustion on the local
    * instance. It works by checking the local activeAgents map for agents that have exceeded their
-   * completion deadline (current_time + agent_timeout).
+   * completion deadline (current_time + agent_timeout), then performs cleanup in Redis to remove
+   * the agents from both WORKING and WAITING sets.
    *
    * @param activeAgents Map of active agents (agentType -> completionDeadline)
    * @param activeAgentsFutures Map of agent futures for cancellation
@@ -119,8 +121,6 @@ public class ZombieCleanupService {
     long currentTime = System.currentTimeMillis();
     List<String> zombieAgentTypes = new ArrayList<>();
 
-    // Find zombie agents by checking local tracking for agents that have been running too long
-    // This is the correct zombie detection logic - scan LOCAL activeAgents, not Redis
     int validAgentsScanned = 0;
 
     for (Map.Entry<String, String> entry : activeAgents.entrySet()) {
@@ -170,7 +170,7 @@ public class ZombieCleanupService {
         log.debug(
             "Batch zombie cleanup disabled, using individual operations for {} agents",
             zombieAgentTypes.size());
-        // Use individual cleanup operations (existing proven approach)
+
         for (String agentType : zombieAgentTypes) {
           try {
             if (cleanupIndividualZombieAgent(jedis, agentType, activeAgents, activeAgentsFutures)) {
@@ -236,8 +236,9 @@ public class ZombieCleanupService {
   }
 
   /**
-   * Clean up zombie batch with built-in fallback mechanism. Attempts batch cleanup first, falls
-   * back to individual cleanup if batch fails.
+   * Clean up zombie batch with optional batch operation and fallback mechanism. If batch operations
+   * are enabled in configuration, attempts batch cleanup first. If batch operations are disabled or
+   * if the batch operation fails, falls back to individual cleanup for each zombie agent.
    *
    * @param jedis Jedis connection for Redis operations
    * @param zombieAgentTypes List of zombie agent types

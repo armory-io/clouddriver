@@ -38,11 +38,17 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Comprehensive integration test suite for ClusteredSortAgentScheduler using live Redis.
+ * Test suite for ClusteredSortAgentScheduler using testcontainers.
  *
- * <p>This test suite focuses on end-to-end functionality with real Redis backend: - Agent
- * registration and scheduling - Configuration validation - Disabled agents handling - Redis
- * operations integration - Live container testing with proper cleanup
+ * <p>This test suite focuses on end-to-end functionality with real Redis backend:
+ *
+ * <ul>
+ *   <li>Agent registration and scheduling
+ *   <li>Configuration validation
+ *   <li>Disabled agents handling
+ *   <li>Redis operations integration
+ *   <li>Live container testing with proper cleanup
+ * </ul>
  */
 @Testcontainers
 @DisplayName("ClusteredSortAgentScheduler Integration Tests")

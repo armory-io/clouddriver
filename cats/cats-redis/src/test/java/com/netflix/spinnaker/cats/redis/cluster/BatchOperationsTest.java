@@ -40,9 +40,14 @@ import redis.clients.jedis.JedisPoolConfig;
 /**
  * Tests for batch Redis operations in ClusteredSortAgentScheduler using live Redis containers.
  *
- * <p>Tests validate: - Batch operations for agent management - Performance optimizations with
- * batched Redis operations - Zombie cleanup with batch processing - Real Redis integration for
- * batch scripts
+ * <p>Tests validate:
+ *
+ * <ul>
+ *   <li>Batch operations for agent management
+ *   <li>Performance optimizations with batched Redis operations
+ *   <li>Zombie cleanup with batch processing
+ *   <li>Real Redis integration for batch scripts
+ * </ul>
  */
 @Testcontainers
 @DisplayName("ClusteredSortAgentScheduler Batch Operations Tests")

@@ -39,9 +39,15 @@ import redis.clients.jedis.JedisPoolConfig;
 /**
  * Tests focused on performance optimizations and reliability improvements in the sort scheduler.
  *
- * <p>This test suite validates: - @ConfigurationProperties caching vs dynamic config calls -
- * AtomicBoolean thread safety improvements - Health monitoring and operational visibility - Service
- * architecture performance benefits - Live Redis integration for realistic testing
+ * <p>This test suite validates:
+ *
+ * <ul>
+ *   <li>@ConfigurationProperties caching vs dynamic config calls
+ *   <li>AtomicBoolean thread safety improvements
+ *   <li>Health monitoring and operational visibility
+ *   <li>Service architecture performance benefits
+ *   <li>Live Redis integration for realistic testing
+ * </ul>
  */
 @Testcontainers
 @DisplayName("Scheduler Performance Optimizations Tests")
@@ -130,8 +136,8 @@ class SchedulerOptimizationsTest {
   }
 
   @Test
-  @DisplayName("Should provide comprehensive health monitoring without performance impact")
-  void shouldProvideComprehensiveHealthMonitoringWithoutPerformanceImpact() {
+  @DisplayName("Should provide health monitoring without performance impact")
+  void shouldProvideHealthMonitoringWithoutPerformanceImpact() {
     // Given - Scheduler with health monitoring enabled
     long startTime = System.currentTimeMillis();
 

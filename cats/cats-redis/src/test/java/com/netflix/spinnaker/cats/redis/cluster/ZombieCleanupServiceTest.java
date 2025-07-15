@@ -38,11 +38,17 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Comprehensive test suite for ZombieCleanupService using testcontainers.
+ * Test suite for ZombieCleanupService using testcontainers.
  *
- * <p>Tests cover: - Zombie agent detection and cleanup - Batch processing of zombie agents - Future
- * cancellation for zombie executions - Configurable thresholds and intervals - Error handling and
- * edge cases - Performance under various load conditions
+ * <p>Tests cover:
+ *
+ * <ul>
+ *   <li>Zombie agent detection and cleanup
+ *   <li>Batch processing of zombie agents
+ *   <li>Future cancellation for zombie executions
+ *   <li>Configurable thresholds and intervals
+ *   <li>Error handling and edge cases
+ * </ul>
  */
 @Testcontainers
 @DisplayName("ZombieCleanupService Tests")
