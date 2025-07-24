@@ -26,7 +26,7 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 
 /**
- * Manages Redis Lua scripts for the ClusteredSortAgentScheduler.
+ * Manages Redis Lua scripts for the PriorityAgentScheduler.
  *
  * <p>This service handles loading, caching, and executing all Lua scripts used for atomic Redis
  * operations. All scripts are loaded once during initialization and cached by SHA hash for
@@ -82,7 +82,7 @@ public class RedisScriptManager {
       try (Jedis jedis = jedisPool.getResource()) {
         loadAllScripts(jedis);
         initialized.set(true);
-        log.info("Loaded {} Redis Lua scripts for ClusteredSortAgentScheduler", scriptShas.size());
+        log.info("Loaded {} Redis Lua scripts for PriorityAgentScheduler", scriptShas.size());
       } catch (Exception e) {
         log.error("Failed to initialize Redis scripts", e);
         throw new AgentSchedulingException("Failed to initialize Redis scripts", e);

@@ -68,7 +68,7 @@ public class OrphanCleanupService {
 
   private final JedisPool jedisPool;
   private final RedisScriptManager scriptManager;
-  private final ClusteredSortSchedulerProperties schedulerProperties;
+  private final PrioritySchedulerProperties schedulerProperties;
   private final AtomicLong orphansCleanedUp = new AtomicLong(0);
 
   // Reference to access agent state for orphan identification
@@ -81,7 +81,7 @@ public class OrphanCleanupService {
   public OrphanCleanupService(
       JedisPool jedisPool,
       RedisScriptManager scriptManager,
-      ClusteredSortSchedulerProperties schedulerProperties) {
+      PrioritySchedulerProperties schedulerProperties) {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.schedulerProperties = schedulerProperties;

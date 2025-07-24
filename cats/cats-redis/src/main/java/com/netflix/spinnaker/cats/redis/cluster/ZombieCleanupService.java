@@ -54,7 +54,7 @@ public class ZombieCleanupService {
 
   private final JedisPool jedisPool;
   private final RedisScriptManager scriptManager;
-  private final ClusteredSortSchedulerProperties schedulerProperties;
+  private final PrioritySchedulerProperties schedulerProperties;
 
   // Tracking for zombie cleanup
   private final AtomicLong zombiesCleanedUp = new AtomicLong(0);
@@ -70,7 +70,7 @@ public class ZombieCleanupService {
   public ZombieCleanupService(
       JedisPool jedisPool,
       RedisScriptManager scriptManager,
-      ClusteredSortSchedulerProperties schedulerProperties) {
+      PrioritySchedulerProperties schedulerProperties) {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.schedulerProperties = schedulerProperties;
@@ -86,7 +86,7 @@ public class ZombieCleanupService {
   public void cleanupZombieAgentsIfNeeded(
       Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
     long now = System.currentTimeMillis();
-    long zombieCleanupInterval = schedulerProperties.getZombieCleanup().getCleanupIntervalMs();
+    long zombieCleanupInterval = schedulerProperties.getZombieCleanup().getIntervalMs();
 
     if (now - lastZombieCleanup >= zombieCleanupInterval) {
       int cleaned = cleanupZombieAgents(activeAgents, activeAgentsFutures);

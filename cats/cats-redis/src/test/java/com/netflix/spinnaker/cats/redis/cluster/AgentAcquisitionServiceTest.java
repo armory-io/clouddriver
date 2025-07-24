@@ -72,8 +72,8 @@ class AgentAcquisitionServiceTest {
   private AgentAcquisitionService acquisitionService;
   private AgentIntervalProvider intervalProvider;
   private ShardingFilter shardingFilter;
-  private ClusteredSortAgentProperties agentProperties;
-  private ClusteredSortSchedulerProperties schedulerProperties;
+  private PriorityAgentProperties agentProperties;
+  private PrioritySchedulerProperties schedulerProperties;
   private ExecutorService executorService;
 
   @BeforeEach
@@ -96,12 +96,12 @@ class AgentAcquisitionServiceTest {
     when(intervalProvider.getInterval(any(Agent.class))).thenReturn(testInterval);
 
     // Create properties with test values
-    agentProperties = new ClusteredSortAgentProperties();
+    agentProperties = new PriorityAgentProperties();
     agentProperties.setMaxConcurrentAgents(5);
     agentProperties.setEnabledPattern(".*");
     agentProperties.setDisabledPattern("");
 
-    schedulerProperties = new ClusteredSortSchedulerProperties();
+    schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setRefreshPeriodSeconds(10);
 
     executorService = Executors.newCachedThreadPool();
@@ -183,7 +183,7 @@ class AgentAcquisitionServiceTest {
       ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
 
       // Update properties to disable this agent using pattern
-      ClusteredSortAgentProperties testAgentProperties = new ClusteredSortAgentProperties();
+      PriorityAgentProperties testAgentProperties = new PriorityAgentProperties();
       testAgentProperties.setDisabledPattern("disabled-agent");
       testAgentProperties.setMaxConcurrentAgents(5);
       testAgentProperties.setEnabledPattern(".*");

@@ -60,12 +60,12 @@ class BatchOperationsTest {
           .withCommand("redis-server", "--requirepass", "testpass");
 
   private JedisPool jedisPool;
-  private ClusteredSortAgentScheduler scheduler;
+  private PriorityAgentScheduler scheduler;
   private NodeStatusProvider nodeStatusProvider;
   private AgentIntervalProvider intervalProvider;
   private ShardingFilter shardingFilter;
-  private ClusteredSortAgentProperties agentProperties;
-  private ClusteredSortSchedulerProperties schedulerProperties;
+  private PriorityAgentProperties agentProperties;
+  private PrioritySchedulerProperties schedulerProperties;
 
   @BeforeEach
   void setUp() {
@@ -91,7 +91,7 @@ class BatchOperationsTest {
 
     // Create scheduler with live Redis
     scheduler =
-        new ClusteredSortAgentScheduler(
+        new PriorityAgentScheduler(
             jedisPool,
             nodeStatusProvider,
             intervalProvider,
@@ -151,9 +151,9 @@ class BatchOperationsTest {
     @DisplayName("Should handle batch zombie cleanup")
     void shouldHandleBatchZombieCleanup() {
       // Given - Scheduler with short zombie threshold for testing
-      ClusteredSortSchedulerProperties zombieProps = createZombieTestSchedulerProperties();
-      ClusteredSortAgentScheduler zombieScheduler =
-          new ClusteredSortAgentScheduler(
+      PrioritySchedulerProperties zombieProps = createZombieTestSchedulerProperties();
+      PriorityAgentScheduler zombieScheduler =
+          new PriorityAgentScheduler(
               jedisPool,
               nodeStatusProvider,
               intervalProvider,
@@ -182,28 +182,28 @@ class BatchOperationsTest {
     }
   }
 
-  private ClusteredSortAgentProperties createDefaultAgentProperties() {
-    ClusteredSortAgentProperties props = new ClusteredSortAgentProperties();
+  private PriorityAgentProperties createDefaultAgentProperties() {
+    PriorityAgentProperties props = new PriorityAgentProperties();
     props.setMaxConcurrentAgents(100);
     props.setEnabledPattern(".*");
     props.setDisabledPattern("");
     return props;
   }
 
-  private ClusteredSortSchedulerProperties createBatchEnabledSchedulerProperties() {
-    ClusteredSortSchedulerProperties props = new ClusteredSortSchedulerProperties();
+  private PrioritySchedulerProperties createBatchEnabledSchedulerProperties() {
+    PrioritySchedulerProperties props = new PrioritySchedulerProperties();
     props.setBatchOperationsEnabled(true);
     props.setIntervalMs(1000L);
     props.setRefreshPeriodSeconds(30);
     props.getZombieCleanup().setThresholdMs(1800000L); // 30 minutes
-    props.getZombieCleanup().setCleanupIntervalMs(300000L); // 5 minutes
+    props.getZombieCleanup().setIntervalMs(300000L); // 5 minutes
     return props;
   }
 
-  private ClusteredSortSchedulerProperties createZombieTestSchedulerProperties() {
-    ClusteredSortSchedulerProperties props = createBatchEnabledSchedulerProperties();
+  private PrioritySchedulerProperties createZombieTestSchedulerProperties() {
+    PrioritySchedulerProperties props = createBatchEnabledSchedulerProperties();
     props.getZombieCleanup().setThresholdMs(5000L); // 5 seconds for testing
-    props.getZombieCleanup().setCleanupIntervalMs(1000L); // 1 second for testing
+    props.getZombieCleanup().setIntervalMs(1000L); // 1 second for testing
     return props;
   }
 

@@ -58,8 +58,8 @@ class AgentAcquisitionServiceConcurrencyTest {
   @Mock private RedisScriptManager mockScriptManager;
   @Mock private AgentIntervalProvider mockIntervalProvider;
   @Mock private ShardingFilter mockShardingFilter;
-  @Mock private ClusteredSortAgentProperties mockAgentProperties;
-  @Mock private ClusteredSortSchedulerProperties mockSchedulerProperties;
+  @Mock private PriorityAgentProperties mockAgentProperties;
+  @Mock private PrioritySchedulerProperties mockSchedulerProperties;
 
   private AgentAcquisitionService acquisitionService;
   private ExecutorService testExecutor;

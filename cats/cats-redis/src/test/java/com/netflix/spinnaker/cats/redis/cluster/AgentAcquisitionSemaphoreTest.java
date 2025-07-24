@@ -47,8 +47,8 @@ public class AgentAcquisitionSemaphoreTest {
   private RedisScriptManager scriptManager;
   private AgentIntervalProvider intervalProvider;
   private ShardingFilter shardingFilter;
-  private ClusteredSortAgentProperties agentProperties;
-  private ClusteredSortSchedulerProperties schedulerProperties;
+  private PriorityAgentProperties agentProperties;
+  private PrioritySchedulerProperties schedulerProperties;
   private AgentExecution agentExecution;
   private ExecutionInstrumentation executionInstrumentation;
 
@@ -91,12 +91,12 @@ public class AgentAcquisitionSemaphoreTest {
     when(intervalProvider.getInterval(any(Agent.class))).thenReturn(testInterval);
 
     // Create properties with test values
-    agentProperties = new ClusteredSortAgentProperties();
+    agentProperties = new PriorityAgentProperties();
     agentProperties.setMaxConcurrentAgents(10);
     agentProperties.setEnabledPattern(".*");
     agentProperties.setDisabledPattern("");
 
-    schedulerProperties = new ClusteredSortSchedulerProperties();
+    schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setRefreshPeriodSeconds(10);
 
     // Create service

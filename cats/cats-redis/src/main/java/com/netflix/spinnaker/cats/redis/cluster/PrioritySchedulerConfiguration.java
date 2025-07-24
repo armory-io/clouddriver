@@ -29,7 +29,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
- * Centralized configuration management for the ClusteredSortAgentScheduler.
+ * Centralized configuration management for the PriorityAgentScheduler.
  *
  * <p>This service handles:
  *
@@ -45,11 +45,11 @@ import org.springframework.stereotype.Component;
  * eliminating the need for dynamic configuration lookups during runtime.
  */
 @Component
-public class SchedulerConfiguration {
-  private static final Logger log = LoggerFactory.getLogger(SchedulerConfiguration.class);
+public class PrioritySchedulerConfiguration {
+  private static final Logger log = LoggerFactory.getLogger(PrioritySchedulerConfiguration.class);
 
-  private final ClusteredSortAgentProperties agentProperties;
-  private final ClusteredSortSchedulerProperties schedulerProperties;
+  private final PriorityAgentProperties agentProperties;
+  private final PrioritySchedulerProperties schedulerProperties;
 
   // Runtime configuration
   private volatile Pattern enabledAgentPattern;
@@ -59,14 +59,13 @@ public class SchedulerConfiguration {
   private volatile Semaphore runningAgents;
 
   /**
-   * Constructs a new SchedulerConfiguration instance with the provided properties.
+   * Constructs a new PriorityConfiguration instance with the provided properties.
    *
    * @param agentProperties Configuration properties for agent management
    * @param schedulerProperties Configuration properties for scheduler behavior
    */
-  public SchedulerConfiguration(
-      ClusteredSortAgentProperties agentProperties,
-      ClusteredSortSchedulerProperties schedulerProperties) {
+  public PrioritySchedulerConfiguration(
+      PriorityAgentProperties agentProperties, PrioritySchedulerProperties schedulerProperties) {
     this.agentProperties = agentProperties;
     this.schedulerProperties = schedulerProperties;
 
@@ -195,8 +194,8 @@ public class SchedulerConfiguration {
    *
    * @return zombie cleanup interval
    */
-  public long getZombieCleanupIntervalMs() {
-    return schedulerProperties.getZombieCleanup().getCleanupIntervalMs();
+  public long getZombieIntervalMs() {
+    return schedulerProperties.getZombieCleanup().getIntervalMs();
   }
 
   /**
@@ -231,7 +230,7 @@ public class SchedulerConfiguration {
    *
    * @return orphan cleanup interval
    */
-  public long getOrphanCleanupIntervalMs() {
+  public long getOrphanIntervalMs() {
     return schedulerProperties.getOrphanCleanup().getIntervalMs();
   }
 
@@ -323,7 +322,7 @@ public class SchedulerConfiguration {
             keepAliveTime,
             TimeUnit.SECONDS,
             new LinkedBlockingQueue<>(), // Unbounded queue like other schedulers
-            new ThreadFactoryBuilder().setNameFormat("ClusteredSortAgentWorker-%d").build(),
+            new ThreadFactoryBuilder().setNameFormat("PriorityAgentWorker-%d").build(),
             new ThreadPoolExecutor.CallerRunsPolicy()); // Execute in caller thread as fallback
   }
 
@@ -331,7 +330,7 @@ public class SchedulerConfiguration {
   private void createSchedulerExecutorService() {
     this.schedulerExecutorService =
         java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
-            new ThreadFactoryBuilder().setNameFormat("ClusteredSortAgentScheduler-%d").build());
+            new ThreadFactoryBuilder().setNameFormat("PriorityAgentScheduler-%d").build());
 
     log.info("Created scheduler executor service");
   }

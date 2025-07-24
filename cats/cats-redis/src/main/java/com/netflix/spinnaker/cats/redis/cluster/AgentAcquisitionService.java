@@ -69,8 +69,8 @@ public class AgentAcquisitionService {
   private final RedisScriptManager scriptManager;
   private final AgentIntervalProvider intervalProvider;
   private final ShardingFilter shardingFilter;
-  private final ClusteredSortAgentProperties agentProperties;
-  private final ClusteredSortSchedulerProperties schedulerProperties;
+  private final PriorityAgentProperties agentProperties;
+  private final PrioritySchedulerProperties schedulerProperties;
 
   // Agent tracking
   private final Map<String, AgentWorker> agents = new ConcurrentHashMap<>();
@@ -112,8 +112,8 @@ public class AgentAcquisitionService {
       RedisScriptManager scriptManager,
       AgentIntervalProvider intervalProvider,
       ShardingFilter shardingFilter,
-      ClusteredSortAgentProperties agentProperties,
-      ClusteredSortSchedulerProperties schedulerProperties) {
+      PriorityAgentProperties agentProperties,
+      PrioritySchedulerProperties schedulerProperties) {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.intervalProvider = intervalProvider;
@@ -980,7 +980,7 @@ public class AgentAcquisitionService {
    * @param agent The agent to lock
    * @return Always returns null (manual locking not supported)
    */
-  public ClusteredSortAgentLock tryLockAgent(Agent agent) {
+  public AgentLock tryLockAgent(Agent agent) {
     // Manual locking is not supported to maintain thread safety and proper coordination
     log.debug(
         "Manual locking not supported for agent {} - use automatic scheduling",
@@ -996,7 +996,7 @@ public class AgentAcquisitionService {
    * @param lock The lock to release
    * @return Always returns false (manual locking not supported)
    */
-  public boolean tryReleaseAgent(ClusteredSortAgentLock lock) {
+  public boolean tryReleaseAgent(AgentLock lock) {
     // Manual locking/releasing is not supported
     log.debug(
         "Manual lock release not supported for agent {} - locks are managed automatically",
@@ -1012,7 +1012,7 @@ public class AgentAcquisitionService {
    * @param lock The lock to validate
    * @return Always returns false (manual locking not supported)
    */
-  public boolean isLockValid(ClusteredSortAgentLock lock) {
+  public boolean isLockValid(AgentLock lock) {
     // Manual locking is not supported, so manual locks are never valid
     log.debug(
         "Manual lock validation not supported for agent {} - locks are managed automatically",

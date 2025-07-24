@@ -38,7 +38,7 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Test suite for ClusteredSortAgentScheduler using testcontainers.
+ * Test suite for PriorityAgentScheduler using testcontainers.
  *
  * <p>This test suite focuses on end-to-end functionality with real Redis backend:
  *
@@ -51,8 +51,8 @@ import redis.clients.jedis.JedisPoolConfig;
  * </ul>
  */
 @Testcontainers
-@DisplayName("ClusteredSortAgentScheduler Integration Tests")
-class SchedulerIntegrationTest {
+@DisplayName("PriorityAgentScheduler Integration Tests")
+public class PrioritySchedulerIntegrationTest {
 
   @Container
   static GenericContainer<?> redis =
@@ -61,12 +61,12 @@ class SchedulerIntegrationTest {
           .withCommand("redis-server", "--requirepass", "testpass");
 
   private JedisPool jedisPool;
-  private ClusteredSortAgentScheduler scheduler;
+  private PriorityAgentScheduler scheduler;
   private NodeStatusProvider nodeStatusProvider;
   private AgentIntervalProvider intervalProvider;
   private ShardingFilter shardingFilter;
-  private ClusteredSortAgentProperties agentProperties;
-  private ClusteredSortSchedulerProperties schedulerProperties;
+  private PriorityAgentProperties agentProperties;
+  private PrioritySchedulerProperties schedulerProperties;
 
   @BeforeEach
   void setUp() {
@@ -92,7 +92,7 @@ class SchedulerIntegrationTest {
 
     // Create scheduler with live Redis
     scheduler =
-        new ClusteredSortAgentScheduler(
+        new PriorityAgentScheduler(
             jedisPool,
             nodeStatusProvider,
             intervalProvider,
@@ -124,11 +124,11 @@ class SchedulerIntegrationTest {
     @DisplayName("Should not register disabled agents")
     void shouldNotRegisterDisabledAgents() {
       // Given - Configure with disabled agent
-      ClusteredSortAgentProperties testProps = createDefaultAgentProperties();
+      PriorityAgentProperties testProps = createDefaultAgentProperties();
       testProps.setDisabledPattern("disabled-agent");
 
-      ClusteredSortAgentScheduler testScheduler =
-          new ClusteredSortAgentScheduler(
+      PriorityAgentScheduler testScheduler =
+          new PriorityAgentScheduler(
               jedisPool,
               nodeStatusProvider,
               intervalProvider,
@@ -184,11 +184,11 @@ class SchedulerIntegrationTest {
     @DisplayName("Should not register disabled agents")
     void shouldNotRegisterDisabledAgents() {
       // Given - Scheduler with disabled pattern
-      ClusteredSortAgentProperties testProps = createDefaultAgentProperties();
+      PriorityAgentProperties testProps = createDefaultAgentProperties();
       testProps.setDisabledPattern(".*test.*");
 
-      ClusteredSortAgentScheduler patternScheduler =
-          new ClusteredSortAgentScheduler(
+      PriorityAgentScheduler patternScheduler =
+          new PriorityAgentScheduler(
               jedisPool,
               nodeStatusProvider,
               intervalProvider,
@@ -238,11 +238,11 @@ class SchedulerIntegrationTest {
     @DisplayName("Should use cached configuration properties")
     void shouldUseCachedConfigurationProperties() {
       // Given - Custom scheduler properties
-      ClusteredSortSchedulerProperties customProps = createDefaultSchedulerProperties();
+      PrioritySchedulerProperties customProps = createDefaultSchedulerProperties();
       customProps.getZombieCleanup().setThresholdMs(120000L); // 2 minutes
 
-      ClusteredSortAgentScheduler customScheduler =
-          new ClusteredSortAgentScheduler(
+      PriorityAgentScheduler customScheduler =
+          new PriorityAgentScheduler(
               jedisPool,
               nodeStatusProvider,
               intervalProvider,
@@ -266,8 +266,8 @@ class SchedulerIntegrationTest {
       NodeStatusProvider disabledNodeProvider = mock(NodeStatusProvider.class);
       when(disabledNodeProvider.isNodeEnabled()).thenReturn(false);
 
-      ClusteredSortAgentScheduler disabledScheduler =
-          new ClusteredSortAgentScheduler(
+      PriorityAgentScheduler disabledScheduler =
+          new PriorityAgentScheduler(
               jedisPool,
               disabledNodeProvider,
               intervalProvider,
@@ -311,8 +311,8 @@ class SchedulerIntegrationTest {
     @DisplayName("Should prevent double agent execution across instances")
     void shouldPreventDoubleAgentExecutionAcrossInstances() throws Exception {
       // Given - Second scheduler instance sharing same Redis
-      ClusteredSortAgentScheduler scheduler2 =
-          new ClusteredSortAgentScheduler(
+      PriorityAgentScheduler scheduler2 =
+          new PriorityAgentScheduler(
               jedisPool,
               nodeStatusProvider,
               intervalProvider,
@@ -354,20 +354,20 @@ class SchedulerIntegrationTest {
     }
   }
 
-  private ClusteredSortAgentProperties createDefaultAgentProperties() {
-    ClusteredSortAgentProperties props = new ClusteredSortAgentProperties();
+  private PriorityAgentProperties createDefaultAgentProperties() {
+    PriorityAgentProperties props = new PriorityAgentProperties();
     props.setMaxConcurrentAgents(100);
     props.setEnabledPattern(".*");
     props.setDisabledPattern("");
     return props;
   }
 
-  private ClusteredSortSchedulerProperties createDefaultSchedulerProperties() {
-    ClusteredSortSchedulerProperties props = new ClusteredSortSchedulerProperties();
+  private PrioritySchedulerProperties createDefaultSchedulerProperties() {
+    PrioritySchedulerProperties props = new PrioritySchedulerProperties();
     props.setIntervalMs(1000L);
     props.setRefreshPeriodSeconds(30);
     props.getZombieCleanup().setThresholdMs(1800000L); // 30 minutes
-    props.getZombieCleanup().setCleanupIntervalMs(300000L); // 5 minutes
+    props.getZombieCleanup().setIntervalMs(300000L); // 5 minutes
     props.getOrphanCleanup().setThresholdMs(7200000L); // 2 hours
     props.getOrphanCleanup().setIntervalMs(3600000L); // 1 hour
     props.setBatchOperationsEnabled(false);
@@ -596,7 +596,7 @@ class SchedulerIntegrationTest {
       }
 
       // Verify scheduler continues to run properly with periodic refresh
-      ClusteredSortAgentScheduler.SchedulerStats stats = scheduler.getStats();
+      PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
       assertThat(stats.getRunCount()).isGreaterThan(0);
       assertThat(stats.isRunning()).isTrue();
     }

@@ -19,9 +19,9 @@ package com.netflix.spinnaker.cats.redis.cluster;
 /**
  * Exception thrown when agent scheduling operations fail.
  *
- * <p>This exception is used by ClusteredSortAgentScheduler to provide more specific error
- * information than generic RuntimeException, making it easier for calling code to handle
- * scheduling-specific failures appropriately.
+ * <p>This exception is used by PriorityAgentScheduler to provide more specific error information
+ * than generic RuntimeException, making it easier for calling code to handle scheduling-specific
+ * failures appropriately.
  *
  * <p>Common scenarios where this exception is thrown:
  *

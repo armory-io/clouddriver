@@ -37,7 +37,8 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Tests focused on performance optimizations and reliability improvements in the sort scheduler.
+ * Tests focused on performance optimizations and reliability improvements in the priority
+ * scheduler.
  *
  * <p>This test suite validates:
  *
@@ -51,7 +52,7 @@ import redis.clients.jedis.JedisPoolConfig;
  */
 @Testcontainers
 @DisplayName("Scheduler Performance Optimizations Tests")
-class SchedulerOptimizationsTest {
+public class PrioritySchedulerOptimizationsTest {
 
   @Container
   static GenericContainer<?> redis =
@@ -60,12 +61,12 @@ class SchedulerOptimizationsTest {
           .withCommand("redis-server", "--requirepass", "testpass");
 
   private JedisPool jedisPool;
-  private ClusteredSortAgentScheduler scheduler;
+  private PriorityAgentScheduler scheduler;
   private NodeStatusProvider nodeStatusProvider;
   private AgentIntervalProvider intervalProvider;
   private ShardingFilter shardingFilter;
-  private ClusteredSortAgentProperties agentProperties;
-  private ClusteredSortSchedulerProperties schedulerProperties;
+  private PriorityAgentProperties agentProperties;
+  private PrioritySchedulerProperties schedulerProperties;
 
   @BeforeEach
   void setUp() {
@@ -91,7 +92,7 @@ class SchedulerOptimizationsTest {
 
     // Create scheduler with live Redis
     scheduler =
-        new ClusteredSortAgentScheduler(
+        new PriorityAgentScheduler(
             jedisPool,
             nodeStatusProvider,
             intervalProvider,
@@ -143,7 +144,7 @@ class SchedulerOptimizationsTest {
 
     // When - Multiple health stat requests (should be fast)
     for (int i = 0; i < 100; i++) {
-      ClusteredSortAgentScheduler.SchedulerStats stats = scheduler.getStats();
+      PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
       assertThat(stats).isNotNull();
       assertThat(stats.getRegisteredAgents()).isGreaterThanOrEqualTo(0);
       assertThat(stats.getActiveAgents()).isGreaterThanOrEqualTo(0);
@@ -168,7 +169,7 @@ class SchedulerOptimizationsTest {
     scheduler.schedule(agent1, execution, instrumentation);
     scheduler.schedule(agent2, execution, instrumentation);
 
-    ClusteredSortAgentScheduler.SchedulerStats stats = scheduler.getStats();
+    PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
 
     // Then - Should track metrics accurately
     assertThat(stats.getRegisteredAgents()).isGreaterThanOrEqualTo(0);
@@ -210,20 +211,20 @@ class SchedulerOptimizationsTest {
     assertThat(scheduler.getStats().getRegisteredAgents()).isGreaterThan(0);
   }
 
-  private ClusteredSortAgentProperties createOptimizedAgentProperties() {
-    ClusteredSortAgentProperties props = new ClusteredSortAgentProperties();
+  private PriorityAgentProperties createOptimizedAgentProperties() {
+    PriorityAgentProperties props = new PriorityAgentProperties();
     props.setMaxConcurrentAgents(200); // Higher concurrency for performance
     props.setEnabledPattern(".*");
     props.setDisabledPattern("");
     return props;
   }
 
-  private ClusteredSortSchedulerProperties createOptimizedSchedulerProperties() {
-    ClusteredSortSchedulerProperties props = new ClusteredSortSchedulerProperties();
+  private PrioritySchedulerProperties createOptimizedSchedulerProperties() {
+    PrioritySchedulerProperties props = new PrioritySchedulerProperties();
     props.setIntervalMs(500L); // Faster scheduling interval
     props.setRefreshPeriodSeconds(15); // More frequent refresh
     props.getZombieCleanup().setThresholdMs(1200000L); // 20 minutes
-    props.getZombieCleanup().setCleanupIntervalMs(120000L); // 2 minutes
+    props.getZombieCleanup().setIntervalMs(120000L); // 2 minutes
     props.getOrphanCleanup().setThresholdMs(3600000L); // 1 hour
     props.getOrphanCleanup().setIntervalMs(1800000L); // 30 minutes
     props.setBatchOperationsEnabled(true); // Enable batch operations

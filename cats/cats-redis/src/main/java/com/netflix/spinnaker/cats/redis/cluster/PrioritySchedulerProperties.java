@@ -20,14 +20,14 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 /**
- * Scheduler execution configuration properties for Redis scheduler.
+ * Priority scheduler execution configuration properties for Redis priority scheduler.
  *
  * <p>This class caches scheduler-related configuration values to avoid dynamic config calls.
  * Configuration changes are applied through Spring Boot's configuration refresh mechanism.
  */
 @Component
 @ConfigurationProperties(prefix = "redis.scheduler")
-public class ClusteredSortSchedulerProperties {
+public class PrioritySchedulerProperties {
 
   /**
    * How often the scheduler runs to check for ready agents (milliseconds). Lower values provide
@@ -149,7 +149,7 @@ class ZombieCleanupProperties {
   private long thresholdMs = 30000L; // 30 seconds
 
   /** How often to check for and clean up zombie agents (milliseconds). */
-  private long cleanupIntervalMs = 300000L; // 5 minutes
+  private long intervalMs = 300000L; // 5 minutes
 
   /** Batch size for zombie cleanup. Defaults to 50, which handles typical bursts. */
   private int batchSize = 50;
@@ -170,12 +170,12 @@ class ZombieCleanupProperties {
     this.thresholdMs = thresholdMs;
   }
 
-  public long getCleanupIntervalMs() {
-    return cleanupIntervalMs;
+  public long getIntervalMs() {
+    return intervalMs;
   }
 
-  public void setCleanupIntervalMs(long cleanupIntervalMs) {
-    this.cleanupIntervalMs = cleanupIntervalMs;
+  public void setIntervalMs(long intervalMs) {
+    this.intervalMs = intervalMs;
   }
 
   public int getBatchSize() {

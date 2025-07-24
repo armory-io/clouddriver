@@ -90,11 +90,11 @@ class ShutdownBehaviorTest {
     ShardingFilter shardingFilter = mock(ShardingFilter.class);
     when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
 
-    ClusteredSortAgentProperties agentProperties = new ClusteredSortAgentProperties();
+    PriorityAgentProperties agentProperties = new PriorityAgentProperties();
     agentProperties.setMaxConcurrentAgents(10);
     agentProperties.setEnabledPattern(".*");
 
-    ClusteredSortSchedulerProperties schedulerProperties = new ClusteredSortSchedulerProperties();
+    PrioritySchedulerProperties schedulerProperties = new PrioritySchedulerProperties();
 
     acquisitionService =
         new AgentAcquisitionService(

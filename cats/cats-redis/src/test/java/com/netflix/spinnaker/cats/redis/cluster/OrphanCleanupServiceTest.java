@@ -70,7 +70,7 @@ class OrphanCleanupServiceTest {
   private JedisPool jedisPool;
   private RedisScriptManager scriptManager;
   private OrphanCleanupService orphanService;
-  private ClusteredSortSchedulerProperties schedulerProperties;
+  private PrioritySchedulerProperties schedulerProperties;
 
   @BeforeEach
   void setUp() {
@@ -81,7 +81,7 @@ class OrphanCleanupServiceTest {
     scriptManager = new RedisScriptManager(jedisPool);
     scriptManager.initializeScripts();
 
-    schedulerProperties = new ClusteredSortSchedulerProperties();
+    schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.getOrphanCleanup().setThresholdMs(60000L); // 1 minute
     schedulerProperties.getOrphanCleanup().setIntervalMs(30000L); // 30 seconds
     schedulerProperties.getOrphanCleanup().setEnabled(true);
@@ -769,7 +769,7 @@ class OrphanCleanupServiceTest {
       schedulerProperties.getOrphanCleanup().setIntervalMs(10L); // Very fast for testing
       schedulerProperties.getOrphanCleanup().setThresholdMs(500L); // 500ms threshold
 
-      ClusteredSortAgentProperties agentProperties = new ClusteredSortAgentProperties();
+      PriorityAgentProperties agentProperties = new PriorityAgentProperties();
 
       // Mock dependencies with reasonable defaults
       AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);

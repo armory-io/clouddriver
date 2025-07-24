@@ -20,14 +20,14 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 /**
- * Agent filtering configuration properties for Redis scheduler.
+ * Agent filtering configuration properties for Redis priority scheduler.
  *
  * <p>This class caches agent-related configuration values to avoid dynamic config calls.
  * Configuration changes are applied through Spring Boot's configuration refresh mechanism.
  */
 @Component
 @ConfigurationProperties(prefix = "redis.agent")
-public class ClusteredSortAgentProperties {
+public class PriorityAgentProperties {
 
   /** Regex pattern for enabled agents. Only agents matching this pattern will be scheduled. */
   private String enabledPattern = ".*";

@@ -17,9 +17,8 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import com.netflix.spinnaker.cats.agent.Agent;
-import com.netflix.spinnaker.cats.agent.AgentLock;
 
-public class ClusteredSortAgentLock extends AgentLock {
+public class AgentLock extends com.netflix.spinnaker.cats.agent.AgentLock {
   // The score the agent was acquired with (Used to ensure we own this agent on release).
   private final String acquireScore;
   // The score the agent was release from the WAITING set with (Used to ensure it is readded to the
@@ -27,13 +26,13 @@ public class ClusteredSortAgentLock extends AgentLock {
   private final String releaseScore;
 
   /**
-   * Constructor for ClusteredSortAgentLock.
+   * Constructor for AgentLock.
    *
    * @param agent The agent associated with this lock
    * @param acquireScore The score the agent was acquired with
    * @param releaseScore The score the agent was released from the WAITING set with
    */
-  public ClusteredSortAgentLock(Agent agent, String acquireScore, String releaseScore) {
+  public AgentLock(Agent agent, String acquireScore, String releaseScore) {
     super(agent);
     this.acquireScore = acquireScore;
     this.releaseScore = releaseScore;

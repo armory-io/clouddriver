@@ -30,7 +30,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 /**
- * Test suite for SchedulerConfiguration.
+ * Test suite for PrioritySchedulerConfiguration.
  *
  * <p>Tests cover:
  *
@@ -43,28 +43,28 @@ import org.junit.jupiter.api.Test;
  *   <li>Performance characteristics
  * </ul>
  */
-@DisplayName("SchedulerConfiguration Tests")
-class SchedulerConfigurationTest {
+@DisplayName("PriorityConfiguration Tests")
+class PrioritySchedulerConfigurationTest {
 
-  private ClusteredSortAgentProperties agentProperties;
-  private ClusteredSortSchedulerProperties schedulerProperties;
-  private SchedulerConfiguration configuration;
+  private PriorityAgentProperties agentProperties;
+  private PrioritySchedulerProperties schedulerProperties;
+  private PrioritySchedulerConfiguration configuration;
 
   @BeforeEach
   void setUp() {
-    agentProperties = new ClusteredSortAgentProperties();
+    agentProperties = new PriorityAgentProperties();
     agentProperties.setMaxConcurrentAgents(10);
     agentProperties.setEnabledPattern(".*");
     agentProperties.setDisabledPattern("");
 
-    schedulerProperties = new ClusteredSortSchedulerProperties();
+    schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setIntervalMs(1000L);
     schedulerProperties.setRefreshPeriodSeconds(30);
 
     // Setup zombie cleanup configuration
     schedulerProperties.getZombieCleanup().setEnabled(true);
     schedulerProperties.getZombieCleanup().setThresholdMs(30000L);
-    schedulerProperties.getZombieCleanup().setCleanupIntervalMs(10000L);
+    schedulerProperties.getZombieCleanup().setIntervalMs(10000L);
 
     // Setup orphan cleanup configuration
     schedulerProperties.getOrphanCleanup().setEnabled(true);
@@ -75,7 +75,7 @@ class SchedulerConfigurationTest {
     schedulerProperties.getPool().setMaxSize(20);
     schedulerProperties.getPool().setKeepAliveSeconds(60);
 
-    configuration = new SchedulerConfiguration(agentProperties, schedulerProperties);
+    configuration = new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
   }
 
   @Nested
@@ -133,8 +133,8 @@ class SchedulerConfigurationTest {
     void shouldReturnNullSemaphoreWhenConcurrencyControlDisabled() {
       // Given - Disable concurrency control
       agentProperties.setMaxConcurrentAgents(0);
-      SchedulerConfiguration disabledConfig =
-          new SchedulerConfiguration(agentProperties, schedulerProperties);
+      PrioritySchedulerConfiguration disabledConfig =
+          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
 
       // When
       Semaphore semaphore = disabledConfig.getRunningAgents();
@@ -148,8 +148,8 @@ class SchedulerConfigurationTest {
     void shouldHandleNegativeConcurrentAgentsAsDisabled() {
       // Given
       agentProperties.setMaxConcurrentAgents(-1);
-      SchedulerConfiguration negativeConfig =
-          new SchedulerConfiguration(agentProperties, schedulerProperties);
+      PrioritySchedulerConfiguration negativeConfig =
+          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
 
       // When
       Semaphore semaphore = negativeConfig.getRunningAgents();
@@ -163,8 +163,8 @@ class SchedulerConfigurationTest {
     void shouldCreateSemaphoreWithCustomPermitCount() {
       // Given
       agentProperties.setMaxConcurrentAgents(25);
-      SchedulerConfiguration customConfig =
-          new SchedulerConfiguration(agentProperties, schedulerProperties);
+      PrioritySchedulerConfiguration customConfig =
+          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
 
       // When
       Semaphore semaphore = customConfig.getRunningAgents();
@@ -195,10 +195,10 @@ class SchedulerConfigurationTest {
     @DisplayName("Should handle custom agent patterns")
     void shouldHandleCustomAgentPatterns() {
       // Given - Use fresh properties to avoid test contamination
-      ClusteredSortAgentProperties freshAgentProps = new ClusteredSortAgentProperties();
+      PriorityAgentProperties freshAgentProps = new PriorityAgentProperties();
       freshAgentProps.setEnabledPattern("test-.*");
-      SchedulerConfiguration customConfig =
-          new SchedulerConfiguration(freshAgentProps, schedulerProperties);
+      PrioritySchedulerConfiguration customConfig =
+          new PrioritySchedulerConfiguration(freshAgentProps, schedulerProperties);
 
       // When
       Pattern pattern = customConfig.getEnabledAgentPattern();
@@ -214,10 +214,10 @@ class SchedulerConfigurationTest {
     @DisplayName("Should handle complex regex patterns")
     void shouldHandleComplexRegexPatterns() {
       // Given - Use fresh properties to avoid test contamination
-      ClusteredSortAgentProperties freshAgentProps = new ClusteredSortAgentProperties();
+      PriorityAgentProperties freshAgentProps = new PriorityAgentProperties();
       freshAgentProps.setEnabledPattern("^(aws|gcp)-.*$");
-      SchedulerConfiguration regexConfig =
-          new SchedulerConfiguration(freshAgentProps, schedulerProperties);
+      PrioritySchedulerConfiguration regexConfig =
+          new PrioritySchedulerConfiguration(freshAgentProps, schedulerProperties);
 
       // When
       Pattern pattern = regexConfig.getEnabledAgentPattern();
@@ -238,10 +238,10 @@ class SchedulerConfigurationTest {
     @DisplayName("Should handle no disabled pattern (empty string)")
     void shouldHandleNoDisabledPattern() {
       // Given - Use fresh properties with no disabled pattern
-      ClusteredSortAgentProperties freshAgentProps = new ClusteredSortAgentProperties();
+      PriorityAgentProperties freshAgentProps = new PriorityAgentProperties();
       freshAgentProps.setDisabledPattern("");
-      SchedulerConfiguration noPatternConfig =
-          new SchedulerConfiguration(freshAgentProps, schedulerProperties);
+      PrioritySchedulerConfiguration noPatternConfig =
+          new PrioritySchedulerConfiguration(freshAgentProps, schedulerProperties);
 
       // When
       Pattern pattern = noPatternConfig.getDisabledAgentPattern();
@@ -254,10 +254,10 @@ class SchedulerConfigurationTest {
     @DisplayName("Should compile simple disabled pattern")
     void shouldCompileSimpleDisabledPattern() {
       // Given - Use fresh properties with simple pattern
-      ClusteredSortAgentProperties freshAgentProps = new ClusteredSortAgentProperties();
+      PriorityAgentProperties freshAgentProps = new PriorityAgentProperties();
       freshAgentProps.setDisabledPattern("test-.*");
-      SchedulerConfiguration patternConfig =
-          new SchedulerConfiguration(freshAgentProps, schedulerProperties);
+      PrioritySchedulerConfiguration patternConfig =
+          new PrioritySchedulerConfiguration(freshAgentProps, schedulerProperties);
 
       // When
       Pattern pattern = patternConfig.getDisabledAgentPattern();
@@ -273,10 +273,10 @@ class SchedulerConfigurationTest {
     @DisplayName("Should handle complex disabled patterns")
     void shouldHandleComplexDisabledPatterns() {
       // Given - Use fresh properties with complex pattern
-      ClusteredSortAgentProperties freshAgentProps = new ClusteredSortAgentProperties();
+      PriorityAgentProperties freshAgentProps = new PriorityAgentProperties();
       freshAgentProps.setDisabledPattern("^(aws|gcp)-(test|dev)-.*$");
-      SchedulerConfiguration complexConfig =
-          new SchedulerConfiguration(freshAgentProps, schedulerProperties);
+      PrioritySchedulerConfiguration complexConfig =
+          new PrioritySchedulerConfiguration(freshAgentProps, schedulerProperties);
 
       // When
       Pattern pattern = complexConfig.getDisabledAgentPattern();
@@ -293,10 +293,10 @@ class SchedulerConfigurationTest {
     @DisplayName("Should handle multi-cloud disabled patterns")
     void shouldHandleMultiCloudDisabledPatterns() {
       // Given - Pattern to disable all test environments across clouds
-      ClusteredSortAgentProperties freshAgentProps = new ClusteredSortAgentProperties();
+      PriorityAgentProperties freshAgentProps = new PriorityAgentProperties();
       freshAgentProps.setDisabledPattern(".*-(test|testing|dev|development)-.*");
-      SchedulerConfiguration multiCloudConfig =
-          new SchedulerConfiguration(freshAgentProps, schedulerProperties);
+      PrioritySchedulerConfiguration multiCloudConfig =
+          new PrioritySchedulerConfiguration(freshAgentProps, schedulerProperties);
 
       // When
       Pattern pattern = multiCloudConfig.getDisabledAgentPattern();
@@ -320,10 +320,10 @@ class SchedulerConfigurationTest {
     @DisplayName("Should be case sensitive in pattern matching")
     void shouldBeCaseSensitiveInPatternMatching() {
       // Given - Case sensitive pattern
-      ClusteredSortAgentProperties freshAgentProps = new ClusteredSortAgentProperties();
+      PriorityAgentProperties freshAgentProps = new PriorityAgentProperties();
       freshAgentProps.setDisabledPattern("aws-.*");
-      SchedulerConfiguration caseConfig =
-          new SchedulerConfiguration(freshAgentProps, schedulerProperties);
+      PrioritySchedulerConfiguration caseConfig =
+          new PrioritySchedulerConfiguration(freshAgentProps, schedulerProperties);
 
       // When
       Pattern pattern = caseConfig.getDisabledAgentPattern();
@@ -374,7 +374,7 @@ class SchedulerConfigurationTest {
     void shouldProvideCorrectZombieConfiguration() {
       // When
       long zombieThreshold = configuration.getZombieThresholdMs();
-      long zombieCleanupInterval = configuration.getZombieCleanupIntervalMs();
+      long zombieCleanupInterval = configuration.getZombieIntervalMs();
 
       // Then
       assertThat(zombieThreshold).isEqualTo(30000L);
@@ -531,8 +531,8 @@ class SchedulerConfigurationTest {
       // Given
       String disabledPattern = "disabled-agent-.*";
       agentProperties.setDisabledPattern(disabledPattern);
-      SchedulerConfiguration configWithDisabled =
-          new SchedulerConfiguration(agentProperties, schedulerProperties);
+      PrioritySchedulerConfiguration configWithDisabled =
+          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
 
       // When
       Pattern retrievedDisabled = configWithDisabled.getDisabledAgentPattern();

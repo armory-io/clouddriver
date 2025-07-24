@@ -63,7 +63,7 @@ class ZombieCleanupServiceTest {
   private JedisPool jedisPool;
   private RedisScriptManager scriptManager;
   private ZombieCleanupService zombieService;
-  private ClusteredSortSchedulerProperties schedulerProperties;
+  private PrioritySchedulerProperties schedulerProperties;
 
   @BeforeEach
   void setUp() {
@@ -79,9 +79,9 @@ class ZombieCleanupServiceTest {
     scriptManager = new RedisScriptManager(jedisPool);
     scriptManager.initializeScripts();
 
-    schedulerProperties = new ClusteredSortSchedulerProperties();
+    schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.getZombieCleanup().setThresholdMs(30000L); // 30 seconds
-    schedulerProperties.getZombieCleanup().setCleanupIntervalMs(10000L); // 10 seconds
+    schedulerProperties.getZombieCleanup().setIntervalMs(10000L); // 10 seconds
 
     zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
   }
@@ -277,7 +277,7 @@ class ZombieCleanupServiceTest {
     @DisplayName("Should perform cleanup after interval has elapsed")
     void shouldPerformCleanupAfterIntervalHasElapsed() throws InterruptedException {
       // Given - Set very short interval for testing
-      schedulerProperties.getZombieCleanup().setCleanupIntervalMs(100L); // 100ms
+      schedulerProperties.getZombieCleanup().setIntervalMs(100L); // 100ms
       zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       Map<String, String> activeAgents = new HashMap<>();

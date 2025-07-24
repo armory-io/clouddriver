@@ -46,18 +46,18 @@ import redis.clients.jedis.JedisPool;
  *   <li>Cross-service interaction bugs
  * </ul>
  */
-@DisplayName("Scheduler Complex Scenarios Tests")
-class SchedulerComplexScenariosTest {
+@DisplayName("Priority Scheduler Complex Scenarios Tests")
+public class PrioritySchedulerComplexScenariosTest {
 
   @Mock private JedisPool mockJedisPool;
   @Mock private Jedis mockJedis;
   @Mock private NodeStatusProvider mockNodeStatusProvider;
   @Mock private AgentIntervalProvider mockIntervalProvider;
   @Mock private ShardingFilter mockShardingFilter;
-  @Mock private ClusteredSortAgentProperties mockAgentProperties;
-  @Mock private ClusteredSortSchedulerProperties mockSchedulerProperties;
+  @Mock private PriorityAgentProperties mockAgentProperties;
+  @Mock private PrioritySchedulerProperties mockSchedulerProperties;
 
-  private ClusteredSortAgentScheduler scheduler;
+  private PriorityAgentScheduler scheduler;
   private ExecutorService testExecutor;
 
   @BeforeEach
@@ -100,7 +100,7 @@ class SchedulerComplexScenariosTest {
     ZombieCleanupProperties zombieProps = mock(ZombieCleanupProperties.class);
     when(zombieProps.isEnabled()).thenReturn(true);
     when(zombieProps.getThresholdMs()).thenReturn(1800000L); // 30 minutes
-    when(zombieProps.getCleanupIntervalMs()).thenReturn(300000L); // 5 minutes
+    when(zombieProps.getIntervalMs()).thenReturn(300000L); // 5 minutes
     when(zombieProps.getBatchSize()).thenReturn(50);
     when(mockSchedulerProperties.getZombieCleanup()).thenReturn(zombieProps);
 
@@ -115,7 +115,7 @@ class SchedulerComplexScenariosTest {
     when(mockSchedulerProperties.getOrphanCleanup()).thenReturn(orphanProps);
 
     scheduler =
-        new ClusteredSortAgentScheduler(
+        new PriorityAgentScheduler(
             mockJedisPool,
             mockNodeStatusProvider,
             mockIntervalProvider,
@@ -257,7 +257,7 @@ class SchedulerComplexScenariosTest {
                 scheduler.run();
 
                 // Collect statistics during the churn
-                ClusteredSortAgentScheduler.SchedulerStats stats = scheduler.getStats();
+                PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
 
                 // Verify statistics are reasonable
                 assertNotNull(stats, "Statistics should not be null during cycle " + cycle);

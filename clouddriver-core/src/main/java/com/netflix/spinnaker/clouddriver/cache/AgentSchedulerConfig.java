@@ -21,9 +21,10 @@ import com.netflix.spinnaker.cats.cluster.DefaultNodeIdentity;
 import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.redis.cluster.ClusteredAgentScheduler;
-import com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentProperties;
 import com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentScheduler;
-import com.netflix.spinnaker.cats.redis.cluster.ClusteredSortSchedulerProperties;
+import com.netflix.spinnaker.cats.redis.cluster.PriorityAgentProperties;
+import com.netflix.spinnaker.cats.redis.cluster.PriorityAgentScheduler;
+import com.netflix.spinnaker.cats.redis.cluster.PrioritySchedulerProperties;
 import com.netflix.spinnaker.clouddriver.core.RedisConfigurationProperties;
 import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import com.netflix.spinnaker.kork.jedis.RedisClientDelegate;
@@ -69,8 +70,13 @@ public class AgentSchedulerConfig {
           dynamicConfigService,
           shardingFilter);
     } else if (redisConfigurationProperties.getScheduler().getType().equalsIgnoreCase("sort")) {
-      // Create properties instances from existing config
-      ClusteredSortAgentProperties agentProperties = new ClusteredSortAgentProperties();
+      return new ClusteredSortAgentScheduler(
+          jedisPool,
+          nodeStatusProvider,
+          agentIntervalProvider,
+          redisConfigurationProperties.getScheduler().getParallelism());
+    } else if (redisConfigurationProperties.getScheduler().getType().equalsIgnoreCase("priority")) {
+      PriorityAgentProperties agentProperties = new PriorityAgentProperties();
       agentProperties.setEnabledPattern(
           redisConfigurationProperties.getAgent().getEnabledPattern());
       // Default to empty pattern (no pattern-based disabling) for backward compatibility
@@ -78,28 +84,28 @@ public class AgentSchedulerConfig {
       agentProperties.setMaxConcurrentAgents(
           redisConfigurationProperties.getAgent().getMaxConcurrentAgents());
 
-      ClusteredSortSchedulerProperties schedulerProperties = new ClusteredSortSchedulerProperties();
+      PrioritySchedulerProperties schedulerProperties = new PrioritySchedulerProperties();
 
-      // Always warn if parallelism is configured since sort scheduler completely ignores it
+      // Always warn if parallelism is configured since priority scheduler completely ignores it
       int parallelism = redisConfigurationProperties.getScheduler().getParallelism();
       if (parallelism != 0) { // Warn for any non-zero value (positive or negative)
         log.warn(
-            "redis.scheduler.parallelism ({}) is completely ignored by ClusteredSortAgentScheduler. "
+            "redis.scheduler.parallelism ({}) is completely ignored by PriorityAgentScheduler. "
                 + "Use redis.agent.maxConcurrentAgents instead (current: {})",
             parallelism,
             agentProperties.getMaxConcurrentAgents());
       }
 
-      // Always warn if disabledAgents list is configured since sort scheduler ignores it
+      // Always warn if disabledAgents list is configured since priority scheduler ignores it
       if (!redisConfigurationProperties.getAgent().getDisabledAgents().isEmpty()) {
         log.warn(
-            "redis.agent.disabledAgents ({} agents) is ignored by ClusteredSortAgentScheduler. "
+            "redis.agent.disabledAgents ({} agents) is ignored by PriorityAgentScheduler. "
                 + "Use redis.agent.disabledPattern instead (current: '{}')",
             redisConfigurationProperties.getAgent().getDisabledAgents().size(),
             agentProperties.getDisabledPattern());
       }
 
-      return new ClusteredSortAgentScheduler(
+      return new PriorityAgentScheduler(
           jedisPool,
           nodeStatusProvider,
           agentIntervalProvider,
@@ -108,7 +114,7 @@ public class AgentSchedulerConfig {
           schedulerProperties);
     } else {
       throw new IllegalStateException(
-          "redis.scheduler.type must be one of 'default', 'sort', or ''.");
+          "redis.scheduler.type must be one of 'default', 'sort', or 'priority'.");
     }
   }
 }
