@@ -43,78 +43,125 @@ public class AgentSchedulerConfig {
 
   private static final Logger log = LoggerFactory.getLogger(AgentSchedulerConfig.class);
 
+  /**
+   * Creates the legacy "default" Redis agent scheduler. This bean is only created if
+   * redis.scheduler.type is "default" or not specified.
+   */
   @Bean
+  @ConditionalOnProperty(
+      value = "redis.scheduler.type",
+      havingValue = "default",
+      matchIfMissing = true)
   @ConditionalOnExpression("${redis.enabled:true} && ${redis.scheduler.enabled:true}")
-  AgentScheduler redisAgentScheduler(
+  public AgentScheduler defaultRedisAgentScheduler(
       RedisConfigurationProperties redisConfigurationProperties,
       RedisClientDelegate redisClientDelegate,
-      JedisPool jedisPool,
       AgentIntervalProvider agentIntervalProvider,
       NodeStatusProvider nodeStatusProvider,
       DynamicConfigService dynamicConfigService,
       ShardingFilter shardingFilter) {
-    if (redisConfigurationProperties.getScheduler().getType().equalsIgnoreCase("default")) {
-      URI redisUri = URI.create(redisConfigurationProperties.getConnection());
-      String redisHost = redisUri.getHost();
-      int redisPort = redisUri.getPort();
-      if (redisPort == -1) {
-        redisPort = 6379;
-      }
-      return new ClusteredAgentScheduler(
-          redisClientDelegate,
-          new DefaultNodeIdentity(redisHost, redisPort),
-          agentIntervalProvider,
-          nodeStatusProvider,
-          redisConfigurationProperties.getAgent().getEnabledPattern(),
-          redisConfigurationProperties.getAgent().getAgentLockAcquisitionIntervalSeconds(),
-          dynamicConfigService,
-          shardingFilter);
-    } else if (redisConfigurationProperties.getScheduler().getType().equalsIgnoreCase("sort")) {
-      return new ClusteredSortAgentScheduler(
-          jedisPool,
-          nodeStatusProvider,
-          agentIntervalProvider,
-          redisConfigurationProperties.getScheduler().getParallelism());
-    } else if (redisConfigurationProperties.getScheduler().getType().equalsIgnoreCase("priority")) {
-      PriorityAgentProperties agentProperties = new PriorityAgentProperties();
-      agentProperties.setEnabledPattern(
-          redisConfigurationProperties.getAgent().getEnabledPattern());
-      // Default to empty pattern (no pattern-based disabling) for backward compatibility
-      agentProperties.setDisabledPattern("");
-      agentProperties.setMaxConcurrentAgents(
-          redisConfigurationProperties.getAgent().getMaxConcurrentAgents());
+    log.info("Creating ClusteredAgentScheduler (default)");
+    URI redisUri = URI.create(redisConfigurationProperties.getConnection());
+    String redisHost = redisUri.getHost();
+    int redisPort = redisUri.getPort() == -1 ? 6379 : redisUri.getPort();
 
-      PrioritySchedulerProperties schedulerProperties = new PrioritySchedulerProperties();
+    return new ClusteredAgentScheduler(
+        redisClientDelegate,
+        new DefaultNodeIdentity(redisHost, redisPort),
+        agentIntervalProvider,
+        nodeStatusProvider,
+        redisConfigurationProperties.getAgent().getEnabledPattern(),
+        redisConfigurationProperties.getAgent().getAgentLockAcquisitionIntervalSeconds(),
+        dynamicConfigService,
+        shardingFilter);
+  }
 
-      // Always warn if parallelism is configured since priority scheduler completely ignores it
-      int parallelism = redisConfigurationProperties.getScheduler().getParallelism();
-      if (parallelism != 0) { // Warn for any non-zero value (positive or negative)
-        log.warn(
-            "redis.scheduler.parallelism ({}) is completely ignored by PriorityAgentScheduler. "
-                + "Use redis.agent.maxConcurrentAgents instead (current: {})",
-            parallelism,
-            agentProperties.getMaxConcurrentAgents());
-      }
+  /**
+   * Creates the legacy "sort" Redis agent scheduler. This bean is only created if
+   * redis.scheduler.type is "sort".
+   */
+  @Bean
+  @ConditionalOnProperty(value = "redis.scheduler.type", havingValue = "sort")
+  @ConditionalOnExpression("${redis.enabled:true} && ${redis.scheduler.enabled:true}")
+  public AgentScheduler sortRedisAgentScheduler(
+      JedisPool jedisPool,
+      NodeStatusProvider nodeStatusProvider,
+      AgentIntervalProvider agentIntervalProvider,
+      RedisConfigurationProperties redisConfigurationProperties) {
+    log.info("Creating ClusteredSortAgentScheduler (sort)");
 
-      // Always warn if disabledAgents list is configured since priority scheduler ignores it
-      if (!redisConfigurationProperties.getAgent().getDisabledAgents().isEmpty()) {
-        log.warn(
-            "redis.agent.disabledAgents ({} agents) is ignored by PriorityAgentScheduler. "
-                + "Use redis.agent.disabledPattern instead (current: '{}')",
-            redisConfigurationProperties.getAgent().getDisabledAgents().size(),
-            agentProperties.getDisabledPattern());
-      }
-
-      return new PriorityAgentScheduler(
-          jedisPool,
-          nodeStatusProvider,
-          agentIntervalProvider,
-          shardingFilter,
-          agentProperties,
-          schedulerProperties);
+    int parallelism = redisConfigurationProperties.getScheduler().getParallelism();
+    if (parallelism > 0) {
+      log.info(
+          "ClusteredSortAgentScheduler using parallelism: {} (max concurrent agents)", parallelism);
+    } else if (parallelism == -1) {
+      log.info("ClusteredSortAgentScheduler using unlimited parallelism");
     } else {
-      throw new IllegalStateException(
-          "redis.scheduler.type must be one of 'default', 'sort', or 'priority'.");
+      log.warn(
+          "Invalid parallelism value: {}. ClusteredSortAgentScheduler requires positive value or -1",
+          parallelism);
     }
+
+    if (!redisConfigurationProperties.getAgent().getDisabledAgents().isEmpty()) {
+      log.warn(
+          "redis.agent.disabledAgents ({} agents) is NOT supported by ClusteredSortAgentScheduler and will be ignored. "
+              + "Consider migrating to priority scheduler for agent filtering support.",
+          redisConfigurationProperties.getAgent().getDisabledAgents().size());
+    }
+
+    return new ClusteredSortAgentScheduler(
+        jedisPool, nodeStatusProvider, agentIntervalProvider, parallelism);
+  }
+
+  /**
+   * Creates the modern "priority" Redis agent scheduler. This bean is only created if
+   * redis.scheduler.type is "priority". Uses proper Spring dependency injection for configuration
+   * properties.
+   */
+  @Bean
+  @ConditionalOnProperty(value = "redis.scheduler.type", havingValue = "priority")
+  @ConditionalOnExpression("${redis.enabled:true} && ${redis.scheduler.enabled:true}")
+  public AgentScheduler priorityRedisAgentScheduler(
+      JedisPool jedisPool,
+      NodeStatusProvider nodeStatusProvider,
+      AgentIntervalProvider agentIntervalProvider,
+      ShardingFilter shardingFilter,
+      PriorityAgentProperties agentProperties,
+      PrioritySchedulerProperties schedulerProperties,
+      RedisConfigurationProperties redisConfigurationProperties) {
+    log.info("Creating PriorityAgentScheduler (priority)");
+
+    int parallelism = redisConfigurationProperties.getScheduler().getParallelism();
+    if (parallelism != 0) {
+      log.warn(
+          "redis.scheduler.parallelism ({}) is completely ignored by PriorityAgentScheduler. "
+              + "Use redis.agent.maxConcurrentAgents instead (current: {})",
+          parallelism,
+          agentProperties.getMaxConcurrentAgents());
+    }
+    if (!redisConfigurationProperties.getAgent().getDisabledAgents().isEmpty()) {
+      log.warn(
+          "redis.agent.disabledAgents ({} agents) is ignored by PriorityAgentScheduler. "
+              + "Use redis.agent.disabledPattern instead (current: '{}')",
+          redisConfigurationProperties.getAgent().getDisabledAgents().size(),
+          agentProperties.getDisabledPattern());
+    }
+
+    log.info(
+        "PriorityAgentScheduler configuration: maxConcurrentAgents={}, threadPoolMaxSize={}, "
+            + "enabledPattern='{}', disabledPattern='{}', batchOperationsEnabled={}",
+        agentProperties.getMaxConcurrentAgents(),
+        schedulerProperties.getThreadPoolMaxSize(),
+        agentProperties.getEnabledPattern(),
+        agentProperties.getDisabledPattern(),
+        schedulerProperties.isBatchOperationsEnabled());
+
+    return new PriorityAgentScheduler(
+        jedisPool,
+        nodeStatusProvider,
+        agentIntervalProvider,
+        shardingFilter,
+        agentProperties,
+        schedulerProperties);
   }
 }
