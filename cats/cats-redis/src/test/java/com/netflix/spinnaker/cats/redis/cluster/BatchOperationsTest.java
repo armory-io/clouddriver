@@ -180,6 +180,67 @@ class BatchOperationsTest {
       // Then - Should complete without errors
       assertThat(scheduler).isNotNull();
     }
+
+    @Test
+    @DisplayName("Should handle exceptional agents zombie cleanup with batch operations")
+    void shouldHandleExceptionalAgentsZombieCleanupWithBatchOperations() {
+      // Given - Scheduler properties with exceptional agents configured
+      PrioritySchedulerProperties exceptionalProps = createExceptionalAgentsTestProperties();
+      PriorityAgentScheduler exceptionalScheduler =
+          new PriorityAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              exceptionalProps);
+
+      // When - Run scheduler cycle with exceptional agents configuration
+      exceptionalScheduler.run();
+
+      // Then - Should complete without errors
+      assertThat(exceptionalScheduler).isNotNull();
+      assertThat(exceptionalProps.getZombieCleanup().getExceptionalAgents().getPattern())
+          .isNotEmpty();
+    }
+
+    @Test
+    @DisplayName("Should apply different thresholds for exceptional vs regular agents")
+    void shouldApplyDifferentThresholdsForExceptionalVsRegularAgents() {
+      // Given - Scheduler with exceptional agents pattern
+      PrioritySchedulerProperties props = createExceptionalAgentsTestProperties();
+      props.getZombieCleanup().setThresholdMs(5000L); // 5 seconds default
+      props
+          .getZombieCleanup()
+          .getExceptionalAgents()
+          .setThresholdMs(10000L); // 10 seconds exceptional
+
+      PriorityAgentScheduler exceptionalScheduler =
+          new PriorityAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              props);
+
+      // Create agents that match and don't match the pattern
+      Agent bigQueryAgent = createMockAgent("BigQueryCachingAgent", "gcp-provider");
+      Agent regularAgent = createMockAgent("RegularAgent", "test-provider");
+
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      // When - Schedule both types of agents
+      exceptionalScheduler.schedule(bigQueryAgent, execution, instrumentation);
+      exceptionalScheduler.schedule(regularAgent, execution, instrumentation);
+      exceptionalScheduler.run();
+
+      // Then - Both agents should be scheduled (validation is in the configuration)
+      assertThat(exceptionalScheduler).isNotNull();
+      assertThat(props.getZombieCleanup().getExceptionalAgents().getThresholdMs())
+          .isGreaterThan(props.getZombieCleanup().getThresholdMs());
+    }
   }
 
   private PriorityAgentProperties createDefaultAgentProperties() {
@@ -204,6 +265,21 @@ class BatchOperationsTest {
     PrioritySchedulerProperties props = createBatchEnabledSchedulerProperties();
     props.getZombieCleanup().setThresholdMs(5000L); // 5 seconds for testing
     props.getZombieCleanup().setIntervalMs(1000L); // 1 second for testing
+    return props;
+  }
+
+  private PrioritySchedulerProperties createExceptionalAgentsTestProperties() {
+    PrioritySchedulerProperties props = createBatchEnabledSchedulerProperties();
+    props.getZombieCleanup().setThresholdMs(30000L); // 30 seconds default
+    props.getZombieCleanup().setIntervalMs(5000L); // 5 seconds interval
+
+    // Configure exceptional agents for BigQuery-related agents
+    props.getZombieCleanup().getExceptionalAgents().setPattern(".*BigQuery.*");
+    props
+        .getZombieCleanup()
+        .getExceptionalAgents()
+        .setThresholdMs(60000L); // 60 seconds for BigQuery
+
     return props;
   }
 

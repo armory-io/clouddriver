@@ -102,6 +102,13 @@ public class PrioritySchedulerComplexScenariosTest {
     when(zombieProps.getThresholdMs()).thenReturn(1800000L); // 30 minutes
     when(zombieProps.getIntervalMs()).thenReturn(300000L); // 5 minutes
     when(zombieProps.getBatchSize()).thenReturn(50);
+
+    // Mock exceptional agents (empty pattern - no exceptional agents)
+    ExceptionalAgentsProperties exceptionalProps = mock(ExceptionalAgentsProperties.class);
+    when(exceptionalProps.getPattern()).thenReturn(""); // Empty pattern
+    when(exceptionalProps.getThresholdMs()).thenReturn(3600000L); // 60 minutes
+    when(zombieProps.getExceptionalAgents()).thenReturn(exceptionalProps);
+
     when(mockSchedulerProperties.getZombieCleanup()).thenReturn(zombieProps);
 
     // Mock orphan cleanup properties

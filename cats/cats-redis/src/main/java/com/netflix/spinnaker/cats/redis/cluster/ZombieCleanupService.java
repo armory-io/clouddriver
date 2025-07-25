@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -60,6 +61,9 @@ public class ZombieCleanupService {
   private final AtomicLong zombiesCleanedUp = new AtomicLong(0);
   private volatile long lastZombieCleanup = 0;
 
+  // Compiled pattern for exceptional agents (cached for performance)
+  private volatile Pattern exceptionalAgentsPattern;
+
   /**
    * Constructs a new ZombieCleanupService instance with the provided properties.
    *
@@ -74,6 +78,49 @@ public class ZombieCleanupService {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.schedulerProperties = schedulerProperties;
+    compileExceptionalAgentsPattern();
+  }
+
+  /**
+   * Compiles the exceptional agents pattern for efficient matching. This method is called during
+   * initialization and can be called again if configuration changes.
+   */
+  private void compileExceptionalAgentsPattern() {
+    String pattern = schedulerProperties.getZombieCleanup().getExceptionalAgents().getPattern();
+    if (pattern != null && !pattern.trim().isEmpty()) {
+      try {
+        this.exceptionalAgentsPattern = Pattern.compile(pattern);
+        log.info("Compiled exceptional agents pattern: {}", pattern);
+      } catch (Exception e) {
+        log.error("Failed to compile exceptional agents pattern '{}': {}", pattern, e.getMessage());
+        this.exceptionalAgentsPattern = null;
+      }
+    } else {
+      this.exceptionalAgentsPattern = null;
+      log.debug("No exceptional agents pattern configured");
+    }
+  }
+
+  /**
+   * Determines the appropriate zombie threshold for the given agent type.
+   *
+   * @param agentType The agent type to check
+   * @return The zombie threshold in milliseconds (default or exceptional)
+   */
+  private long getZombieThresholdForAgent(String agentType) {
+    // Check if agent matches exceptional pattern
+    if (exceptionalAgentsPattern != null && exceptionalAgentsPattern.matcher(agentType).matches()) {
+      long exceptionalThreshold =
+          schedulerProperties.getZombieCleanup().getExceptionalAgents().getThresholdMs();
+      log.debug(
+          "Agent '{}' matches exceptional pattern, using threshold: {}ms",
+          agentType,
+          exceptionalThreshold);
+      return exceptionalThreshold;
+    }
+
+    // Use default threshold
+    return schedulerProperties.getZombieCleanup().getThresholdMs();
   }
 
   /**
@@ -117,7 +164,6 @@ public class ZombieCleanupService {
    */
   public int cleanupZombieAgents(
       Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
-    long zombieThreshold = schedulerProperties.getZombieCleanup().getThresholdMs();
     long currentTime = System.currentTimeMillis();
     List<String> zombieAgentTypes = new ArrayList<>();
 
@@ -133,16 +179,23 @@ public class ZombieCleanupService {
         long completionDeadlineMs = Long.parseLong(acquireScore) * 1000;
         validAgentsScanned++;
 
+        // Get the appropriate zombie threshold for this specific agent
+        long zombieThreshold = getZombieThresholdForAgent(agentType);
+
         // The agent is considered a zombie if current time exceeds completion deadline + zombie
         // threshold buffer
         if (currentTime > completionDeadlineMs + zombieThreshold) {
           zombieAgentTypes.add(agentType);
           long overdueMs = currentTime - completionDeadlineMs;
+          boolean isExceptional =
+              exceptionalAgentsPattern != null
+                  && exceptionalAgentsPattern.matcher(agentType).matches();
           log.warn(
-              "Zombie agent detected: {} ({}ms overdue past completion deadline, {}ms buffer exceeded)",
+              "Zombie agent detected: {} ({}ms overdue past completion deadline, {}ms {} threshold exceeded)",
               agentType,
               overdueMs,
-              zombieThreshold);
+              zombieThreshold,
+              isExceptional ? "exceptional" : "default");
         }
       } catch (NumberFormatException e) {
         log.warn("Invalid acquire score for agent {}: {}", agentType, acquireScore);
@@ -233,6 +286,14 @@ public class ZombieCleanupService {
    */
   public long getLastZombieCleanup() {
     return lastZombieCleanup;
+  }
+
+  /**
+   * Refreshes the exceptional agents pattern configuration. This can be called when configuration
+   * is updated at runtime.
+   */
+  public void refreshExceptionalAgentsPattern() {
+    compileExceptionalAgentsPattern();
   }
 
   /**

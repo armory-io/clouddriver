@@ -134,25 +134,37 @@ public class PrioritySchedulerProperties {
   }
 }
 
-/** Zombie cleanup configuration properties for stuck agents. */
+/**
+ * Zombie cleanup configuration properties for stuck agents.
+ *
+ * <p>Configuration example: redis: scheduler: zombieCleanup: enabled: true # Default: zombie
+ * detection enabled thresholdMs: 30000 # Default: 30 seconds (30 * 1000) intervalMs: 300000 #
+ * Default: 5 minutes (5 * 60 * 1000) batchSize: 50 # Default: process 50 zombies per batch
+ * exceptionalAgents: pattern: ".*BigQuery.*" # Example: Regex pattern for agent names thresholdMs:
+ * 3600000 # Different threshold for matching agents (60 * 60 * 1000)
+ */
 class ZombieCleanupProperties {
 
-  /** Whether zombie cleanup is enabled. */
+  /** Whether zombie cleanup is enabled. Can be disabled for debugging or during maintenance. */
   private boolean enabled = true;
 
   /**
-   * Additional time buffer beyond agent completion deadline before considering an agent a zombie
-   * (milliseconds). Zombies are agents that have exceeded their completion deadline + this buffer
-   * and are forcibly terminated. This buffer provides operational safety for Redis delays and clock
-   * skew.
+   * How long an agent can run beyond its completion deadline before being considered a zombie
+   * (milliseconds). This is a buffer beyond the expected completion time to account for Redis
+   * delays and clock skew. Agents past deadline + threshold are considered stuck or orphaned and
+   * are forcibly terminated. This buffer provides operational safety for Redis delays and clock
+   * skew. Default: 30 seconds.
    */
   private long thresholdMs = 30000L; // 30 seconds
 
-  /** How often to check for and clean up zombie agents (milliseconds). */
+  /** How often to check for and clean up zombie agents (milliseconds). Default: 5 minutes. */
   private long intervalMs = 300000L; // 5 minutes
 
   /** Batch size for zombie cleanup. Defaults to 50, which handles typical bursts. */
   private int batchSize = 50;
+
+  /** Configuration for exceptional agents that require different zombie thresholds. */
+  private ExceptionalAgentsProperties exceptionalAgents = new ExceptionalAgentsProperties();
 
   public boolean isEnabled() {
     return enabled;
@@ -184,6 +196,51 @@ class ZombieCleanupProperties {
 
   public void setBatchSize(int batchSize) {
     this.batchSize = batchSize;
+  }
+
+  public ExceptionalAgentsProperties getExceptionalAgents() {
+    if (exceptionalAgents == null) {
+      exceptionalAgents = new ExceptionalAgentsProperties();
+    }
+    return exceptionalAgents;
+  }
+
+  public void setExceptionalAgents(ExceptionalAgentsProperties exceptionalAgents) {
+    this.exceptionalAgents = exceptionalAgents;
+  }
+}
+
+/** Configuration properties for exceptional agents that require different zombie thresholds. */
+class ExceptionalAgentsProperties {
+
+  /**
+   * Regular expression pattern to match agent names that should use exceptional thresholds. Empty
+   * string means no exceptional agents. Example patterns: - ".*BigQuery.*" - matches agents
+   * containing "BigQuery" - "^(AWS|GCP).*" - matches agents starting with "AWS" or "GCP" -
+   * ".*Provider$" - matches agents ending with "Provider"
+   */
+  private String pattern = "";
+
+  /**
+   * Zombie threshold for agents matching the pattern (milliseconds). Default: 60 minutes for
+   * exceptional agents that may need longer processing time.
+   */
+  private long thresholdMs = 3600000L; // 60 minutes
+
+  public String getPattern() {
+    return pattern;
+  }
+
+  public void setPattern(String pattern) {
+    this.pattern = pattern;
+  }
+
+  public long getThresholdMs() {
+    return thresholdMs;
+  }
+
+  public void setThresholdMs(long thresholdMs) {
+    this.thresholdMs = thresholdMs;
   }
 }
 

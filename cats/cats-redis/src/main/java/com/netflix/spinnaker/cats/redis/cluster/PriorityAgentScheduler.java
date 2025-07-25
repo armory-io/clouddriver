@@ -110,9 +110,12 @@ import redis.clients.jedis.JedisPool;
  *   scheduler:
  *     zombieCleanup:
  *       enabled: true                  # Default: zombie detection enabled
- *       thresholdMs: 1800000           # Default: 30 minutes (30 * 60 * 1000)
+ *       thresholdMs: 30000             # Default: 30 seconds (30 * 1000)
  *       intervalMs: 300000             # Default: 5 minutes (5 * 60 * 1000)
  *       batchSize: 50                  # Default: process 50 zombies per batch
+ *       exceptionalAgents:
+ *         pattern: ".*BigQuery.*"      # Example: Regex pattern for agent names
+ *         thresholdMs: 3600000         # Different threshold for matching agents (60 * 60 * 1000)
  * </pre>
  *
  * <ul>
@@ -125,6 +128,11 @@ import redis.clients.jedis.JedisPool;
  *       accumulation but not cause excessive load. Recommended: 2-5 minutes.
  *   <li><strong>batchSize:</strong> Zombies processed per cleanup cycle. Higher values = fewer
  *       Redis round-trips but larger memory usage. Optimal: 25-100 based on typical zombie count.
+ *   <li><strong>exceptionalAgents:</strong> Configuration for exceptional agents that require
+ *       different zombie thresholds.
+ *   <li><strong>pattern:</strong> Regex pattern for agent names.
+ *   <li><strong>thresholdMs:</strong> Different time buffer beyond agent completion deadline before
+ *       considering an agent zombie.
  * </ul>
  *
  * <p><strong>Orphan Cleanup Configuration (redis.scheduler.orphanCleanup.*):</strong>
