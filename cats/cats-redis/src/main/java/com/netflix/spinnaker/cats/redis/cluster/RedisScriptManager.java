@@ -54,6 +54,7 @@ public class RedisScriptManager {
   public static final String ORPHAN_REMOVE_SCRIPT = "orphanRemove";
   public static final String BATCH_ORPHAN_REMOVE_SCRIPT = "batchOrphanRemove";
   public static final String BATCH_ADD_AGENTS_SCRIPT = "batchAddAgents";
+  public static final String BATCH_ACQUIRE_AGENTS_SCRIPT = "batchAcquireAgents";
   public static final String BATCH_CLEANUP_AGENTS_SCRIPT = "batchCleanupAgents";
   public static final String RELEASE_LEADERSHIP_SCRIPT = "releaseLeadership";
 
@@ -98,6 +99,10 @@ public class RedisScriptManager {
    * @throws IllegalStateException if scripts are not initialized or script not found
    */
   public String getScriptSha(String scriptName) {
+    if (scriptName == null) {
+      throw new IllegalArgumentException("Script name cannot be null");
+    }
+
     if (!initialized.get()) {
       throw new IllegalStateException("Scripts not initialized. Call initializeScripts() first.");
     }
@@ -178,7 +183,7 @@ public class RedisScriptManager {
                 + "  return score\n" // We still own it
                 + "else return nil end\n")); // Ownership lost or agent not found
 
-    // --- OPTIMIZATION SCRIPTS ---
+    // --- CLEANUP SCRIPTS ---
 
     // Remove a single orphaned agent if score matches
     scriptShas.put(
@@ -190,7 +195,9 @@ public class RedisScriptManager {
                 + "  return 1\n" // Success
                 + "else return 0 end\n")); // Failed - score mismatch or agent missing
 
-    // Remove multiple orphaned agents in a single batch operation
+    // --- OPTIMIZATION SCRIPTS ---
+
+    // Remove multiple orphaned agents in a single operation
     scriptShas.put(
         BATCH_ORPHAN_REMOVE_SCRIPT,
         jedis.scriptLoad(
@@ -228,7 +235,28 @@ public class RedisScriptManager {
                 + "end\n"
                 + "return {count, added}\n")); // Return count and list of added agents
 
-    // Remove multiple zombie agents in a single batch operation
+    // Acquire multiple agents from WAITING → WORKING in a single operation
+    scriptShas.put(
+        BATCH_ACQUIRE_AGENTS_SCRIPT,
+        jedis.scriptLoad(
+            "local acquired = {}\n" // Track acquired agents for logging
+                + "local count = 0\n" // Count of successful acquisitions
+                + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
+                + "for i=2,#ARGV,2 do\n" // For each agent-score pair
+                + "  local agent = ARGV[i-1]\n" // Agent name
+                + "  local newScore = ARGV[i]\n" // New working score
+                + "  local waitingScore = redis.call('zscore', KEYS[2], agent)\n" // Check if in
+                // WAITING
+                + "  if waitingScore then\n" // If agent is in WAITING set
+                + "    redis.call('zrem', KEYS[2], agent)\n" // Remove from WAITING set
+                + "    redis.call('zadd', KEYS[1], newScore, agent)\n" // Add to WORKING set
+                + "    table.insert(acquired, agent)\n" // Track for logging
+                + "    count = count + 1\n"
+                + "  end\n"
+                + "end\n"
+                + "return {count, acquired}\n")); // Return count and list of acquired agents
+
+    // Remove multiple zombie agents in a single operation
     scriptShas.put(
         BATCH_CLEANUP_AGENTS_SCRIPT,
         jedis.scriptLoad(

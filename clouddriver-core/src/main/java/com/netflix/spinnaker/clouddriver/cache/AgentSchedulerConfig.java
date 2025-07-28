@@ -168,11 +168,10 @@ public class AgentSchedulerConfig {
         agentProperties.getDisabledPattern());
 
     log.info(
-        "PriorityAgentScheduler zombie cleanup: enabled={}, thresholdMs={}, intervalMs={}, batchSize={}",
+        "PriorityAgentScheduler zombie cleanup: enabled={}, thresholdMs={}, intervalMs={}",
         schedulerProperties.isZombieCleanupEnabled(),
         schedulerProperties.getZombieThresholdMs(),
-        schedulerProperties.getZombieIntervalMs(),
-        schedulerProperties.getZombieBatchSize());
+        schedulerProperties.getZombieIntervalMs());
 
     if (schedulerProperties.hasExceptionalAgents()) {
       log.info(
@@ -182,17 +181,17 @@ public class AgentSchedulerConfig {
     }
 
     log.info(
-        "PriorityAgentScheduler orphan cleanup: enabled={}, thresholdMs={}, intervalMs={}, batchSize={}, leadershipTtlMs={}, forceAllPods={}",
+        "PriorityAgentScheduler orphan cleanup: enabled={}, thresholdMs={}, intervalMs={}, leadershipTtlMs={}, forceAllPods={}",
         schedulerProperties.isOrphanCleanupEnabled(),
         schedulerProperties.getOrphanThresholdMs(),
         schedulerProperties.getOrphanIntervalMs(),
-        schedulerProperties.getOrphanBatchSize(),
         schedulerProperties.getOrphanLeadershipTtlMs(),
         schedulerProperties.isOrphanForceAllPods());
 
     log.info(
-        "PriorityAgentScheduler optimizations: batchOperationsEnabled={}",
-        schedulerProperties.isBatchOperationsEnabled());
+        "PriorityAgentScheduler batch operations: enabled={}, batchSize={}",
+        schedulerProperties.isBatchOperationsEnabled(),
+        schedulerProperties.getAgentAcquisitionBatchSize());
 
     return new PriorityAgentScheduler(
         jedisPool,

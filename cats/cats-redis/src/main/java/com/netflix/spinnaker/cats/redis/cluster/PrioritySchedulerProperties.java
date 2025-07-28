@@ -48,10 +48,29 @@ public class PrioritySchedulerProperties {
   private OrphanCleanupProperties orphanCleanup = new OrphanCleanupProperties();
 
   /**
-   * Whether to enable batch operations for performance. Batch operations reduce Redis round trips
-   * but are more complex.
+   * Enable batch operations for improved performance. When enabled, the scheduler will attempt to
+   * acquire and process multiple agents in single Redis operations instead of processing them
+   * individually.
    */
   private boolean batchOperationsEnabled = false;
+
+  /**
+   * Maximum number of agents to process in a single batch operation.
+   *
+   * <p>Larger batch sizes reduce Redis round-trips but increase memory usage and potential lock
+   * contention.
+   *
+   * <p>This setting applies to:
+   *
+   * <ul>
+   *   <li>Agent acquisition operations
+   *   <li>Zombie cleanup operations
+   *   <li>Orphan cleanup operations
+   * </ul>
+   *
+   * <p>Default: 50 agents per batch
+   */
+  private int batchOperationsBatchSize = 50;
 
   /**
    * How long to cache Redis server time to reduce TIME command calls (milliseconds). Higher values
@@ -100,8 +119,24 @@ public class PrioritySchedulerProperties {
     return batchOperationsEnabled;
   }
 
-  public void setBatchOperationsEnabled(boolean batchOperationsEnabled) {
-    this.batchOperationsEnabled = batchOperationsEnabled;
+  public void setBatchOperationsEnabled(boolean enabled) {
+    this.batchOperationsEnabled = enabled;
+  }
+
+  public int getBatchOperationsBatchSize() {
+    return batchOperationsBatchSize;
+  }
+
+  public void setBatchOperationsBatchSize(int batchSize) {
+    this.batchOperationsBatchSize = batchSize;
+  }
+
+  public int getAgentAcquisitionBatchSize() {
+    return batchOperationsBatchSize;
+  }
+
+  public void setAgentAcquisitionBatchSize(int batchSize) {
+    this.batchOperationsBatchSize = batchSize;
   }
 
   public long getTimeCacheDurationMs() {
@@ -120,7 +155,6 @@ public class PrioritySchedulerProperties {
     this.pool = pool;
   }
 
-  // Convenience methods for backward compatibility and external access
   public int getThreadPoolCoreSize() {
     return pool.getCoreSize();
   }
@@ -133,7 +167,6 @@ public class PrioritySchedulerProperties {
     return pool.getKeepAliveSeconds();
   }
 
-  // Zombie cleanup convenience methods
   public boolean isZombieCleanupEnabled() {
     return zombieCleanup.isEnabled();
   }
@@ -147,7 +180,7 @@ public class PrioritySchedulerProperties {
   }
 
   public int getZombieBatchSize() {
-    return zombieCleanup.getBatchSize();
+    return batchOperationsBatchSize;
   }
 
   public boolean hasExceptionalAgents() {
@@ -163,7 +196,6 @@ public class PrioritySchedulerProperties {
     return zombieCleanup.getExceptionalAgents().getThresholdMs();
   }
 
-  // Orphan cleanup convenience methods
   public boolean isOrphanCleanupEnabled() {
     return orphanCleanup.isEnabled();
   }
@@ -177,7 +209,7 @@ public class PrioritySchedulerProperties {
   }
 
   public int getOrphanBatchSize() {
-    return orphanCleanup.getBatchSize();
+    return batchOperationsBatchSize;
   }
 
   public long getOrphanLeadershipTtlMs() {
@@ -215,9 +247,6 @@ class ZombieCleanupProperties {
   /** How often to check for and clean up zombie agents (milliseconds). Default: 5 minutes. */
   private long intervalMs = 300000L; // 5 minutes
 
-  /** Batch size for zombie cleanup. Defaults to 50, which handles typical bursts. */
-  private int batchSize = 50;
-
   /** Configuration for exceptional agents that require different zombie thresholds. */
   private ExceptionalAgentsProperties exceptionalAgents = new ExceptionalAgentsProperties();
 
@@ -243,14 +272,6 @@ class ZombieCleanupProperties {
 
   public void setIntervalMs(long intervalMs) {
     this.intervalMs = intervalMs;
-  }
-
-  public int getBatchSize() {
-    return batchSize;
-  }
-
-  public void setBatchSize(int batchSize) {
-    this.batchSize = batchSize;
   }
 
   public ExceptionalAgentsProperties getExceptionalAgents() {
@@ -316,9 +337,6 @@ class OrphanCleanupProperties {
   /** How often to check for and clean up orphaned agents (milliseconds). */
   private long intervalMs = 300000L; // 5 minutes
 
-  /** Batch size for orphan cleanup. Defaults to 50, which handles typical bursts. */
-  private int batchSize = 50;
-
   /**
    * TTL for distributed cleanup leadership lock (milliseconds). Only one pod gets cleanup
    * leadership at a time.
@@ -353,14 +371,6 @@ class OrphanCleanupProperties {
 
   public void setIntervalMs(long intervalMs) {
     this.intervalMs = intervalMs;
-  }
-
-  public int getBatchSize() {
-    return batchSize;
-  }
-
-  public void setBatchSize(int batchSize) {
-    this.batchSize = batchSize;
   }
 
   public long getLeadershipTtlMs() {

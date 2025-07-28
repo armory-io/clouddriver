@@ -23,6 +23,7 @@ import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
 import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -205,53 +206,76 @@ public class AgentAcquisitionService {
           readyAgents.size(),
           availableSlotsForNewAgents);
 
-      for (String agentType : readyAgents) {
-        if (agentsAcquiredThisCycle >= availableSlotsForNewAgents) {
-          log.debug(
-              "Reached available slot limit for new agents this cycle ({} acquired out of {} target slots).",
-              agentsAcquiredThisCycle,
-              availableSlotsForNewAgents);
-          break;
-        }
-
-        if (runningAgents != null && !runningAgents.tryAcquire()) {
-          log.debug(
-              "Instance concurrent agent limit reached (no permits from 'runningAgents' semaphore). Cannot acquire more agents this cycle.");
-          break; // Stop trying if semaphore is full
-        }
-
-        // Semaphore permit acquired
-        AgentWorker worker = agents.get(agentType);
-        if (worker == null) {
+      // Use batch acquisition if enabled and there are multiple agents ready
+      if (schedulerProperties.isBatchOperationsEnabled() && readyAgents.size() > 1) {
+        try {
+          agentsAcquiredThisCycle =
+              saturatePoolBatch(
+                  jedis, readyAgents, availableSlotsForNewAgents, runningAgents, workersToSubmit);
+        } catch (Exception e) {
           log.warn(
-              "Ready agent {} not found in local agents map, releasing semaphore permit and skipping.",
-              agentType);
-          if (runningAgents != null) {
-            runningAgents.release();
-          }
-          continue;
+              "Batch agent acquisition failed, falling back to individual mode: {}",
+              e.getMessage());
+          // Clear any partially processed workers from the failed batch attempt
+          workersToSubmit.clear();
+          // Fallback to individual acquisition
+          agentsAcquiredThisCycle =
+              saturatePoolIndividual(
+                  jedis, readyAgents, availableSlotsForNewAgents, runningAgents, workersToSubmit);
         }
+      } else {
+        // Fallback: Individual agent acquisition (legacy mode)
+        agentsAcquiredThisCycle =
+            saturatePoolIndividual(
+                jedis, readyAgents, availableSlotsForNewAgents, runningAgents, workersToSubmit);
+      }
 
-        // Try to acquire this agent from Redis
-        String agentAcquireScore = tryAcquireAgent(jedis, worker.getAgent());
-        if (agentAcquireScore != null) {
-          // Successfully acquired agent, prepare for execution
-          worker.acquireScore = agentAcquireScore;
-          workersToSubmit.add(worker);
-          agentsAcquiredThisCycle++;
+      // PHASE 3.5: Instant retry on zero acquisition (optimization for high-contention scenarios)
+      if (agentsAcquiredThisCycle == 0
+          && !readyAgents.isEmpty()
+          && schedulerProperties.isBatchOperationsEnabled()) {
+        log.debug(
+            "Zero agents acquired from {} ready agents, checking for new arrivals",
+            readyAgents.size());
 
-          // Track active agent
-          activeAgents.put(agentType, agentAcquireScore);
-          activeAgentMapSize.incrementAndGet();
-          agentsAcquired.incrementAndGet(); // Track acquisition statistics
+        // Quick check: Are there new agents available now?
+        Set<String> newReadyAgents =
+            jedis.zrangeByScore(WAITING_SET, 0, Double.parseDouble(currentScore));
 
-          log.debug("Acquired agent {} with score {}", agentType, agentAcquireScore);
-        } else {
-          // Failed to acquire (another instance got it first)
-          if (runningAgents != null) {
-            runningAgents.release();
+        if (!newReadyAgents.isEmpty() && !newReadyAgents.equals(readyAgents)) {
+          log.debug(
+              "Found {} new ready agents (was {}), attempting instant retry",
+              newReadyAgents.size(),
+              readyAgents.size());
+
+          // Single retry attempt - try batch first, then individual if needed
+          try {
+            agentsAcquiredThisCycle =
+                saturatePoolBatch(
+                    jedis,
+                    newReadyAgents,
+                    availableSlotsForNewAgents,
+                    runningAgents,
+                    workersToSubmit);
+
+            if (agentsAcquiredThisCycle > 0) {
+              log.debug("Instant retry succeeded: acquired {} agents", agentsAcquiredThisCycle);
+            }
+          } catch (Exception e) {
+            log.debug("Instant retry batch failed, trying individual: {}", e.getMessage());
+            // Clear any partial state from failed retry
+            workersToSubmit.clear();
+            agentsAcquiredThisCycle =
+                saturatePoolIndividual(
+                    jedis,
+                    newReadyAgents,
+                    availableSlotsForNewAgents,
+                    runningAgents,
+                    workersToSubmit);
           }
-          log.debug("Agent {} was acquired by another instance, releasing permit", agentType);
+        } else {
+          log.debug(
+              "No new agents found for instant retry (still {} ready)", newReadyAgents.size());
         }
       }
 
@@ -274,6 +298,251 @@ public class AgentAcquisitionService {
       log.error("Error during agent acquisition", e);
       return 0;
     }
+  }
+
+  /**
+   * <strong>Batch Size Control:</strong> Uses {@code agentAcquisitionBatchSize} to limit the number
+   * of agents processed in each Redis operation, preventing memory exhaustion and lock contention
+   * in large deployments.
+   *
+   * @param jedis Redis connection
+   * @param readyAgents Set of agent types ready for execution
+   * @param maxToAcquire Maximum number of agents to acquire (concurrency limit)
+   * @param runningAgents Semaphore for concurrency control
+   * @param workersToSubmit Collection to add successfully acquired workers
+   * @return Number of agents successfully acquired
+   */
+  private int saturatePoolBatch(
+      Jedis jedis,
+      Set<String> readyAgents,
+      int maxToAcquire,
+      Semaphore runningAgents,
+      Set<AgentWorker> workersToSubmit) {
+
+    // Apply batch size limit to prevent overwhelming Redis and memory
+    int configuredBatchSize = schedulerProperties.getAgentAcquisitionBatchSize();
+    int effectiveBatchSize = Math.min(maxToAcquire, configuredBatchSize);
+
+    log.debug(
+        "Using batch agent acquisition: {} ready agents, max: {}, batch size: {}",
+        readyAgents.size(),
+        maxToAcquire,
+        effectiveBatchSize);
+
+    int candidateCount = 0;
+    List<String> candidateAgents = new ArrayList<>();
+    List<AgentWorker> candidateWorkers = new ArrayList<>();
+
+    // PHASE 1: Prepare candidates and acquire semaphore permits
+    // Note: We respect BOTH the concurrency limit (maxToAcquire) AND batch size limit
+    for (String agentType : readyAgents) {
+      if (candidateCount >= effectiveBatchSize) {
+        log.debug(
+            "Reached batch size limit: {} agents prepared for acquisition", effectiveBatchSize);
+        break;
+      }
+
+      if (runningAgents != null && !runningAgents.tryAcquire()) {
+        log.debug("Semaphore limit reached at {} agents", candidateCount);
+        break;
+      }
+
+      AgentWorker worker = agents.get(agentType);
+      if (worker == null) {
+        log.warn("Agent {} not found in local registry, skipping", agentType);
+        if (runningAgents != null) {
+          runningAgents.release();
+        }
+        continue;
+      }
+
+      candidateAgents.add(agentType);
+      candidateWorkers.add(worker);
+      candidateCount++; // Track candidates prepared
+    }
+
+    if (candidateAgents.isEmpty()) {
+      log.debug("No valid candidate agents for batch acquisition");
+      return 0;
+    }
+
+    // PHASE 2: Batch acquire agents using Redis Lua script
+    try {
+      // Prepare Redis Lua script arguments: [agent1, score1, agent2, score2, ...]
+      // The Lua script expects alternating agent names and scores
+      List<String> agentScorePairs = new ArrayList<>();
+
+      for (int i = 0; i < candidateAgents.size(); i++) {
+        String agentType = candidateAgents.get(i);
+        AgentWorker worker = candidateWorkers.get(i);
+
+        // Generate completion deadline for this agent (current time + timeout)
+        long agentTimeout = intervalProvider.getInterval(worker.getAgent()).getTimeout();
+        String acquireScore = score(jedis, agentTimeout);
+
+        // Add to script arguments: agent name, then its score
+        agentScorePairs.add(agentType); // Even index: agent name
+        agentScorePairs.add(acquireScore); // Odd index: agent score
+      }
+
+      // Execute batch acquisition Lua script
+      Object result =
+          jedis.evalsha(
+              scriptManager.getScriptSha(RedisScriptManager.BATCH_ACQUIRE_AGENTS_SCRIPT),
+              java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+              agentScorePairs);
+
+      // PHASE 3: Process batch acquisition results
+      if (result instanceof List) {
+        List<Object> resultList = (List<Object>) result;
+        long successCount = (Long) resultList.get(0);
+        List<String> acquiredAgentTypes = (List<String>) resultList.get(1);
+
+        log.debug(
+            "Batch acquisition completed: {} successes out of {} attempts",
+            successCount,
+            candidateAgents.size());
+
+        // Process each candidate agent to see if it was successfully acquired
+        for (int i = 0; i < candidateAgents.size(); i++) {
+          String agentType = candidateAgents.get(i);
+
+          if (acquiredAgentTypes.contains(agentType)) {
+            // SUCCESS: This pod acquired the agent - set up for execution
+            AgentWorker worker = candidateWorkers.get(i);
+
+            // Extract the agent's score from agentScorePairs array
+            // Array structure: [agent1, score1, agent2, score2, ...]
+            // For agent at index i: score is at position (i * 2 + 1)
+            // Example: agent at index 0 → score at position 1
+            //          agent at index 1 → score at position 3
+            String acquireScore = agentScorePairs.get(i * 2 + 1);
+
+            worker.acquireScore = acquireScore;
+            workersToSubmit.add(worker);
+            activeAgents.put(agentType, acquireScore);
+            activeAgentMapSize.incrementAndGet();
+            agentsAcquired.incrementAndGet();
+
+            log.debug("Batch acquired agent {} with score {}", agentType, acquireScore);
+          } else {
+            // FAILURE: Agent lost to another pod in race condition
+            // Release the semaphore permit we pre-acquired
+            if (runningAgents != null) {
+              runningAgents.release();
+            }
+            log.debug("Agent {} was acquired by another pod", agentType);
+          }
+        }
+
+        log.info(
+            "Batch acquisition completed: {}/{} agents acquired",
+            successCount,
+            candidateAgents.size());
+        return (int) successCount; // Return actual successful acquisitions from Redis
+      }
+
+      log.warn("Unexpected batch acquisition result: {}", result);
+      // Release all semaphore permits on batch failure
+      if (runningAgents != null) {
+        for (int i = 0; i < candidateAgents.size(); i++) {
+          runningAgents.release();
+        }
+      }
+      return 0;
+
+    } catch (Exception e) {
+      log.error(
+          "Batch agent acquisition failed, falling back to individual mode: {}", e.getMessage());
+      // Release all semaphore permits on batch failure
+      if (runningAgents != null) {
+        for (int i = 0; i < candidateAgents.size(); i++) {
+          runningAgents.release();
+        }
+      }
+
+      // Fallback to individual acquisition
+      return saturatePoolIndividual(
+          jedis, new HashSet<>(candidateAgents), maxToAcquire, runningAgents, workersToSubmit);
+    }
+  }
+
+  /**
+   * This is the original individual acquisition logic, kept as fallback when batch operations are
+   * disabled or fail.
+   *
+   * @param jedis Redis connection
+   * @param readyAgents Set of agent types ready for execution
+   * @param maxToAcquire Maximum number of agents to acquire
+   * @param runningAgents Semaphore for concurrency control
+   * @param workersToSubmit Collection to add successfully acquired workers
+   * @return Number of agents successfully acquired
+   */
+  private int saturatePoolIndividual(
+      Jedis jedis,
+      Set<String> readyAgents,
+      int maxToAcquire,
+      Semaphore runningAgents,
+      Set<AgentWorker> workersToSubmit) {
+
+    log.debug(
+        "Using individual agent acquisition for {} ready agents (max: {})",
+        readyAgents.size(),
+        maxToAcquire);
+
+    int agentsAcquiredThisCycle = 0;
+
+    for (String agentType : readyAgents) {
+      if (agentsAcquiredThisCycle >= maxToAcquire) {
+        log.debug(
+            "Reached available slot limit for new agents this cycle ({} acquired out of {} target slots).",
+            agentsAcquiredThisCycle,
+            maxToAcquire);
+        break;
+      }
+
+      if (runningAgents != null && !runningAgents.tryAcquire()) {
+        log.debug(
+            "Instance concurrent agent limit reached (no permits from 'runningAgents' semaphore). Cannot acquire more agents this cycle.");
+        break; // Stop trying if semaphore is full
+      }
+
+      // Semaphore permit acquired
+      AgentWorker worker = agents.get(agentType);
+      if (worker == null) {
+        log.warn(
+            "Ready agent {} not found in local agents map, releasing semaphore permit and skipping.",
+            agentType);
+        if (runningAgents != null) {
+          runningAgents.release();
+        }
+        continue;
+      }
+
+      // Try to acquire this agent from Redis
+      String agentAcquireScore = tryAcquireAgent(jedis, worker.getAgent());
+      if (agentAcquireScore != null) {
+        // Successfully acquired agent, prepare for execution
+        worker.acquireScore = agentAcquireScore;
+        workersToSubmit.add(worker);
+        agentsAcquiredThisCycle++;
+
+        // Track active agent
+        activeAgents.put(agentType, agentAcquireScore);
+        activeAgentMapSize.incrementAndGet();
+        agentsAcquired.incrementAndGet(); // Track acquisition statistics
+
+        log.debug("Acquired agent {} with score {}", agentType, agentAcquireScore);
+      } else {
+        // Failed to acquire (another instance got it first)
+        if (runningAgents != null) {
+          runningAgents.release();
+        }
+        log.debug("Agent {} was acquired by another instance, releasing permit", agentType);
+      }
+    }
+
+    return agentsAcquiredThisCycle;
   }
 
   /**

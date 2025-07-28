@@ -149,8 +149,8 @@ class ZombieCleanupServiceTest {
     }
 
     @Test
-    @DisplayName("Should handle multiple zombie agents in batch")
-    void shouldHandleMultipleZombieAgentsInBatch() {
+    @DisplayName("Should detect and clean up multiple zombie agents individually")
+    void shouldDetectAndCleanupMultipleZombieAgentsIndividually() {
       // Given - Clean up and add multiple old agents
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
@@ -457,7 +457,7 @@ class ZombieCleanupServiceTest {
     void shouldRespectBatchSizeConfiguration() {
       // Enable batch operations with specific batch size
       schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.getZombieCleanup().setBatchSize(5);
+      schedulerProperties.setBatchOperationsBatchSize(5);
       zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Given - More zombies than batch size
@@ -799,7 +799,7 @@ class ZombieCleanupServiceTest {
     void shouldUseBatchCleanupWhenEnabled() {
       // Update scheduler properties to enable batch operations for this test
       schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.getZombieCleanup().setBatchSize(5);
+      schedulerProperties.setBatchOperationsBatchSize(5);
       zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Given - Multiple zombie agents

@@ -101,7 +101,7 @@ public class PrioritySchedulerComplexScenariosTest {
     when(zombieProps.isEnabled()).thenReturn(true);
     when(zombieProps.getThresholdMs()).thenReturn(1800000L); // 30 minutes
     when(zombieProps.getIntervalMs()).thenReturn(300000L); // 5 minutes
-    when(zombieProps.getBatchSize()).thenReturn(50);
+    // Batch size is now handled via batch operations properties
 
     // Mock exceptional agents (empty pattern - no exceptional agents)
     ExceptionalAgentsProperties exceptionalProps = mock(ExceptionalAgentsProperties.class);
@@ -116,7 +116,7 @@ public class PrioritySchedulerComplexScenariosTest {
     when(orphanProps.isEnabled()).thenReturn(true);
     when(orphanProps.getThresholdMs()).thenReturn(600000L); // 10 minutes
     when(orphanProps.getIntervalMs()).thenReturn(300000L); // 5 minutes
-    when(orphanProps.getBatchSize()).thenReturn(50);
+    // Batch size is now handled via batch operations properties
     when(orphanProps.getLeadershipTtlMs()).thenReturn(120000L); // 2 minutes
     when(orphanProps.isForceAllPods()).thenReturn(false);
     when(mockSchedulerProperties.getOrphanCleanup()).thenReturn(orphanProps);

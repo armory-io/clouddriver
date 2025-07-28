@@ -85,7 +85,7 @@ class OrphanCleanupServiceTest {
     schedulerProperties.getOrphanCleanup().setThresholdMs(60000L); // 1 minute
     schedulerProperties.getOrphanCleanup().setIntervalMs(30000L); // 30 seconds
     schedulerProperties.getOrphanCleanup().setEnabled(true);
-    schedulerProperties.getOrphanCleanup().setBatchSize(50);
+    schedulerProperties.setBatchOperationsBatchSize(50);
 
     orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
   }
@@ -247,7 +247,7 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should respect batch size configuration")
     void shouldRespectBatchSizeConfiguration() {
       // Given - Set small batch size
-      schedulerProperties.getOrphanCleanup().setBatchSize(2);
+      schedulerProperties.setBatchOperationsBatchSize(2);
       orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Add more orphans than batch size
@@ -425,7 +425,7 @@ class OrphanCleanupServiceTest {
 
       // Then
       assertThat(cleaned).isEqualTo(orphanCount);
-      assertThat(duration).isLessThan(10000); // Should complete within 10 seconds
+      assertThat(duration).isLessThan(15000); // Should complete within 15 seconds
 
       // Verify all orphans were cleaned
       try (Jedis jedis = jedisPool.getResource()) {

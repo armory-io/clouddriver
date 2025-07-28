@@ -236,9 +236,7 @@ public class ZombieCleanupService {
       } else {
         // Use batch cleanup with fallback to individual operations
         List<String> zombieBatch = new ArrayList<>();
-        int batchSize =
-            Math.min(
-                schedulerProperties.getZombieCleanup().getBatchSize(), zombieAgentTypes.size());
+        int batchSize = Math.min(schedulerProperties.getZombieBatchSize(), zombieAgentTypes.size());
         log.debug(
             "Processing {} zombie agents in batches of {} with fallback",
             zombieAgentTypes.size(),

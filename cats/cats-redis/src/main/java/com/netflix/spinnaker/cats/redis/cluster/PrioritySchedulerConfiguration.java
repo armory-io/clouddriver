@@ -204,7 +204,7 @@ public class PrioritySchedulerConfiguration {
    * @return batch size for zombie cleanup
    */
   public int getZombieCleanupBatchSize() {
-    return schedulerProperties.getZombieCleanup().getBatchSize();
+    return schedulerProperties.getZombieBatchSize();
   }
 
   /**
@@ -240,7 +240,7 @@ public class PrioritySchedulerConfiguration {
    * @return batch size for orphan cleanup
    */
   public int getOrphanCleanupBatchSize() {
-    return schedulerProperties.getOrphanCleanup().getBatchSize();
+    return schedulerProperties.getOrphanBatchSize();
   }
 
   /**

@@ -83,7 +83,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(11);
     }
 
     @Test
@@ -120,7 +120,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(firstSha).isEqualTo(secondSha);
-      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(11);
     }
   }
 
@@ -157,7 +157,7 @@ class RedisScriptManagerTest {
       // Then
       assertThat(threadException[0]).isNull();
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(11);
     }
   }
 
