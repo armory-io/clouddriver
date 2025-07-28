@@ -33,11 +33,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import redis.clients.jedis.JedisPool;
 
 @Configuration
+@EnableConfigurationProperties({PriorityAgentProperties.class, PrioritySchedulerProperties.class})
 @ConditionalOnProperty(value = "caching.write-enabled", matchIfMissing = true)
 public class AgentSchedulerConfig {
 
@@ -147,13 +149,49 @@ public class AgentSchedulerConfig {
           agentProperties.getDisabledPattern());
     }
 
+    // Log scheduler configuration for operational visibility
     log.info(
-        "PriorityAgentScheduler configuration: maxConcurrentAgents={}, threadPoolMaxSize={}, "
-            + "enabledPattern='{}', disabledPattern='{}', batchOperationsEnabled={}",
+        "PriorityAgentScheduler configuration: maxConcurrentAgents={}, schedulerIntervalMs={}, refreshPeriodSeconds={}",
         agentProperties.getMaxConcurrentAgents(),
+        schedulerProperties.getIntervalMs(),
+        schedulerProperties.getRefreshPeriodSeconds());
+
+    log.info(
+        "PriorityAgentScheduler thread pool: coreSize={}, maxSize={}, keepAliveSeconds={}",
+        schedulerProperties.getThreadPoolCoreSize(),
         schedulerProperties.getThreadPoolMaxSize(),
+        schedulerProperties.getThreadPoolKeepAliveSeconds());
+
+    log.info(
+        "PriorityAgentScheduler agent filtering: enabledPattern='{}', disabledPattern='{}'",
         agentProperties.getEnabledPattern(),
-        agentProperties.getDisabledPattern(),
+        agentProperties.getDisabledPattern());
+
+    log.info(
+        "PriorityAgentScheduler zombie cleanup: enabled={}, thresholdMs={}, intervalMs={}, batchSize={}",
+        schedulerProperties.isZombieCleanupEnabled(),
+        schedulerProperties.getZombieThresholdMs(),
+        schedulerProperties.getZombieIntervalMs(),
+        schedulerProperties.getZombieBatchSize());
+
+    if (schedulerProperties.hasExceptionalAgents()) {
+      log.info(
+          "PriorityAgentScheduler exceptional agents: pattern='{}', thresholdMs={}",
+          schedulerProperties.getExceptionalAgentsPattern(),
+          schedulerProperties.getExceptionalAgentsThresholdMs());
+    }
+
+    log.info(
+        "PriorityAgentScheduler orphan cleanup: enabled={}, thresholdMs={}, intervalMs={}, batchSize={}, leadershipTtlMs={}, forceAllPods={}",
+        schedulerProperties.isOrphanCleanupEnabled(),
+        schedulerProperties.getOrphanThresholdMs(),
+        schedulerProperties.getOrphanIntervalMs(),
+        schedulerProperties.getOrphanBatchSize(),
+        schedulerProperties.getOrphanLeadershipTtlMs(),
+        schedulerProperties.isOrphanForceAllPods());
+
+    log.info(
+        "PriorityAgentScheduler optimizations: batchOperationsEnabled={}",
         schedulerProperties.isBatchOperationsEnabled());
 
     return new PriorityAgentScheduler(

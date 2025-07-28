@@ -120,7 +120,7 @@ public class PrioritySchedulerProperties {
     this.pool = pool;
   }
 
-  // Convenience methods for backward compatibility
+  // Convenience methods for backward compatibility and external access
   public int getThreadPoolCoreSize() {
     return pool.getCoreSize();
   }
@@ -131,6 +131,61 @@ public class PrioritySchedulerProperties {
 
   public long getThreadPoolKeepAliveSeconds() {
     return pool.getKeepAliveSeconds();
+  }
+
+  // Zombie cleanup convenience methods
+  public boolean isZombieCleanupEnabled() {
+    return zombieCleanup.isEnabled();
+  }
+
+  public long getZombieThresholdMs() {
+    return zombieCleanup.getThresholdMs();
+  }
+
+  public long getZombieIntervalMs() {
+    return zombieCleanup.getIntervalMs();
+  }
+
+  public int getZombieBatchSize() {
+    return zombieCleanup.getBatchSize();
+  }
+
+  public boolean hasExceptionalAgents() {
+    return zombieCleanup.getExceptionalAgents() != null
+        && !zombieCleanup.getExceptionalAgents().getPattern().isEmpty();
+  }
+
+  public String getExceptionalAgentsPattern() {
+    return zombieCleanup.getExceptionalAgents().getPattern();
+  }
+
+  public long getExceptionalAgentsThresholdMs() {
+    return zombieCleanup.getExceptionalAgents().getThresholdMs();
+  }
+
+  // Orphan cleanup convenience methods
+  public boolean isOrphanCleanupEnabled() {
+    return orphanCleanup.isEnabled();
+  }
+
+  public long getOrphanThresholdMs() {
+    return orphanCleanup.getThresholdMs();
+  }
+
+  public long getOrphanIntervalMs() {
+    return orphanCleanup.getIntervalMs();
+  }
+
+  public int getOrphanBatchSize() {
+    return orphanCleanup.getBatchSize();
+  }
+
+  public long getOrphanLeadershipTtlMs() {
+    return orphanCleanup.getLeadershipTtlMs();
+  }
+
+  public boolean isOrphanForceAllPods() {
+    return orphanCleanup.isForceAllPods();
   }
 }
 
