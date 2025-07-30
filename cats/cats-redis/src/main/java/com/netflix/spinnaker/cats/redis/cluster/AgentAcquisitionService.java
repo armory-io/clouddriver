@@ -24,6 +24,8 @@ import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
 import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -36,6 +38,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -301,9 +304,9 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * <strong>Batch Size Control:</strong> Uses {@code agentAcquisitionBatchSize} to limit the number
-   * of agents processed in each Redis operation, preventing memory exhaustion and lock contention
-   * in large deployments.
+   * Acquires agents in batches to control memory consumption and lock contention in large
+   * deployments. Uses {@code agentAcquisitionBatchSize} to limit the number of agents processed in
+   * each Redis operation.
    *
    * @param jedis Redis connection
    * @param readyAgents Set of agent types ready for execution
@@ -832,28 +835,105 @@ public class AgentAcquisitionService {
    * @param jedis Jedis connection to Redis
    */
   private void repopulateRedisAgents(Jedis jedis) {
-    log.debug("Repopulating Redis with {} known agents", agents.size());
+    int totalAgents = agents.size();
+    log.debug("Repopulating Redis with {} known agents (batch mode)", totalAgents);
 
-    Pipeline pipeline = jedis.pipelined();
-    int addedCount = 0;
-
-    for (Map.Entry<String, AgentWorker> entry : agents.entrySet()) {
-      String agentType = entry.getKey();
-      Agent agent = entry.getValue().getAgent();
-
-      // Calculate next execution score
-      String nextScore = agentScore(agent);
-
-      // Add to Redis if not already present (script handles the check)
-      pipeline.evalsha(
-          scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT),
-          java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-          java.util.Arrays.asList(agentType, nextScore));
-      addedCount++;
+    if (totalAgents == 0) {
+      log.debug("No agents to repopulate");
+      return;
     }
 
-    pipeline.sync();
-    log.debug("Repopulated Redis with {} agents", addedCount);
+    try {
+      // Use batch scoring if enabled and we have multiple agents
+      Map<String, String> agentScores;
+      if (schedulerProperties.isBatchOperationsEnabled() && totalAgents > 1) {
+        // OPTIMIZATION: Single Redis call instead of 2 * totalAgents calls
+        agentScores = batchAgentScore(jedis, agents.values());
+        log.debug("Batch scored {} agents", agentScores.size());
+      } else {
+        // Fallback to individual scoring
+        agentScores = new HashMap<>();
+        for (AgentWorker worker : agents.values()) {
+          agentScores.put(worker.getAgent().getAgentType(), agentScore(worker.getAgent()));
+        }
+        log.debug("Individual scored {} agents", agentScores.size());
+      }
+
+      // Batch add agents to Redis in chunks to avoid memory issues
+      int batchSize = schedulerProperties.getBatchOperationsBatchSize();
+      int processed = 0;
+      int totalAdded = 0;
+
+      List<String> batchArgs = new ArrayList<>();
+      for (Map.Entry<String, String> entry : agentScores.entrySet()) {
+        batchArgs.add(entry.getKey()); // agent name
+        batchArgs.add(entry.getValue()); // score
+        processed++;
+
+        // Process batch when we reach batch size or end of agents
+        if (batchArgs.size() >= batchSize * 2 || processed == agentScores.size()) {
+          try {
+            @SuppressWarnings("unchecked")
+            List<Object> result =
+                (List<Object>)
+                    jedis.evalsha(
+                        scriptManager.getScriptSha(RedisScriptManager.BATCH_ADD_AGENTS_SCRIPT),
+                        Arrays.asList(WORKING_SET, WAITING_SET),
+                        batchArgs);
+
+            if (result.size() >= 1) {
+              totalAdded += ((Long) result.get(0)).intValue();
+            }
+
+            log.debug(
+                "Batch added {} agents to Redis (batch {} of {})",
+                batchArgs.size() / 2,
+                (processed + batchSize - 1) / batchSize,
+                (totalAgents + batchSize - 1) / batchSize);
+
+          } catch (Exception e) {
+            log.warn(
+                "Batch repopulation failed for {} agents, using individual mode: {}",
+                batchArgs.size() / 2,
+                e.getMessage());
+
+            // Fallback: Individual ADD_AGENT_SCRIPT calls
+            Pipeline pipeline = jedis.pipelined();
+            for (int i = 0; i < batchArgs.size(); i += 2) {
+              pipeline.evalsha(
+                  scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT),
+                  Arrays.asList(WORKING_SET, WAITING_SET),
+                  Arrays.asList(batchArgs.get(i), batchArgs.get(i + 1)));
+            }
+            pipeline.sync();
+            totalAdded += batchArgs.size() / 2;
+          }
+
+          batchArgs.clear();
+        }
+      }
+
+      log.debug(
+          "Repopulated Redis with {} agents ({} actually added/updated)", totalAgents, totalAdded);
+
+    } catch (Exception e) {
+      log.error(
+          "Batch repopulation failed completely, falling back to legacy mode: {}", e.getMessage());
+
+      // Complete fallback to original individual mode
+      Pipeline pipeline = jedis.pipelined();
+      for (AgentWorker worker : agents.values()) {
+        String agentType = worker.getAgent().getAgentType();
+        String nextScore = agentScore(worker.getAgent());
+
+        pipeline.evalsha(
+            scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT),
+            Arrays.asList(WORKING_SET, WAITING_SET),
+            Arrays.asList(agentType, nextScore));
+      }
+      pipeline.sync();
+      log.debug("Legacy repopulated Redis with {} agents", totalAgents);
+    }
   }
 
   /**
@@ -896,6 +976,14 @@ public class AgentAcquisitionService {
   /**
    * Get the current score of an agent in the working or waiting set.
    *
+   * <p>Behavior:
+   *
+   * <ul>
+   *   <li>Working agents: Calculate NEXT execution time (current + interval)
+   *   <li>Waiting agents: Keep existing score (regardless of overdue status)
+   *   <li>New agents (not in Redis): Execute immediately (score = 0)
+   * </ul>
+   *
    * @param agent The agent to check
    * @return The current score of the agent, or "unknown" if Redis is unavailable
    */
@@ -911,26 +999,166 @@ public class AgentAcquisitionService {
 
       // If agent is currently working, calculate next execution from now
       if (workingScore.get() != null) {
-        return score(jedis, intervalProvider.getInterval(agent).getInterval());
+        String result = score(jedis, intervalProvider.getInterval(agent).getInterval());
+        log.debug("Agent {} working - next execution scheduled: {}", agent.getAgentType(), result);
+        return result;
       }
 
-      // If agent is waiting and not overdue, keep existing score
+      // If agent is waiting, keep existing score regardless of overdue status
+      // Overdue agents will be naturally picked up by saturatePool() since their score <=
+      // currentTime
       if (waitingScore.get() != null) {
-        long waitingTimeSeconds = waitingScore.get().longValue();
-        long currentTimeSeconds = System.currentTimeMillis() / 1000;
-
         // All Redis scores are stored as seconds since epoch for consistent priority scheduling
-        if (waitingTimeSeconds > currentTimeSeconds) {
-          return String.valueOf(waitingTimeSeconds);
-        }
+        long waitingTimeSeconds = waitingScore.get().longValue();
+        log.debug(
+            "Agent {} waiting - keeping existing score: {} (preserves priority ordering)",
+            agent.getAgentType(),
+            waitingTimeSeconds);
+        return String.valueOf(waitingTimeSeconds);
       }
 
-      // New agent or overdue - execute immediately
-      return score(jedis, 0L);
+      // Only NEW agents (not in Redis) get immediate execution priority
+      String result = score(jedis, 0L);
+      log.debug(
+          "Agent {} is new - giving immediate execution priority: {}",
+          agent.getAgentType(),
+          result);
+      return result;
     } catch (Exception e) {
       log.debug(
           "Could not get agent score from Redis for {}: {}", agent.getAgentType(), e.getMessage());
       return "unknown";
+    }
+  }
+
+  /**
+   * Batch version of agentScore() that processes multiple agents in a single Redis call.
+   *
+   * @param jedis Redis connection to use
+   * @param agents Collection of agents to score
+   * @return Map of agent type to calculated score
+   */
+  private Map<String, String> batchAgentScore(Jedis jedis, Collection<AgentWorker> agents) {
+    if (agents.isEmpty()) {
+      return new HashMap<>();
+    }
+
+    try {
+      // Prepare agent names for batch lookup
+      List<String> agentNames =
+          agents.stream()
+              .map(worker -> worker.getAgent().getAgentType())
+              .collect(Collectors.toList());
+
+      log.debug("Batch scoring {} agents", agentNames.size());
+
+      // Single Redis call to get all agent scores
+      @SuppressWarnings("unchecked")
+      List<String> results =
+          (List<String>)
+              jedis.evalsha(
+                  scriptManager.getScriptSha(RedisScriptManager.BATCH_AGENT_SCORE_SCRIPT),
+                  Arrays.asList(WORKING_SET, WAITING_SET),
+                  agentNames);
+
+      // Process results: [agent1, workScore1, waitScore1, agent2, workScore2, waitScore2, ...]
+      Map<String, String> agentScores = new HashMap<>();
+      Map<String, Agent> agentMap =
+          agents.stream()
+              .collect(
+                  Collectors.toMap(
+                      worker -> worker.getAgent().getAgentType(), AgentWorker::getAgent));
+
+      for (int i = 0; i < results.size(); i += 3) {
+        String agentType = results.get(i);
+        String workingScoreStr = results.get(i + 1);
+        String waitingScoreStr = results.get(i + 2);
+
+        Agent agent = agentMap.get(agentType);
+        if (agent == null) {
+          log.warn("Agent {} not found in batch scoring map", agentType);
+          continue;
+        }
+
+        String calculatedScore =
+            calculateAgentScore(jedis, agent, workingScoreStr, waitingScoreStr);
+        agentScores.put(agentType, calculatedScore);
+      }
+
+      log.debug("Batch scored {} agents successfully", agentScores.size());
+      return agentScores;
+
+    } catch (Exception e) {
+      log.warn(
+          "Batch agent scoring failed, falling back to individual scoring: {}", e.getMessage());
+      // Fallback to individual scoring
+      Map<String, String> scores = new HashMap<>();
+      for (AgentWorker worker : agents) {
+        scores.put(worker.getAgent().getAgentType(), agentScore(worker.getAgent()));
+      }
+      return scores;
+    }
+  }
+
+  /**
+   * Calculate the score for an agent based on its current Redis state. This exactly matches the
+   * logic from agentScore() to ensure consistent behavior.
+   *
+   * <p>The behavior is:
+   *
+   * <ul>
+   *   <li>Working agents: Calculate NEXT execution time (current + interval)
+   *   <li>Waiting agents: Keep existing score (regardless of overdue status)
+   *   <li>New agents (not in Redis): Execute immediately (score = 0)
+   * </ul>
+   */
+  private String calculateAgentScore(
+      Jedis jedis, Agent agent, String workingScoreStr, String waitingScoreStr) {
+    try {
+      // If agent is currently working, calculate next execution time (current + interval)
+      // This matches original agentScore() behavior for working agents
+      if (!"null".equals(workingScoreStr)) {
+        String result = score(jedis, intervalProvider.getInterval(agent).getInterval());
+        log.debug("Agent {} working - next execution scheduled: {}", agent.getAgentType(), result);
+        return result;
+      }
+
+      // If agent is waiting, keep existing score regardless of overdue status
+      // Overdue agents will be naturally picked up by saturatePool() since their score <=
+      // currentTime
+      if (!"null".equals(waitingScoreStr)) {
+        try {
+          long waitingTimeSeconds = Long.parseLong(waitingScoreStr);
+          log.debug(
+              "Agent {} waiting - keeping existing score: {} (preserves priority ordering)",
+              agent.getAgentType(),
+              waitingScoreStr);
+          return String.valueOf(waitingTimeSeconds);
+        } catch (NumberFormatException e) {
+          log.debug(
+              "Invalid waiting score for agent {}: {}", agent.getAgentType(), waitingScoreStr);
+        }
+      }
+    } catch (Exception e) {
+      log.error(
+          "Error calculating score for agent {}: {}", agent.getAgentType(), e.getMessage(), e);
+      // Fall through to default case
+    }
+
+    try {
+      // Only NEW agents (not in Redis) get immediate execution priority
+      String result = score(jedis, 0L);
+      log.debug("Agent {} new - immediate execution: {}", agent.getAgentType(), result);
+      return result;
+    } catch (Exception e) {
+      log.error(
+          "Error generating immediate execution score for agent {}: {}",
+          agent.getAgentType(),
+          e.getMessage(),
+          e);
+      // Return immediate execution score as fallback - this matches agentScore() behavior
+      // where Redis failures still allow the agent to be scheduled
+      return String.valueOf(System.currentTimeMillis() / 1000);
     }
   }
 

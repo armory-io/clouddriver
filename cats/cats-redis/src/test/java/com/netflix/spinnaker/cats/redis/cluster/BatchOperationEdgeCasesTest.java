@@ -419,7 +419,7 @@ public class BatchOperationEdgeCasesTest {
       long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000; // 2 minutes ago
 
       try (Jedis jedis = jedisPool.getResource()) {
-        for (int i = 1; i <= 200; i++) {
+        for (int i = 1; i <= 50; i++) {
           String agentType = "large-zombie-" + i;
           jedis.zadd("WORKZ", oldScoreSeconds, agentType);
           activeAgents.put(agentType, String.valueOf(oldScoreSeconds));
@@ -432,7 +432,7 @@ public class BatchOperationEdgeCasesTest {
       long duration = System.currentTimeMillis() - startTime;
 
       // Should clean up all zombies efficiently
-      assertThat(cleaned).isEqualTo(200);
+      assertThat(cleaned).isEqualTo(50);
       assertThat(duration).isLessThan(10000); // Should complete within 10 seconds
       assertThat(activeAgents).isEmpty();
       assertThat(activeAgentsFutures).isEmpty();

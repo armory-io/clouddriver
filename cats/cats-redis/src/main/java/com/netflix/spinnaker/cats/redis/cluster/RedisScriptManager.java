@@ -55,6 +55,7 @@ public class RedisScriptManager {
   public static final String BATCH_ORPHAN_REMOVE_SCRIPT = "batchOrphanRemove";
   public static final String BATCH_ADD_AGENTS_SCRIPT = "batchAddAgents";
   public static final String BATCH_ACQUIRE_AGENTS_SCRIPT = "batchAcquireAgents";
+  public static final String BATCH_AGENT_SCORE_SCRIPT = "batchAgentScore";
   public static final String BATCH_CLEANUP_AGENTS_SCRIPT = "batchCleanupAgents";
   public static final String RELEASE_LEADERSHIP_SCRIPT = "releaseLeadership";
 
@@ -204,9 +205,9 @@ public class RedisScriptManager {
             "local removed = {}\n" // Track removed agents for logging
                 + "local count = 0\n" // Count of successful removals
                 + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
-                + "for i=2,#ARGV,2 do\n" // For each agent-score pair
-                + "  local agent = ARGV[i-1]\n" // Agent name
-                + "  local expectedScore = ARGV[i]\n" // Expected score
+                + "for i=1,#ARGV,2 do\n" // For each agent-score pair
+                + "  local agent = ARGV[i]\n" // Agent name
+                + "  local expectedScore = ARGV[i+1]\n" // Expected score
                 + "  local actualScore = redis.call('zscore', KEYS[1], agent)\n"
                 + "  if actualScore and tonumber(actualScore) == tonumber(expectedScore) then\n"
                 + "    redis.call('zrem', KEYS[1], agent)\n" // Remove orphaned agent
@@ -223,9 +224,9 @@ public class RedisScriptManager {
             "local added = {}\n" // Track added agents for logging
                 + "local count = 0\n" // Count of successful additions
                 + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
-                + "for i=2,#ARGV,2 do\n" // For each agent-score pair
-                + "  local agent = ARGV[i-1]\n" // Agent name
-                + "  local score = ARGV[i]\n" // Score
+                + "for i=1,#ARGV,2 do\n" // For each agent-score pair
+                + "  local agent = ARGV[i]\n" // Agent name
+                + "  local score = ARGV[i+1]\n" // Score
                 + "  local exists = redis.call('zscore', KEYS[1], agent) or redis.call('zscore', KEYS[2], agent)\n"
                 + "  if not exists then\n" // If not in either set
                 + "    redis.call('zadd', KEYS[2], score, agent)\n" // Add to WAITING set
@@ -242,9 +243,9 @@ public class RedisScriptManager {
             "local acquired = {}\n" // Track acquired agents for logging
                 + "local count = 0\n" // Count of successful acquisitions
                 + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
-                + "for i=2,#ARGV,2 do\n" // For each agent-score pair
-                + "  local agent = ARGV[i-1]\n" // Agent name
-                + "  local newScore = ARGV[i]\n" // New working score
+                + "for i=1,#ARGV,2 do\n" // For each agent-score pair
+                + "  local agent = ARGV[i]\n" // Agent name
+                + "  local newScore = ARGV[i+1]\n" // New working score
                 + "  local waitingScore = redis.call('zscore', KEYS[2], agent)\n" // Check if in
                 // WAITING
                 + "  if waitingScore then\n" // If agent is in WAITING set
@@ -256,6 +257,23 @@ public class RedisScriptManager {
                 + "end\n"
                 + "return {count, acquired}\n")); // Return count and list of acquired agents
 
+    // Batch score lookup for multiple agents (eliminates 2 Redis calls per agent)
+    scriptShas.put(
+        BATCH_AGENT_SCORE_SCRIPT,
+        jedis.scriptLoad(
+            "local results = {}\n" // Results array
+                + "for i=1,#ARGV do\n" // For each agent name
+                + "  local agent = ARGV[i]\n" // Agent name
+                + "  local workingScore = redis.call('zscore', KEYS[1], agent)\n" // Check WORKING
+                // set
+                + "  local waitingScore = redis.call('zscore', KEYS[2], agent)\n" // Check WAITING
+                // set
+                + "  table.insert(results, agent)\n" // Agent name
+                + "  table.insert(results, workingScore or 'null')\n" // Working score or 'null'
+                + "  table.insert(results, waitingScore or 'null')\n" // Waiting score or 'null'
+                + "end\n"
+                + "return results\n")); // Return [agent1, workScore1, waitScore1, agent2, ...]
+
     // Remove multiple zombie agents in a single operation
     scriptShas.put(
         BATCH_CLEANUP_AGENTS_SCRIPT,
@@ -263,9 +281,9 @@ public class RedisScriptManager {
             "local cleaned = {}\n" // Track cleaned agents for logging
                 + "local count = 0\n" // Count of successful cleanups
                 + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
-                + "for i=2,#ARGV,2 do\n" // For each agent-score pair
-                + "  local agent = ARGV[i-1]\n" // Agent name
-                + "  local expectedScore = ARGV[i]\n" // Expected score
+                + "for i=1,#ARGV,2 do\n" // For each agent-score pair
+                + "  local agent = ARGV[i]\n" // Agent name
+                + "  local expectedScore = ARGV[i+1]\n" // Expected score
                 + "  local actualScore = redis.call('zscore', KEYS[1], agent)\n"
                 + "  if actualScore and tonumber(actualScore) == tonumber(expectedScore) then\n"
                 + "    redis.call('zrem', KEYS[1], agent)\n" // Remove zombie agent
