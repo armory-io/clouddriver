@@ -391,8 +391,8 @@ public class AgentAcquisitionService {
       // Execute batch acquisition Lua script
       Object result =
           jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.BATCH_ACQUIRE_AGENTS_SCRIPT),
-              java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+              scriptManager.getScriptSha(RedisScriptManager.ACQUIRE_AGENTS),
+              Arrays.asList(WORKING_SET, WAITING_SET),
               agentScorePairs);
 
       // PHASE 3: Process batch acquisition results
@@ -417,8 +417,7 @@ public class AgentAcquisitionService {
             // Extract the agent's score from agentScorePairs array
             // Array structure: [agent1, score1, agent2, score2, ...]
             // For agent at index i: score is at position (i * 2 + 1)
-            // Example: agent at index 0 → score at position 1
-            //          agent at index 1 → score at position 3
+
             String acquireScore = agentScorePairs.get(i * 2 + 1);
 
             worker.acquireScore = acquireScore;
@@ -628,7 +627,7 @@ public class AgentAcquisitionService {
         } else {
           // Normal operation: Remove from both sets
           jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_SCRIPT),
+              scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
               java.util.Arrays.asList(WORKING_SET, WAITING_SET), // Script needs both keys
               java.util.Collections.singletonList(agentType));
           log.debug("Removed agent {} from active tracking and Redis sets", agentType);
@@ -742,10 +741,10 @@ public class AgentAcquisitionService {
           currentWorkzScore,
           currentWaitzScore);
 
-      // Use CONDITIONAL_SWAP_SET_SCRIPT - only moves if agent is in WORKZ with expected score
+      // Use MOVE_AGENTS_CONDITIONAL - only moves if agent is in WORKZ with expected score
       Object result =
           jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.CONDITIONAL_SWAP_SET_SCRIPT),
+              scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
               java.util.Arrays.asList(WORKING_SET, WAITING_SET),
               java.util.Arrays.asList(agentType, expectedScore, nextScore));
 
@@ -877,7 +876,7 @@ public class AgentAcquisitionService {
             List<Object> result =
                 (List<Object>)
                     jedis.evalsha(
-                        scriptManager.getScriptSha(RedisScriptManager.BATCH_ADD_AGENTS_SCRIPT),
+                        scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
                         Arrays.asList(WORKING_SET, WAITING_SET),
                         batchArgs);
 
@@ -897,16 +896,22 @@ public class AgentAcquisitionService {
                 batchArgs.size() / 2,
                 e.getMessage());
 
-            // Fallback: Individual ADD_AGENT_SCRIPT calls
+            // Fallback: Use pipeline with individual ADD_AGENT script for performance
             Pipeline pipeline = jedis.pipelined();
             for (int i = 0; i < batchArgs.size(); i += 2) {
               pipeline.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT),
+                  scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   Arrays.asList(batchArgs.get(i), batchArgs.get(i + 1)));
             }
-            pipeline.sync();
-            totalAdded += batchArgs.size() / 2;
+            List<Object> pipelineResults = pipeline.syncAndReturnAll();
+
+            // Count successful additions (ADD_AGENT returns 1 for success, 0 for already exists)
+            for (Object result : pipelineResults) {
+              if (result != null && ((Long) result).intValue() == 1) {
+                totalAdded++;
+              }
+            }
           }
 
           batchArgs.clear();
@@ -920,19 +925,20 @@ public class AgentAcquisitionService {
       log.error(
           "Batch repopulation failed completely, falling back to legacy mode: {}", e.getMessage());
 
-      // Complete fallback to original individual mode
+      // Complete fallback to pipeline with individual ADD_AGENT scripts (optimized for performance)
       Pipeline pipeline = jedis.pipelined();
       for (AgentWorker worker : agents.values()) {
         String agentType = worker.getAgent().getAgentType();
         String nextScore = agentScore(worker.getAgent());
 
+        // Use individual ADD_AGENT script for pipeline compatibility
         pipeline.evalsha(
-            scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT),
+            scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
             Arrays.asList(WORKING_SET, WAITING_SET),
             Arrays.asList(agentType, nextScore));
       }
-      pipeline.sync();
-      log.debug("Legacy repopulated Redis with {} agents", totalAgents);
+      pipeline.sync(); // Execute all operations in a single network round trip
+      log.debug("Pipeline fallback repopulated Redis with {} agents", totalAgents);
     }
   }
 
@@ -955,16 +961,13 @@ public class AgentAcquisitionService {
       // Args: [WORKING_SET, WAITING_SET, agentType, acquireScore]
       Object result =
           jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.SWAP_SET_SCRIPT),
-              2, // Number of Redis keys (WORKING_SET, WAITING_SET)
-              WORKING_SET, // Destination set for acquired agents
-              WAITING_SET, // Source set of agents ready for execution
-              agentType, // Agent name to acquire
-              acquireScore); // Completion deadline: current_time + timeout
+              scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS),
+              Arrays.asList(WORKING_SET, WAITING_SET), // Redis keys
+              Arrays.asList(agentType, acquireScore)); // Agent name and completion deadline
 
-      // Lua script returns the score if successful, null if agent was already taken
+      // MOVE_AGENTS script returns the score on success, nil on failure
       if (result != null) {
-        return result.toString();
+        return result.toString(); // Return the acquire score from script
       }
       return null; // Agent was acquired by another instance
     } catch (Exception e) {
@@ -1057,7 +1060,7 @@ public class AgentAcquisitionService {
       List<String> results =
           (List<String>)
               jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.BATCH_AGENT_SCORE_SCRIPT),
+                  scriptManager.getScriptSha(RedisScriptManager.SCORE_AGENTS),
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   agentNames);
 
@@ -1273,11 +1276,12 @@ public class AgentAcquisitionService {
 
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
                 java.util.Arrays.asList(WORKING_SET, WAITING_SET),
                 java.util.Arrays.asList(agentType, nextScore));
 
-        log.debug("Agent {} scheduled in Redis, result: {}", agentType, result);
+        boolean scheduled = result != null && ((Long) result).intValue() == 1;
+        log.debug("Agent {} scheduled in Redis: {}, result: {}", agentType, scheduled, result);
         return; // Success - exit retry loop
 
       } catch (Exception e) {

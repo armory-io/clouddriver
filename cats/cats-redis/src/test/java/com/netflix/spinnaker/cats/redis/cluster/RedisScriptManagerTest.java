@@ -93,19 +93,23 @@ class RedisScriptManagerTest {
       scriptManager.initializeScripts();
 
       // When & Then - Verify all script constants are loaded
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT)).isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_SCRIPT)).isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.SWAP_SET_SCRIPT)).isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.CONDITIONAL_SWAP_SET_SCRIPT))
+      // Individual scripts
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT)).isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT)).isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENT)).isNotEmpty();
+
+      // Batch scripts
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS)).isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS)).isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS)).isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL))
           .isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.VALID_SCORE_SCRIPT)).isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.ORPHAN_REMOVE_SCRIPT)).isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.BATCH_ORPHAN_REMOVE_SCRIPT))
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.ACQUIRE_AGENTS)).isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.SCORE_AGENTS)).isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL))
           .isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.BATCH_ADD_AGENTS_SCRIPT))
-          .isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.BATCH_CLEANUP_AGENTS_SCRIPT))
-          .isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.VALIDATE_OWNERSHIP)).isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP)).isNotEmpty();
     }
 
     @Test
@@ -113,10 +117,10 @@ class RedisScriptManagerTest {
     void shouldBeIdempotentWhenCalledMultipleTimes() {
       // When
       scriptManager.initializeScripts();
-      String firstSha = scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT);
+      String firstSha = scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS);
 
       scriptManager.initializeScripts(); // Call again
-      String secondSha = scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT);
+      String secondSha = scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS);
 
       // Then
       assertThat(firstSha).isEqualTo(secondSha);
@@ -169,7 +173,7 @@ class RedisScriptManagerTest {
     @DisplayName("Should throw exception when accessing uninitialized scripts")
     void shouldThrowExceptionWhenAccessingUninitializedScripts() {
       // When & Then
-      assertThatThrownBy(() -> scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT))
+      assertThatThrownBy(() -> scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS))
           .isInstanceOf(IllegalStateException.class)
           .hasMessageContaining("Scripts not initialized");
     }
@@ -209,8 +213,8 @@ class RedisScriptManagerTest {
     }
 
     @Test
-    @DisplayName("Should execute ADD_AGENT_SCRIPT correctly")
-    void shouldExecuteAddAgentScriptCorrectly() {
+    @DisplayName("Should execute ADD_AGENTS_SCRIPT correctly")
+    void shouldExecuteAddAgentsScriptCorrectly() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Given
         String agentType = "test-agent";
@@ -220,42 +224,40 @@ class RedisScriptManagerTest {
         jedis.zrem("WORKZ", agentType);
         jedis.zrem("WAITZ", agentType);
 
-        // When - Execute ADD_AGENT_SCRIPT
+        // When - Execute ADD_AGENTS_SCRIPT
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
                 2, // Key count
                 "WORKZ",
                 "WAITZ",
                 agentType,
                 score);
 
-        // Then
-        assertThat(result).isEqualTo("added");
+        // Then - Expect [count, [addedAgents]] format
+        assertThat(result)
+            .isEqualTo(java.util.Arrays.asList(1L, java.util.Arrays.asList("test-agent")));
         assertThat(jedis.zscore("WAITZ", agentType)).isEqualTo(100.0);
       }
     }
 
     @Test
-    @DisplayName("Should execute SWAP_SET_SCRIPT correctly")
-    void shouldExecuteSwapSetScriptCorrectly() {
+    @DisplayName("Should execute MOVE_AGENTS_SCRIPT correctly")
+    void shouldExecuteMoveAgentsScriptCorrectly() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Given - Add agent to WAITING set first
         jedis.zadd("WAITZ", 100, "test-agent");
 
         String newScore = "200";
 
-        // When - Execute SWAP_SET_SCRIPT to move from WAITING to WORKING
+        // When - Execute MOVE_AGENTS_SCRIPT to move from WAITING to WORKING
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.SWAP_SET_SCRIPT),
-                2, // Key count
-                "WORKZ",
-                "WAITZ",
-                "test-agent",
-                newScore);
+                scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS),
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("test-agent", newScore));
 
-        // Then
+        // Then - MOVE_AGENTS returns the score on success
         assertThat(result).isEqualTo(newScore);
         assertThat(jedis.zscore("WORKZ", "test-agent")).isEqualTo(200.0);
         assertThat(jedis.zscore("WAITZ", "test-agent")).isNull();
@@ -272,7 +274,7 @@ class RedisScriptManagerTest {
         // When - Check valid score
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.VALID_SCORE_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.VALIDATE_OWNERSHIP),
                 1, // Key count
                 "WORKZ",
                 "test-agent",
@@ -293,7 +295,7 @@ class RedisScriptManagerTest {
         // When - Check with wrong score
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.VALID_SCORE_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.VALIDATE_OWNERSHIP),
                 1, // Key count
                 "WORKZ",
                 "test-agent",
@@ -323,7 +325,7 @@ class RedisScriptManagerTest {
         // When - Execute conditional swap with string representation (how Java passes it)
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.CONDITIONAL_SWAP_SET_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
                 java.util.Arrays.asList("WORKZ", "WAITZ"),
                 java.util.Arrays.asList(
                     agentType,
@@ -344,7 +346,7 @@ class RedisScriptManagerTest {
 
         result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.CONDITIONAL_SWAP_SET_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
                 java.util.Arrays.asList("WORKZ", "WAITZ"),
                 java.util.Arrays.asList(
                     agentType,
@@ -360,6 +362,102 @@ class RedisScriptManagerTest {
   }
 
   @Nested
+  @DisplayName("Individual Script Tests")
+  class IndividualScriptTests {
+
+    @BeforeEach
+    void setUp() {
+      scriptManager.initializeScripts();
+    }
+
+    @Test
+    @DisplayName("Should execute ADD_AGENT script correctly")
+    void shouldExecuteAddAgentScriptCorrectly() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Given - Clear Redis
+        jedis.flushAll();
+
+        // When - Add single agent
+        Object result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("test-agent", "100"));
+
+        // Then - Returns 1 for success
+        assertThat(result).isEqualTo(1L);
+        assertThat(jedis.zscore("WAITZ", "test-agent")).isEqualTo(100.0);
+
+        // When - Try to add same agent again
+        result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("test-agent", "200"));
+
+        // Then - Returns 0 for already exists
+        assertThat(result).isEqualTo(0L);
+        assertThat(jedis.zscore("WAITZ", "test-agent")).isEqualTo(100.0); // Score unchanged
+      }
+    }
+
+    @Test
+    @DisplayName("Should execute REMOVE_AGENT script correctly")
+    void shouldExecuteRemoveAgentScriptCorrectly() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Given - Add agents to both sets
+        jedis.zadd("WORKZ", 100, "agent1");
+        jedis.zadd("WAITZ", 200, "agent2");
+
+        // When - Remove agent
+        Object result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("agent1"));
+
+        // Then - Returns 1 and removes from both sets
+        assertThat(result).isEqualTo(1L);
+        assertThat(jedis.zscore("WORKZ", "agent1")).isNull();
+        assertThat(jedis.zscore("WAITZ", "agent1")).isNull();
+        assertThat(jedis.zscore("WAITZ", "agent2")).isEqualTo(200.0); // Other agent untouched
+      }
+    }
+
+    @Test
+    @DisplayName("Should execute MOVE_AGENT script correctly")
+    void shouldExecuteMoveAgentScriptCorrectly() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Given - Add agent to WAITING set
+        jedis.zadd("WAITZ", 100, "test-agent");
+
+        // When - Move agent to WORKING set
+        Object result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENT),
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("test-agent", "150"));
+
+        // Then - Returns 1 and moves agent
+        assertThat(result).isEqualTo(1L);
+        assertThat(jedis.zscore("WAITZ", "test-agent")).isNull(); // Removed from WAITING
+        assertThat(jedis.zscore("WORKZ", "test-agent")).isEqualTo(150.0); // Added to WORKING
+
+        // When - Try to move agent that's not in WAITING set
+        result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENT),
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("nonexistent-agent", "200"));
+
+        // Then - Returns 0 for failure
+        assertThat(result).isEqualTo(0L);
+        assertThat(jedis.zscore("WORKZ", "nonexistent-agent")).isNull(); // Not added to WORKING
+      }
+    }
+  }
+
+  @Nested
   @DisplayName("Batch Script Tests")
   class BatchScriptTests {
 
@@ -369,13 +467,13 @@ class RedisScriptManagerTest {
     }
 
     @Test
-    @DisplayName("Should execute BATCH_ADD_AGENTS_SCRIPT correctly")
-    void shouldExecuteBatchAddAgentsScriptCorrectly() {
+    @DisplayName("Should execute ADD_AGENTS_SCRIPT correctly for batch")
+    void shouldExecuteAddAgentsScriptCorrectlyForBatch() {
       try (Jedis jedis = jedisPool.getResource()) {
         // When - Execute batch add with multiple agents
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.BATCH_ADD_AGENTS_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
                 java.util.Arrays.asList("WORKZ", "WAITZ"),
                 java.util.Arrays.asList("agent1", "100", "agent2", "200", "agent3", "300"));
 
@@ -394,17 +492,17 @@ class RedisScriptManagerTest {
     }
 
     @Test
-    @DisplayName("Should execute BATCH_ORPHAN_REMOVE_SCRIPT correctly")
-    void shouldExecuteBatchOrphanRemoveScriptCorrectly() {
+    @DisplayName("Should execute REMOVE_AGENTS_CONDITIONAL_SCRIPT correctly")
+    void shouldExecuteRemoveAgentsConditionalScriptCorrectly() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Given - Add orphaned agents to WORKING set
         jedis.zadd("WORKZ", 100, "orphan1");
         jedis.zadd("WORKZ", 200, "orphan2");
 
-        // When - Execute batch orphan removal
+        // When - Execute conditional removal
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.BATCH_ORPHAN_REMOVE_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL),
                 java.util.Collections.singletonList("WORKZ"),
                 java.util.Arrays.asList("orphan1", "100", "orphan2", "200"));
 
@@ -433,7 +531,7 @@ class RedisScriptManagerTest {
         // When - Release leadership with correct ownership ID
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP),
                 java.util.Collections.singletonList(leadershipKey),
                 java.util.Collections.singletonList(ownershipId));
 
@@ -456,7 +554,7 @@ class RedisScriptManagerTest {
         // When - Try to release leadership with wrong ownership ID
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP_SCRIPT),
+                scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP),
                 java.util.Collections.singletonList(leadershipKey),
                 java.util.Collections.singletonList(wrongOwnerId));
 
@@ -491,7 +589,7 @@ class RedisScriptManagerTest {
         // When - Execute many script operations
         for (int i = 0; i < iterations; i++) {
           jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT_SCRIPT),
+              scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
               2,
               "WORKZ",
               "WAITZ",

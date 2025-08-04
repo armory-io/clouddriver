@@ -225,7 +225,7 @@ public class ErrorHandlingComprehensiveTest {
       RedisScriptManager spyScriptManager = spy(scriptManager);
 
       // Make batch acquisition script return invalid SHA to trigger failure
-      when(spyScriptManager.getScriptSha(RedisScriptManager.BATCH_ACQUIRE_AGENTS_SCRIPT))
+      when(spyScriptManager.getScriptSha(RedisScriptManager.ACQUIRE_AGENTS))
           .thenReturn("invalid-batch-sha-will-cause-redis-error");
       // All other scripts work normally (using real implementation)
 
@@ -259,8 +259,7 @@ public class ErrorHandlingComprehensiveTest {
           .doesNotThrowAnyException();
 
       // Additional verification: ensure the batch script was actually called (and failed)
-      verify(spyScriptManager, atLeastOnce())
-          .getScriptSha(RedisScriptManager.BATCH_ACQUIRE_AGENTS_SCRIPT);
+      verify(spyScriptManager, atLeastOnce()).getScriptSha(RedisScriptManager.ACQUIRE_AGENTS);
     }
 
     @Test

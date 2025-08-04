@@ -228,7 +228,7 @@ public class BatchOperationEdgeCasesTest {
 
       // Mock script manager that simulates script execution failure
       RedisScriptManager mockScriptManager = spy(scriptManager);
-      when(mockScriptManager.getScriptSha(RedisScriptManager.BATCH_ACQUIRE_AGENTS_SCRIPT))
+      when(mockScriptManager.getScriptSha(RedisScriptManager.ACQUIRE_AGENTS))
           .thenReturn("nonexistent-sha-that-will-cause-noscript-error");
 
       AgentAcquisitionService serviceWithFailingScript =

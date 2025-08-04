@@ -343,7 +343,7 @@ public class OrphanCleanupService {
       // and removes only agents that are still orphaned at the same timestamp
       Object result =
           jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.BATCH_ORPHAN_REMOVE_SCRIPT),
+              scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL),
               java.util.Collections.singletonList(setName), // Redis set key (WORKZ/WAITZ)
               batchArgs); // Flattened [name, score, name, score, ...] arguments
 
@@ -428,7 +428,7 @@ public class OrphanCleanupService {
       // Only delete the key if we own it (atomic check-and-delete)
       Object result =
           jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP_SCRIPT),
+              scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP),
               java.util.Collections.singletonList(CLEANUP_LEADER_KEY),
               java.util.Collections.singletonList(currentLeadershipId));
 
@@ -474,7 +474,7 @@ public class OrphanCleanupService {
           String newScore = score(jedis, 0L); // Schedule for immediate execution
           Object result =
               jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.CONDITIONAL_SWAP_SET_SCRIPT),
+                  scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
                   java.util.Arrays.asList(WORKING_SET, WAITING_SET),
                   java.util.Arrays.asList(
                       agentName,
@@ -499,16 +499,14 @@ public class OrphanCleanupService {
                 (long) score);
           }
         } else {
-          // For invalid agents or agents in WAITZ, completely remove them
+          // For invalid agents or agents in WAITZ, completely remove them using individual script
           Object result =
               jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.ORPHAN_REMOVE_SCRIPT),
-                  java.util.Collections.singletonList(setName), // Redis set key
-                  java.util.Arrays.asList(
-                      agentName, scoreInSet // Agent name and score for verification
-                      ));
+                  scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
+                  java.util.Arrays.asList("WORKZ", "WAITZ"), // Both sets for unconditional removal
+                  java.util.Collections.singletonList(agentName)); // Only agent name needed
 
-          // ORPHAN_REMOVE_SCRIPT returns 1 for success, 0 for failure
+          // REMOVE_AGENT returns 1 for success
           boolean removed = result != null && ((Long) result).intValue() == 1;
           if (removed) {
             cleaned++;

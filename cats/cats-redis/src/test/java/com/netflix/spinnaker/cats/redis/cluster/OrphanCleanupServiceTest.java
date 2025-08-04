@@ -374,7 +374,7 @@ class OrphanCleanupServiceTest {
     void shouldHandleScriptExecutionFailuresGracefully() {
       // Given - Invalid script manager
       RedisScriptManager invalidScriptManager = mock(RedisScriptManager.class);
-      when(invalidScriptManager.getScriptSha(RedisScriptManager.BATCH_ORPHAN_REMOVE_SCRIPT))
+      when(invalidScriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL))
           .thenReturn("invalid-sha");
 
       OrphanCleanupService invalidService =

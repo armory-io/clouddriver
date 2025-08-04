@@ -333,7 +333,7 @@ public class ZombieCleanupService {
           // Execute Lua script to batch cleanup zombie agents from Redis WORKING set
           Object result =
               jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.BATCH_CLEANUP_AGENTS_SCRIPT),
+                  scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL),
                   java.util.Collections.singletonList(WORKING_SET), // Redis key (WORKZ)
                   batchArgs); // [agent1, score1, agent2, score2, ...]
 
@@ -463,7 +463,7 @@ public class ZombieCleanupService {
       // Remove from Redis using REMOVE_AGENT_SCRIPT (removes from both WORKZ and WAITZ)
       Object result =
           jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_SCRIPT),
+              scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
               java.util.Arrays.asList(WORKING_SET, "WAITZ"), // KEYS[1] and KEYS[2]
               java.util.Collections.singletonList(agentType) // ARGV[1] - only agent name needed
               );

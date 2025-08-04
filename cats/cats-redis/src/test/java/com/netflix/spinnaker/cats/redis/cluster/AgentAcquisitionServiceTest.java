@@ -1258,7 +1258,7 @@ class AgentAcquisitionServiceTest {
       }
     }
 
-    @Test
+    @Test // TODO: review for race conditions
     @DisplayName("Should prevent thundering herd during mass overdue recovery")
     void shouldPreventThunderingHerdDuringMassOverdueRecovery() throws Exception {
       System.out.println("\n=== Testing Thundering Herd Prevention ===");
