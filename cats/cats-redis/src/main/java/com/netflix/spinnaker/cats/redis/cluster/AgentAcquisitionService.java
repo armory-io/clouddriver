@@ -173,8 +173,7 @@ public class AgentAcquisitionService {
 
       // PHASE 2: Find ready agents in priority order
       String currentScore = score(jedis, 0L);
-      Set<String> readyAgents =
-          jedis.zrangeByScore(WAITING_SET, 0, Double.parseDouble(currentScore));
+      Set<String> readyAgents = jedis.zrangeByScore(WAITING_SET, "-inf", currentScore);
 
       log.debug(
           "Found {} agents ready for execution at score {}", readyAgents.size(), currentScore);
@@ -242,8 +241,7 @@ public class AgentAcquisitionService {
             readyAgents.size());
 
         // Quick check: Are there new agents available now?
-        Set<String> newReadyAgents =
-            jedis.zrangeByScore(WAITING_SET, 0, Double.parseDouble(currentScore));
+        Set<String> newReadyAgents = jedis.zrangeByScore(WAITING_SET, "-inf", currentScore);
 
         if (!newReadyAgents.isEmpty() && !newReadyAgents.equals(readyAgents)) {
           log.debug(
