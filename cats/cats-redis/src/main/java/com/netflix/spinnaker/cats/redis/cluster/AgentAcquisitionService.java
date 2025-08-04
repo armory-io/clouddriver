@@ -827,18 +827,124 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Repopulate Redis with known agents from the local agents map.
+   * Repopulate Redis with known agents from the local agents map. Performs differential sync to
+   * avoid unnecessary Redis operations.
    *
    * @param jedis Jedis connection to Redis
    */
   private void repopulateRedisAgents(Jedis jedis) {
     int totalAgents = agents.size();
-    log.debug("Repopulating Redis with {} known agents (batch mode)", totalAgents);
+    log.debug("Repopulation check for {} known agents", totalAgents);
 
     if (totalAgents == 0) {
       log.debug("No agents to repopulate");
       return;
     }
+
+    try {
+      // Get current Redis state efficiently
+      Set<String> redisAgents = getCurrentRedisAgents(jedis);
+      Set<String> localAgents = agents.keySet();
+
+      // Calculate what needs to be added (missing agents from this instance)
+      Set<String> toAdd =
+          localAgents.stream()
+              .filter(agent -> !redisAgents.contains(agent))
+              .collect(Collectors.toSet());
+
+      // True NOOP if nothing to add
+      if (toAdd.isEmpty()) {
+        log.debug("Repopulation: Redis state is consistent, no missing agents");
+        return;
+      }
+
+      log.debug("Repopulation: +{} missing agents to add", toAdd.size());
+
+      // Add missing agents from this instance
+      addMissingAgents(jedis, toAdd);
+
+    } catch (Exception e) {
+      log.warn("Repopulation failed, falling back to full sync: {}", e.getMessage());
+      repopulateRedisAgentsFallback(jedis);
+    }
+  }
+
+  /** Get all agent names currently in Redis (both WORKING and WAITING sets). */
+  private Set<String> getCurrentRedisAgents(Jedis jedis) {
+    Pipeline pipeline = jedis.pipelined();
+    Response<Set<String>> waitingAgents = pipeline.zrange(WAITING_SET, 0, -1);
+    Response<Set<String>> workingAgents = pipeline.zrange(WORKING_SET, 0, -1);
+    pipeline.sync();
+
+    Set<String> allAgents = new HashSet<>(waitingAgents.get());
+    allAgents.addAll(workingAgents.get());
+    return allAgents;
+  }
+
+  /** Add missing agents to Redis with appropriate scores. */
+  private void addMissingAgents(Jedis jedis, Set<String> agentsToAdd) {
+    if (schedulerProperties.isBatchOperationsEnabled() && agentsToAdd.size() > 1) {
+      addMissingAgentsBatch(jedis, agentsToAdd);
+    } else {
+      addMissingAgentsIndividual(jedis, agentsToAdd);
+    }
+  }
+
+  private void addMissingAgentsBatch(Jedis jedis, Set<String> agentsToAdd) {
+    List<String> batchArgs = new ArrayList<>();
+    for (String agentType : agentsToAdd) {
+      AgentWorker worker = agents.get(agentType);
+      if (worker != null) {
+        batchArgs.add(agentType);
+        batchArgs.add(score(jedis, 0L)); // New agents get immediate execution
+      }
+    }
+
+    if (!batchArgs.isEmpty()) {
+      try {
+        @SuppressWarnings("unchecked")
+        List<Object> result =
+            (List<Object>)
+                jedis.evalsha(
+                    scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
+                    Arrays.asList(WORKING_SET, WAITING_SET),
+                    batchArgs);
+        int added = result.size() >= 1 ? ((Long) result.get(0)).intValue() : 0;
+        log.debug("Batch added {} missing agents to Redis", added);
+      } catch (Exception e) {
+        log.warn("Batch add failed, using individual mode: {}", e.getMessage());
+        addMissingAgentsIndividual(jedis, agentsToAdd);
+      }
+    }
+  }
+
+  private void addMissingAgentsIndividual(Jedis jedis, Set<String> agentsToAdd) {
+    int added = 0;
+    for (String agentType : agentsToAdd) {
+      AgentWorker worker = agents.get(agentType);
+      if (worker != null) {
+        String newScore = score(jedis, 0L); // New agents get immediate execution
+        try {
+          Object result =
+              jedis.evalsha(
+                  scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
+                  Arrays.asList(WORKING_SET, WAITING_SET),
+                  Arrays.asList(agentType, newScore));
+          if (result != null && ((Long) result).intValue() == 1) {
+            added++;
+          }
+        } catch (Exception e) {
+          log.warn("Failed to add missing agent {}: {}", agentType, e.getMessage());
+        }
+      }
+    }
+    log.debug("Individual added {} missing agents to Redis", added);
+  }
+
+  /** Fallback to full repopulation logic if smart sync fails. */
+  private void repopulateRedisAgentsFallback(Jedis jedis) {
+    int totalAgents = agents.size();
+    log.debug("Fallback: Full repopulation of {} agents", totalAgents);
 
     try {
       // Use batch scoring if enabled and we have multiple agents
