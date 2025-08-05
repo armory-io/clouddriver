@@ -695,13 +695,25 @@ class AgentAcquisitionServiceTest {
       // Note: We can't reliably check getActiveAgentCount() due to immediate execution
       // The important validation is that 'acquired' returns 5, proving batch mode worked
 
-      // Give a moment for Redis state to settle, then verify
-      Thread.sleep(50);
+      // Give a moment for execution to complete
+      Thread.sleep(100);
 
-      // Verify Redis state - agents will be back in WAITING after execution
+      // IMPORTANT: Process completion queue with another scheduler cycle
+      // This is critical for our new connection optimization approach
+      System.out.println("PROCESSING COMPLETIONS: Calling saturatePool again to process queue...");
+      int secondRun = acquisitionService.saturatePool(1L, null, executorService);
+      System.out.println("PROCESSING COMPLETIONS: Second saturatePool returned: " + secondRun);
+
+      // NOW verify Redis state - agents should be back in WAITING after completion processing
       try (var jedis = jedisPool.getResource()) {
-        long totalAgents = jedis.zcard("WORKZ") + jedis.zcard("WAITZ");
-        assertThat(totalAgents).isEqualTo(5); // All agents should be tracked in Redis
+        long workingAgents = jedis.zcard("WORKZ");
+        long waitingAgents = jedis.zcard("WAITZ");
+        long totalAgents = workingAgents + waitingAgents;
+        System.out.println("FINAL STATE: WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+
+        if (totalAgents != 5) {
+          throw new AssertionError("Expected 5 total agents in Redis, but got " + totalAgents);
+        }
       }
     }
 
@@ -720,21 +732,47 @@ class AgentAcquisitionServiceTest {
         acquisitionService.registerAgent(agent, execution, instrumentation);
       }
 
-      // Trigger batch acquisition
+      System.out.println(
+          "Registered "
+              + acquisitionService.getRegisteredAgentCount()
+              + " agents for concurrency test");
+
+      // Trigger batch acquisition with concurrency limit
       int acquired = acquisitionService.saturatePool(0L, null, executorService);
 
       // Should only acquire 3 agents due to concurrency limit
-      assertThat(acquired).isEqualTo(3);
+      if (acquired != 3) {
+        throw new AssertionError(
+            "Expected 3 agents acquired due to concurrency limit, but got " + acquired);
+      }
+      System.out.println("Successfully acquired " + acquired + " agents with concurrency limit");
 
-      // Give time for execution to complete
+      // Give time for agents to complete
       Thread.sleep(100);
+
+      // Wait a bit more to ensure all completions are properly queued
+      System.out.println("Ensuring all completions are fully queued...");
+      Thread.sleep(50); // Additional wait to ensure all threads finish queueing completions
+
+      // Process completion queue with another scheduler cycle
+      System.out.println("Processing completion queue with second cycle...");
+      acquisitionService.saturatePool(1L, null, executorService);
+
+      // Just to be safe, let's process one more time in case of any race conditions
+      Thread.sleep(50);
+      acquisitionService.saturatePool(2L, null, executorService);
 
       // Verify Redis state - all 5 agents should be tracked somewhere
       try (var jedis = jedisPool.getResource()) {
-        long totalAgents = jedis.zcard("WORKZ") + jedis.zcard("WAITZ");
-        assertThat(totalAgents).isEqualTo(5); // All agents still tracked
-        // The 3 acquired agents execute quickly and return to waiting
-        // The 2 non-acquired agents remain in waiting
+        long workingAgents = jedis.zcard("WORKZ");
+        long waitingAgents = jedis.zcard("WAITZ");
+        long totalAgents = workingAgents + waitingAgents;
+        System.out.println(
+            "After concurrency test: WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+
+        if (totalAgents != 5) {
+          throw new AssertionError("Expected 5 total agents in Redis, but got " + totalAgents);
+        }
       }
     }
 
@@ -752,20 +790,57 @@ class AgentAcquisitionServiceTest {
         acquisitionService.registerAgent(agent, execution, instrumentation);
       }
 
+      System.out.println(
+          "Registered "
+              + acquisitionService.getRegisteredAgentCount()
+              + " agents with semaphore test");
+
       // Trigger batch acquisition with semaphore limit
       int acquired = acquisitionService.saturatePool(0L, limitedSemaphore, executorService);
 
       // Should only acquire 2 agents due to semaphore limit
-      assertThat(acquired).isEqualTo(2);
+      if (acquired != 2) {
+        throw new AssertionError(
+            "Expected 2 agents acquired due to semaphore, but got " + acquired);
+      }
+      System.out.println("Successfully acquired " + acquired + " agents with semaphore limit");
 
       // Wait for agents to complete and release permits
       Thread.sleep(100);
-      assertThat(limitedSemaphore.availablePermits()).isEqualTo(2); // Permits should be released
+      int permits = limitedSemaphore.availablePermits();
+      if (permits != 2) {
+        throw new AssertionError("Expected 2 permits available, but got " + permits);
+      }
+      System.out.println("Permits properly released: " + permits);
+
+      // Process completion queue with second cycle - this will:
+      // 1) Process completions for the first 2 agents (putting them in WAITZ)
+      // 2) Acquire the remaining 2 agents with the now-available semaphore permits
+      System.out.println(
+          "SEMAPHORE TEST: Processing first batch of completions and acquiring second batch...");
+      int secondCycleAcquired =
+          acquisitionService.saturatePool(1L, limitedSemaphore, executorService);
+      System.out.println("SEMAPHORE TEST: Second cycle acquired: " + secondCycleAcquired);
+
+      // Wait for second batch to complete execution
+      Thread.sleep(100);
+
+      // CRITICAL: Need a third cycle to process the completions of the second batch
+      // Without this, agents 3 & 4 would be missing from Redis
+      System.out.println("SEMAPHORE TEST: Processing second batch of completions...");
+      acquisitionService.saturatePool(2L, limitedSemaphore, executorService);
 
       // Verify Redis state - all 4 agents should be tracked
       try (var jedis = jedisPool.getResource()) {
-        long totalAgents = jedis.zcard("WORKZ") + jedis.zcard("WAITZ");
-        assertThat(totalAgents).isEqualTo(4); // All agents tracked
+        long workingAgents = jedis.zcard("WORKZ");
+        long waitingAgents = jedis.zcard("WAITZ");
+        long totalAgents = workingAgents + waitingAgents;
+        System.out.println(
+            "After semaphore test: WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+
+        if (totalAgents != 4) {
+          throw new AssertionError("Expected 4 total agents in Redis, but got " + totalAgents);
+        }
       }
     }
 
@@ -822,18 +897,44 @@ class AgentAcquisitionServiceTest {
       int acquired2 = pod2Service.saturatePool(0L, null, executorService);
 
       // Each pod should acquire some agents, total should be reasonable
-      assertThat(acquired1).isGreaterThanOrEqualTo(0);
-      assertThat(acquired2).isGreaterThanOrEqualTo(0);
+      if (acquired1 < 0) {
+        throw new AssertionError("Expected pod1 to acquire >= 0 agents, but got " + acquired1);
+      }
+      if (acquired2 < 0) {
+        throw new AssertionError("Expected pod2 to acquire >= 0 agents, but got " + acquired2);
+      }
+
+      System.out.println("Pod 1 acquired: " + acquired1 + ", Pod 2 acquired: " + acquired2);
 
       // Give time for execution and Redis cleanup
       Thread.sleep(100);
 
-      // Verify Redis doesn't have inconsistent state
+      // Wait a bit more to ensure all completions are properly queued
+      System.out.println("Ensuring all completions are fully queued...");
+      Thread.sleep(50); // Additional wait to ensure all threads finish queueing completions
+
+      // Process completion queue with another scheduler cycle
+      System.out.println("Processing completion queue with second cycle...");
+      acquisitionService.saturatePool(1L, null, executorService);
+
+      // Just to be safe, let's process one more time in case of any race conditions
+      Thread.sleep(50);
+      acquisitionService.saturatePool(2L, null, executorService);
+      pod2Service.saturatePool(1L, null, executorService);
+
+      // Verify Redis state - all agents should be tracked somewhere
       try (var jedis = jedisPool.getResource()) {
-        long totalAgents = jedis.zcard("WORKZ") + jedis.zcard("WAITZ");
+        long workingAgents = jedis.zcard("WORKZ");
+        long waitingAgents = jedis.zcard("WAITZ");
+        long totalAgents = workingAgents + waitingAgents;
+        System.out.println(
+            "After race condition test: WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+
         // Note: Both pods repopulate Redis, so we may have more agents than expected
         // The key is that the system doesn't crash and maintains consistency
-        assertThat(totalAgents).isGreaterThan(0);
+        if (totalAgents <= 0) {
+          throw new AssertionError("Expected agents to be tracked in Redis, but found none");
+        }
       }
     }
 
@@ -854,24 +955,47 @@ class AgentAcquisitionServiceTest {
       int acquired = acquisitionService.saturatePool(0L, null, executorService);
 
       // Should acquire all 3 agents in batch
-      assertThat(acquired).isEqualTo(3);
+      if (acquired != 3) {
+        throw new AssertionError("Expected to acquire 3 agents, but got " + acquired);
+      }
+      System.out.println("Successfully acquired all 3 agents in priority order");
 
       // Give time for agents to execute
+      Thread.sleep(100);
+
+      // Wait a bit more to ensure all completions are properly queued
+      System.out.println("Ensuring all completions are fully queued...");
+      Thread.sleep(50); // Additional wait to ensure all threads finish queueing completions
+
+      // Process completion queue with another scheduler cycle
+      System.out.println("Processing completion queue with second cycle...");
+      acquisitionService.saturatePool(1L, null, executorService);
+
+      // Just to be safe, let's process one more time in case of any race conditions
       Thread.sleep(50);
+      acquisitionService.saturatePool(2L, null, executorService);
 
       // Verify all agents were processed correctly
       try (var jedis = jedisPool.getResource()) {
-        long totalAgents = jedis.zcard("WORKZ") + jedis.zcard("WAITZ");
-        assertThat(totalAgents).isEqualTo(3);
+        long workingAgents = jedis.zcard("WORKZ");
+        long waitingAgents = jedis.zcard("WAITZ");
+        long totalAgents = workingAgents + waitingAgents;
+        System.out.println("WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+
+        if (totalAgents != 3) {
+          throw new AssertionError("Expected 3 total agents in Redis, but got " + totalAgents);
+        }
 
         // Check that agents have valid scores (agents will be back in WAITING after execution)
-        var waitingAgents = jedis.zrangeWithScores("WAITZ", 0, -1);
-        if (!waitingAgents.isEmpty()) {
+        var waitingAgentsWithScores = jedis.zrangeWithScores("WAITZ", 0, -1);
+        if (!waitingAgentsWithScores.isEmpty()) {
           long currentTime = System.currentTimeMillis() / 1000;
-          for (var agentScore : waitingAgents) {
+          for (var agentScore : waitingAgentsWithScores) {
             double score = agentScore.getScore();
-            assertThat(score).isGreaterThan(currentTime - 600); // Recent score
-            assertThat(score).isLessThan(currentTime + 3600); // Future score
+            // Validate score is reasonable (recent past to near future)
+            if (score <= currentTime - 600 || score >= currentTime + 3600) {
+              throw new AssertionError("Agent score " + score + " is outside of expected range");
+            }
           }
         }
       }
@@ -977,15 +1101,37 @@ class AgentAcquisitionServiceTest {
       int acquired = acquisitionService.saturatePool(0L, null, executorService);
 
       // Should work normally (using individual mode instead of batch)
-      assertThat(acquired).isEqualTo(3);
+      if (acquired != 3) {
+        throw new AssertionError("Expected 3 agents with individual mode, but got " + acquired);
+      }
+      System.out.println("Successfully acquired " + acquired + " agents using individual mode");
 
       // Give time for execution
       Thread.sleep(100);
 
+      // Wait a bit more to ensure all completions are properly queued
+      System.out.println("Ensuring all completions are fully queued...");
+      Thread.sleep(50); // Additional wait to ensure all threads finish queueing completions
+
+      // Process completion queue with another scheduler cycle
+      System.out.println("Processing completion queue with second cycle...");
+      acquisitionService.saturatePool(1L, null, executorService);
+
+      // Just to be safe, let's process one more time in case of any race conditions
+      Thread.sleep(50);
+      acquisitionService.saturatePool(2L, null, executorService);
+
       // Verify Redis state is still correct
       try (var jedis = jedisPool.getResource()) {
-        long totalAgents = jedis.zcard("WORKZ") + jedis.zcard("WAITZ");
-        assertThat(totalAgents).isEqualTo(3); // All agents should be tracked
+        long workingAgents = jedis.zcard("WORKZ");
+        long waitingAgents = jedis.zcard("WAITZ");
+        long totalAgents = workingAgents + waitingAgents;
+        System.out.println("Individual mode - WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+
+        if (totalAgents != 3) {
+          throw new AssertionError(
+              "Expected 3 agents in Redis with individual mode, got " + totalAgents);
+        }
       }
     }
   }

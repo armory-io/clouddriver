@@ -30,8 +30,8 @@ import org.springframework.stereotype.Component;
 public class PrioritySchedulerProperties {
 
   /**
-   * How often the scheduler runs to check for ready agents (milliseconds). Lower values provide
-   * faster response but increase CPU usage.
+   * How often the scheduler runs to check for ready agents (milliseconds). Controls the frequency
+   * of the main scheduling loop.
    */
   private long intervalMs = 1000L;
 
@@ -48,9 +48,9 @@ public class PrioritySchedulerProperties {
   private OrphanCleanupProperties orphanCleanup = new OrphanCleanupProperties();
 
   /**
-   * Enable batch operations for improved performance. When enabled, the scheduler will attempt to
-   * acquire and process multiple agents in single Redis operations instead of processing them
-   * individually.
+   * Enable batch operations for Redis operations. When enabled, the scheduler will group agent
+   * operations together in batches rather than processing them individually. This affects how
+   * agents are acquired and scheduled.
    */
   private boolean batchOperationsEnabled = false;
 

@@ -420,7 +420,14 @@ class BatchScoringIntegrationTest {
       schedulerProperties.setBatchOperationsEnabled(true);
       acquisitionService.saturatePool(0L, runningAgents, executorService);
 
+      // Wait for agent executions to complete
       Thread.sleep(100);
+
+      // Process completion queue with another scheduler cycle
+      // This is required for our connection optimization where completions
+      // are queued and processed in the next cycle
+      System.out.println("Processing completions in batch scoring test...");
+      acquisitionService.saturatePool(1L, runningAgents, executorService);
 
       try (var jedis = jedisPool.getResource()) {
         Double workingScore = jedis.zscore("WORKZ", "WorkingAgent");

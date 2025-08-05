@@ -61,7 +61,7 @@ public class ZombieCleanupService {
   private final AtomicLong zombiesCleanedUp = new AtomicLong(0);
   private volatile long lastZombieCleanup = 0;
 
-  // Compiled pattern for exceptional agents (cached for performance)
+  // Compiled regex pattern for exceptional agents
   private volatile Pattern exceptionalAgentsPattern;
 
   /**
@@ -149,9 +149,9 @@ public class ZombieCleanupService {
    * Cleans up zombie agents on the local instance based on execution duration.
    *
    * <p>Zombie agents are those that have been running for too long on this Clouddriver instance.
-   * This can happen due to rate limiting, excessive processing time, or other performance issues.
-   * Unlike orphaned agents (which have no running instance), zombies are still executing but have
-   * exceeded their expected runtime.
+   * This can happen due to rate limiting, execution timeouts, or other interruptions in agent
+   * processing. Unlike orphaned agents (which have no running instance), zombies are still
+   * executing but have exceeded their expected runtime.
    *
    * <p>This cleanup mechanism is important for preventing resource exhaustion on the local
    * instance. It works by checking the local activeAgents map for agents that have exceeded their

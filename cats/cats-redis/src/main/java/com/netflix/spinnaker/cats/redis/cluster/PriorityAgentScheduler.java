@@ -55,7 +55,7 @@ import redis.clients.jedis.JedisPool;
  *   <li><strong>Agent-Specific Timeouts:</strong> Each agent type gets appropriate timeout handling
  * </ul>
  *
- * <h2>Configuration Properties & Performance Tuning</h2>
+ * <h2>Configuration Properties</h2>
  *
  * <p><strong>Agent Configuration (redis.agent.*):</strong>
  *
@@ -68,14 +68,12 @@ import redis.clients.jedis.JedisPool;
  * </pre>
  *
  * <ul>
- *   <li><strong>enabledPattern:</strong> Regex for agent inclusion. Performance impact: O(k) regex
- *       evaluation per agent where k=pattern complexity. Use simple patterns for better
- *       performance.
- *   <li><strong>disabledPattern:</strong> Regex for agent exclusion (takes precedence). Same
- *       performance characteristics as enabledPattern. Empty string disables pattern matching.
- *   <li><strong>maxConcurrentAgents:</strong> Instance-wide semaphore limit. Prevents resource
- *       exhaustion. Increase for powerful instances (500-1000+), decrease for constrained
- *       environments (50-100). Affects memory usage and Redis connection pool pressure.
+ *   <li><strong>enabledPattern:</strong> Regex for agent inclusion. Controls which agents are
+ *       enabled for this scheduler instance.
+ *   <li><strong>disabledPattern:</strong> Regex for agent exclusion (takes precedence over
+ *       enabledPattern). Empty string disables pattern matching.
+ *   <li><strong>maxConcurrentAgents:</strong> Instance-wide semaphore limit for concurrent agent
+ *       executions. Controls resource utilization across the system.
  * </ul>
  *
  * <p><strong>Scheduler Configuration (redis.scheduler.*):</strong>
@@ -90,17 +88,14 @@ import redis.clients.jedis.JedisPool;
  * </pre>
  *
  * <ul>
- *   <li><strong>intervalMs:</strong> Main scheduling loop frequency. Lower values = faster agent
- *       pickup but higher CPU/Redis load. Minimum recommended: 500ms. Optimal range: 1000-2000ms.
- *       High-load deployments can use 500ms with adequate resources.
+ *   <li><strong>intervalMs:</strong> Main scheduling loop frequency. Controls how often the
+ *       scheduler checks for and acquires ready agents.
  *   <li><strong>refreshPeriodSeconds:</strong> How often agents are synchronized from Spring
- *       context to Redis. Lower values = faster discovery of new agents but more Redis write
- *       operations. Scale with agent count: 1000+ agents use 15-20s, <100 agents can use 60s.
- *   <li><strong>batchOperationsEnabled:</strong> Groups multiple Redis operations for efficiency.
- *       Significant performance improvement for 200+ agents. Increases complexity but reduces
- *       network round-trips by 60-80%.
- *   <li><strong>timeCacheDurationMs:</strong> Caches Redis TIME command results to reduce calls.
- *       Higher values reduce Redis load but may cause timestamp drift. Range: 5000-30000ms.
+ *       context to Redis. Controls the frequency of agent registration updates.
+ *   <li><strong>batchOperationsEnabled:</strong> Groups multiple Redis operations into batches.
+ *       Controls whether operations like agent acquisition use batch mode.
+ *   <li><strong>timeCacheDurationMs:</strong> Duration to cache Redis TIME command results.
+ *       Controls how frequently the scheduler refreshes its time synchronization.
  * </ul>
  *
  * <p><strong>Zombie Cleanup Configuration (redis.scheduler.zombieCleanup.*):</strong>
@@ -121,13 +116,12 @@ import redis.clients.jedis.JedisPool;
  * <ul>
  *   <li><strong>enabled:</strong> Master switch for zombie detection. Disable only for debugging.
  *   <li><strong>thresholdMs:</strong> Additional time buffer beyond agent completion deadline
- *       before considering an agent zombie. Zombies are agents that have exceeded their specific
- *       timeout + this buffer. Typical: 30-60 seconds for operational safety (Redis delays, clock
- *       skew). Too low kills valid agents, too high allows resource leaks.
- *   <li><strong>intervalMs:</strong> Zombie scan frequency. Should be frequent enough to prevent
- *       accumulation but not cause excessive load. Recommended: 2-5 minutes.
- *   <li><strong>batchSize:</strong> Zombies processed per cleanup cycle. Higher values = fewer
- *       Redis round-trips but larger memory usage. Optimal: 25-100 based on typical zombie count.
+ *       before considering an agent zombie. Defines how long to wait after an agent exceeds its
+ *       timeout before marking it as a zombie.
+ *   <li><strong>intervalMs:</strong> Zombie scan frequency. Controls how often the system checks
+ *       for and cleans up zombie agents.
+ *   <li><strong>batchSize:</strong> Number of zombies processed per cleanup cycle. Controls how
+ *       many zombie agents can be cleaned up in a single operation.
  *   <li><strong>exceptionalAgents:</strong> Configuration for exceptional agents that require
  *       different zombie thresholds.
  *   <li><strong>pattern:</strong> Regex pattern for agent names.
@@ -150,20 +144,20 @@ import redis.clients.jedis.JedisPool;
  * </pre>
  *
  * <ul>
- *   <li><strong>enabled:</strong> Controls cleanup of agents from crashed instances. Essential for
- *       preventing Redis memory bloat in multi-instance deployments.
- *   <li><strong>thresholdMs:</strong> Time buffer for orphan detection with context-aware logic.
- *       WORKZ orphans: agents past completion deadline + buffer. WAITZ orphans: agents with
- *       execution times older than current time - buffer. Accounts for network partitions and Redis
- *       latency. Typical: 5-10 minutes.
- *   <li><strong>intervalMs:</strong> Cleanup frequency. More frequent = cleaner Redis but higher
- *       overhead. Less frequent = potential memory bloat but lower load. Optimal: 5-10 minutes.
- *   <li><strong>batchSize:</strong> Orphans processed per cycle. Scale with typical orphan count
- *       after instance failures.
+ *   <li><strong>enabled:</strong> Controls cleanup of agents from crashed instances. Manages the
+ *       removal of agents left behind by pods that no longer exist.
+ *   <li><strong>thresholdMs:</strong> Time buffer for orphan detection. Defines how long to wait
+ *       before considering an agent as orphaned. Different logic applies for agents in the WORKZ vs
+ *       WAITZ sets: - WORKZ orphans: agents past completion deadline + buffer. - WAITZ orphans:
+ *       agents with execution times older than current time - buffer.
+ *   <li><strong>intervalMs:</strong> Orphan cleanup frequency. Controls how often the system checks
+ *       for and removes orphaned agents.
+ *   <li><strong>batchSize:</strong> Number of orphans processed per cleanup cycle. Controls how
+ *       many orphaned agents can be cleaned up in a single operation.
  *   <li><strong>leadershipTtlMs:</strong> Duration of cleanup leadership lock. Prevents multiple
- *       instances from cleaning simultaneously. Should be 2-3x intervalMs.
- *   <li><strong>forceAllPods:</strong> If true, all instances clean (no leadership). Use only for
- *       small deployments or troubleshooting.
+ *       instances from cleaning simultaneously.
+ *   <li><strong>forceAllPods:</strong> If true, all instances perform cleanup without leadership
+ *       coordination.
  * </ul>
  *
  * <p><strong>Thread Pool Configuration (redis.scheduler.pool.*):</strong>
@@ -178,12 +172,12 @@ import redis.clients.jedis.JedisPool;
  * </pre>
  *
  * <ul>
- *   <li><strong>coreSize:</strong> Always-active threads for agent execution. Scale with
- *       steady-state agent load. Too low = queuing delays, too high = wasted resources.
- *   <li><strong>maxSize:</strong> Maximum threads under peak load. Should handle burst capacity.
- *       Monitor thread pool metrics to optimize. Typical ratio: maxSize = 3-5x coreSize.
- *   <li><strong>keepAliveSeconds:</strong> Idle thread timeout. Higher values = less thread churn
- *       but more memory usage. Lower values = more responsive to load changes.
+ *   <li><strong>coreSize:</strong> Base number of threads for agent execution. Controls the number
+ *       of always-available threads in the pool.
+ *   <li><strong>maxSize:</strong> Maximum number of threads the pool can grow to. Controls the
+ *       upper limit of concurrent agent executions.
+ *   <li><strong>keepAliveSeconds:</strong> Idle thread timeout. Controls how long non-core threads
+ *       remain in the pool when idle.
  * </ul>
  */
 @Component

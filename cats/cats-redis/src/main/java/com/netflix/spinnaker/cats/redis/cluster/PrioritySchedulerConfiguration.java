@@ -41,8 +41,8 @@ import org.springframework.stereotype.Component;
  *   <li>Runtime configuration access
  * </ul>
  *
- * <p>All configuration is cached via Spring Boot @ConfigurationProperties for high performance,
- * eliminating the need for dynamic configuration lookups during runtime.
+ * <p>All configuration is cached via Spring Boot @ConfigurationProperties, which allows consistent
+ * access to configuration values during runtime.
  */
 @Component
 public class PrioritySchedulerConfiguration {

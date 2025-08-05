@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
@@ -93,7 +94,7 @@ public class AgentAcquisitionService {
   private final AtomicLong agentsExecuted = new AtomicLong(0);
   private final AtomicLong agentsFailed = new AtomicLong(0);
 
-  // Performance optimization: Reusable collections to reduce GC pressure in high-load scenarios.
+  // Reusable collections to reduce GC pressure in high-load scenarios.
   // ThreadLocal is safe here because saturatePool() runs in single-threaded scheduler executor.
   // This avoids creating new HashSet instances on every scheduler cycle (every 1-2 seconds).
   private static final ThreadLocal<Set<AgentWorker>> REUSABLE_WORKERS_SET =
@@ -110,6 +111,25 @@ public class AgentAcquisitionService {
 
   // Track initial registration completion to prevent premature orphan cleanup
   private final AtomicBoolean initialRegistrationComplete = new AtomicBoolean(false);
+
+  // Queue agent completions for batch processing
+  private final ConcurrentLinkedQueue<AgentCompletion> completionQueue =
+      new ConcurrentLinkedQueue<>();
+
+  /** Represents an agent completion waiting to be processed in the next scheduler cycle. */
+  private static class AgentCompletion {
+    final Agent agent;
+    final String acquireScore;
+    final boolean success;
+    final long timestamp;
+
+    AgentCompletion(Agent agent, String acquireScore, boolean success) {
+      this.agent = agent;
+      this.acquireScore = acquireScore;
+      this.success = success;
+      this.timestamp = System.currentTimeMillis();
+    }
+  }
 
   public AgentAcquisitionService(
       JedisPool jedisPool,
@@ -162,16 +182,19 @@ public class AgentAcquisitionService {
         return 0;
       }
 
-      // PHASE 1: Agent Repopulation (Redis Recovery, periodic)
+      // PHASE 1: Process queued agent completions
+      processQueuedCompletions(jedis);
+
+      // PHASE 2: Agent Repopulation (Redis Recovery, periodic)
       if (runCount % redisRefreshPeriod == 0) {
         repopulateRedisAgents(jedis);
-        // Mark initial registration as complete after first Redis repopulation
+        // Mark initial registration as complete AFTER first repopulation to ensure Redis is seeded
         if (!initialRegistrationComplete.get()) {
           markInitialRegistrationComplete();
         }
       }
 
-      // PHASE 2: Find ready agents in priority order
+      // PHASE 3: Find ready agents in priority order
       String currentScore = score(jedis, 0L);
       Set<String> readyAgents = jedis.zrangeByScore(WAITING_SET, "-inf", currentScore);
 
@@ -183,8 +206,8 @@ public class AgentAcquisitionService {
         return 0;
       }
 
-      // PHASE 3: Agent Acquisition and Execution
-      // Performance optimization: Reusing thread-local collection to reduce GC pressure
+      // PHASE 4: Agent Acquisition and Execution
+      // Reusing thread-local collection to avoid memory allocations
       Set<AgentWorker> workersToSubmit = REUSABLE_WORKERS_SET.get();
       workersToSubmit.clear(); // Clear any previous contents
       int agentsAcquiredThisCycle = 0;
@@ -232,7 +255,7 @@ public class AgentAcquisitionService {
                 jedis, readyAgents, availableSlotsForNewAgents, runningAgents, workersToSubmit);
       }
 
-      // PHASE 3.5: Instant retry on zero acquisition (optimization for high-contention scenarios)
+      // PHASE 4.5: Instant retry on zero acquisition to handle concurrency conditions
       if (agentsAcquiredThisCycle == 0
           && !readyAgents.isEmpty()
           && schedulerProperties.isBatchOperationsEnabled()) {
@@ -280,13 +303,20 @@ public class AgentAcquisitionService {
         }
       }
 
-      // PHASE 4: Submit all acquired agents for execution
-      for (AgentWorker worker : workersToSubmit) {
-        // CRITICAL: Set semaphore before execution so it can be released when done
-        worker.setRunningAgents(runningAgents);
-        java.util.concurrent.Future<?> future = agentWorkPool.submit(worker);
-        activeAgentsFutures.put(worker.getAgent().getAgentType(), future);
-        log.debug("Submitted agent {} for execution", worker.getAgent().getAgentType());
+      // PHASE 5: Submit all acquired agents for execution
+      try {
+        for (AgentWorker worker : workersToSubmit) {
+          // CRITICAL: Set semaphore before execution so it can be released when done
+          worker.setRunningAgents(runningAgents);
+          java.util.concurrent.Future<?> future = agentWorkPool.submit(worker);
+          activeAgentsFutures.put(worker.getAgent().getAgentType(), future);
+          log.debug("Submitted agent {} for execution", worker.getAgent().getAgentType());
+        }
+      } catch (Exception e) {
+        log.error(
+            "Error submitting agents for execution, but returning acquisition count anyway", e);
+        // Don't return 0 here - agents were successfully acquired from Redis
+        // The submission error is a separate issue and shouldn't affect the acquisition count
       }
 
       log.debug(
@@ -296,7 +326,7 @@ public class AgentAcquisitionService {
       return agentsAcquiredThisCycle;
 
     } catch (Exception e) {
-      log.error("Error during agent acquisition", e);
+      log.error("Error during agent acquisition cycle", e);
       return 0;
     }
   }
@@ -549,8 +579,8 @@ public class AgentAcquisitionService {
    * Register an agent for scheduling.
    *
    * @param agent The agent to register
-   * @param agentExecution Agent execution callback
-   * @param executionInstrumentation Metrics instrumentation
+   * @param agentExecution The execution wrapper for the agent
+   * @param executionInstrumentation Instrumentation for tracking agent execution
    */
   public void registerAgent(
       Agent agent,
@@ -583,7 +613,8 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Unregister an agent from scheduling.
+   * Unregisters an agent from the scheduler. This removes the agent from local tracking and
+   * prevents it from being scheduled for execution.
    *
    * @param agent The agent to unregister
    */
@@ -600,9 +631,10 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Remove an agent from active tracking (called when agent execution completes).
+   * Removes an agent from active tracking. Called when an agent execution completes or is
+   * interrupted.
    *
-   * @param agentType The agent type to remove
+   * @param agentType The type identifier of the agent to remove
    */
   public void removeActiveAgent(String agentType) {
     // CRITICAL: Capture removed value to ensure atomic consistency between map and counter
@@ -706,7 +738,13 @@ public class AgentAcquisitionService {
     return activeAgentsFutures.size();
   }
 
-  /** Get agent by type from registered agents (needed for graceful shutdown). */
+  /**
+   * Retrieves an agent by its type identifier from the registered agents map. Used during graceful
+   * shutdown to properly re-queue active agents.
+   *
+   * @param agentType The type identifier of the agent to retrieve
+   * @return The agent if found, null otherwise
+   */
   public Agent getAgentByType(String agentType) {
     AgentWorker worker = agents.get(agentType);
     return worker != null ? worker.getAgent() : null;
@@ -842,7 +880,7 @@ public class AgentAcquisitionService {
     }
 
     try {
-      // Get current Redis state efficiently
+      // Get current Redis state from both sets
       Set<String> redisAgents = getCurrentRedisAgents(jedis);
       Set<String> localAgents = agents.keySet();
 
@@ -869,9 +907,18 @@ public class AgentAcquisitionService {
     }
   }
 
-  /** Get all agent names currently in Redis (both WORKING and WAITING sets). */
+  /**
+   * Gets all agent names currently in both Redis sets (WORKZ and WAITZ) using pipelining. This
+   * method retrieves all agents from both Redis sorted sets in a single operation.
+   *
+   * @param jedis Redis connection to use
+   * @return Set containing all agent names from both Redis sets
+   */
   private Set<String> getCurrentRedisAgents(Jedis jedis) {
     Pipeline pipeline = jedis.pipelined();
+    // Using zrange(0, -1) to get all members by index position rather than by score range
+    // This is equivalent to zrangeByScore("-inf", "+inf") but more direct when we need all elements
+    // regardless of score value
     Response<Set<String>> waitingAgents = pipeline.zrange(WAITING_SET, 0, -1);
     Response<Set<String>> workingAgents = pipeline.zrange(WORKING_SET, 0, -1);
     pipeline.sync();
@@ -881,7 +928,14 @@ public class AgentAcquisitionService {
     return allAgents;
   }
 
-  /** Add missing agents to Redis with appropriate scores. */
+  /**
+   * Adds missing agents to Redis with appropriate scores. Delegates to either batch or individual
+   * processing based on configuration. This is a critical component of the differential update
+   * system that only adds agents not already present in Redis.
+   *
+   * @param jedis Redis connection to use
+   * @param agentsToAdd Set of agent types to add to Redis
+   */
   private void addMissingAgents(Jedis jedis, Set<String> agentsToAdd) {
     if (schedulerProperties.isBatchOperationsEnabled() && agentsToAdd.size() > 1) {
       addMissingAgentsBatch(jedis, agentsToAdd);
@@ -918,6 +972,12 @@ public class AgentAcquisitionService {
     }
   }
 
+  /**
+   * Add missing agents to Redis one by one.
+   *
+   * @param jedis Jedis connection to Redis
+   * @param agentsToAdd Set of agent types to add
+   */
   private void addMissingAgentsIndividual(Jedis jedis, Set<String> agentsToAdd) {
     int added = 0;
     for (String agentType : agentsToAdd) {
@@ -941,7 +1001,11 @@ public class AgentAcquisitionService {
     log.debug("Individual added {} missing agents to Redis", added);
   }
 
-  /** Fallback to full repopulation logic if smart sync fails. */
+  /**
+   * Fallback to full repopulation logic if smart sync fails.
+   *
+   * @param jedis Jedis connection to Redis
+   */
   private void repopulateRedisAgentsFallback(Jedis jedis) {
     int totalAgents = agents.size();
     log.debug("Fallback: Full repopulation of {} agents", totalAgents);
@@ -950,7 +1014,7 @@ public class AgentAcquisitionService {
       // Use batch scoring if enabled and we have multiple agents
       Map<String, String> agentScores;
       if (schedulerProperties.isBatchOperationsEnabled() && totalAgents > 1) {
-        // OPTIMIZATION: Single Redis call instead of 2 * totalAgents calls
+        // Batch scoring for multiple agents
         agentScores = batchAgentScore(jedis, agents.values());
         log.debug("Batch scored {} agents", agentScores.size());
       } else {
@@ -1000,7 +1064,7 @@ public class AgentAcquisitionService {
                 batchArgs.size() / 2,
                 e.getMessage());
 
-            // Fallback: Use pipeline with individual ADD_AGENT script for performance
+            // Fallback: Use pipeline with individual ADD_AGENT script
             Pipeline pipeline = jedis.pipelined();
             for (int i = 0; i < batchArgs.size(); i += 2) {
               pipeline.evalsha(
@@ -1029,7 +1093,7 @@ public class AgentAcquisitionService {
       log.error(
           "Batch repopulation failed completely, falling back to legacy mode: {}", e.getMessage());
 
-      // Complete fallback to pipeline with individual ADD_AGENT scripts (optimized for performance)
+      // Complete fallback to pipeline with individual ADD_AGENT scripts
       Pipeline pipeline = jedis.pipelined();
       for (AgentWorker worker : agents.values()) {
         String agentType = worker.getAgent().getAgentType();
@@ -1044,6 +1108,193 @@ public class AgentAcquisitionService {
       pipeline.sync(); // Execute all operations in a single network round trip
       log.debug("Pipeline fallback repopulated Redis with {} agents", totalAgents);
     }
+  }
+
+  /**
+   * Process queued agent completions using the shared Redis connection. Processes agent completions
+   * that were queued during previous execution cycles.
+   */
+  private void processQueuedCompletions(Jedis jedis) {
+    // Skip processing during startup to avoid handling stale completions
+    if (!initialRegistrationComplete.get()) {
+      // Do not process the queue yet – we are still in startup phase and Redis may not contain all
+      // registered agents. Keep the completions buffered until after the first repopulation when
+      // markInitialRegistrationComplete() is invoked.
+      return;
+    }
+
+    List<AgentCompletion> completions = drainCompletionQueue();
+    if (completions.isEmpty()) {
+      return;
+    }
+
+    log.debug("Processing {} queued agent completions", completions.size());
+
+    // Group completions by scheduling offset for batch efficiency
+    Map<Long, List<AgentCompletion>> groupedCompletions =
+        completions.stream().collect(Collectors.groupingBy(this::getSchedulingOffset));
+
+    int totalProcessed = 0;
+    // Process each group with shared connection
+    for (Map.Entry<Long, List<AgentCompletion>> entry : groupedCompletions.entrySet()) {
+      long offset = entry.getKey();
+      List<AgentCompletion> group = entry.getValue();
+
+      if (schedulerProperties.isBatchOperationsEnabled() && group.size() > 1) {
+        totalProcessed += batchScheduleCompletions(jedis, group, offset);
+      } else {
+        totalProcessed += individualScheduleCompletions(jedis, group, offset);
+      }
+    }
+
+    log.debug("Processed {} agent completions with shared connection", totalProcessed);
+  }
+
+  /**
+   * Drain the completion queue in a thread-safe manner. Extracts all agent completions from the
+   * queue for processing.
+   */
+  private List<AgentCompletion> drainCompletionQueue() {
+    List<AgentCompletion> completions = new ArrayList<>();
+    int queueSize = completionQueue.size();
+    log.debug("Draining completion queue, current size: {}", queueSize);
+
+    AgentCompletion completion;
+    while ((completion = completionQueue.poll()) != null) {
+      log.debug(
+          "Drained completion for agent: {} (success={})",
+          completion.agent.getAgentType(),
+          completion.success);
+      completions.add(completion);
+    }
+
+    log.debug("Drained {} completions from queue", completions.size());
+    return completions;
+  }
+
+  /**
+   * Calculate scheduling offset based on completion success and shutdown state. Maintains the same
+   * logic as the original conditionalReleaseAgent method.
+   */
+  private long getSchedulingOffset(AgentCompletion completion) {
+    // Failed executions get immediate retry
+    if (!completion.success) {
+      return 0L;
+    }
+
+    // Compute next schedule based on original acquire score when possible to preserve cadence.
+    try {
+      AgentIntervalProvider.Interval interval = intervalProvider.getInterval(completion.agent);
+      long intervalMs = interval.getInterval();
+
+      // If acquireScore is available, attempt to keep consistent cadence relative to the original
+      // acquisition time. The acquireScore stored on completion represents the completion deadline
+      // (acquireTime + timeout) in seconds. We approximate the original acquisition moment by
+      // subtracting the timeout from this score, then add the normal interval to get the ideal next
+      // execution time. If any part of this calculation fails, we simply fall back to intervalMs.
+      if (completion.acquireScore != null) {
+        try {
+          long acquireScoreSeconds = Long.parseLong(completion.acquireScore);
+          long agentTimeoutMs = interval.getTimeout();
+          long originalAcquireMs = (acquireScoreSeconds * 1000L) - agentTimeoutMs;
+          long desiredNextRunMs = originalAcquireMs + intervalMs;
+          long nowMs = System.currentTimeMillis();
+          long offsetMs = desiredNextRunMs - nowMs;
+          return Math.max(offsetMs, 0L);
+        } catch (NumberFormatException ignored) {
+          // Fall through to simple interval scheduling when parsing fails
+        }
+      }
+
+      // Fallback – schedule for intervalMs from now
+      return intervalMs;
+    } catch (Exception e) {
+      log.warn(
+          "Failed to calculate scheduling offset for agent {}, using immediate scheduling",
+          completion.agent.getAgentType(),
+          e);
+      return 0L;
+    }
+  }
+
+  /**
+   * Batch schedule multiple completions with the same offset using batch Redis operations. This
+   * method is called by processQueuedCompletions after grouping completions by their scheduling
+   * offset. It uses the ADD_AGENTS Lua script for efficient multi-agent scheduling.
+   *
+   * @param jedis Redis connection to use for operations
+   * @param completions List of agent completions with the same offset to schedule
+   * @param offset Time offset in milliseconds for agent scheduling
+   * @return Number of agents successfully scheduled
+   */
+  private int batchScheduleCompletions(
+      Jedis jedis, List<AgentCompletion> completions, long offset) {
+    try {
+      List<String> batchArgs = new ArrayList<>();
+      for (AgentCompletion completion : completions) {
+        batchArgs.add(completion.agent.getAgentType());
+        batchArgs.add(score(jedis, offset));
+      }
+
+      @SuppressWarnings("unchecked")
+      List<Object> result =
+          (List<Object>)
+              jedis.evalsha(
+                  scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
+                  Arrays.asList(WORKING_SET, WAITING_SET),
+                  batchArgs);
+
+      int scheduled = result.size() >= 1 ? ((Long) result.get(0)).intValue() : 0;
+      log.debug("Batch scheduled {} completions with offset {}ms", scheduled, offset);
+      return scheduled;
+
+    } catch (Exception e) {
+      log.warn("Batch completion scheduling failed, using individual mode: {}", e.getMessage());
+      return individualScheduleCompletions(jedis, completions, offset);
+    }
+  }
+
+  /**
+   * Schedule completions individually for agents with the same time offset. Used as a fallback when
+   * batch operations fail or when processing small groups of agents. Schedules each agent
+   * separately using the ADD_AGENT Lua script.
+   *
+   * @param jedis Redis connection to use for operations
+   * @param completions List of agent completions with the same offset to schedule
+   * @param offset Time offset in milliseconds for agent scheduling
+   * @return Number of agents successfully scheduled
+   */
+  private int individualScheduleCompletions(
+      Jedis jedis, List<AgentCompletion> completions, long offset) {
+    int scheduled = 0;
+    String offsetScore = score(jedis, offset); // Calculate once for all agents with same offset
+
+    for (AgentCompletion completion : completions) {
+      try {
+        Object result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
+                Arrays.asList(WORKING_SET, WAITING_SET),
+                Arrays.asList(completion.agent.getAgentType(), offsetScore));
+
+        if (result != null && ((Long) result).intValue() == 1) {
+          scheduled++;
+        }
+
+        log.debug(
+            "Scheduled completion for agent {} with offset {}ms",
+            completion.agent.getAgentType(),
+            offset);
+
+      } catch (Exception e) {
+        log.warn(
+            "Failed to schedule completion for agent {}: {}",
+            completion.agent.getAgentType(),
+            e.getMessage());
+      }
+    }
+
+    return scheduled;
   }
 
   /**
@@ -1330,27 +1581,33 @@ public class AgentAcquisitionService {
     String agentType = agent.getAgentType();
 
     try {
-      // During shutdown, always re-queue agents immediately regardless of success status
-      // This ensures agents don't get lost during deployments/restarts
+      // During shutdown, immediately schedule (bypass queue for urgent shutdown handling)
       if (shuttingDown.get()) {
-        log.debug("Re-queuing agent {} due to shutdown in progress", agentType);
+        log.debug("Immediate re-queuing agent {} due to shutdown in progress", agentType);
         scheduleAgentInRedis(agent, 0L); // Schedule for immediate pickup after restart
         return;
       }
 
-      // If execution failed, re-queue the agent for immediate retry
-      if (!success) {
-        log.debug("Re-queuing agent {} due to execution failure", agentType);
-        scheduleAgentInRedis(agent, 0L); // Schedule for immediate retry
-      } else {
-        // Successful execution - schedule for next interval
-        AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
-        long nextRunOffset = interval.getInterval();
-        log.debug("Scheduling agent {} for next execution in {}ms", agentType, nextRunOffset);
-        scheduleAgentInRedis(agent, nextRunOffset);
-      }
+      // Queue completion for batch processing in next scheduler cycle
+      completionQueue.offer(new AgentCompletion(agent, acquireScore, success));
+      log.debug("Queued completion for agent {}: success={}", agentType, success);
+
     } catch (Exception e) {
-      log.error("Failed to conditionally release agent {}", agentType, e);
+      log.error(
+          "Failed to queue agent completion for {}, falling back to immediate scheduling",
+          agentType,
+          e);
+      // Fallback to immediate scheduling on queue failure
+      try {
+        if (!success) {
+          scheduleAgentInRedis(agent, 0L);
+        } else {
+          AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
+          scheduleAgentInRedis(agent, interval.getInterval());
+        }
+      } catch (Exception fallbackException) {
+        log.error("Failed fallback scheduling for agent {}", agentType, fallbackException);
+      }
     }
   }
 
@@ -1419,14 +1676,82 @@ public class AgentAcquisitionService {
   public void setShuttingDown(boolean shuttingDown) {
     this.shuttingDown.set(shuttingDown);
     log.info("AgentAcquisitionService shutdown flag set to: {}", shuttingDown);
+
+    if (shuttingDown) {
+      // Drain and process all queued completions during shutdown
+      // to ensure we don't lose any agents
+      processCompletionQueueForShutdown();
+    }
   }
 
-  /** Check if shutdown is in progress. */
+  /**
+   * Drains and processes all queued completions during shutdown. Ensures pending agent completions
+   * are properly recorded in Redis.
+   */
+  private void processCompletionQueueForShutdown() {
+    int queueSize = completionQueue.size();
+    if (queueSize == 0) {
+      log.info("No queued completions to process during shutdown");
+      return;
+    }
+
+    log.info("Processing {} queued agent completions during shutdown", queueSize);
+
+    try (Jedis jedis = jedisPool.getResource()) {
+      // Process all queued completions with immediate scheduling (0ms offset)
+      List<AgentCompletion> completions = drainCompletionQueue();
+      int processed = 0;
+
+      // Process each completion immediately with 0ms offset (instant execution on restart)
+      for (AgentCompletion completion : completions) {
+        try {
+          String agentType = completion.agent.getAgentType();
+          String score = score(jedis, 0L); // Schedule for immediate execution after restart
+
+          Object result =
+              jedis.evalsha(
+                  scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
+                  Arrays.asList(WORKING_SET, WAITING_SET),
+                  Arrays.asList(agentType, score));
+
+          if (result != null && ((Long) result).intValue() == 1) {
+            processed++;
+            log.debug("Shutdown processed agent completion: {}", agentType);
+          }
+        } catch (Exception e) {
+          log.error(
+              "Failed to process agent completion during shutdown: {}",
+              completion.agent.getAgentType(),
+              e);
+        }
+      }
+
+      log.info(
+          "Successfully processed {}/{} agent completions during shutdown",
+          processed,
+          completions.size());
+    } catch (Exception e) {
+      log.error("Failed to process completion queue during shutdown", e);
+    }
+  }
+
+  /**
+   * Checks if the service is in the process of shutting down. This flag affects agent completion
+   * handling - during shutdown, agent completions are processed immediately rather than queued.
+   *
+   * @return true if shutdown is in progress, false otherwise
+   */
   public boolean isShuttingDown() {
     return shuttingDown.get();
   }
 
-  /** Set graceful shutdown flag to coordinate re-queuing during shutdown. */
+  /**
+   * Sets the graceful shutdown flag to coordinate agent re-queuing during shutdown. When enabled,
+   * active agents are moved back to the WAITZ set with immediate execution scores to ensure they
+   * run after service restart.
+   *
+   * @param gracefulShutdown true to enable graceful shutdown mode, false otherwise
+   */
   public void setGracefulShutdown(boolean gracefulShutdown) {
     this.gracefulShutdown.set(gracefulShutdown);
     log.debug("AgentAcquisitionService graceful shutdown flag set to: {}", gracefulShutdown);
@@ -1439,18 +1764,61 @@ public class AgentAcquisitionService {
   public void markInitialRegistrationComplete() {
     if (initialRegistrationComplete.compareAndSet(false, true)) {
       log.info("Initial agent registration completed");
+      // Now that registration is complete, perform startup consistency check
+      performStartupConsistencyCheck();
     }
   }
 
   /**
-   * Check if initial agent registration is complete. Used by orphan cleanup to avoid false
-   * positives during startup.
+   * Performs a startup consistency check to ensure all agents are properly registered in Redis.
+   * Verifies that all local agents are synchronized to the Redis state.
+   */
+  private void performStartupConsistencyCheck() {
+    log.info("Performing startup consistency check for agent reliability");
+
+    try (Jedis jedis = jedisPool.getResource()) {
+      // Get current Redis state from both sets
+      Set<String> redisAgents = getCurrentRedisAgents(jedis);
+      Set<String> localAgents = agents.keySet();
+
+      // Calculate what needs to be added (missing agents)
+      Set<String> toAdd =
+          localAgents.stream()
+              .filter(agent -> !redisAgents.contains(agent))
+              .collect(Collectors.toSet());
+
+      if (toAdd.isEmpty()) {
+        log.info("Startup consistency check: All agents properly registered in Redis");
+      } else {
+        log.warn(
+            "Startup consistency check: Found {} agents missing from Redis, adding now",
+            toAdd.size());
+        // Add missing agents with immediate execution to ensure they run soon
+        addMissingAgents(jedis, toAdd);
+      }
+    } catch (Exception e) {
+      log.error("Error during startup consistency check", e);
+    }
+  }
+
+  /**
+   * Checks if the initial agent registration is complete. This flag controls the startup lifecycle
+   * and prevents processing of agent completions until all agents have been registered in Redis.
+   * It's also used by orphan cleanup to avoid false positives during startup.
+   *
+   * @return true if initial registration is complete, false otherwise
    */
   public boolean isInitialRegistrationComplete() {
     return initialRegistrationComplete.get();
   }
 
-  /** Check if graceful shutdown is in progress. */
+  /**
+   * Checks if graceful shutdown is in progress. This flag affects agent handling during shutdown -
+   * graceful shutdown attempts to re-queue in-progress agents back to Redis for pickup after
+   * restart.
+   *
+   * @return true if graceful shutdown is in progress, false otherwise
+   */
   public boolean isGracefulShutdown() {
     return gracefulShutdown.get();
   }

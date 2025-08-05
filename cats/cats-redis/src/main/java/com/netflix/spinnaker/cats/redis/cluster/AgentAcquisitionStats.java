@@ -19,8 +19,7 @@ package com.netflix.spinnaker.cats.redis.cluster;
 /**
  * Advanced statistics for agent acquisition and execution tracking.
  *
- * <p>Provides detailed metrics for operational monitoring and performance analysis of the agent
- * scheduling system.
+ * <p>Provides detailed metrics for operational monitoring of the agent scheduling system.
  */
 public class AgentAcquisitionStats {
   private final long registeredAgents;
