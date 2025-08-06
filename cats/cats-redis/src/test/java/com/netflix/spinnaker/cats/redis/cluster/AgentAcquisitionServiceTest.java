@@ -427,12 +427,17 @@ class AgentAcquisitionServiceTest {
       ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
 
       acquisitionService.registerAgent(agent, execution, instrumentation);
-      // Note: Not adding agent to Redis
+      // Simulate agent missing in Redis by clearing WAITZ/WORKZ sets after registration
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zrem("WAITZ", "missing-agent");
+        jedis.zrem("WORKZ", "missing-agent");
+      }
 
       // When
       int acquired = acquisitionService.saturatePool(1L, null, executorService);
 
-      // Then
+      // Then – service should not crash and should acquire zero agents because the entry truly is
+      // missing
       assertThat(acquired).isEqualTo(0);
     }
   }

@@ -109,9 +109,6 @@ public class AgentAcquisitionService {
   private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
   private final AtomicBoolean gracefulShutdown = new AtomicBoolean(false);
 
-  // Track initial registration completion to prevent premature orphan cleanup
-  private final AtomicBoolean initialRegistrationComplete = new AtomicBoolean(false);
-
   // Queue agent completions for batch processing
   private final ConcurrentLinkedQueue<AgentCompletion> completionQueue =
       new ConcurrentLinkedQueue<>();
@@ -188,10 +185,6 @@ public class AgentAcquisitionService {
       // PHASE 2: Agent Repopulation (Redis Recovery, periodic)
       if (runCount % redisRefreshPeriod == 0) {
         repopulateRedisAgents(jedis);
-        // Mark initial registration as complete AFTER first repopulation to ensure Redis is seeded
-        if (!initialRegistrationComplete.get()) {
-          markInitialRegistrationComplete();
-        }
       }
 
       // PHASE 3: Find ready agents in priority order
@@ -610,6 +603,21 @@ public class AgentAcquisitionService {
         interval.getTimeout() / 1000,
         initialScore,
         agents.size());
+
+    // Persist the agent into Redis immediately with its first-run score so that it is visible
+    // cluster-wide even before the first repopulation cycle. This write is idempotent because the
+    // ADD_AGENT Lua script uses NX semantics when the agent already exists.
+    try {
+      // Schedule for immediate execution on initial registration to preserve legacy behavior and
+      // ensure new agents are picked up in the very first acquisition cycle. The regular interval
+      // will be applied after the first successful execution when the agent is re-queued.
+      scheduleAgentInRedis(agent, 0L);
+    } catch (Exception e) {
+      log.warn(
+          "Failed to write initial Redis entry for agent {} – will rely on repopulation: {}",
+          agent.getAgentType(),
+          e.getMessage());
+    }
   }
 
   /**
@@ -1115,14 +1123,6 @@ public class AgentAcquisitionService {
    * that were queued during previous execution cycles.
    */
   private void processQueuedCompletions(Jedis jedis) {
-    // Skip processing during startup to avoid handling stale completions
-    if (!initialRegistrationComplete.get()) {
-      // Do not process the queue yet – we are still in startup phase and Redis may not contain all
-      // registered agents. Keep the completions buffered until after the first repopulation when
-      // markInitialRegistrationComplete() is invoked.
-      return;
-    }
-
     List<AgentCompletion> completions = drainCompletionQueue();
     if (completions.isEmpty()) {
       return;
@@ -1758,18 +1758,6 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Mark that initial agent registration is complete. This prevents orphan cleanup from running
-   * prematurely during startup before all agents are registered.
-   */
-  public void markInitialRegistrationComplete() {
-    if (initialRegistrationComplete.compareAndSet(false, true)) {
-      log.info("Initial agent registration completed");
-      // Now that registration is complete, perform startup consistency check
-      performStartupConsistencyCheck();
-    }
-  }
-
-  /**
    * Performs a startup consistency check to ensure all agents are properly registered in Redis.
    * Verifies that all local agents are synchronized to the Redis state.
    */
@@ -1799,17 +1787,6 @@ public class AgentAcquisitionService {
     } catch (Exception e) {
       log.error("Error during startup consistency check", e);
     }
-  }
-
-  /**
-   * Checks if the initial agent registration is complete. This flag controls the startup lifecycle
-   * and prevents processing of agent completions until all agents have been registered in Redis.
-   * It's also used by orphan cleanup to avoid false positives during startup.
-   *
-   * @return true if initial registration is complete, false otherwise
-   */
-  public boolean isInitialRegistrationComplete() {
-    return initialRegistrationComplete.get();
   }
 
   /**
