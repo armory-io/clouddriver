@@ -351,10 +351,11 @@ public class OrphanCleanupService {
       // Script verifies agent score hasn't changed (prevents race conditions)
       // and removes only agents that are still orphaned at the same timestamp
       Object result =
-          jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL),
-              java.util.Collections.singletonList(setName), // Redis set key (WORKZ/WAITZ)
-              batchArgs); // Flattened [name, score, name, score, ...] arguments
+          scriptManager.evalshaWithSelfHeal(
+              jedis,
+              RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+              java.util.Collections.singletonList(setName),
+              batchArgs);
 
       // Parse Lua script response: [numRemoved, [removedAgent1, removedAgent2, ...]]
       // Script returns both count and list for verification and logging
@@ -509,14 +510,11 @@ public class OrphanCleanupService {
             // immediate rescheduling
             String newScore = score(jedis, 0L); // Schedule for immediate execution
             Object result =
-                jedis.evalsha(
-                    scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.MOVE_AGENTS_CONDITIONAL,
                     java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                    java.util.Arrays.asList(
-                        agentName,
-                        scoreInSet, // Expected score in WORKING set (ARGV[2])
-                        newScore // New score in WAITING set (ARGV[3])
-                        ));
+                    java.util.Arrays.asList(agentName, scoreInSet, newScore));
 
             if (result != null && "swapped".equals(result)) {
               cleaned++;
@@ -537,11 +535,11 @@ public class OrphanCleanupService {
           } else {
             // For invalid agents or agents in WAITZ, completely remove them using individual script
             Object result =
-                jedis.evalsha(
-                    scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
-                    java.util.Arrays.asList(
-                        "WORKZ", "WAITZ"), // Both sets for unconditional removal
-                    java.util.Collections.singletonList(agentName)); // Only agent name needed
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.REMOVE_AGENT,
+                    java.util.Arrays.asList("WORKZ", "WAITZ"),
+                    java.util.Collections.singletonList(agentName));
 
             // REMOVE_AGENT returns 1 for success
             boolean removed = result != null && ((Long) result).intValue() == 1;
@@ -575,8 +573,9 @@ public class OrphanCleanupService {
           // WAITZ: Only remove invalid entries for this shard; preserve others regardless of age
           if (!isStillValid && belongsToThisShard) {
             Object result =
-                jedis.evalsha(
-                    scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.REMOVE_AGENT,
                     java.util.Arrays.asList("WORKZ", "WAITZ"),
                     java.util.Collections.singletonList(agentName));
             boolean removed = result != null && ((Long) result).intValue() == 1;

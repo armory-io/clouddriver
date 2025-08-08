@@ -16,6 +16,7 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -41,6 +42,55 @@ import redis.clients.jedis.JedisPool;
  *   <li><strong>Advanced Operations:</strong> Conditional operations and ownership validation
  *   <li><strong>System Operations:</strong> Leadership management and scoring
  * </ul>
+ *
+ * <p><strong>Script Glossary (quick reference)</strong>
+ *
+ * <p>Sets and score semantics: - WAITZ: waiting/ready agents; WORKZ: working/leased agents. -
+ * Scores are seconds-based timestamps used for scheduling and ownership (lock) semantics.
+ *
+ * <p>ADD_AGENT (addAgent) - KEYS: WORKZ, WAITZ | ARGV: agentName, score | Returns: 1 if added, 0 if
+ * present - Purpose: Idempotent single-agent enqueue; preserves single membership invariant.
+ *
+ * <p>REMOVE_AGENT (removeAgent) - KEYS: WORKZ, WAITZ | ARGV: agentName | Returns: 1 - Purpose:
+ * Unconditional removal from both sets; used by completion/zombie cleanup.
+ *
+ * <p>MOVE_AGENT (moveAgent) - KEYS: WORKZ, WAITZ | ARGV: agentName, newScore | Returns: 1 if moved,
+ * 0 otherwise - Purpose: Atomic single-agent acquisition WAITZ → WORKZ (non-batch path).
+ *
+ * <p>ADD_AGENTS (addAgents) - KEYS: WORKZ, WAITZ | ARGV: [agent1, score1, agent2, score2, ...] -
+ * Returns: [count, [addedAgents...]] - Purpose: Batched enqueue; idempotent per agent.
+ *
+ * <p>REMOVE_AGENTS (removeAgents) - KEYS: WORKZ, WAITZ | ARGV: agentName | Returns: 1 - Purpose:
+ * Unconditional removal (compatibility single-arg variant).
+ *
+ * <p>MOVE_AGENTS (moveAgents) - KEYS: WORKZ, WAITZ | ARGV: agentName, newScore | Returns: newScore
+ * or nil - Purpose: Atomic single-agent acquisition WAITZ → WORKZ (used in acquisition flows).
+ *
+ * <p>MOVE_AGENTS_CONDITIONAL (moveAgentsConditional) - KEYS: WORKZ, WAITZ | ARGV: agentName,
+ * expectedScore, newScore | Returns: 'swapped' or nil - Purpose: Ownership-verified WORKZ → WAITZ
+ * requeue (e.g., graceful shutdown).
+ *
+ * <p>VALIDATE_OWNERSHIP (validateOwnership) - KEYS: WORKZ | ARGV: agentName, expectedScore |
+ * Returns: score or nil - Purpose: Check if this node still owns the WORKZ lock (score match).
+ *
+ * <p>REMOVE_AGENTS_CONDITIONAL (removeAgentsConditional) - KEYS: one of WORKZ or WAITZ | ARGV:
+ * [agent1, expectedScore1, ...] - Returns: [count, [removedAgents...]] - Purpose: Safe,
+ * score-validated cleanup for orphans/zombies; avoids racey deletes.
+ *
+ * <p>ACQUIRE_AGENTS (acquireAgents) - KEYS: WORKZ, WAITZ | ARGV: [agent1, newScore1, ...] -
+ * Returns: [count, [acquiredAgents...]] - Purpose: Batched acquisition WAITZ → WORKZ with atomic
+ * per-entry checks; used with ready-scan limit for O(N) cycles.
+ *
+ * <p>SCORE_AGENTS (scoreAgents) - KEYS: WORKZ, WAITZ | ARGV: [agent1, agent2, ...] - Returns:
+ * [agent, workScore|'null', waitScore|'null', ...] - Purpose: Diagnostics/observability of an
+ * agent's presence and scores.
+ *
+ * <p>RELEASE_LEADERSHIP (releaseLeadership) - KEYS: leadershipKey | ARGV: ownerId | Returns: 1 if
+ * deleted, 0 otherwise - Purpose: Atomic leadership release, guarded by ownership value.
+ *
+ * <p>Self-heal on NOSCRIPT: - evalshaWithSelfHeal transparently reloads scripts on NOSCRIPT,
+ * retries EVALSHA, and falls back to EVAL using the same single-source body, avoiding operator
+ * intervention.
  */
 @Component
 public class RedisScriptManager {
@@ -84,6 +134,9 @@ public class RedisScriptManager {
   private final JedisPool jedisPool;
   private final Map<String, String> scriptShas = new ConcurrentHashMap<>();
   private final AtomicBoolean initialized = new AtomicBoolean(false);
+
+  // Single source of truth for Lua bodies used by both scriptLoad and EVAL fallback
+  private final Map<String, String> scriptBodies = new ConcurrentHashMap<>();
 
   public RedisScriptManager(JedisPool jedisPool) {
     this.jedisPool = jedisPool;
@@ -147,6 +200,46 @@ public class RedisScriptManager {
   }
 
   /**
+   * Execute a script via EVALSHA with automatic self-heal on NOSCRIPT.
+   *
+   * <p>Lifecycle alignment: - Scripts are the single source of truth for atomic queue mutations
+   * (WAITZ/WORKZ): add, move, acquire, remove, validate ownership, and release leadership. These
+   * implement the invariants documented in priority-scheduler-agent-lifecycle.md (e.g., single
+   * membership across sets, atomic transitions, and score-as-ownership semantics). - If Redis has
+   * flushed scripts (failover, SCRIPT FLUSH, upgrades), EVALSHA will throw NOSCRIPT. We
+   * transparently reload all scripts, retry EVALSHA, and finally EVAL the raw body as a last resort
+   * so the scheduler can continue without operator intervention.
+   */
+  public Object evalshaWithSelfHeal(
+      Jedis jedis, String scriptName, java.util.List<String> keys, java.util.List<String> args) {
+    try {
+      return jedis.evalsha(getScriptSha(scriptName), keys, args);
+    } catch (redis.clients.jedis.exceptions.JedisDataException e) {
+      String msg = e.getMessage();
+      if (msg != null && msg.contains("NOSCRIPT")) {
+        try {
+          // Reload all scripts once
+          loadAllScripts(jedis);
+          // Retry EVALSHA
+          return jedis.evalsha(getScriptSha(scriptName), keys, args);
+        } catch (Exception retry) {
+          // Final fallback: EVAL with body if available
+          String body = getScriptBody(scriptName);
+          if (body != null) {
+            return jedis.eval(body, keys, args);
+          }
+        }
+      }
+      throw e;
+    }
+  }
+
+  // Returns the script body for a given name from the single-source map.
+  private String getScriptBody(String scriptName) {
+    return scriptBodies.get(scriptName);
+  }
+
+  /**
    * Check if scripts are initialized.
    *
    * @return true if all scripts are loaded and ready for use
@@ -156,207 +249,230 @@ public class RedisScriptManager {
   }
 
   private void loadAllScripts(Jedis jedis) {
+    // Build bodies once to avoid duplication and drift. These scripts codify the agent lifecycle
+    // invariants used by the Priority scheduler. Inline comments explain expected semantics.
+    Map<String, String> bodies = new LinkedHashMap<>();
+
     // --- INDIVIDUAL OPERATIONS ---
 
-    // ADD_AGENT: Add single agent to WAITING set with pipeline compatibility
+    // ADD_AGENT: Add single agent to WAITING set with pipeline compatibility.
+    // Invariants:
+    // - An agent may be in at most one of WAITZ or WORKZ at any time.
+    // - If present in either, re-adding is a no-op (idempotent enqueue).
     // ARGS: KEYS[1]=WORKZ, KEYS[2]=WAITZ, ARGV[1]=agentName, ARGV[2]=score
     // RETURNS: 1 if agent added successfully, 0 if agent already exists in either set
     // USAGE: Pipeline-friendly for bulk operations, individual scheduling
-    scriptShas.put(
+    bodies.put(
         ADD_AGENT,
-        jedis.scriptLoad(
-            "-- Check if agent exists in either WORKING or WAITING set\n"
-                + "local exists = redis.call('zscore', KEYS[1], ARGV[1]) or redis.call('zscore', KEYS[2], ARGV[1])\n"
-                + "if not exists then\n"
-                + "  -- Agent is new, add to WAITING set with provided score\n"
-                + "  redis.call('zadd', KEYS[2], ARGV[2], ARGV[1])\n"
-                + "  return 1  -- Success: agent added\n"
-                + "else\n"
-                + "  return 0  -- Already exists: no action taken\n"
-                + "end\n"));
+        "-- Check if agent exists in either WORKING or WAITING set\n"
+            + "local exists = redis.call('zscore', KEYS[1], ARGV[1]) or redis.call('zscore', KEYS[2], ARGV[1])\n"
+            + "if not exists then\n"
+            + "  -- Agent is new, add to WAITING set with provided score\n"
+            + "  redis.call('zadd', KEYS[2], ARGV[2], ARGV[1])\n"
+            + "  return 1  -- Success: agent added\n"
+            + "else\n"
+            + "  return 0  -- Already exists: no action taken\n"
+            + "end\n");
 
-    // REMOVE_AGENT: Unconditionally remove agent from both WORKING and WAITING sets
+    // REMOVE_AGENT: Unconditionally remove agent from both WORKING and WAITING sets.
+    // Invariants:
+    // - Removal is idempotent; used by completion, zombie cleanup, and defensive cleanup.
     // ARGS: KEYS[1]=WORKZ, KEYS[2]=WAITZ, ARGV[1]=agentName
     // RETURNS: 1 (always successful - removes from both sets regardless of presence)
     // USAGE: Agent completion cleanup, zombie cleanup, pipeline-friendly removal
-    scriptShas.put(
+    bodies.put(
         REMOVE_AGENT,
-        jedis.scriptLoad(
-            "-- Remove agent from WORKING set (may not exist)\n"
-                + "redis.call('zrem', KEYS[1], ARGV[1])\n"
-                + "-- Remove agent from WAITING set (may not exist)\n"
-                + "redis.call('zrem', KEYS[2], ARGV[1])\n"
-                + "return 1  -- Always successful: Redis ZREM is idempotent\n"));
+        "-- Remove agent from WORKING set (may not exist)\n"
+            + "redis.call('zrem', KEYS[1], ARGV[1])\n"
+            + "-- Remove agent from WAITING set (may not exist)\n"
+            + "redis.call('zrem', KEYS[2], ARGV[1])\n"
+            + "return 1  -- Always successful: Redis ZREM is idempotent\n");
 
-    // MOVE_AGENT: Atomically move single agent from WAITING → WORKING
+    // MOVE_AGENT: Atomically move single agent from WAITING → WORKING.
+    // Invariants:
+    // - Transition is atomic: agent is removed from WAITZ and added to WORKZ with new score.
+    // - Returns 1 on success, 0 if agent was not waiting (no-op, safe under races).
     // ARGS: KEYS[1]=WORKZ, KEYS[2]=WAITZ, ARGV[1]=agentName, ARGV[2]=newScore
     // RETURNS: 1 if agent was moved successfully, 0 if agent was not in WAITING set
     // USAGE: Individual agent acquisition, pipeline-friendly conditional move
-    scriptShas.put(
+    bodies.put(
         MOVE_AGENT,
-        jedis.scriptLoad(
-            "-- Attempt to remove agent from WAITING set\n"
-                + "local removed = redis.call('zrem', KEYS[2], ARGV[1])\n"
-                + "if removed == 1 then\n"
-                + "  -- Agent existed in WAITING, move to WORKING with new score\n"
-                + "  redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n"
-                + "  return 1  -- Success: agent moved WAITING → WORKING\n"
-                + "else\n"
-                + "  return 0  -- Failure: agent was not in WAITING set\n"
-                + "end\n"));
+        "-- Attempt to remove agent from WAITING set\n"
+            + "local removed = redis.call('zrem', KEYS[2], ARGV[1])\n"
+            + "if removed == 1 then\n"
+            + "  -- Agent existed in WAITING, move to WORKING with new score\n"
+            + "  redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n"
+            + "  return 1  -- Success: agent moved WAITING → WORKING\n"
+            + "else\n"
+            + "  return 0  -- Failure: agent was not in WAITING set\n"
+            + "end\n");
 
     // --- BATCH OPERATIONS ---
 
-    // Add single or multiple agents to WAITING set (consolidated from ADD_AGENT + BATCH_ADD_AGENTS)
+    // ADD_AGENTS: Add single or multiple agents to WAITING set (consolidated from ADD_AGENT +
+    // BATCH_ADD_AGENTS).
+    // Invariants:
+    // - Same as ADD_AGENT but batched; returns {count, [added...]} for observability.
     // Handles both single [agent, score] and batch [agent1, score1, agent2, score2, ...] operations
-    scriptShas.put(
+    // Track added agents and the count of successful additions.
+    bodies.put(
         ADD_AGENTS,
-        jedis.scriptLoad(
-            "local added = {}\n" // Track added agents for logging
-                + "local count = 0\n" // Count of successful additions
-                + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
-                + "for i=1,#ARGV,2 do\n" // For each agent-score pair
-                + "  local agent = ARGV[i]\n" // Agent name
-                + "  local score = ARGV[i+1]\n" // Score
-                + "  local exists = redis.call('zscore', KEYS[1], agent) or redis.call('zscore', KEYS[2], agent)\n"
-                + "  if not exists then\n" // If not in either set
-                + "    redis.call('zadd', KEYS[2], score, agent)\n" // Add to WAITING set
-                + "    table.insert(added, agent)\n" // Track for logging
-                + "    count = count + 1\n"
-                + "  end\n"
-                + "end\n"
-                + "return {count, added}\n")); // Return count and list of added agents
+        "local added = {}\n"
+            + "local count = 0\n"
+            + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
+            + "for i=1,#ARGV,2 do\n"
+            + "  local agent = ARGV[i]\n"
+            + "  local score = ARGV[i+1]\n"
+            + "  local exists = redis.call('zscore', KEYS[1], agent) or redis.call('zscore', KEYS[2], agent)\n"
+            + "  if not exists then\n"
+            + "    redis.call('zadd', KEYS[2], score, agent)\n"
+            + "    table.insert(added, agent)\n"
+            + "    count = count + 1\n"
+            + "  end\n"
+            + "end\n"
+            + "return {count, added}\n");
 
-    // Remove agent from both WAITING and WORKING sets (unconditional removal)
-    scriptShas.put(
+    // REMOVE_AGENTS: Unconditional removal (single-arg variant kept for compatibility).
+    bodies.put(
         REMOVE_AGENTS,
-        jedis.scriptLoad(
-            "redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from WORKING_SET
-                + "redis.call('zrem', KEYS[2], ARGV[1])\n" // Remove from WAITING_SET
-                + "return 1\n")); // Always return success
+        "redis.call('zrem', KEYS[1], ARGV[1])\n"
+            + "redis.call('zrem', KEYS[2], ARGV[1])\n"
+            + "return 1\n");
 
     // --- AGENT STATE TRANSITION SCRIPTS ---
 
-    // MOVE_AGENTS: Unconditionally move agent WAITING → WORKING for acquisition
+    // MOVE_AGENTS: Unconditionally move agent WAITING → WORKING for acquisition (single agent).
+    // Invariants:
+    // - Returns newScore if moved; nil if not waiting. Used by acquisition flows.
     // ARGS: KEYS[1]=WORKZ, KEYS[2]=WAITZ, ARGV[1]=agentName, ARGV[2]=newScore
     // RETURNS: newScore if successful, nil if agent not in WAITING set
     // USAGE: Agent acquisition (WAITING → WORKING transition)
-    scriptShas.put(
+    bodies.put(
         MOVE_AGENTS,
-        jedis.scriptLoad(
-            "-- Attempt to remove agent from WAITING set\n"
-                + "local removed = redis.call('zrem', KEYS[2], ARGV[1])\n"
-                + "if removed == 1 then\n"
-                + "  -- Agent was in WAITING, move to WORKING with new score\n"
-                + "  redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n"
-                + "  return ARGV[2]  -- Return new score for success\n"
-                + "else\n"
-                + "  return nil  -- Agent was not in WAITING set\n"
-                + "end\n"));
+        "-- Attempt to remove agent from WAITING set\n"
+            + "local removed = redis.call('zrem', KEYS[2], ARGV[1])\n"
+            + "if removed == 1 then\n"
+            + "  -- Agent was in WAITING, move to WORKING with new score\n"
+            + "  redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n"
+            + "  return ARGV[2]\n"
+            + "else\n"
+            + "  return nil\n"
+            + "end\n");
 
-    // MOVE_AGENTS_CONDITIONAL: Conditionally move agent WORKING → WAITING with ownership
-    // verification
+    // MOVE_AGENTS_CONDITIONAL: Conditionally move WORKING → WAITING with ownership verification.
+    // Invariants:
+    // - Score encodes lock ownership. Only the owning scorer may requeue.
+    // - Used by graceful shutdown and local zombie/orphan fixes.
     // ARGS: KEYS[1]=WORKZ, KEYS[2]=WAITZ, ARGV[1]=agentName, ARGV[2]=expectedScore,
     // ARGV[3]=newScore
     // RETURNS: 'swapped' if agent moved successfully, nil if ownership verification failed
     // USAGE: Graceful shutdown re-queuing, ensures only owning pod moves its agents
-    scriptShas.put(
+    bodies.put(
         MOVE_AGENTS_CONDITIONAL,
-        jedis.scriptLoad(
-            "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
-                + "if score and tonumber(score) == tonumber(ARGV[2]) then\n" // Numeric comparison
-                + "  redis.call('zrem', KEYS[1], ARGV[1])\n" // Remove from WORKING_SET
-                + "  redis.call('zadd', KEYS[2], ARGV[3], ARGV[1])\n" // Add to WAITING_SET
-                + "  return 'swapped'\n" // Success
-                + "else return nil end\n")); // Failed - score mismatch or agent missing
+        "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
+            + "if score and tonumber(score) == tonumber(ARGV[2]) then\n"
+            + "  redis.call('zrem', KEYS[1], ARGV[1])\n"
+            + "  redis.call('zadd', KEYS[2], ARGV[3], ARGV[1])\n"
+            + "  return 'swapped'\n"
+            + "else return nil end\n");
 
-    // Check if we still own the agent lock (score validation)
-    scriptShas.put(
+    // VALIDATE_OWNERSHIP: Check if we still own the agent lock (score validation).
+    bodies.put(
         VALIDATE_OWNERSHIP,
-        jedis.scriptLoad(
-            "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
-                + "if score and tonumber(score) == tonumber(ARGV[2]) then\n" // Numeric comparison
-                + "  return score\n" // We still own it
-                + "else return nil end\n")); // Ownership lost or agent not found
+        "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
+            + "if score and tonumber(score) == tonumber(ARGV[2]) then\n"
+            + "  return score\n"
+            + "else return nil end\n");
 
     // --- ADVANCED CLEANUP SCRIPTS ---
 
-    // Remove single or multiple agents with score validation (consolidated orphan + zombie cleanup)
-    // Used for both orphan cleanup (cross-instance) and zombie cleanup (local instance)
-    // Handles batch [agent1, score1, agent2, score2, ...] operations
-    scriptShas.put(
+    // REMOVE_AGENTS_CONDITIONAL: Remove single or multiple agents with score validation.
+    // Invariants:
+    // - Used for orphan cleanup (cross-instance) and zombie cleanup (local instance).
+    // - Only removes entries whose scores match expectations, preventing races.
+    // - Handles batch [agent1, score1, agent2, score2, ...] operations.
+    // Track removed agents and the count of successful removals.
+    bodies.put(
         REMOVE_AGENTS_CONDITIONAL,
-        jedis.scriptLoad(
-            "local removed = {}\n" // Track removed agents for logging
-                + "local count = 0\n" // Count of successful removals
-                + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
-                + "for i=1,#ARGV,2 do\n" // For each agent-score pair
-                + "  local agent = ARGV[i]\n" // Agent name
-                + "  local expectedScore = ARGV[i+1]\n" // Expected score
-                + "  local actualScore = redis.call('zscore', KEYS[1], agent)\n"
-                + "  if actualScore and tonumber(actualScore) == tonumber(expectedScore) then\n"
-                + "    redis.call('zrem', KEYS[1], agent)\n" // Remove agent from specified set
-                + "    table.insert(removed, agent)\n" // Track for logging
-                + "    count = count + 1\n"
-                + "  end\n"
-                + "end\n"
-                + "return {count, removed}\n")); // Return count and list of removed agents
+        "local removed = {}\n"
+            + "local count = 0\n"
+            + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
+            + "for i=1,#ARGV,2 do\n"
+            + "  local agent = ARGV[i]\n"
+            + "  local expectedScore = ARGV[i+1]\n"
+            + "  local actualScore = redis.call('zscore', KEYS[1], agent)\n"
+            + "  if actualScore and tonumber(actualScore) == tonumber(expectedScore) then\n"
+            + "    redis.call('zrem', KEYS[1], agent)\n"
+            + "    table.insert(removed, agent)\n"
+            + "    count = count + 1\n"
+            + "  end\n"
+            + "end\n"
+            + "return {count, removed}\n");
 
-    // Batch atomic agent acquisition: WAITING → WORKING in a single operation
-    scriptShas.put(
+    // ACQUIRE_AGENTS: Batch atomic acquisition WAITING → WORKING.
+    // Invariants:
+    // - For each candidate, if it is still in WAITZ, atomically move and track acquired list.
+    // - Combined with ready-scan limit, keeps acquisition O(N) per cycle.
+    bodies.put(
         ACQUIRE_AGENTS,
-        jedis.scriptLoad(
-            "local acquired = {}\n" // Track acquired agents for logging
-                + "local count = 0\n" // Count of successful acquisitions
-                + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
-                + "for i=1,#ARGV,2 do\n" // For each agent-score pair
-                + "  local agent = ARGV[i]\n" // Agent name
-                + "  local newScore = ARGV[i+1]\n" // New working score
-                + "  local waitingScore = redis.call('zscore', KEYS[2], agent)\n" // Check if in
-                // WAITING
-                + "  if waitingScore then\n" // If agent is in WAITING set
-                + "    redis.call('zrem', KEYS[2], agent)\n" // Remove from WAITING set
-                + "    redis.call('zadd', KEYS[1], newScore, agent)\n" // Add to WORKING set
-                + "    table.insert(acquired, agent)\n" // Track for logging
-                + "    count = count + 1\n"
-                + "  end\n"
-                + "end\n"
-                + "return {count, acquired}\n")); // Return count and list of acquired agents
+        "local acquired = {}\n"
+            + "local count = 0\n"
+            + "-- Agent scores are provided as pairs: [agent1, score1, agent2, score2, ...]\n"
+            + "for i=1,#ARGV,2 do\n"
+            + "  local agent = ARGV[i]\n"
+            + "  local newScore = ARGV[i+1]\n"
+            + "  local waitingScore = redis.call('zscore', KEYS[2], agent)\n"
+            + "  if waitingScore then\n"
+            + "    redis.call('zrem', KEYS[2], agent)\n"
+            + "    redis.call('zadd', KEYS[1], newScore, agent)\n"
+            + "    table.insert(acquired, agent)\n"
+            + "    count = count + 1\n"
+            + "  end\n"
+            + "end\n"
+            + "return {count, acquired}\n");
 
     // --- QUERY SCRIPTS ---
 
-    // Batch score lookup for multiple agents
-    scriptShas.put(
+    // SCORE_AGENTS: Batch score lookup for multiple agents.
+    // Invariants:
+    // - Returns [agent, workScore|'null', waitScore|'null', ...] for diagnostics/observability.
+    bodies.put(
         SCORE_AGENTS,
-        jedis.scriptLoad(
-            "-- Input validation: ensure at least one agent name provided\n"
-                + "if #ARGV == 0 then\n"
-                + "  return {}  -- Explicit empty input handling\n"
-                + "end\n"
-                + "local results = {}\n" // Results array
-                + "for i=1,#ARGV do\n" // For each agent name
-                + "  local agent = ARGV[i]\n" // Agent name
-                + "  local workingScore = redis.call('zscore', KEYS[1], agent)\n" // Check WORKING
-                // set
-                + "  local waitingScore = redis.call('zscore', KEYS[2], agent)\n" // Check WAITING
-                // set
-                + "  table.insert(results, agent)\n" // Agent name
-                + "  table.insert(results, workingScore or 'null')\n" // Working score or 'null'
-                + "  table.insert(results, waitingScore or 'null')\n" // Waiting score or 'null'
-                + "end\n"
-                + "return results\n")); // Return [agent1, workScore1, waitScore1, agent2, ...]
+        "-- Input validation: ensure at least one agent name provided\n"
+            + "if #ARGV == 0 then\n"
+            + "  return {}\n"
+            + "end\n"
+            + "local results = {}\n"
+            + "for i=1,#ARGV do\n"
+            + "  local agent = ARGV[i]\n"
+            + "  local workingScore = redis.call('zscore', KEYS[1], agent)\n"
+            + "  local waitingScore = redis.call('zscore', KEYS[2], agent)\n"
+            + "  table.insert(results, agent)\n"
+            + "  table.insert(results, workingScore or 'null')\n"
+            + "  table.insert(results, waitingScore or 'null')\n"
+            + "end\n"
+            + "return results\n");
 
     // --- LEADERSHIP MANAGEMENT ---
 
-    // Release leadership only if we own it (atomic check-and-delete)
-    scriptShas.put(
+    // RELEASE_LEADERSHIP: Release leadership only if we own it (atomic check-and-delete).
+    // Invariants:
+    // - Prevents another node from releasing a lock it does not own.
+    bodies.put(
         RELEASE_LEADERSHIP,
-        jedis.scriptLoad(
-            "if redis.call('get', KEYS[1]) == ARGV[1] then\n"
-                + "  return redis.call('del', KEYS[1])\n"
-                + "else\n"
-                + "  return 0\n"
-                + "end\n"));
+        "if redis.call('get', KEYS[1]) == ARGV[1] then\n"
+            + "  return redis.call('del', KEYS[1])\n"
+            + "else\n"
+            + "  return 0\n"
+            + "end\n");
+
+    // Persist and load
+    scriptBodies.clear();
+    scriptBodies.putAll(bodies);
+    scriptShas.clear();
+    for (Map.Entry<String, String> e : bodies.entrySet()) {
+      scriptShas.put(e.getKey(), jedis.scriptLoad(e.getValue()));
+    }
 
     log.debug("Loaded Redis Lua scripts: {}", scriptShas.keySet());
   }

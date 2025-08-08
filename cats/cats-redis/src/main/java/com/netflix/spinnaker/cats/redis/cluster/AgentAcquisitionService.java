@@ -191,8 +191,9 @@ public class AgentAcquisitionService {
       // Check concurrent agent limits before processing
       int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
       int currentlyRunning = (int) activeAgentMapSize.get();
+      boolean unbounded = maxConcurrentAgents <= 0;
 
-      if (currentlyRunning >= maxConcurrentAgents) {
+      if (!unbounded && currentlyRunning >= maxConcurrentAgents) {
         log.debug(
             "Skipping agent acquisition - at max concurrent limit ({} running, {} max)",
             currentlyRunning,
@@ -210,7 +211,19 @@ public class AgentAcquisitionService {
 
       // PHASE 3: Find ready agents in priority order
       String currentScore = score(jedis, 0L);
-      Set<String> readyAgents = jedis.zrangeByScore(WAITING_SET, "-inf", currentScore);
+      // Limit ready scan to the amount we can actually attempt this cycle
+      int availableSlotsForNewAgentsPrefetch =
+          unbounded
+              ? schedulerProperties.getAgentAcquisitionBatchSize()
+              : Math.max(0, maxConcurrentAgents - currentlyRunning);
+      int scanLimit =
+          Math.min(
+              Math.max(availableSlotsForNewAgentsPrefetch, 0),
+              schedulerProperties.getAgentAcquisitionBatchSize());
+      Set<String> readyAgents =
+          scanLimit > 0
+              ? jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, 0, scanLimit)
+              : java.util.Collections.emptySet();
 
       log.debug(
           "Found {} agents ready for execution at score {}", readyAgents.size(), currentScore);
@@ -257,9 +270,10 @@ public class AgentAcquisitionService {
       int agentsAcquiredThisCycle = 0;
 
       // Calculate how many new agents this pod can try to acquire
-      int availableSlotsForNewAgents = maxConcurrentAgents - currentlyRunning;
+      int availableSlotsForNewAgents =
+          unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - currentlyRunning);
 
-      if (availableSlotsForNewAgents <= 0) {
+      if (!unbounded && availableSlotsForNewAgents <= 0) {
         log.debug(
             "No available slots to acquire new agents this cycle ({} running, {} max). Skipping acquisition phase.",
             currentlyRunning,
@@ -267,7 +281,8 @@ public class AgentAcquisitionService {
         return 0;
       }
 
-      int effectiveMaxToAcquire = Math.min(availableSlotsForNewAgents, readyAgents.size());
+      int effectiveMaxToAcquire =
+          unbounded ? readyAgents.size() : Math.min(availableSlotsForNewAgents, readyAgents.size());
 
       // Evaluate health/degradation and rate-limited WARNing.
       // Avoid false positives by excluding known-orphan/zombie cases: we base the decision purely
@@ -528,8 +543,9 @@ public class AgentAcquisitionService {
 
       // Execute batch acquisition Lua script
       Object result =
-          jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.ACQUIRE_AGENTS),
+          scriptManager.evalshaWithSelfHeal(
+              jedis,
+              RedisScriptManager.ACQUIRE_AGENTS,
               Arrays.asList(WORKING_SET, WAITING_SET),
               agentScorePairs);
 
@@ -836,9 +852,10 @@ public class AgentAcquisitionService {
               agentType);
         } else {
           // Normal operation: Remove from both sets
-          jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
-              java.util.Arrays.asList(WORKING_SET, WAITING_SET), // Script needs both keys
+          scriptManager.evalshaWithSelfHeal(
+              jedis,
+              RedisScriptManager.REMOVE_AGENT,
+              java.util.Arrays.asList(WORKING_SET, WAITING_SET),
               java.util.Collections.singletonList(agentType));
           log.debug("Removed agent {} from active tracking and Redis sets", agentType);
         }

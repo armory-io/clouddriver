@@ -607,6 +607,107 @@ class RedisScriptManagerTest {
   }
 
   @Nested
+  @DisplayName("Self-Heal and Single-Source Body Tests")
+  class SelfHealAndSingleSourceBodyTests {
+
+    @BeforeEach
+    void setUp() {
+      scriptManager.initializeScripts();
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.flushAll();
+      }
+    }
+
+    @Test
+    @DisplayName("Should self-heal on NOSCRIPT by reloading scripts")
+    void shouldSelfHealOnNOSCRIPTByReloadingScripts() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // First call works normally via self-heal wrapper
+        Object first =
+            scriptManager.evalshaWithSelfHeal(
+                jedis,
+                RedisScriptManager.ADD_AGENTS,
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("agent-a", "100"));
+
+        assertThat(first)
+            .isEqualTo(java.util.Arrays.asList(1L, java.util.Arrays.asList("agent-a")));
+        assertThat(jedis.zscore("WAITZ", "agent-a")).isEqualTo(100.0);
+
+        // Flush scripts to force NOSCRIPT
+        jedis.scriptFlush();
+
+        // Direct evalsha with cached SHA should now fail with NOSCRIPT
+        assertThatThrownBy(
+                () ->
+                    jedis.evalsha(
+                        scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
+                        java.util.Arrays.asList("WORKZ", "WAITZ"),
+                        java.util.Arrays.asList("agent-b", "200")))
+            .isInstanceOf(redis.clients.jedis.exceptions.JedisDataException.class)
+            .hasMessageContaining("NOSCRIPT");
+
+        // Wrapper should detect NOSCRIPT, reload, and succeed
+        Object second =
+            scriptManager.evalshaWithSelfHeal(
+                jedis,
+                RedisScriptManager.ADD_AGENTS,
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("agent-b", "200"));
+
+        assertThat(second)
+            .isEqualTo(java.util.Arrays.asList(1L, java.util.Arrays.asList("agent-b")));
+        assertThat(jedis.zscore("WAITZ", "agent-b")).isEqualTo(200.0);
+      }
+    }
+
+    @Test
+    @DisplayName("Should expose non-null bodies for all scripts and bodies are executable")
+    void shouldExposeBodiesForAllScriptsAndBodiesAreExecutable() throws Exception {
+      // Access private getScriptBody via reflection
+      java.lang.reflect.Method getBody =
+          RedisScriptManager.class.getDeclaredMethod("getScriptBody", String.class);
+      getBody.setAccessible(true);
+
+      String[] scriptNames = {
+        RedisScriptManager.ADD_AGENT,
+        RedisScriptManager.REMOVE_AGENT,
+        RedisScriptManager.MOVE_AGENT,
+        RedisScriptManager.ADD_AGENTS,
+        RedisScriptManager.REMOVE_AGENTS,
+        RedisScriptManager.MOVE_AGENTS,
+        RedisScriptManager.MOVE_AGENTS_CONDITIONAL,
+        RedisScriptManager.VALIDATE_OWNERSHIP,
+        RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+        RedisScriptManager.ACQUIRE_AGENTS,
+        RedisScriptManager.SCORE_AGENTS,
+        RedisScriptManager.RELEASE_LEADERSHIP
+      };
+
+      for (String name : scriptNames) {
+        String body = (String) getBody.invoke(scriptManager, name);
+        assertThat(body).as("Body for script %s should be present", name).isNotNull();
+        assertThat(body.trim()).isNotEmpty();
+      }
+
+      // Prove that a body can be executed directly via EVAL (single-source of truth)
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.flushAll();
+        String body = (String) getBody.invoke(scriptManager, RedisScriptManager.ADD_AGENTS);
+        Object res =
+            jedis.eval(
+                body,
+                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("body-agent", "350"));
+
+        assertThat(res)
+            .isEqualTo(java.util.Arrays.asList(1L, java.util.Arrays.asList("body-agent")));
+        assertThat(jedis.zscore("WAITZ", "body-agent")).isEqualTo(350.0);
+      }
+    }
+  }
+
+  @Nested
   @DisplayName("Timestamp Format Consistency Tests")
   class TimestampFormatConsistencyTests {
 
