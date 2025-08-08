@@ -34,27 +34,37 @@ import redis.clients.jedis.params.SetParams;
 /**
  * Service responsible for detecting and cleaning up orphaned agents.
  *
- * <p>Orphaned agents are agents that remain in Redis sets but are no longer known to any
- * clouddriver instance. This can happen due to deployment changes, pod restarts, or configuration
- * updates. This service identifies such agents and removes them to prevent resource leaks and stale
- * state.
- *
- * <p>The cleanup process handles two Redis sets:
+ * <p>Definitions:
  *
  * <ul>
- *   <li><strong>WORKING set (WORKZ):</strong> Agents currently being executed
- *   <li><strong>WAITING set (WAITZ):</strong> Agents waiting to be executed
+ *   <li><strong>WAITZ</strong> – Agents ready to run, scored by next execution time (epoch seconds)
+ *   <li><strong>WORKZ</strong> – Agents running, scored by completion deadline (acquire_time +
+ *       timeout)
+ * </ul>
+ *
+ * <p>Correctness rules (Priority 0):
+ *
+ * <ul>
+ *   <li>Do not purge valid WAITZ entries solely by age. Only remove WAITZ members that are
+ *       positively identified as invalid (e.g., not registered/enabled locally). This preserves
+ *       FIFO ordering under backlog and prevents queue cycling.
+ *   <li>When cleaning WORKZ orphans, skip entries that are locally active on this pod. Local
+ *       overruns are handled by the Zombie cleaner; orphan cleanup should not interfere with
+ *       currently executing work.
+ *   <li>For valid WORKZ orphans (owned by other pods and past deadline + buffer), move back to
+ *       WAITZ using a conditional, score-checked move; for invalid ones, remove.
  * </ul>
  *
  * <p>Configuration:
  *
  * <ul>
- *   <li>{@code redis.scheduler.orphanThresholdMs} - Age threshold for orphaned agents
- *   <li>{@code redis.scheduler.orphanCleanupIntervalMs} - How often cleanup runs
- *   <li>{@code redis.scheduler.orphanCleanupEnabled} - Enable/disable cleanup per pod
- *   <li>{@code redis.scheduler.forceOrphanCleanupAllPods} - Force all pods to clean or use leader
+ *   <li>{@code redis.scheduler.orphanThresholdMs} – Age threshold for orphaned agents
+ *   <li>{@code redis.scheduler.orphanCleanupIntervalMs} – How often cleanup runs
+ *   <li>{@code redis.scheduler.orphanCleanupEnabled} – Enable/disable cleanup per pod
+ *   <li>{@code redis.scheduler.forceOrphanCleanupAllPods} – Force all pods to clean or use leader
  *       election
- *   <li>{@code redis.scheduler.orphanCleanupBatchSize} - Batch size for efficient cleanup
+ *   <li>{@code redis.scheduler.orphanCleanupBatchSize} – Batch size for efficient cleanup (applies
+ *       when safe)
  * </ul>
  */
 @Component
@@ -207,8 +217,7 @@ public class OrphanCleanupService {
     long thresholdForLogging;
 
     if (WAITING_SET.equals(setName)) {
-      // For WAITZ: agents scheduled with score = next_execution_time
-      // Consider orphaned if: score < current_time - orphan_threshold
+      // For WAITZ: consider orphaned if score < current_time - threshold
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
       cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
       thresholdForLogging = orphanThreshold;
@@ -264,39 +273,46 @@ public class OrphanCleanupService {
     boolean batchOperationsEnabled = schedulerProperties.isBatchOperationsEnabled();
     int totalCleaned = 0;
 
-    if (batchOperationsEnabled) {
-      log.debug(
-          "Processing {} orphans from {} in batches of {} with fallback",
-          orphans.size(),
-          setName,
-          batchSize);
-    } else {
-      log.debug(
-          "Batch orphan cleanup disabled, using individual operations for {} agents from {}",
-          orphans.size(),
-          setName);
-    }
-
-    // Process orphans in batches
-    for (int i = 0; i < orphans.size(); i += batchSize) {
-      int endIndex = Math.min(i + batchSize, orphans.size());
-      List<Tuple> batch = orphans.subList(i, endIndex);
-
-      if (batchOperationsEnabled && batch.size() > 1) {
-        // Try batch operation first
-        int batchCleaned = cleanupSingleBatch(jedis, setName, batch);
-        if (batchCleaned > 0) {
-          totalCleaned += batchCleaned;
-        } else {
-          // Batch operation failed, fall back to individual cleanup
-          log.warn(
-              "Batch cleanup failed for {} agents from {}, falling back to individual cleanup",
-              batch.size(),
-              setName);
-          totalCleaned += cleanupIndividualOrphans(jedis, setName, batch);
+    if (WAITING_SET.equals(setName)) {
+      // Priority 0: Never purge valid WAITZ by age. Batch-remove only invalid entries.
+      if (batchOperationsEnabled) {
+        List<String> invalidArgs = new ArrayList<>();
+        for (Tuple orphan : orphans) {
+          String agentName = orphan.getElement();
+          if (!isAgentStillValid(agentName)) {
+            invalidArgs.add(agentName);
+            invalidArgs.add(String.valueOf((long) orphan.getScore()));
+          }
+        }
+        if (!invalidArgs.isEmpty()) {
+          try {
+            Object result =
+                jedis.evalsha(
+                    scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL),
+                    java.util.Collections.singletonList(WAITING_SET),
+                    invalidArgs);
+            if (result instanceof java.util.List) {
+              java.util.List<?> list = (java.util.List<?>) result;
+              if (!list.isEmpty()) {
+                totalCleaned += ((Long) list.get(0)).intValue();
+              }
+            }
+          } catch (Exception e) {
+            log.warn(
+                "Batch removal of invalid WAITZ agents failed, using individual path: {}",
+                e.getMessage());
+            totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans);
+          }
         }
       } else {
-        // Use individual cleanup (batch disabled or single agent)
+        totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans);
+      }
+    } else {
+      // WORKZ: Prefer individual path to allow validity checks and conditional moves, and to skip
+      // locally active work.
+      for (int i = 0; i < orphans.size(); i += batchSize) {
+        int endIndex = Math.min(i + batchSize, orphans.size());
+        List<Tuple> batch = orphans.subList(i, endIndex);
         totalCleaned += cleanupIndividualOrphans(jedis, setName, batch);
       }
     }
@@ -461,70 +477,100 @@ public class OrphanCleanupService {
         // Determine if this is a valid agent or an agent for a removed account
         boolean isStillValid = isAgentStillValid(agentName);
 
-        if (isStillValid && WORKING_SET.equals(setName)) {
-          // For valid agents in WORKZ (truly orphaned due to crashes), move them to WAITZ for
-          // immediate rescheduling
-          String newScore = score(jedis, 0L); // Schedule for immediate execution
-          Object result =
-              jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
-                  java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                  java.util.Arrays.asList(
-                      agentName,
-                      scoreInSet, // Expected score in WORKING set (ARGV[2])
-                      newScore // New score in WAITING set (ARGV[3])
-                      ));
-
-          if (result != null && "swapped".equals(result)) {
-            cleaned++;
-            log.info(
-                "Successfully moved orphaned agent {} (original score: {}, new score: {}) from WORKZ to WAITZ set.",
-                agentName,
-                (long) score,
-                Long.valueOf(newScore));
-
-            // Also clean up local state if needed
-            removeActiveAgent(agentName);
-          } else {
-            log.debug(
-                "Failed to move orphaned agent {} (original score: {}) from WORKZ to WAITZ. It might have been removed or modified by another process.",
-                agentName,
-                (long) score);
+        if (WORKING_SET.equals(setName)) {
+          // Skip locally active agents; zombie cleanup manages overruns
+          boolean locallyActive =
+              acquisitionService != null
+                  && acquisitionService.getActiveAgentsMap() != null
+                  && acquisitionService.getActiveAgentsMap().containsKey(agentName);
+          if (locallyActive) {
+            log.debug("Skipping locally active WORKZ agent {} during orphan cleanup", agentName);
+            continue;
           }
-        } else {
-          // For invalid agents or agents in WAITZ, completely remove them using individual script
-          Object result =
-              jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
-                  java.util.Arrays.asList("WORKZ", "WAITZ"), // Both sets for unconditional removal
-                  java.util.Collections.singletonList(agentName)); // Only agent name needed
 
-          // REMOVE_AGENT returns 1 for success
-          boolean removed = result != null && ((Long) result).intValue() == 1;
-          if (removed) {
-            cleaned++;
-            if (isStillValid) {
+          if (isStillValid) {
+            // For valid agents in WORKZ (truly orphaned due to crashes), move them to WAITZ for
+            // immediate rescheduling
+            String newScore = score(jedis, 0L); // Schedule for immediate execution
+            Object result =
+                jedis.evalsha(
+                    scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
+                    java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                    java.util.Arrays.asList(
+                        agentName,
+                        scoreInSet, // Expected score in WORKING set (ARGV[2])
+                        newScore // New score in WAITING set (ARGV[3])
+                        ));
+
+            if (result != null && "swapped".equals(result)) {
+              cleaned++;
               log.info(
-                  "Successfully removed orphaned agent {} (original score: {}) from {} set.",
+                  "Successfully moved orphaned agent {} (original score: {}, new score: {}) from WORKZ to WAITZ set.",
                   agentName,
                   (long) score,
-                  setName);
+                  Long.valueOf(newScore));
+
+              // Also clean up local state if needed
+              removeActiveAgent(agentName);
             } else {
-              log.info(
-                  "Successfully removed invalid orphaned agent {} (original score: {}) from {} set and local registry.",
+              log.debug(
+                  "Failed to move orphaned agent {} (original score: {}) from WORKZ to WAITZ. It might have been removed or modified by another process.",
+                  agentName,
+                  (long) score);
+            }
+          } else {
+            // For invalid agents or agents in WAITZ, completely remove them using individual script
+            Object result =
+                jedis.evalsha(
+                    scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
+                    java.util.Arrays.asList(
+                        "WORKZ", "WAITZ"), // Both sets for unconditional removal
+                    java.util.Collections.singletonList(agentName)); // Only agent name needed
+
+            // REMOVE_AGENT returns 1 for success
+            boolean removed = result != null && ((Long) result).intValue() == 1;
+            if (removed) {
+              cleaned++;
+              if (isStillValid) {
+                log.info(
+                    "Successfully removed orphaned agent {} (original score: {}) from {} set.",
+                    agentName,
+                    (long) score,
+                    setName);
+              } else {
+                log.info(
+                    "Successfully removed invalid orphaned agent {} (original score: {}) from {} set and local registry.",
+                    agentName,
+                    (long) score,
+                    setName);
+              }
+
+              // Also clean up local state if needed
+              removeActiveAgent(agentName);
+            } else {
+              log.debug(
+                  "Failed to remove orphaned agent {} (score: {}) from {} set. It might have been removed by another process.",
                   agentName,
                   (long) score,
                   setName);
             }
-
-            // Also clean up local state if needed
-            removeActiveAgent(agentName);
+          }
+        } else if (WAITING_SET.equals(setName)) {
+          // WAITZ: Only remove invalid entries; preserve valid entries regardless of age
+          if (!isStillValid) {
+            Object result =
+                jedis.evalsha(
+                    scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
+                    java.util.Arrays.asList("WORKZ", "WAITZ"),
+                    java.util.Collections.singletonList(agentName));
+            boolean removed = result != null && ((Long) result).intValue() == 1;
+            if (removed) {
+              cleaned++;
+              log.info(
+                  "Removed invalid WAITZ agent {} (original score: {})", agentName, (long) score);
+            }
           } else {
-            log.debug(
-                "Failed to remove orphaned agent {} (score: {}) from {} set. It might have been removed by another process.",
-                agentName,
-                (long) score,
-                setName);
+            log.debug("Preserving valid WAITZ agent {} (age-based purge disabled)", agentName);
           }
         }
 
@@ -555,7 +601,8 @@ public class OrphanCleanupService {
    */
   private boolean isAgentStillValid(String agentType) {
     if (acquisitionService == null) {
-      // Fallback: In test environment or when service not available, treat all agents as invalid
+      // In absence of local registry, treat entries as invalid (test environments). Production pods
+      // always wire acquisitionService; tests should set it explicitly when needed.
       log.debug(
           "AgentAcquisitionService not available, treating agent {} as invalid (will be removed)",
           agentType);

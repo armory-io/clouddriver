@@ -124,28 +124,47 @@ class OrphanCleanupServiceTest {
     }
 
     @Test
-    @DisplayName("Should detect orphaned agents in WAITING set with longer threshold")
-    void shouldDetectOrphanedAgentsInWaitingSetWithLongerThreshold() {
-      // Given - Clean up and add old agents to WAITING set
-      // Redis scores are stored as seconds since epoch, not milliseconds
+    @DisplayName("WAITZ purge preserves valid entries; removes only invalid ones")
+    void waitzCleanupRemovesOnlyInvalid() {
+      // Given - Add two agents; one valid (registered), one invalid (unregistered)
       long oldScoreSeconds = (System.currentTimeMillis() - 150000) / 1000; // 2.5 minutes ago
       try (Jedis jedis = jedisPool.getResource()) {
-        // Clean up any existing data first
         jedis.del("WORKZ", "WAITZ");
-
-        jedis.zadd("WAITZ", oldScoreSeconds, "waiting-orphan-1");
-        jedis.zadd("WAITZ", oldScoreSeconds - 1, "waiting-orphan-2");
+        jedis.zadd("WAITZ", oldScoreSeconds, "valid-agent");
+        jedis.zadd("WAITZ", oldScoreSeconds - 1, "invalid-agent");
       }
+
+      // Register only the valid agent via a minimal acquisition service to mark it valid
+      PriorityAgentProperties agentProps = new PriorityAgentProperties();
+      PrioritySchedulerProperties schedulerProps = new PrioritySchedulerProperties();
+      AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
+      when(intervalProvider.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
+      ShardingFilter shardingFilter = mock(ShardingFilter.class);
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
+      AgentAcquisitionService acq =
+          new AgentAcquisitionService(
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardingFilter,
+              agentProps,
+              schedulerProps);
+
+      Agent valid = mock(Agent.class);
+      when(valid.getAgentType()).thenReturn("valid-agent");
+      acq.registerAgent(valid, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
+
+      orphanService.setAcquisitionService(acq);
 
       // When
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then
-      assertThat(cleaned).isEqualTo(2);
-
-      // Verify agents were removed from Redis
+      // Then - Only invalid agent is removed; valid remains in WAITZ
+      assertThat(cleaned).isEqualTo(1);
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
+        assertThat(jedis.zscore("WAITZ", "valid-agent")).isNotNull();
+        assertThat(jedis.zscore("WAITZ", "invalid-agent")).isNull();
       }
     }
 
@@ -173,16 +192,36 @@ class OrphanCleanupServiceTest {
     @Test
     @DisplayName("Should not clean agents within threshold in WAITING set")
     void shouldNotCleanAgentsWithinThresholdInWaitingSet() {
-      // Given - Add agents to WAITING set
-      long recentScore = System.currentTimeMillis() - 90000; // 1.5 minutes ago
+      // Given - Add agent to WAITING set whose score is within threshold (10s ago)
+      long recentScore = (System.currentTimeMillis() - 10000) / 1000; // 10 seconds ago
       try (Jedis jedis = jedisPool.getResource()) {
+        jedis.del("WORKZ", "WAITZ");
         jedis.zadd("WAITZ", recentScore, "waiting-recent");
       }
+
+      // Provide acquisition service so WAITZ validity checks preserve entries
+      PriorityAgentProperties agentProps = new PriorityAgentProperties();
+      agentProps.setEnabledPattern(".*");
+      agentProps.setDisabledPattern("");
+      PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
+      when(intervalProvider.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
+      ShardingFilter shardingFilter = mock(ShardingFilter.class);
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
+      AgentAcquisitionService acq =
+          new AgentAcquisitionService(
+              jedisPool, scriptManager, intervalProvider, shardingFilter, agentProps, props);
+      Agent waitingRecent = mock(Agent.class);
+      when(waitingRecent.getAgentType()).thenReturn("waiting-recent");
+      acq.registerAgent(
+          waitingRecent, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
+      orphanService.setAcquisitionService(acq);
 
       // When
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then
+      // Then - within threshold, nothing removed
       assertThat(cleaned).isEqualTo(0);
 
       // Verify agent was NOT removed
@@ -192,28 +231,49 @@ class OrphanCleanupServiceTest {
     }
 
     @Test
-    @DisplayName("Should clean orphans from both sets in single operation")
-    void shouldCleanOrphansFromBothSetsInSingleOperation() {
-      // Given - Add orphans to both sets
-      // Redis scores are stored as seconds since epoch, not milliseconds
+    @DisplayName("Should clean WORKZ and remove only invalid from WAITZ in one run")
+    void shouldCleanWorkzAndRemoveOnlyInvalidFromWaitz() {
+      // Given - Add orphans to both sets; register only the WAITZ valid agent
       long workingOrphanScoreSeconds = (System.currentTimeMillis() - 120000) / 1000; // 2 minutes
       long waitingOrphanScoreSeconds = (System.currentTimeMillis() - 180000) / 1000; // 3 minutes
 
       try (Jedis jedis = jedisPool.getResource()) {
+        jedis.del("WORKZ", "WAITZ");
         jedis.zadd("WORKZ", workingOrphanScoreSeconds, "working-orphan");
-        jedis.zadd("WAITZ", waitingOrphanScoreSeconds, "waiting-orphan");
+        jedis.zadd("WAITZ", waitingOrphanScoreSeconds, "valid-waiting");
+        jedis.zadd("WAITZ", waitingOrphanScoreSeconds - 1, "invalid-waiting");
       }
+
+      // Register only the valid waiting agent
+      PriorityAgentProperties agentProps = new PriorityAgentProperties();
+      PrioritySchedulerProperties schedulerProps = new PrioritySchedulerProperties();
+      AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
+      when(intervalProvider.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
+      ShardingFilter shardingFilter = mock(ShardingFilter.class);
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
+      AgentAcquisitionService acq =
+          new AgentAcquisitionService(
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardingFilter,
+              agentProps,
+              schedulerProps);
+      Agent valid = mock(Agent.class);
+      when(valid.getAgentType()).thenReturn("valid-waiting");
+      acq.registerAgent(valid, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
+      orphanService.setAcquisitionService(acq);
 
       // When
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then
+      // Then - 1 from WORKZ + 1 invalid from WAITZ = 2 cleaned; valid remains
       assertThat(cleaned).isEqualTo(2);
-
-      // Verify both sets are cleaned
       try (Jedis jedis = jedisPool.getResource()) {
         assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
+        assertThat(jedis.zscore("WAITZ", "valid-waiting")).isNotNull();
+        assertThat(jedis.zscore("WAITZ", "invalid-waiting")).isNull();
       }
     }
   }
@@ -425,11 +485,11 @@ class OrphanCleanupServiceTest {
 
       long duration = System.currentTimeMillis() - startTime;
 
-      // Then
+      // Then - With default invalid treatment (no acquisition service), both sets get cleaned
       assertThat(cleaned).isEqualTo(orphanCount);
       assertThat(duration).isLessThan(15000); // Should complete within 15 seconds
 
-      // Verify all orphans were cleaned
+      // Verify both sets cleaned
       try (Jedis jedis = jedisPool.getResource()) {
         assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
         assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
@@ -476,6 +536,10 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should track total orphans cleaned up")
     void shouldTrackTotalOrphansCleanedUp() {
       // Given
+      // Ensure clean state
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.del("WORKZ", "WAITZ");
+      }
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
@@ -657,8 +721,8 @@ class OrphanCleanupServiceTest {
     }
 
     @Test
-    @DisplayName("Should fall back to simple removal when AgentAcquisitionService not available")
-    void shouldFallbackToSimpleRemovalWithoutAcquisitionService() {
+    @DisplayName("Without acquisition service, WORKZ orphan is conservatively moved to WAITZ")
+    void shouldConservativelyMoveWorkzOrphanWithoutAcquisitionService() {
       // Given - Reset to no acquisition service (test environment behavior)
       orphanService.setAcquisitionService(null);
 
@@ -671,19 +735,19 @@ class OrphanCleanupServiceTest {
       // When
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then - Agent should be removed completely (fallback behavior)
+      // Then - Without acquisition service (treated invalid), agent should be removed
       assertThat(cleaned).isEqualTo(1);
 
       try (Jedis jedis = jedisPool.getResource()) {
         assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(0); // Not moved to WAITZ
+        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
       }
     }
 
     @Test
-    @DisplayName("Should handle orphans in WAITZ set by removing them completely")
-    void shouldRemoveOrphansFromWAITZSet() {
-      // Given - Add orphaned agents to WAITZ (these should always be removed, never moved)
+    @DisplayName("WAITZ cleanup removes only invalid entries and preserves valid ones")
+    void shouldRemoveOnlyInvalidOrphansFromWAITZSet() {
+      // Given - Add orphaned agents to WAITZ (valid-agent registered, invalid-agent not)
       long oldScoreSeconds =
           (System.currentTimeMillis() - 4 * 60 * 60 * 1000) / 1000; // 4 hours ago
 
@@ -692,14 +756,33 @@ class OrphanCleanupServiceTest {
         jedis.zadd("WAITZ", oldScoreSeconds - 1, "invalid-agent");
       }
 
+      // Register only the valid agent to mark it as valid
+      PriorityAgentProperties agentProps = new PriorityAgentProperties();
+      agentProps.setEnabledPattern(".*");
+      agentProps.setDisabledPattern("");
+      PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
+      when(intervalProvider.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
+      ShardingFilter shardingFilter = mock(ShardingFilter.class);
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
+      AgentAcquisitionService acq =
+          new AgentAcquisitionService(
+              jedisPool, scriptManager, intervalProvider, shardingFilter, agentProps, props);
+      Agent valid = mock(Agent.class);
+      when(valid.getAgentType()).thenReturn("valid-agent");
+      acq.registerAgent(valid, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
+      orphanService.setAcquisitionService(acq);
+
       // When
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then - Both agents removed completely from WAITZ
-      assertThat(cleaned).isEqualTo(2);
+      // Then - Only invalid removed; valid remains
+      assertThat(cleaned).isEqualTo(1);
 
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
+        assertThat(jedis.zscore("WAITZ", "valid-agent")).isNotNull();
+        assertThat(jedis.zscore("WAITZ", "invalid-agent")).isNull();
         assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
       }
     }

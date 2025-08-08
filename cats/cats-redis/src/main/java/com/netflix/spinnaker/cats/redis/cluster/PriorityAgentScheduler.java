@@ -55,6 +55,19 @@ import redis.clients.jedis.JedisPool;
  *   <li><strong>Agent-Specific Timeouts:</strong> Each agent type gets appropriate timeout handling
  * </ul>
  *
+ * <h2>Priority 0 invariants and health</h2>
+ *
+ * <ul>
+ *   <li>Re-scheduling: On success, re-schedule for the next cadence (prefer original acquire-based
+ *       cadence; else now + interval). On failure, immediate retry.
+ *   <li>WAITZ preservation: Do not purge valid WAITZ entries by age; preserve FIFO under backlog.
+ *   <li>WORKZ orphans: Skip locally active entries; move valid stale entries back to WAITZ using
+ *       conditional move; remove invalid ones.
+ *   <li>Health logging: Every 10 minutes, emit HEALTHY/DEGRADED and queue lag in seconds (0 if
+ *       none). DEGRADED when oldest_overdue_seconds > minimum enabled-agent interval on this pod.
+ *       WARNs are rate-limited to avoid flooding.
+ * </ul>
+ *
  * <h2>Configuration Properties</h2>
  *
  * <p><strong>Agent Configuration (redis.agent.*):</strong>
@@ -308,14 +321,17 @@ public class PriorityAgentScheduler extends CatsModuleAware
       if (currentRun % 600 == 0) {
         SchedulerStats stats = getStats();
         log.info(
-            "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={}",
+            "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={} health={}{} oldest_overdue={}s",
             stats.getRegisteredAgents(),
             stats.getActiveAgents(),
             acquisitionService.getFuturesMapSize(),
             scriptManager.getScriptCount(),
             stats.getZombiesCleanedUp(),
             stats.getOrphansCleanedUp(),
-            stats.isRunning());
+            stats.isRunning(),
+            stats.isDegraded() ? "DEGRADED" : "HEALTHY",
+            stats.isDegraded() ? (" reason=" + stats.getDegradedReason()) : "",
+            stats.getOldestOverdueSeconds());
       }
 
     } catch (Throwable t) {
@@ -597,7 +613,10 @@ public class PriorityAgentScheduler extends CatsModuleAware
         acquisitionService.getActiveAgentCount(),
         zombieService.getZombiesCleanedUp(),
         orphanService.getOrphansCleanedUp(),
-        running.get());
+        running.get(),
+        acquisitionService.isDegraded(),
+        acquisitionService.getDegradedReason(),
+        acquisitionService.getOldestOverdueSeconds());
   }
 
   private void startScheduler() {
@@ -646,7 +665,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
         && config.getDisabledAgentPattern().matcher(agentType).matches();
   }
 
-  /** Statistics holder for scheduler metrics. */
+  /**
+   * Statistics holder for scheduler metrics.
+   *
+   * <p>Includes a config-free health state derived from WAITZ queue lag relative to the minimum
+   * enabled-agent interval on this pod. Queue lag is emitted in seconds even when HEALTHY to aid
+   * sizing and performance diagnostics.
+   */
   public static class SchedulerStats {
     private final long runCount;
     private final int registeredAgents;
@@ -654,6 +679,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
     private final long zombiesCleanedUp;
     private final long orphansCleanedUp;
     private final boolean running;
+    private final boolean degraded;
+    private final String degradedReason;
+    private final long oldestOverdueSeconds;
 
     public SchedulerStats(
         long runCount,
@@ -661,13 +689,19 @@ public class PriorityAgentScheduler extends CatsModuleAware
         int activeAgents,
         long zombiesCleanedUp,
         long orphansCleanedUp,
-        boolean running) {
+        boolean running,
+        boolean degraded,
+        String degradedReason,
+        long oldestOverdueSeconds) {
       this.runCount = runCount;
       this.registeredAgents = registeredAgents;
       this.activeAgents = activeAgents;
       this.zombiesCleanedUp = zombiesCleanedUp;
       this.orphansCleanedUp = orphansCleanedUp;
       this.running = running;
+      this.degraded = degraded;
+      this.degradedReason = degradedReason == null ? "" : degradedReason;
+      this.oldestOverdueSeconds = oldestOverdueSeconds;
     }
 
     public long getRunCount() {
@@ -694,11 +728,33 @@ public class PriorityAgentScheduler extends CatsModuleAware
       return running;
     }
 
+    public boolean isDegraded() {
+      return degraded;
+    }
+
+    public String getDegradedReason() {
+      return degradedReason;
+    }
+
+    public long getOldestOverdueSeconds() {
+      return oldestOverdueSeconds;
+    }
+
     @Override
     public String toString() {
       return String.format(
-          "SchedulerStats{runCount=%d, registered=%d, active=%d, zombies=%d, orphans=%d, running=%s}",
-          runCount, registeredAgents, activeAgents, zombiesCleanedUp, orphansCleanedUp, running);
+          "SchedulerStats{runCount=%d, registered=%d, active=%d, zombies=%d, orphans=%d, running=%s, health=%s, oldest_overdue=%ds%s}",
+          runCount,
+          registeredAgents,
+          activeAgents,
+          zombiesCleanedUp,
+          orphansCleanedUp,
+          running,
+          degraded ? "DEGRADED" : "HEALTHY",
+          oldestOverdueSeconds,
+          degraded && degradedReason != null && !degradedReason.isEmpty()
+              ? ", reason=" + degradedReason
+              : "");
     }
   }
 }

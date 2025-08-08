@@ -507,6 +507,86 @@ class AgentAcquisitionServiceTest {
   }
 
   @Nested
+  @DisplayName("Health/Degradation Signal Tests")
+  class HealthSignalTests {
+
+    @Test
+    @DisplayName("Should remain HEALTHY when no overdue agents in WAITZ")
+    void shouldRemainHealthyWhenNoOverdueAgents() throws Exception {
+      // Given
+      Agent a1 = createMockAgent("agent-healthy-1", "test");
+      Agent a2 = createMockAgent("agent-healthy-2", "test");
+
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+
+      acquisitionService.registerAgent(a1, execution, instr);
+      acquisitionService.registerAgent(a2, execution, instr);
+
+      // Put both agents in WAITZ with future scores (not overdue)
+      try (Jedis jedis = jedisPool.getResource()) {
+        long nowSec = System.currentTimeMillis() / 1000;
+        jedis.zadd("WAITZ", nowSec + 60, "agent-healthy-1");
+        jedis.zadd("WAITZ", nowSec + 120, "agent-healthy-2");
+      }
+
+      // When
+      acquisitionService.saturatePool(1L, null, executorService);
+
+      // Then
+      assertThat(acquisitionService.getOldestOverdueSeconds()).isEqualTo(0L);
+      assertThat(acquisitionService.isDegraded()).isFalse();
+    }
+
+    @Test
+    @DisplayName("Should mark DEGRADED only when oldest_overdue > min_interval (config-free)")
+    void shouldMarkDegradedBasedOnOldestOverdueVsMinInterval() throws Exception {
+      // Given min interval 60s from setUp(); create one overdue agent by 90s
+      Agent a1 = createMockAgent("agent-degraded-1", "test");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      acquisitionService.registerAgent(a1, execution, instr);
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        long nowSec = System.currentTimeMillis() / 1000;
+        jedis.zadd("WAITZ", nowSec - 90, "agent-degraded-1");
+      }
+
+      // When
+      acquisitionService.saturatePool(1L, null, executorService);
+
+      // Then
+      assertThat(acquisitionService.getOldestOverdueSeconds()).isGreaterThanOrEqualTo(60L);
+      assertThat(acquisitionService.isDegraded()).isTrue();
+      assertThat(acquisitionService.getDegradedReason()).contains("oldest_overdue=");
+    }
+
+    @Test
+    @DisplayName(
+        "Should avoid false positives by ignoring WORKZ overruns (zombies handled elsewhere)")
+    void shouldAvoidFalsePositivesFromWorkzOverruns() throws Exception {
+      // Given: place a recent WAITZ entry (no overdue) and an ancient WORKZ entry
+      Agent a1 = createMockAgent("agent-ok", "test");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      acquisitionService.registerAgent(a1, execution, instr);
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        long nowSec = System.currentTimeMillis() / 1000;
+        jedis.zadd("WAITZ", nowSec + 30, "agent-ok"); // not overdue
+        jedis.zadd("WORKZ", nowSec - 3600, "stale-workz"); // overrun in WORKZ
+      }
+
+      // When
+      acquisitionService.saturatePool(1L, null, executorService);
+
+      // Then: HEALTHY since WAITZ has no overdue entries; WORKZ overrun is zombie domain
+      assertThat(acquisitionService.getOldestOverdueSeconds()).isEqualTo(0L);
+      assertThat(acquisitionService.isDegraded()).isFalse();
+    }
+  }
+
+  @Nested
   @DisplayName("Disabled Pattern Integration Tests")
   class DisabledPatternIntegrationTests {
 

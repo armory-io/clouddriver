@@ -47,6 +47,7 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.Response;
+import redis.clients.jedis.Tuple;
 
 /**
  * Service responsible for acquiring agents from Redis and executing them.
@@ -93,6 +94,26 @@ public class AgentAcquisitionService {
   private final AtomicLong agentsAcquired = new AtomicLong(0);
   private final AtomicLong agentsExecuted = new AtomicLong(0);
   private final AtomicLong agentsFailed = new AtomicLong(0);
+
+  // Backlog/health snapshots and rate-limiting
+  private final AtomicLong lastBacklogWarnEpochMs = new AtomicLong(0);
+  private final AtomicLong lastOldestOverdueSeconds = new AtomicLong(0);
+  private final AtomicLong lastReadyCount = new AtomicLong(0);
+  private final AtomicLong lastCapacityPerCycle = new AtomicLong(0);
+  private final AtomicBoolean lastDegraded = new AtomicBoolean(false);
+  private final java.util.concurrent.atomic.AtomicReference<String> lastDegradedReason =
+      new java.util.concurrent.atomic.AtomicReference<>("");
+
+  /**
+   * Health evaluation notes:
+   *
+   * <ul>
+   *   <li>Queue lag is computed from WAITZ only; WORKZ overruns (zombies) are handled elsewhere.
+   *   <li>Degradation is config-free: oldest_overdue_seconds > min enabled-agent interval on this
+   *       pod.
+   *   <li>WARNs are rate-limited to once per 60 seconds to avoid flooding.
+   * </ul>
+   */
 
   // Reusable collections to reduce GC pressure in high-load scenarios.
   // ThreadLocal is safe here because saturatePool() runs in single-threaded scheduler executor.
@@ -199,6 +220,36 @@ public class AgentAcquisitionService {
         return 0;
       }
 
+      // Compute queue lag and health before acquisition; reuse Redis results when possible
+      long nowSec;
+      try {
+        nowSec = Long.parseLong(currentScore);
+      } catch (NumberFormatException nfe) {
+        nowSec = System.currentTimeMillis() / 1000L;
+      }
+
+      long readyCount = readyAgents.size();
+      long oldestOverdueSec = 0L;
+      try {
+        // To avoid false positives on DEGRADED, consider only agents known and enabled locally.
+        // Fetch a small window of the oldest ready entries and pick the first matching local agent.
+        final int window =
+            Math.max(8, Math.min(64, schedulerProperties.getAgentAcquisitionBatchSize()));
+        Set<Tuple> oldestWindow =
+            jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", currentScore, 0, window);
+        for (Tuple t : oldestWindow) {
+          String agentType = t.getElement();
+          AgentWorker local = agents.get(agentType);
+          if (local != null && isAgentEnabled(local.getAgent())) {
+            long oldestScore = (long) t.getScore();
+            oldestOverdueSec = Math.max(0L, nowSec - oldestScore);
+            break;
+          }
+        }
+      } catch (Exception ignore) {
+        // Best-effort; keep defaults on failure
+      }
+
       // PHASE 4: Agent Acquisition and Execution
       // Reusing thread-local collection to avoid memory allocations
       Set<AgentWorker> workersToSubmit = REUSABLE_WORKERS_SET.get();
@@ -217,6 +268,51 @@ public class AgentAcquisitionService {
       }
 
       int effectiveMaxToAcquire = Math.min(availableSlotsForNewAgents, readyAgents.size());
+
+      // Evaluate health/degradation and rate-limited WARNing.
+      // Avoid false positives by excluding known-orphan/zombie cases: we base the decision purely
+      // on WAITZ queue lag (oldest_overdueSec) and local agent cadences. WORKZ overruns are managed
+      // by Zombie cleanup and are not considered in this decision.
+      long minIntervalSec = 0L;
+      try {
+        minIntervalSec =
+            agents.values().stream()
+                .map(AgentWorker::getAgent)
+                .filter(this::isAgentEnabled)
+                .mapToLong(a -> intervalProvider.getInterval(a).getInterval() / 1000L)
+                .filter(v -> v > 0L)
+                .min()
+                .orElse(0L);
+      } catch (Exception e) {
+        // Keep 0 -> disables degradation if cannot compute
+      }
+
+      boolean degraded = oldestOverdueSec > minIntervalSec && minIntervalSec > 0L;
+      int capacityPerCycle =
+          Math.min(availableSlotsForNewAgents, schedulerProperties.getAgentAcquisitionBatchSize());
+
+      if (degraded && shouldWarnNow(lastBacklogWarnEpochMs, 60_000)) {
+        log.warn(
+            "PriorityScheduler degraded: oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
+            oldestOverdueSec,
+            minIntervalSec,
+            readyCount,
+            capacityPerCycle,
+            currentlyRunning,
+            agentProperties.getMaxConcurrentAgents());
+      }
+
+      // Persist snapshots for stats/periodic health log
+      lastOldestOverdueSeconds.set(oldestOverdueSec);
+      lastReadyCount.set(readyCount);
+      lastCapacityPerCycle.set(capacityPerCycle);
+      lastDegraded.set(degraded);
+      lastDegradedReason.set(
+          degraded
+              ? String.format(
+                  "oldest_overdue=%ss > min_interval=%ss; ready=%d capacityPerCycle=%d",
+                  oldestOverdueSec, minIntervalSec, readyCount, capacityPerCycle)
+              : "");
       log.debug(
           "Attempting to acquire agents ({} running, {} max capacity, {} ready in Redis, limited by {} available slots)",
           currentlyRunning,
@@ -322,6 +418,16 @@ public class AgentAcquisitionService {
       log.error("Error during agent acquisition cycle", e);
       return 0;
     }
+  }
+
+  private static boolean shouldWarnNow(AtomicLong lastEpochMs, long minPeriodMs) {
+    long now = System.currentTimeMillis();
+    long last = lastEpochMs.get();
+    if (now - last >= minPeriodMs) {
+      lastEpochMs.set(now);
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -744,6 +850,18 @@ public class AgentAcquisitionService {
    */
   public int getFuturesMapSize() {
     return activeAgentsFutures.size();
+  }
+
+  public long getOldestOverdueSeconds() {
+    return lastOldestOverdueSeconds.get();
+  }
+
+  public boolean isDegraded() {
+    return lastDegraded.get();
+  }
+
+  public String getDegradedReason() {
+    return lastDegradedReason.get();
   }
 
   /**
