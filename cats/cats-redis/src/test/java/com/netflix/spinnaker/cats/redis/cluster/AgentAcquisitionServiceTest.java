@@ -397,6 +397,106 @@ class AgentAcquisitionServiceTest {
   }
 
   @Nested
+  @DisplayName("Sharding Filter Integration Tests")
+  class ShardingFilterIntegrationTests {
+
+    @Test
+    @DisplayName("Registration is gated by sharding filter")
+    void registrationGatedByShardingFilter() throws Exception {
+      // Given
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(false);
+
+      Agent agent = createMockAgent("acct/denied-agent", "test-provider");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      // When
+      acquisitionService.registerAgent(agent, execution, instrumentation);
+
+      // Then - Not registered locally and not written to WAITZ
+      assertThat(acquisitionService.getRegisteredAgentCount()).isEqualTo(0);
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zscore("WAITZ", agent.getAgentType())).isNull();
+      }
+    }
+
+    @Test
+    @DisplayName("Acquisition is gated by sharding filter dynamically")
+    void acquisitionGatedDynamicallyByShardingFilter() {
+      // Given - allow at registration time
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
+
+      Agent agent = createMockAgent("acct/owned-agent", "test-provider");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+      acquisitionService.registerAgent(agent, execution, instrumentation);
+
+      // Flip filter to deny at acquisition time
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(false);
+
+      // When - attempt to acquire
+      int acquired = acquisitionService.saturatePool(1L, null, executorService);
+
+      // Then - not acquired; remains inactive
+      assertThat(acquired).isEqualTo(0);
+      assertThat(acquisitionService.getActiveAgentCount()).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("Two pods partition work via sharding without double-acquisition")
+    void twoPodsPartitionWithoutDoubleAcquisition() {
+      // Given two services sharing the same Redis but with different shard filters
+      ShardingFilter shardA = a -> a.getAgentType().contains("-A");
+      ShardingFilter shardB = a -> a.getAgentType().contains("-B");
+
+      PriorityAgentProperties props = new PriorityAgentProperties();
+      props.setMaxConcurrentAgents(10);
+      PrioritySchedulerProperties schedProps = new PrioritySchedulerProperties();
+
+      AgentAcquisitionService acqA =
+          new AgentAcquisitionService(
+              jedisPool, scriptManager, intervalProvider, shardA, props, schedProps);
+      AgentAcquisitionService acqB =
+          new AgentAcquisitionService(
+              jedisPool, scriptManager, intervalProvider, shardB, props, schedProps);
+
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+
+      // Register four agents on both pods; shard gating will limit local registry
+      String[] agents = {"acct/agent-A1", "acct/agent-A2", "acct/agent-B1", "acct/agent-B2"};
+      for (String name : agents) {
+        Agent a = createMockAgent(name, "test-provider");
+        acqA.registerAgent(a, execution, instr);
+        acqB.registerAgent(a, execution, instr);
+      }
+
+      // When - both attempt acquisition
+      int aAcquired = acqA.saturatePool(0L, null, executorService);
+      int bAcquired = acqB.saturatePool(0L, null, executorService);
+
+      // Then - each acquires only its shard; total equals 4 only if enough capacity
+      assertThat(aAcquired).isBetween(0, 2);
+      assertThat(bAcquired).isBetween(0, 2);
+
+      // Verify no cross-shard acquisitions
+      Set<String> activeA = acqA.getActiveAgentsMap().keySet();
+      Set<String> activeB = acqB.getActiveAgentsMap().keySet();
+      for (String name : activeA) {
+        assertThat(name).contains("-A");
+      }
+      for (String name : activeB) {
+        assertThat(name).contains("-B");
+      }
+
+      // Ensure no agent is active on both pods (only when both have active work)
+      if (!activeA.isEmpty() && !activeB.isEmpty()) {
+        assertThat(activeA).doesNotContainAnyElementsOf(activeB);
+      }
+    }
+  }
+
+  @Nested
   @DisplayName("Error Handling Tests")
   class ErrorHandlingTests {
 

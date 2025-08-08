@@ -169,6 +169,44 @@ class OrphanCleanupServiceTest {
     }
 
     @Test
+    @DisplayName("WAITZ cleanup should not remove invalid entries belonging to other shards")
+    void waitzCleanupPreservesOtherShardInvalidEntries() {
+      // Given - Add an old invalid agent that belongs to another shard
+      long oldScoreSeconds = (System.currentTimeMillis() - 4 * 60 * 1000) / 1000; // 4 minutes ago
+      String foreignInvalid = "acct/foreign-invalid-B"; // shard tag: -B
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.del("WORKZ", "WAITZ");
+        jedis.zadd("WAITZ", oldScoreSeconds, foreignInvalid);
+      }
+
+      // Build acquisition service with sharding filter that claims ownership only for "-A"
+      PriorityAgentProperties agentProps = new PriorityAgentProperties();
+      PrioritySchedulerProperties schedulerProps = new PrioritySchedulerProperties();
+      AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
+      when(intervalProvider.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
+
+      ShardingFilter shardA = a -> a.getAgentType().contains("-A");
+
+      AgentAcquisitionService acq =
+          new AgentAcquisitionService(
+              jedisPool, scriptManager, intervalProvider, shardA, agentProps, schedulerProps);
+
+      // Wire acquisition service so orphan cleanup can evaluate shard ownership
+      orphanService.setAcquisitionService(acq);
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - invalid but foreign entry should be preserved by this shard
+      assertThat(cleaned).isEqualTo(0);
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zscore("WAITZ", foreignInvalid)).isNotNull();
+      }
+    }
+
+    @Test
     @DisplayName("Should not clean agents within threshold in WORKING set")
     void shouldNotCleanAgentsWithinThresholdInWorkingSet() {
       // Given - Add recent agents to WORKING set

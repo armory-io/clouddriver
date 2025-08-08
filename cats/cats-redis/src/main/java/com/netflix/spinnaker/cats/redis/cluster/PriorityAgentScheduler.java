@@ -215,6 +215,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
   private final AtomicLong runCount = new AtomicLong(0);
   private final AtomicBoolean running = new AtomicBoolean(false);
 
+  // Track all agents provided via schedule(), regardless of current sharding gating
+  private final java.util.concurrent.ConcurrentMap<String, KnownAgent> knownAgents =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  // Reconciliation cadence control
+  private final AtomicLong lastReconcileEpochMs = new AtomicLong(0);
+
   public PriorityAgentScheduler(
       JedisPool jedisPool,
       NodeStatusProvider nodeStatusProvider,
@@ -301,6 +308,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // PHASE 0: Dynamic configuration refresh (periodic)
       refreshConfigurationIfNeeded(currentRun);
 
+      // PHASE 0.5: Reconcile known agents with current sharding/enablement (periodic)
+      reconcileKnownAgentsIfNeeded(currentRun);
+
       // PHASE 1: Cleanup operations
       zombieService.cleanupZombieAgentsIfNeeded(
           acquisitionService.getActiveAgentsMap(), acquisitionService.getActiveAgentsFutures());
@@ -352,6 +362,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
       Agent agent,
       AgentExecution agentExecution,
       ExecutionInstrumentation executionInstrumentation) {
+    // Always track the agent so that we can re-balance on shard changes
+    knownAgents.put(
+        agent.getAgentType(), new KnownAgent(agent, agentExecution, executionInstrumentation));
 
     if (!isAgentEnabled(agent)) {
       log.debug("Agent {} not enabled, skipping registration", agent.getAgentType());
@@ -378,6 +391,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
   public void unschedule(Agent agent) {
     acquisitionService.unregisterAgent(agent);
     log.debug("Unregistered agent {} from scheduling", agent.getAgentType());
+    knownAgents.remove(agent.getAgentType());
   }
 
   /**
@@ -580,6 +594,57 @@ public class PriorityAgentScheduler extends CatsModuleAware
     if (cyclesPerRefresh > 0 && currentRun % cyclesPerRefresh == 0) {
       refreshConfiguration();
     }
+  }
+
+  // Periodically re-apply sharding/enablement to known agents to achieve re-balancing when
+  // podCount/podIndex or configuration changes.
+  private void reconcileKnownAgentsIfNeeded(long currentRun) {
+    try {
+      long intervalMs = config.getSchedulerIntervalMs();
+      long refreshPeriodSeconds = config.getRedisRefreshPeriod();
+      long refreshPeriodMs = Math.max(1, refreshPeriodSeconds) * 1000L;
+      long now = System.currentTimeMillis();
+      long last = lastReconcileEpochMs.get();
+      if (now - last < refreshPeriodMs) {
+        return;
+      }
+      lastReconcileEpochMs.set(now);
+
+      for (KnownAgent ka : knownAgents.values()) {
+        Agent agent = ka.agent;
+        boolean enabledNow = isAgentEnabled(agent);
+        Agent registered = acquisitionService.getRegisteredAgent(agent.getAgentType());
+
+        if (enabledNow && registered == null) {
+          log.debug("Reconcile: registering newly-owned agent {}", agent.getAgentType());
+          acquisitionService.registerAgent(agent, ka.execution, ka.instrumentation);
+        } else if (!enabledNow && registered != null) {
+          log.debug("Reconcile: unregistering no-longer-owned agent {}", agent.getAgentType());
+          acquisitionService.unregisterAgent(agent);
+        }
+      }
+    } catch (Throwable t) {
+      log.warn("Failed to reconcile known agents with current shard/config: {}", t.getMessage());
+    }
+  }
+
+  // Helper holder for known agent metadata
+  private static final class KnownAgent {
+    final Agent agent;
+    final AgentExecution execution;
+    final ExecutionInstrumentation instrumentation;
+
+    KnownAgent(Agent agent, AgentExecution execution, ExecutionInstrumentation instrumentation) {
+      this.agent = agent;
+      this.execution = execution;
+      this.instrumentation = instrumentation;
+    }
+  }
+
+  // Test hook to force an immediate reconciliation without waiting for the cadence.
+  void reconcileKnownAgentsNow() {
+    lastReconcileEpochMs.set(0);
+    reconcileKnownAgentsIfNeeded(runCount.get());
   }
 
   /**

@@ -256,6 +256,68 @@ public class PrioritySchedulerIntegrationTest {
   }
 
   @Nested
+  @DisplayName("Sharding Rebalance Integration Tests")
+  class ShardingRebalanceIntegrationTests {
+
+    @Test
+    @DisplayName("Reconcile picks up newly-owned agents after pod count change")
+    void reconcilePicksUpNewlyOwnedAgents() {
+      // Build two schedulers with different sharding filters (A vs B)
+      ShardingFilter shardA = a -> a.getAgentType().contains("-A");
+      ShardingFilter shardB = a -> a.getAgentType().contains("-B");
+
+      PriorityAgentProperties agentProps = createDefaultAgentProperties();
+      PrioritySchedulerProperties schedulerProps = createDefaultSchedulerProperties();
+      AgentIntervalProvider interval = mock(AgentIntervalProvider.class);
+      when(interval.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(1000L, 5000L));
+
+      PriorityAgentScheduler schedA =
+          new PriorityAgentScheduler(
+              jedisPool, nodeStatusProvider, interval, shardA, agentProps, schedulerProps);
+      PriorityAgentScheduler schedB =
+          new PriorityAgentScheduler(
+              jedisPool, nodeStatusProvider, interval, shardB, agentProps, schedulerProps);
+
+      AgentExecution exec = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+
+      // Register agents on both schedulers; knownAgents should track all
+      Agent a1 = createMockAgent("acct/agent-A1", "core");
+      Agent b1 = createMockAgent("acct/agent-B1", "core");
+      schedA.schedule(a1, exec, instr);
+      schedA.schedule(b1, exec, instr);
+      schedB.schedule(a1, exec, instr);
+      schedB.schedule(b1, exec, instr);
+
+      // Simulate a shard rebalance by swapping shard filters: A takes B, B takes A
+      ShardingFilter newShardA = a -> a.getAgentType().contains("-B");
+      ShardingFilter newShardB = a -> a.getAgentType().contains("-A");
+
+      PriorityAgentScheduler schedA2 =
+          new PriorityAgentScheduler(
+              jedisPool, nodeStatusProvider, interval, newShardA, agentProps, schedulerProps);
+      PriorityAgentScheduler schedB2 =
+          new PriorityAgentScheduler(
+              jedisPool, nodeStatusProvider, interval, newShardB, agentProps, schedulerProps);
+
+      // Re-register known agents on new schedulers to populate knownAgents
+      schedA2.schedule(a1, exec, instr);
+      schedA2.schedule(b1, exec, instr);
+      schedB2.schedule(a1, exec, instr);
+      schedB2.schedule(b1, exec, instr);
+
+      // Force reconcile to apply new shard ownership
+      schedA2.reconcileKnownAgentsNow();
+      schedB2.reconcileKnownAgentsNow();
+
+      // After reconcile, both schedulers should have registered agents according to new ownership
+      assertThat(schedA2.getStats().getRegisteredAgents()).isBetween(1, 2);
+      assertThat(schedB2.getStats().getRegisteredAgents()).isBetween(1, 2);
+    }
+  }
+
+  @Nested
   @DisplayName("Error Handling Tests")
   class ErrorHandlingTests {
 

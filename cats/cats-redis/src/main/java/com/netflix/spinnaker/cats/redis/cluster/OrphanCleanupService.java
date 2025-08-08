@@ -477,6 +477,22 @@ public class OrphanCleanupService {
         // Determine if this is a valid agent or an agent for a removed account
         boolean isStillValid = isAgentStillValid(agentName);
 
+        // Shard-aware protection: For WAITZ entries, only this shard should consider removal.
+        // If ownership cannot be determined or belongs to other shard, preserve.
+        boolean belongsToThisShard;
+        if (acquisitionService == null) {
+          // Test environments (and legacy callers) may not wire acquisitionService. In that case,
+          // treat entries as belonging to this shard so cleanup behavior matches previous default
+          // (both sets cleaned when agents are considered invalid).
+          belongsToThisShard = true;
+        } else {
+          try {
+            belongsToThisShard = acquisitionService.belongsToThisShard(agentName);
+          } catch (Throwable t) {
+            belongsToThisShard = false; // fail-safe preserve
+          }
+        }
+
         if (WORKING_SET.equals(setName)) {
           // Skip locally active agents; zombie cleanup manages overruns
           boolean locallyActive =
@@ -556,8 +572,8 @@ public class OrphanCleanupService {
             }
           }
         } else if (WAITING_SET.equals(setName)) {
-          // WAITZ: Only remove invalid entries; preserve valid entries regardless of age
-          if (!isStillValid) {
+          // WAITZ: Only remove invalid entries for this shard; preserve others regardless of age
+          if (!isStillValid && belongsToThisShard) {
             Object result =
                 jedis.evalsha(
                     scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),

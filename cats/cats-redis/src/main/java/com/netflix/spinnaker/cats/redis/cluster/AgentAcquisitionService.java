@@ -111,13 +111,13 @@ public class AgentAcquisitionService {
    *   <li>Queue lag is computed from WAITZ only; WORKZ overruns (zombies) are handled elsewhere.
    *   <li>Degradation is config-free: oldest_overdue_seconds > min enabled-agent interval on this
    *       pod.
-   *   <li>WARNs are rate-limited to once per 60 seconds to avoid flooding.
+   *   <li>WARNs are rate-limited to once per 10 minutes to avoid flooding.
    * </ul>
    */
 
   // Reusable collections to reduce GC pressure in high-load scenarios.
   // ThreadLocal is safe here because saturatePool() runs in single-threaded scheduler executor.
-  // This avoids creating new HashSet instances on every scheduler cycle (every 1-2 seconds).
+  // This avoids creating new HashSet instances on every scheduler cycle.
   private static final ThreadLocal<Set<AgentWorker>> REUSABLE_WORKERS_SET =
       ThreadLocal.withInitial(HashSet::new);
 
@@ -291,7 +291,7 @@ public class AgentAcquisitionService {
       int capacityPerCycle =
           Math.min(availableSlotsForNewAgents, schedulerProperties.getAgentAcquisitionBatchSize());
 
-      if (degraded && shouldWarnNow(lastBacklogWarnEpochMs, 60_000)) {
+      if (degraded && shouldWarnNow(lastBacklogWarnEpochMs, 600_000)) {
         log.warn(
             "PriorityScheduler degraded: oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
             oldestOverdueSec,
@@ -486,6 +486,17 @@ public class AgentAcquisitionService {
         continue;
       }
 
+      // Sharding/enablement gating at acquisition time (dynamic-safe)
+      if (!isAgentEnabled(worker.getAgent())) {
+        log.debug(
+            "Skipping candidate agent {} due to sharding/enablement filter during acquisition",
+            agentType);
+        if (runningAgents != null) {
+          runningAgents.release();
+        }
+        continue;
+      }
+
       candidateAgents.add(agentType);
       candidateWorkers.add(worker);
       candidateCount++; // Track candidates prepared
@@ -648,6 +659,17 @@ public class AgentAcquisitionService {
         continue;
       }
 
+      // Sharding/enablement gating at acquisition time (dynamic-safe)
+      if (!isAgentEnabled(worker.getAgent())) {
+        log.debug(
+            "Skipping ready agent {} due to sharding/enablement filter during acquisition",
+            agentType);
+        if (runningAgents != null) {
+          runningAgents.release();
+        }
+        continue;
+      }
+
       // Try to acquire this agent from Redis
       String agentAcquireScore = tryAcquireAgent(jedis, worker.getAgent());
       if (agentAcquireScore != null) {
@@ -672,6 +694,50 @@ public class AgentAcquisitionService {
     }
 
     return agentsAcquiredThisCycle;
+  }
+
+  /**
+   * Determine if the provided agent type belongs to this shard according to the configured {@link
+   * ShardingFilter}. When the agent is not registered locally, a lightweight stub is used to
+   * evaluate sharding based on agentType alone (providerName defaults to "unknown").
+   *
+   * <p>Returns false if the shard ownership cannot be determined to avoid cross-shard deletions in
+   * cleanup flows.
+   */
+  public boolean belongsToThisShard(String agentType) {
+    try {
+      AgentWorker worker = agents.get(agentType);
+      Agent agent = worker != null ? worker.getAgent() : new AgentTypeOnlyStub(agentType);
+      return shardingFilter.filter(agent);
+    } catch (Exception e) {
+      log.debug("Unable to determine shard ownership for {}: {}", agentType, e.getMessage());
+      return false;
+    }
+  }
+
+  /** Minimal Agent implementation for sharding checks when only agentType is available. */
+  private static final class AgentTypeOnlyStub implements com.netflix.spinnaker.cats.agent.Agent {
+    private final String agentType;
+
+    AgentTypeOnlyStub(String agentType) {
+      this.agentType = agentType;
+    }
+
+    @Override
+    public String getAgentType() {
+      return agentType;
+    }
+
+    @Override
+    public String getProviderName() {
+      return "unknown";
+    }
+
+    @Override
+    public com.netflix.spinnaker.cats.agent.AgentExecution getAgentExecution(
+        com.netflix.spinnaker.cats.provider.ProviderRegistry providerRegistry) {
+      throw new UnsupportedOperationException("Not supported in shard ownership checks");
+    }
   }
 
   /**
