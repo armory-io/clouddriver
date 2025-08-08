@@ -968,7 +968,7 @@ public class AgentAcquisitionService {
     String agentType = agent.getAgentType();
 
     try (Jedis jedis = jedisPool.getResource()) {
-      // Calculate immediate execution score for restart
+      // Calculate immediate execution score for restart (seconds since epoch)
       String nextScore = score(jedis, 0L);
 
       log.debug(
@@ -976,7 +976,6 @@ public class AgentAcquisitionService {
           agentType,
           expectedScore,
           nextScore);
-      // TODO: fix score format to be s vs ms
       // Check current state in Redis before attempting swap
       Double currentWorkzScore = jedis.zscore(WORKING_SET, agentType);
       Double currentWaitzScore = jedis.zscore(WAITING_SET, agentType);

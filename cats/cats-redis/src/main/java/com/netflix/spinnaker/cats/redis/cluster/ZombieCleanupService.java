@@ -204,7 +204,9 @@ public class ZombieCleanupService {
 
     // Log scanning summary
     if (zombieAgentTypes.isEmpty()) {
-      log.debug("Zombie scan completed: {} agents analyzed, 0 zombies found", validAgentsScanned);
+      if (log.isDebugEnabled()) {
+        log.debug("Zombie scan completed: {} agents analyzed, 0 zombies found", validAgentsScanned);
+      }
       return 0;
     }
 
@@ -220,9 +222,11 @@ public class ZombieCleanupService {
 
     try (Jedis jedis = jedisPool.getResource()) {
       if (!batchOperationsEnabled) {
-        log.debug(
-            "Batch zombie cleanup disabled, using individual operations for {} agents",
-            zombieAgentTypes.size());
+        if (log.isDebugEnabled()) {
+          log.debug(
+              "Batch zombie cleanup disabled, using individual operations for {} agents",
+              zombieAgentTypes.size());
+        }
 
         for (String agentType : zombieAgentTypes) {
           try {
@@ -237,10 +241,12 @@ public class ZombieCleanupService {
         // Use batch cleanup with fallback to individual operations
         List<String> zombieBatch = new ArrayList<>();
         int batchSize = Math.min(schedulerProperties.getZombieBatchSize(), zombieAgentTypes.size());
-        log.debug(
-            "Processing {} zombie agents in batches of {} with fallback",
-            zombieAgentTypes.size(),
-            batchSize);
+        if (log.isDebugEnabled()) {
+          log.debug(
+              "Processing {} zombie agents in batches of {} with fallback",
+              zombieAgentTypes.size(),
+              batchSize);
+        }
 
         for (String agentType : zombieAgentTypes) {
           zombieBatch.add(agentType);
@@ -259,7 +265,9 @@ public class ZombieCleanupService {
       }
 
       zombiesCleanedUp.addAndGet(totalCleaned);
-      log.debug("Zombie cleanup completed: {} agents cleaned up", totalCleaned);
+      if (log.isDebugEnabled()) {
+        log.debug("Zombie cleanup completed: {} agents cleaned up", totalCleaned);
+      }
       return totalCleaned;
 
     } catch (Exception e) {

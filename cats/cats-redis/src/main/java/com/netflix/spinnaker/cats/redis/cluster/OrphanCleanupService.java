@@ -415,7 +415,9 @@ public class OrphanCleanupService {
       boolean acquired = "OK".equals(result);
       if (acquired) {
         currentLeadershipId = instanceId;
-        log.debug("Acquired orphan cleanup leadership: {}", instanceId);
+        if (log.isDebugEnabled()) {
+          log.debug("Acquired orphan cleanup leadership: {}", instanceId);
+        }
       } else {
         log.debug("Failed to acquire orphan cleanup leadership");
       }
@@ -443,9 +445,13 @@ public class OrphanCleanupService {
               java.util.Collections.singletonList(currentLeadershipId));
 
       if ("1".equals(result.toString())) {
-        log.debug("Released orphan cleanup leadership: {}", currentLeadershipId);
+        if (log.isDebugEnabled()) {
+          log.debug("Released orphan cleanup leadership: {}", currentLeadershipId);
+        }
       } else {
-        log.debug("Leadership was already released or expired: {}", currentLeadershipId);
+        if (log.isDebugEnabled()) {
+          log.debug("Leadership was already released or expired: {}", currentLeadershipId);
+        }
       }
 
     } catch (Exception e) {
@@ -618,9 +624,11 @@ public class OrphanCleanupService {
     if (acquisitionService == null) {
       // In absence of local registry, treat entries as invalid (test environments). Production pods
       // always wire acquisitionService; tests should set it explicitly when needed.
-      log.debug(
-          "AgentAcquisitionService not available, treating agent {} as invalid (will be removed)",
-          agentType);
+      if (log.isDebugEnabled()) {
+        log.debug(
+            "AgentAcquisitionService not available, treating agent {} as invalid (will be removed)",
+            agentType);
+      }
       return false;
     }
 
@@ -628,11 +636,15 @@ public class OrphanCleanupService {
     // If it's registered, it's considered valid (enabled agents are registered)
     Agent registeredAgent = acquisitionService.getRegisteredAgent(agentType);
     if (registeredAgent == null) {
-      log.debug("Agent {} is not registered locally, treating as invalid", agentType);
+      if (log.isDebugEnabled()) {
+        log.debug("Agent {} is not registered locally, treating as invalid", agentType);
+      }
       return false;
     }
 
-    log.debug("Agent {} is valid (registered locally)", agentType);
+    if (log.isDebugEnabled()) {
+      log.debug("Agent {} is valid (registered locally)", agentType);
+    }
     return true;
   }
 

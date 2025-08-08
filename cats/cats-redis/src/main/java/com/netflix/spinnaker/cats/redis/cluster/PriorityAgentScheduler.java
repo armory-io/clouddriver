@@ -322,7 +322,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
           acquisitionService.saturatePool(
               currentRun, config.getRunningAgents(), config.getAgentWorkPool());
 
-      if (agentsAcquired > 0) {
+      if (log.isDebugEnabled() && agentsAcquired > 0) {
         log.debug(
             "Scheduler run cycle {} completed: {} agents acquired", currentRun, agentsAcquired);
       }
