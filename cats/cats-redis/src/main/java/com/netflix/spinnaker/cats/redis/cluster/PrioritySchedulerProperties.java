@@ -16,6 +16,7 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import javax.annotation.PostConstruct;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -218,6 +219,39 @@ public class PrioritySchedulerProperties {
 
   public boolean isOrphanForceAllPods() {
     return orphanCleanup.isForceAllPods();
+  }
+
+  @PostConstruct
+  void validate() {
+    validatePositive(intervalMs, "redis.scheduler.intervalMs");
+    validatePositive(refreshPeriodSeconds, "redis.scheduler.refreshPeriodSeconds");
+    validateNonNegative(batchOperationsBatchSize, "redis.scheduler.batchOperationsBatchSize");
+
+    // Pool bounds sanity
+    if (pool.getCoreSize() <= 0) {
+      throw new IllegalArgumentException("redis.scheduler.pool.coreSize must be > 0");
+    }
+    if (pool.getMaxSize() < pool.getCoreSize()) {
+      throw new IllegalArgumentException("redis.scheduler.pool.maxSize must be >= coreSize");
+    }
+  }
+
+  private static void validatePositive(long v, String name) {
+    if (v <= 0) {
+      throw new IllegalArgumentException(name + " must be > 0 (was " + v + ")");
+    }
+  }
+
+  private static void validatePositive(int v, String name) {
+    if (v <= 0) {
+      throw new IllegalArgumentException(name + " must be > 0 (was " + v + ")");
+    }
+  }
+
+  private static void validateNonNegative(int v, String name) {
+    if (v < 0) {
+      throw new IllegalArgumentException(name + " must be >= 0 (was " + v + ")");
+    }
   }
 }
 

@@ -214,6 +214,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
   // Runtime state
   private final AtomicLong runCount = new AtomicLong(0);
   private final AtomicBoolean running = new AtomicBoolean(false);
+  private final AtomicLong lastHealthLogEpochMs = new AtomicLong(0);
 
   // Track all agents provided via schedule(), regardless of current sharding gating
   private final java.util.concurrent.ConcurrentMap<String, KnownAgent> knownAgents =
@@ -222,6 +223,20 @@ public class PriorityAgentScheduler extends CatsModuleAware
   // Reconciliation cadence control
   private final AtomicLong lastReconcileEpochMs = new AtomicLong(0);
 
+  /**
+   * Creates a PriorityAgentScheduler and wires core services.
+   *
+   * <p>Initializes script management, runtime configuration (thread pool, semaphore, regex
+   * patterns), and the acquisition/zombie/orphan services. Also cross-links the orphan cleaner with
+   * acquisition for shard-aware cleanup.
+   *
+   * @param jedisPool Redis connection pool used by all scheduler services
+   * @param nodeStatusProvider Provides node enablement for gating scheduling
+   * @param intervalProvider Supplies per-agent intervals/timeouts
+   * @param shardingFilter Predicate to decide local shard ownership of agents
+   * @param agentProperties Agent-level configuration properties
+   * @param schedulerProperties Scheduler-level configuration properties
+   */
   public PriorityAgentScheduler(
       JedisPool jedisPool,
       NodeStatusProvider nodeStatusProvider,
@@ -327,27 +342,55 @@ public class PriorityAgentScheduler extends CatsModuleAware
             "Scheduler run cycle {} completed: {} agents acquired", currentRun, agentsAcquired);
       }
 
-      // Log periodic operational health summary (every 10 minutes)
-      if (currentRun % 600 == 0) {
-        SchedulerStats stats = getStats();
-        log.info(
-            "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={} health={}{} oldest_overdue={}s",
-            stats.getRegisteredAgents(),
-            stats.getActiveAgents(),
-            acquisitionService.getFuturesMapSize(),
-            scriptManager.getScriptCount(),
-            stats.getZombiesCleanedUp(),
-            stats.getOrphansCleanedUp(),
-            stats.isRunning(),
-            stats.isDegraded() ? "DEGRADED" : "HEALTHY",
-            stats.isDegraded() ? (" reason=" + stats.getDegradedReason()) : "",
-            stats.getOldestOverdueSeconds());
-      }
+      // Log periodic operational health summary based on time (not cycle count)
+      maybeLogHealthSummary();
 
     } catch (Throwable t) {
       log.error("Critical error in scheduler run cycle {}", runCount.get(), t);
       // Don't rethrow - let scheduler continue and try again next cycle
     }
+  }
+
+  /**
+   * Emit a periodic health summary at most once every 10 minutes, regardless of scheduler interval.
+   *
+   * <p>Includes: registered/active counts, scripts loaded, zombies/orphans cleaned, health state
+   * (HEALTHY/DEGRADED + reason), oldest overdue (seconds), executor queue depth, and available
+   * semaphore permits when enabled.
+   */
+  private void maybeLogHealthSummary() {
+    long now = System.currentTimeMillis();
+    long last = lastHealthLogEpochMs.get();
+    if (now - last < 10 * 60 * 1000L) {
+      return;
+    }
+    if (!lastHealthLogEpochMs.compareAndSet(last, now)) {
+      return; // another thread logged
+    }
+
+    SchedulerStats stats = getStats();
+    int queueDepth = -1;
+    if (config.getAgentWorkPool() instanceof java.util.concurrent.ThreadPoolExecutor) {
+      queueDepth =
+          ((java.util.concurrent.ThreadPoolExecutor) config.getAgentWorkPool()).getQueue().size();
+    }
+    int availablePermits =
+        config.getRunningAgents() != null ? config.getRunningAgents().availablePermits() : -1;
+
+    log.info(
+        "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={} health={}{} oldest_overdue={}s queueDepth={} permitsAvailable={}",
+        stats.getRegisteredAgents(),
+        stats.getActiveAgents(),
+        acquisitionService.getFuturesMapSize(),
+        scriptManager.getScriptCount(),
+        stats.getZombiesCleanedUp(),
+        stats.getOrphansCleanedUp(),
+        stats.isRunning(),
+        stats.isDegraded() ? "DEGRADED" : "HEALTHY",
+        stats.isDegraded() ? (" reason=" + stats.getDegradedReason()) : "",
+        stats.getOldestOverdueSeconds(),
+        queueDepth,
+        availablePermits);
   }
 
   /**
@@ -488,9 +531,11 @@ public class PriorityAgentScheduler extends CatsModuleAware
   }
 
   /**
-   * Gracefully releases all active agents back to the waiting queue during shutdown. This prevents
-   * agent loss during deployments and restarts. Only re-queues agents this instance was actively
-   * working on to prevent conflicts in multi-instance non-sharded environments.
+   * Gracefully re-queues agents owned by this instance during shutdown.
+   *
+   * <p>Process: 1) Interrupt running futures and release permits 2) Conditionally move owned WORKZ
+   * entries back to WAITZ if still owned (score match) 3) Perform a best-effort wait and log
+   * outcomes
    */
   private void gracefullyReleaseActiveAgents() {
     // Get count of agents this instance is actively working on
@@ -576,10 +621,10 @@ public class PriorityAgentScheduler extends CatsModuleAware
   }
 
   /**
-   * Refresh configuration if needed based on the configured refresh interval. This allows dynamic
-   * configuration updates without restarts.
+   * Periodically refreshes configuration based on elapsed cycles. Acts as a hook for dynamic config
+   * even when properties are cached via {@code @ConfigurationProperties}.
    *
-   * @param currentRun The current run cycle number
+   * @param currentRun current scheduler cycle number
    */
   private void refreshConfigurationIfNeeded(long currentRun) {
     // Check if we should refresh configuration (every 30 seconds by default)
@@ -596,8 +641,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
     }
   }
 
-  // Periodically re-apply sharding/enablement to known agents to achieve re-balancing when
-  // podCount/podIndex or configuration changes.
+  /**
+   * Periodically reconciles known agents with current sharding/enablement, registering newly-owned
+   * agents and unregistering no-longer-owned ones without a restart.
+   *
+   * @param currentRun current scheduler cycle number
+   */
   private void reconcileKnownAgentsIfNeeded(long currentRun) {
     try {
       long intervalMs = config.getSchedulerIntervalMs();
@@ -628,7 +677,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     }
   }
 
-  // Helper holder for known agent metadata
+  /** Lightweight holder for a scheduled agent and its execution/instrumentation handles. */
   private static final class KnownAgent {
     final Agent agent;
     final AgentExecution execution;
@@ -641,7 +690,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     }
   }
 
-  // Test hook to force an immediate reconciliation without waiting for the cadence.
+  /** Test hook that forces an immediate reconciliation without waiting for cadence. */
   void reconcileKnownAgentsNow() {
     lastReconcileEpochMs.set(0);
     reconcileKnownAgentsIfNeeded(runCount.get());
@@ -684,6 +733,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         acquisitionService.getOldestOverdueSeconds());
   }
 
+  /** Starts the periodic scheduler execution at the configured interval. */
   private void startScheduler() {
     long intervalMs = config.getSchedulerIntervalMs();
 
@@ -698,6 +748,11 @@ public class PriorityAgentScheduler extends CatsModuleAware
     log.info("Scheduler started with interval {}ms", intervalMs);
   }
 
+  /**
+   * Determines whether an agent is eligible for scheduling on this node.
+   *
+   * <p>Checks shard ownership, enabled pattern, and disabled pattern.
+   */
   private boolean isAgentEnabled(Agent agent) {
     String agentType = agent.getAgentType();
 

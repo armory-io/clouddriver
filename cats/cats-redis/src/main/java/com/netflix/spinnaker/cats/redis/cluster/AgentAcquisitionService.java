@@ -434,8 +434,15 @@ public class AgentAcquisitionService {
             "Zero agents acquired from {} ready agents, checking for new arrivals",
             readyAgents.size());
 
-        // Quick check: Are there new agents available now?
-        Set<String> newReadyAgents = jedis.zrangeByScore(WAITING_SET, "-inf", currentScore);
+        // Quick check: Are there new agents available now? Limit scan to actual capacity
+        int retryScanLimit =
+            Math.min(
+                Math.max(availableSlotsForNewAgents, 0),
+                schedulerProperties.getAgentAcquisitionBatchSize());
+        Set<String> newReadyAgents =
+            retryScanLimit > 0
+                ? jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, 0, retryScanLimit)
+                : java.util.Collections.emptySet();
 
         if (!newReadyAgents.isEmpty() && !newReadyAgents.equals(readyAgents)) {
           log.debug(
@@ -1190,17 +1197,44 @@ public class AgentAcquisitionService {
    * @return Set containing all agent names from both Redis sets
    */
   private Set<String> getCurrentRedisAgents(Jedis jedis) {
-    Pipeline pipeline = jedis.pipelined();
-    // Using zrange(0, -1) to get all members by index position rather than by score range
-    // This is equivalent to zrangeByScore("-inf", "+inf") but more direct when we need all elements
-    // regardless of score value
-    Response<Set<String>> waitingAgents = pipeline.zrange(WAITING_SET, 0, -1);
-    Response<Set<String>> workingAgents = pipeline.zrange(WORKING_SET, 0, -1);
-    pipeline.sync();
+    // Avoid full-set scans: check presence for locally registered agents only
+    List<String> agentNames = new ArrayList<>(agents.keySet());
+    if (agentNames.isEmpty()) {
+      return java.util.Collections.emptySet();
+    }
 
-    Set<String> allAgents = new HashSet<>(waitingAgents.get());
-    allAgents.addAll(workingAgents.get());
-    return allAgents;
+    try {
+      @SuppressWarnings("unchecked")
+      List<String> results =
+          (List<String>)
+              jedis.evalsha(
+                  scriptManager.getScriptSha(RedisScriptManager.SCORE_AGENTS),
+                  Arrays.asList(WORKING_SET, WAITING_SET),
+                  agentNames);
+
+      // Results format: [agent, workScore|'null', waitScore|'null', ...]
+      Set<String> allAgents = new HashSet<>();
+      for (int i = 0; i < results.size(); i += 3) {
+        String agent = results.get(i);
+        String workScore = results.get(i + 1);
+        String waitScore = results.get(i + 2);
+        if (!"null".equals(workScore) || !"null".equals(waitScore)) {
+          allAgents.add(agent);
+        }
+      }
+      return allAgents;
+    } catch (Exception e) {
+      // Fallback: full-set scan if script fails
+      log.warn(
+          "Repopulation presence check failed, falling back to full-set scan: {}", e.getMessage());
+      Pipeline pipeline = jedis.pipelined();
+      Response<Set<String>> waitingAgents = pipeline.zrange(WAITING_SET, 0, -1);
+      Response<Set<String>> workingAgents = pipeline.zrange(WORKING_SET, 0, -1);
+      pipeline.sync();
+      Set<String> allAgents = new HashSet<>(waitingAgents.get());
+      allAgents.addAll(workingAgents.get());
+      return allAgents;
+    }
   }
 
   /**
@@ -1465,7 +1499,10 @@ public class AgentAcquisitionService {
           long agentTimeoutMs = interval.getTimeout();
           long originalAcquireMs = (acquireScoreSeconds * 1000L) - agentTimeoutMs;
           long desiredNextRunMs = originalAcquireMs + intervalMs;
-          long nowMs = System.currentTimeMillis();
+          // Use server-synchronized 'now' to keep desired next run in the same time basis as
+          // acquireScore (which is derived from Redis server time). This avoids client/server clock
+          // skew showing up as multi-second drift in tests and scheduling.
+          long nowMs = System.currentTimeMillis() + serverClientOffset.get();
           long offsetMs = desiredNextRunMs - nowMs;
           return Math.max(offsetMs, 0L);
         } catch (NumberFormatException ignored) {

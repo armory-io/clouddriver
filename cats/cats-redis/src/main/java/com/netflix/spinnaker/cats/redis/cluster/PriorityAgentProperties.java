@@ -16,6 +16,8 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import java.util.regex.Pattern;
+import javax.annotation.PostConstruct;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -94,5 +96,26 @@ public class PriorityAgentProperties {
    */
   public void setMaxConcurrentAgents(int maxConcurrentAgents) {
     this.maxConcurrentAgents = maxConcurrentAgents;
+  }
+
+  @PostConstruct
+  void validate() {
+    // Validate enabled/disabled regex eagerly for fast fail at startup
+    try {
+      Pattern.compile(enabledPattern);
+    } catch (Exception e) {
+      throw new IllegalArgumentException(
+          "redis.agent.enabledPattern is invalid: " + enabledPattern, e);
+    }
+
+    if (disabledPattern != null && !disabledPattern.isEmpty()) {
+      try {
+        Pattern.compile(disabledPattern);
+      } catch (Exception e) {
+        throw new IllegalArgumentException(
+            "redis.agent.disabledPattern is invalid: " + disabledPattern, e);
+      }
+    }
+    // maxConcurrentAgents: allow <=0 for unbounded as documented; no check here
   }
 }
