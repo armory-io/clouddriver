@@ -97,6 +97,7 @@ public class AgentAcquisitionService {
 
   // Backlog/health snapshots and rate-limiting
   private final AtomicLong lastBacklogWarnEpochMs = new AtomicLong(0);
+  private final AtomicLong lastStallWarnEpochMs = new AtomicLong(0);
   private final AtomicLong lastOldestOverdueSeconds = new AtomicLong(0);
   private final AtomicLong lastReadyCount = new AtomicLong(0);
   private final AtomicLong lastCapacityPerCycle = new AtomicLong(0);
@@ -229,6 +230,72 @@ public class AgentAcquisitionService {
           "Found {} agents ready for execution at score {}", readyAgents.size(), currentScore);
 
       if (readyAgents.isEmpty()) {
+        // Detect acquisition stall: WAITZ has backlog but none are ready (e.g., future-scored)
+        try {
+          long waitzBacklog = jedis.zcard(WAITING_SET);
+
+          if (waitzBacklog > 0) {
+            // Compute current time from Redis score if possible
+            long nowSec;
+            try {
+              nowSec = Long.parseLong(currentScore);
+            } catch (NumberFormatException nfe) {
+              nowSec = System.currentTimeMillis() / 1000L;
+            }
+
+            // Find the earliest local-enabled WAITZ entry
+            final int window =
+                Math.max(8, Math.min(64, schedulerProperties.getAgentAcquisitionBatchSize()));
+            Long earliestLocalWaitzScore = null;
+            try {
+              Set<Tuple> earliest = jedis.zrangeWithScores(WAITING_SET, 0, Math.max(0, window - 1));
+              for (Tuple t : earliest) {
+                String agentType = t.getElement();
+                AgentWorker local = agents.get(agentType);
+                if (local != null && isAgentEnabled(local.getAgent())) {
+                  earliestLocalWaitzScore = (long) t.getScore();
+                  break;
+                }
+              }
+            } catch (Exception ignore) {
+              // Best-effort; keep null on failure
+            }
+
+            // Compute the minimal enabled-agent interval in seconds
+            long minIntervalSec = 0L;
+            try {
+              minIntervalSec =
+                  agents.values().stream()
+                      .map(AgentWorker::getAgent)
+                      .filter(this::isAgentEnabled)
+                      .mapToLong(a -> intervalProvider.getInterval(a).getInterval() / 1000L)
+                      .filter(v -> v > 0L)
+                      .min()
+                      .orElse(0L);
+            } catch (Exception e) {
+              // Keep 0 -> disables warning refinement if cannot compute
+            }
+
+            // Warn only if the next local-ready time is significantly in the future compared to
+            // the minimal rescheduling threshold (minIntervalSec). This indicates a likely stall
+            // due to future-scored entries.
+            if (earliestLocalWaitzScore != null
+                && minIntervalSec > 0L
+                && (earliestLocalWaitzScore - nowSec) > minIntervalSec
+                && shouldWarnNow(lastStallWarnEpochMs, 300_000)) {
+              long nextReadyInSec = Math.max(0L, earliestLocalWaitzScore - nowSec);
+              log.warn(
+                  "Acquisition stall detected: ready=0, waitz_backlog={}, next_local_ready_in={}s > min_interval={}s, pool_active={}, pool_waiters={}",
+                  waitzBacklog,
+                  nextReadyInSec,
+                  minIntervalSec,
+                  jedisPool.getNumActive(),
+                  jedisPool.getNumWaiters());
+            }
+          }
+        } catch (Exception ignore) {
+          // Diagnostics only
+        }
         log.debug("No agents ready for execution");
         return 0;
       }

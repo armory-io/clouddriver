@@ -18,7 +18,6 @@ package com.netflix.spinnaker.cats.redis.cluster;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -315,16 +314,28 @@ public class PrioritySchedulerConfiguration {
         maximumPoolSize,
         keepAliveTime);
 
+    java.util.concurrent.BlockingQueue<Runnable> workQueue;
+    if (schedulerProperties.getPool().isUseSynchronousQueue()) {
+      // Direct handoff: no queuing. Strong backpressure via CallerRunsPolicy.
+      workQueue = new java.util.concurrent.SynchronousQueue<>();
+    } else {
+      // Default parity with other schedulers: unbounded queue
+      workQueue = new java.util.concurrent.LinkedBlockingQueue<>();
+    }
+
     this.agentWorkPool =
         new ThreadPoolExecutor(
             corePoolSize,
             maximumPoolSize,
             keepAliveTime,
             TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(), // Unbounded queue like other schedulers
+            workQueue,
             new ThreadFactoryBuilder().setNameFormat("PriorityAgentWorker-%d").build(),
-            new ThreadPoolExecutor.CallerRunsPolicy()); // Execute in caller thread as fallback
+            new ThreadPoolExecutor.CallerRunsPolicy()); // Backpressure to scheduler thread
   }
+
+  // No derived capacity logic: default is unbounded queue for parity; optional direct handoff via
+  // SynchronousQueue provides a single strong safety switch without extra knobs.
 
   /** Creates the scheduler executor service. */
   private void createSchedulerExecutorService() {

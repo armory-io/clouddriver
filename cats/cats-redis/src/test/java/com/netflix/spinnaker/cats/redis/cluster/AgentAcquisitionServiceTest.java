@@ -684,6 +684,43 @@ class AgentAcquisitionServiceTest {
       assertThat(acquisitionService.getOldestOverdueSeconds()).isEqualTo(0L);
       assertThat(acquisitionService.isDegraded()).isFalse();
     }
+
+    @Test
+    @DisplayName("Warn when acquisition stall occurs (backlog but no ready agents)")
+    void shouldWarnOnAcquisitionStall() throws Exception {
+      // Use a tiny batch size to simplify
+      schedulerProperties.setBatchOperationsEnabled(false);
+      recreateAcquisitionService();
+
+      // Register an agent but give it a future score so it's not ready
+      Agent agent = createMockAgent("stall-agent", "test");
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      acquisitionService.registerAgent(agent, execution, instr);
+
+      // Force the rate limiter to allow immediate WARN emission
+      java.lang.reflect.Field f =
+          AgentAcquisitionService.class.getDeclaredField("lastStallWarnEpochMs");
+      f.setAccessible(true);
+      java.util.concurrent.atomic.AtomicLong rateLimiter =
+          (java.util.concurrent.atomic.AtomicLong) f.get(acquisitionService);
+      rateLimiter.set(0L);
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        long nowSec = System.currentTimeMillis() / 1000;
+        jedis.zadd("WAITZ", nowSec + 600, "stall-agent"); // backlog but not ready
+      }
+
+      int acquired = acquisitionService.saturatePool(1L, null, executorService);
+      assertThat(acquired).isEqualTo(0);
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("WAITZ")).isGreaterThan(0);
+      }
+
+      // Assert the stall path executed by verifying the rate-limiter timestamp updated
+      long afterTs = rateLimiter.get();
+      assertThat(afterTs).isGreaterThan(0L);
+    }
   }
 
   @Nested

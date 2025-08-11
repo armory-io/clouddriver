@@ -407,6 +407,13 @@ class RedisThreadPoolProperties {
   /** Thread keep-alive time in seconds. */
   private long keepAliveSeconds = 60L;
 
+  /**
+   * When true, use a SynchronousQueue for direct handoff (no internal queue). This applies strong
+   * backpressure to the scheduler once all workers are busy and up to max threads are in use. New
+   * tasks will run in the caller via CallerRunsPolicy, eliminating memory build-up.
+   */
+  private boolean useSynchronousQueue = false;
+
   public int getCoreSize() {
     return coreSize;
   }
@@ -429,5 +436,13 @@ class RedisThreadPoolProperties {
 
   public void setKeepAliveSeconds(long keepAliveSeconds) {
     this.keepAliveSeconds = keepAliveSeconds;
+  }
+
+  public boolean isUseSynchronousQueue() {
+    return useSynchronousQueue;
+  }
+
+  public void setUseSynchronousQueue(boolean useSynchronousQueue) {
+    this.useSynchronousQueue = useSynchronousQueue;
   }
 }
