@@ -395,12 +395,18 @@ public class AgentAcquisitionService {
                   "oldest_overdue=%ss > min_interval=%ss; ready=%d capacityPerCycle=%d",
                   oldestOverdueSec, minIntervalSec, readyCount, capacityPerCycle)
               : "");
+      int queueDepthDebug = -1;
+      if (agentWorkPool instanceof java.util.concurrent.ThreadPoolExecutor) {
+        queueDepthDebug =
+            ((java.util.concurrent.ThreadPoolExecutor) agentWorkPool).getQueue().size();
+      }
       log.debug(
-          "Attempting to acquire agents ({} running, {} max capacity, {} ready in Redis, limited by {} available slots)",
+          "Attempting to acquire agents ({} running, {} max capacity, {} ready in Redis, limited by {} available slots, queueDepth={})",
           currentlyRunning,
           maxConcurrentAgents,
           readyAgents.size(),
-          availableSlotsForNewAgents);
+          availableSlotsForNewAgents,
+          queueDepthDebug);
 
       // Use batch acquisition if enabled and there are multiple agents ready
       if (schedulerProperties.isBatchOperationsEnabled() && readyAgents.size() > 1) {
@@ -503,6 +509,9 @@ public class AgentAcquisitionService {
 
       return agentsAcquiredThisCycle;
 
+    } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+      log.warn("Redis connection error during agent acquisition: {}", e.getMessage());
+      return 0;
     } catch (Exception e) {
       log.error("Error during agent acquisition cycle", e);
       return 0;
