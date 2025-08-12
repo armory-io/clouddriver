@@ -1096,6 +1096,11 @@ public class AgentAcquisitionService {
             result);
       }
 
+    } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+      log.warn(
+          "Redis connection error while re-queuing {} during shutdown: {}",
+          agentType,
+          e.getMessage());
     } catch (Exception e) {
       log.error("Failed to conditionally re-queue agent {} during shutdown", agentType, e);
     }
@@ -1638,6 +1643,10 @@ public class AgentAcquisitionService {
         return result.toString(); // Return the acquire score from script
       }
       return null; // Agent was acquired by another instance
+    } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+      log.warn(
+          "Redis connection error while acquiring {}: {}", agent.getAgentType(), e.getMessage());
+      return null;
     } catch (Exception e) {
       log.warn("Failed to acquire agent {}", agent.getAgentType(), e);
       return null;
@@ -1905,6 +1914,9 @@ public class AgentAcquisitionService {
       completionQueue.offer(new AgentCompletion(agent, acquireScore, success));
       log.debug("Queued completion for agent {}: success={}", agentType, success);
 
+    } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+      log.warn(
+          "Redis connection error while queueing completion for {}: {}", agentType, e.getMessage());
     } catch (Exception e) {
       log.error(
           "Failed to queue agent completion for {}, falling back to immediate scheduling",

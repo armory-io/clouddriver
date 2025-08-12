@@ -353,6 +353,11 @@ public class ZombieCleanupService {
             return cleaned;
           }
         }
+      } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+        log.warn(
+            "Redis connection error during batch zombie cleanup for {} agents: {}",
+            zombieAgentTypes.size(),
+            e.getMessage());
       } catch (Exception e) {
         log.warn(
             "Batch zombie cleanup failed for {} agents, falling back to individual cleanup: {}",
@@ -369,6 +374,8 @@ public class ZombieCleanupService {
         if (cleanupIndividualZombieAgent(jedis, agentType, activeAgents, activeAgentsFutures)) {
           totalCleaned++;
         }
+      } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+        log.warn("Redis connection error while cleaning zombie {}: {}", agentType, e.getMessage());
       } catch (Exception e) {
         log.warn("Failed to cleanup individual zombie {}: {}", agentType, e.getMessage());
       }
@@ -485,6 +492,10 @@ public class ZombieCleanupService {
 
       return removed;
 
+    } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+      log.warn(
+          "Redis connection error removing zombie {} from Redis: {}", agentType, e.getMessage());
+      return false;
     } catch (Exception e) {
       log.warn("Failed to remove zombie agent {} from Redis: {}", agentType, e.getMessage());
       return false;

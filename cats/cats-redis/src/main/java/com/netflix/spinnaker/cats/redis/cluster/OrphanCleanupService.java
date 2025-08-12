@@ -250,6 +250,9 @@ public class OrphanCleanupService {
       List<Tuple> orphanList = new ArrayList<>(potentialOrphans);
       return processOrphanBatch(jedis, setName, orphanList);
 
+    } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+      log.warn("Redis connection error while scanning {} for orphans: {}", setName, e.getMessage());
+      return 0;
     } catch (Exception e) {
       log.error("Error cleaning orphaned agents from {} set", setName, e);
       return 0;
@@ -595,6 +598,12 @@ public class OrphanCleanupService {
           }
         }
 
+      } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+        log.warn(
+            "Redis connection error during orphan cleanup for {} (score {}): {}",
+            orphan.getElement(),
+            (long) orphan.getScore(),
+            e.getMessage());
       } catch (Exception e) {
         log.error(
             "Error during orphaned agent cleanup attempt for {} (original score: {}): {}",
