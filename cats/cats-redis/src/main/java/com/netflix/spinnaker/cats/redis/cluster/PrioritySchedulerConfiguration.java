@@ -203,7 +203,7 @@ public class PrioritySchedulerConfiguration {
    * @return batch size for zombie cleanup
    */
   public int getZombieCleanupBatchSize() {
-    return schedulerProperties.getZombieBatchSize();
+    return schedulerProperties.getBatchOperations().getBatchSize();
   }
 
   /**
@@ -239,7 +239,7 @@ public class PrioritySchedulerConfiguration {
    * @return batch size for orphan cleanup
    */
   public int getOrphanCleanupBatchSize() {
-    return schedulerProperties.getOrphanBatchSize();
+    return schedulerProperties.getBatchOperations().getBatchSize();
   }
 
   /**
@@ -266,7 +266,7 @@ public class PrioritySchedulerConfiguration {
    * @return true if batch operations are enabled
    */
   public boolean isBatchOperationsEnabled() {
-    return schedulerProperties.isBatchOperationsEnabled();
+    return schedulerProperties.getBatchOperations().isEnabled();
   }
 
   /** Shutdown all managed resources. */

@@ -190,8 +190,8 @@ public class AgentSchedulerConfig {
 
     log.info(
         "PriorityAgentScheduler batch operations: enabled={}, batchSize={}",
-        schedulerProperties.isBatchOperationsEnabled(),
-        schedulerProperties.getAgentAcquisitionBatchSize());
+        schedulerProperties.getBatchOperations().isEnabled(),
+        schedulerProperties.getBatchOperations().getBatchSize());
 
     return new PriorityAgentScheduler(
         jedisPool,

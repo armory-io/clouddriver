@@ -128,7 +128,7 @@ class BatchOperationsTest {
     @DisplayName("Should use batch operations for performance")
     void shouldUseBatchOperationsForPerformance() {
       // Given - Scheduler with batch operations enabled
-      assertThat(schedulerProperties.isBatchOperationsEnabled()).isTrue();
+      assertThat(schedulerProperties.getBatchOperations().isEnabled()).isTrue();
 
       // When - Register many agents
       for (int i = 0; i < 10; i++) {
@@ -253,7 +253,7 @@ class BatchOperationsTest {
 
   private PrioritySchedulerProperties createBatchEnabledSchedulerProperties() {
     PrioritySchedulerProperties props = new PrioritySchedulerProperties();
-    props.setBatchOperationsEnabled(true);
+    props.getBatchOperations().setEnabled(true);
     props.setIntervalMs(1000L);
     props.setRefreshPeriodSeconds(30);
     props.getZombieCleanup().setThresholdMs(1800000L); // 30 minutes

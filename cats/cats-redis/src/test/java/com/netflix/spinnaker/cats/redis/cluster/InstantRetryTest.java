@@ -78,10 +78,11 @@ public class InstantRetryTest {
     when(mockAgentProperties.getMaxConcurrentAgents())
         .thenReturn(10); // Low concurrency for contention
     when(mockSchedulerProperties.getRefreshPeriodSeconds()).thenReturn(1);
-    when(mockSchedulerProperties.isBatchOperationsEnabled())
-        .thenReturn(true); // Enable instant retry
-    when(mockSchedulerProperties.getBatchOperationsBatchSize())
-        .thenReturn(50); // Unified batch size
+    PrioritySchedulerProperties.BatchOperations mockBatch =
+        new PrioritySchedulerProperties.BatchOperations();
+    mockBatch.setEnabled(true);
+    mockBatch.setBatchSize(50);
+    when(mockSchedulerProperties.getBatchOperations()).thenReturn(mockBatch);
     when(mockScriptManager.getScriptSha(anyString())).thenReturn("mock-sha");
     when(mockScriptManager.isInitialized()).thenReturn(true);
 
@@ -241,7 +242,8 @@ public class InstantRetryTest {
     }
 
     System.out.println("\n=== Key Insight ===");
-    System.out.println("This test creates the exact conditions for instant retry:");
+    System.out.println(
+        "This test created conditions similar to instant retry (now superseded by chunked acquisition):");
     System.out.println("1. Initial query finds ready agents (!readyAgents.isEmpty())");
     System.out.println("2. Batch acquisition returns 0 (agents taken by other pod)");
     System.out.println("3. New agents become available during execution");

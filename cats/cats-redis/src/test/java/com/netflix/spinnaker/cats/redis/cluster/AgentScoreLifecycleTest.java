@@ -136,8 +136,17 @@ class AgentScoreLifecycleTest {
   @DisplayName("Acquisition moves WAITZ→WORKZ with deadline = now + timeout")
   void acquisitionSetsDeadline() {
     Agent agent = mkAgent("acq-agent");
-    acquisitionService.registerAgent(
-        agent, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
+    AgentExecution exec = mock(AgentExecution.class);
+    // Slow execution slightly so WORKZ entry is observable before completion clears it
+    doAnswer(
+            inv -> {
+              Thread.sleep(150);
+              return null;
+            })
+        .when(exec)
+        .executeAgent(any());
+
+    acquisitionService.registerAgent(agent, exec, mock(ExecutionInstrumentation.class));
 
     int acquired = acquisitionService.saturatePool(0L, null, executorService);
     assertThat(acquired).isEqualTo(1);

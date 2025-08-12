@@ -180,6 +180,13 @@ public class AgentAcquisitionService {
   /**
    * Core scheduling logic: Find ready agents, acquire them, and submit for execution.
    *
+   * <p>Semantics (chunked acquisition): - Compute available slots = max(0, maxConcurrentAgents -
+   * currentlyRunning) unless unbounded - Fill up to available slots in chunks of size
+   * redis.scheduler.batch-operations.batch-size within the same scheduler tick (multiple scans if
+   * needed) - If batch-operations.batch-size <= 0, treat as "no per-chunk cap" and use remaining
+   * slots as the chunk size (still uses batch acquisition if enabled) - Never spin: if a chunk
+   * acquires 0, stop and submit what was acquired
+   *
    * @param runCount Current run cycle number for periodic refresh
    * @param runningAgents Optional semaphore for instance-wide concurrency control
    * @param agentWorkPool Thread pool for executing agents
@@ -210,26 +217,16 @@ public class AgentAcquisitionService {
         repopulateRedisAgents(jedis);
       }
 
-      // PHASE 3: Find ready agents in priority order
+      // PHASE 3: Determine current readiness state for diagnostics
       String currentScore = score(jedis, 0L);
-      // Limit ready scan to the amount we can actually attempt this cycle
-      int availableSlotsForNewAgentsPrefetch =
-          unbounded
-              ? schedulerProperties.getAgentAcquisitionBatchSize()
-              : Math.max(0, maxConcurrentAgents - currentlyRunning);
-      int scanLimit =
-          Math.min(
-              Math.max(availableSlotsForNewAgentsPrefetch, 0),
-              schedulerProperties.getAgentAcquisitionBatchSize());
-      Set<String> readyAgents =
-          scanLimit > 0
-              ? jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, 0, scanLimit)
-              : java.util.Collections.emptySet();
+      long readyCountForDiagnostics = 0L;
+      try {
+        readyCountForDiagnostics = jedis.zcount(WAITING_SET, "-inf", currentScore);
+      } catch (Exception ignore) {
+        // Best effort; keep 0 if unable to compute
+      }
 
-      log.debug(
-          "Found {} agents ready for execution at score {}", readyAgents.size(), currentScore);
-
-      if (readyAgents.isEmpty()) {
+      if (readyCountForDiagnostics == 0L) {
         // Detect acquisition stall: WAITZ has backlog but none are ready (e.g., future-scored)
         try {
           long waitzBacklog = jedis.zcard(WAITING_SET);
@@ -245,7 +242,7 @@ public class AgentAcquisitionService {
 
             // Find the earliest local-enabled WAITZ entry
             final int window =
-                Math.max(8, Math.min(64, schedulerProperties.getAgentAcquisitionBatchSize()));
+                Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
             Long earliestLocalWaitzScore = null;
             try {
               Set<Tuple> earliest = jedis.zrangeWithScores(WAITING_SET, 0, Math.max(0, window - 1));
@@ -308,13 +305,13 @@ public class AgentAcquisitionService {
         nowSec = System.currentTimeMillis() / 1000L;
       }
 
-      long readyCount = readyAgents.size();
+      long readyCount = readyCountForDiagnostics;
       long oldestOverdueSec = 0L;
       try {
         // To avoid false positives on DEGRADED, consider only agents known and enabled locally.
         // Fetch a small window of the oldest ready entries and pick the first matching local agent.
         final int window =
-            Math.max(8, Math.min(64, schedulerProperties.getAgentAcquisitionBatchSize()));
+            Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
         Set<Tuple> oldestWindow =
             jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", currentScore, 0, window);
         for (Tuple t : oldestWindow) {
@@ -330,7 +327,7 @@ public class AgentAcquisitionService {
         // Best-effort; keep defaults on failure
       }
 
-      // PHASE 4: Agent Acquisition and Execution
+      // PHASE 4: Agent acquisition setup
       // Reusing thread-local collection to avoid memory allocations
       Set<AgentWorker> workersToSubmit = REUSABLE_WORKERS_SET.get();
       workersToSubmit.clear(); // Clear any previous contents
@@ -349,7 +346,9 @@ public class AgentAcquisitionService {
       }
 
       int effectiveMaxToAcquire =
-          unbounded ? readyAgents.size() : Math.min(availableSlotsForNewAgents, readyAgents.size());
+          unbounded
+              ? (int) Math.min(Integer.MAX_VALUE, readyCount)
+              : (int) Math.min(availableSlotsForNewAgents, Math.max(0L, readyCount));
 
       // Evaluate health/degradation and rate-limited WARNing.
       // Avoid false positives by excluding known-orphan/zombie cases: we base the decision purely
@@ -370,8 +369,7 @@ public class AgentAcquisitionService {
       }
 
       boolean degraded = oldestOverdueSec > minIntervalSec && minIntervalSec > 0L;
-      int capacityPerCycle =
-          Math.min(availableSlotsForNewAgents, schedulerProperties.getAgentAcquisitionBatchSize());
+      int capacityPerCycle = availableSlotsForNewAgents;
 
       if (degraded && shouldWarnNow(lastBacklogWarnEpochMs, 600_000)) {
         log.warn(
@@ -401,93 +399,63 @@ public class AgentAcquisitionService {
             ((java.util.concurrent.ThreadPoolExecutor) agentWorkPool).getQueue().size();
       }
       log.debug(
-          "Attempting to acquire agents ({} running, {} max capacity, {} ready in Redis, limited by {} available slots, queueDepth={})",
+          "Attempting to acquire agents ({} running, {} max capacity, {} ready in Redis, up to {} slots this cycle, queueDepth={})",
           currentlyRunning,
           maxConcurrentAgents,
-          readyAgents.size(),
+          readyCount,
           availableSlotsForNewAgents,
           queueDepthDebug);
 
-      // Use batch acquisition if enabled and there are multiple agents ready
-      if (schedulerProperties.isBatchOperationsEnabled() && readyAgents.size() > 1) {
-        try {
-          agentsAcquiredThisCycle =
-              saturatePoolBatch(
-                  jedis, readyAgents, availableSlotsForNewAgents, runningAgents, workersToSubmit);
-        } catch (Exception e) {
-          log.warn(
-              "Batch agent acquisition failed, falling back to individual mode: {}",
-              e.getMessage());
-          // Clear any partially processed workers from the failed batch attempt
-          workersToSubmit.clear();
-          // Fallback to individual acquisition
-          agentsAcquiredThisCycle =
-              saturatePoolIndividual(
-                  jedis, readyAgents, availableSlotsForNewAgents, runningAgents, workersToSubmit);
+      // PHASE 5: Acquire up to available slots in chunks of batch-size
+      int remainingToAcquire = availableSlotsForNewAgents;
+      while (remainingToAcquire > 0) {
+        // Use configured batch size when positive; otherwise treat as unlimited for this chunk
+        int configuredBatch = schedulerProperties.getBatchOperations().getBatchSize();
+        int perChunkLimit = configuredBatch > 0 ? configuredBatch : remainingToAcquire;
+        int chunkSize = Math.min(remainingToAcquire, perChunkLimit);
+        if (chunkSize <= 0) {
+          break;
         }
-      } else {
-        // Fallback: Individual agent acquisition (legacy mode)
-        agentsAcquiredThisCycle =
-            saturatePoolIndividual(
-                jedis, readyAgents, availableSlotsForNewAgents, runningAgents, workersToSubmit);
-      }
 
-      // PHASE 4.5: Instant retry on zero acquisition to handle concurrency conditions
-      if (agentsAcquiredThisCycle == 0
-          && !readyAgents.isEmpty()
-          && schedulerProperties.isBatchOperationsEnabled()) {
-        log.debug(
-            "Zero agents acquired from {} ready agents, checking for new arrivals",
-            readyAgents.size());
+        // Refresh server time for fairness across chunks
+        currentScore = score(jedis, 0L);
 
-        // Quick check: Are there new agents available now? Limit scan to actual capacity
-        int retryScanLimit =
-            Math.min(
-                Math.max(availableSlotsForNewAgents, 0),
-                schedulerProperties.getAgentAcquisitionBatchSize());
-        Set<String> newReadyAgents =
-            retryScanLimit > 0
-                ? jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, 0, retryScanLimit)
-                : java.util.Collections.emptySet();
+        Set<String> readyChunk =
+            jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, 0, chunkSize);
 
-        if (!newReadyAgents.isEmpty() && !newReadyAgents.equals(readyAgents)) {
-          log.debug(
-              "Found {} new ready agents (was {}), attempting instant retry",
-              newReadyAgents.size(),
-              readyAgents.size());
+        if (readyChunk == null || readyChunk.isEmpty()) {
+          break; // Nothing else ready right now
+        }
 
-          // Single retry attempt - try batch first, then individual if needed
+        int acquiredThisChunk = 0;
+        if (schedulerProperties.getBatchOperations().isEnabled() && readyChunk.size() > 1) {
           try {
-            agentsAcquiredThisCycle =
-                saturatePoolBatch(
-                    jedis,
-                    newReadyAgents,
-                    availableSlotsForNewAgents,
-                    runningAgents,
-                    workersToSubmit);
-
-            if (agentsAcquiredThisCycle > 0) {
-              log.debug("Instant retry succeeded: acquired {} agents", agentsAcquiredThisCycle);
-            }
+            acquiredThisChunk =
+                saturatePoolBatch(jedis, readyChunk, chunkSize, runningAgents, workersToSubmit);
           } catch (Exception e) {
-            log.debug("Instant retry batch failed, trying individual: {}", e.getMessage());
-            // Clear any partial state from failed retry
+            log.warn(
+                "Batch acquisition failed for chunk, falling back to individual: {}",
+                e.getMessage());
             workersToSubmit.clear();
-            agentsAcquiredThisCycle =
+            acquiredThisChunk =
                 saturatePoolIndividual(
-                    jedis,
-                    newReadyAgents,
-                    availableSlotsForNewAgents,
-                    runningAgents,
-                    workersToSubmit);
+                    jedis, readyChunk, chunkSize, runningAgents, workersToSubmit);
           }
         } else {
-          log.debug(
-              "No new agents found for instant retry (still {} ready)", newReadyAgents.size());
+          acquiredThisChunk =
+              saturatePoolIndividual(jedis, readyChunk, chunkSize, runningAgents, workersToSubmit);
         }
+
+        if (acquiredThisChunk <= 0) {
+          // Avoid spinning if we couldn't acquire from this chunk
+          break;
+        }
+
+        agentsAcquiredThisCycle += acquiredThisChunk;
+        remainingToAcquire -= acquiredThisChunk;
       }
 
-      // PHASE 5: Submit all acquired agents for execution
+      // PHASE 6: Submit all acquired agents for execution
       try {
         for (AgentWorker worker : workersToSubmit) {
           // CRITICAL: Set semaphore before execution so it can be released when done
@@ -547,9 +515,11 @@ public class AgentAcquisitionService {
       Semaphore runningAgents,
       Set<AgentWorker> workersToSubmit) {
 
-    // Apply batch size limit to prevent overwhelming Redis and memory
-    int configuredBatchSize = schedulerProperties.getAgentAcquisitionBatchSize();
-    int effectiveBatchSize = Math.min(maxToAcquire, configuredBatchSize);
+    // Apply batch size limit to prevent overwhelming Redis and memory. If configured batch size is
+    // non-positive, treat it as unlimited for this chunk.
+    int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
+    int effectiveBatchSize =
+        configuredBatchSize > 0 ? Math.min(maxToAcquire, configuredBatchSize) : maxToAcquire;
 
     log.debug(
         "Using batch agent acquisition: {} ready agents, max: {}, batch size: {}",
@@ -1260,7 +1230,7 @@ public class AgentAcquisitionService {
    * @param agentsToAdd Set of agent types to add to Redis
    */
   private void addMissingAgents(Jedis jedis, Set<String> agentsToAdd) {
-    if (schedulerProperties.isBatchOperationsEnabled() && agentsToAdd.size() > 1) {
+    if (schedulerProperties.getBatchOperations().isEnabled() && agentsToAdd.size() > 1) {
       addMissingAgentsBatch(jedis, agentsToAdd);
     } else {
       addMissingAgentsIndividual(jedis, agentsToAdd);
@@ -1336,7 +1306,7 @@ public class AgentAcquisitionService {
     try {
       // Use batch scoring if enabled and we have multiple agents
       Map<String, String> agentScores;
-      if (schedulerProperties.isBatchOperationsEnabled() && totalAgents > 1) {
+      if (schedulerProperties.getBatchOperations().isEnabled() && totalAgents > 1) {
         // Batch scoring for multiple agents
         agentScores = batchAgentScore(jedis, agents.values());
         log.debug("Batch scored {} agents", agentScores.size());
@@ -1350,7 +1320,7 @@ public class AgentAcquisitionService {
       }
 
       // Batch add agents to Redis in chunks to avoid memory issues
-      int batchSize = schedulerProperties.getBatchOperationsBatchSize();
+      int batchSize = schedulerProperties.getBatchOperations().getBatchSize();
       int processed = 0;
       int totalAdded = 0;
 
@@ -1455,7 +1425,7 @@ public class AgentAcquisitionService {
       long offset = entry.getKey();
       List<AgentCompletion> group = entry.getValue();
 
-      if (schedulerProperties.isBatchOperationsEnabled() && group.size() > 1) {
+      if (schedulerProperties.getBatchOperations().isEnabled() && group.size() > 1) {
         totalProcessed += batchScheduleCompletions(jedis, group, offset);
       } else {
         totalProcessed += individualScheduleCompletions(jedis, group, offset);

@@ -32,13 +32,13 @@ public class PrioritySchedulerProperties {
 
   /**
    * How often the scheduler runs to check for ready agents (milliseconds). Controls the frequency
-   * of the main scheduling loop.
+   * of the main scheduling loop. Config key: {@code redis.scheduler.interval-ms}
    */
   private long intervalMs = 1000L;
 
   /**
    * How often to refresh the Redis agent list (seconds). This helps recover from Redis failures and
-   * ensures consistency.
+   * ensures consistency. Config key: {@code redis.scheduler.refresh-period-seconds}
    */
   private int refreshPeriodSeconds = 30;
 
@@ -52,30 +52,16 @@ public class PrioritySchedulerProperties {
    * Enable batch operations for Redis operations. When enabled, the scheduler will group agent
    * operations together in batches rather than processing them individually. This affects how
    * agents are acquired and scheduled.
+   *
+   * <p>All batchable workflows (acquisition, completion, zombie/orphan cleanup, repopulation)
+   * respect this configuration. See {@link BatchOperations}.
    */
-  private boolean batchOperationsEnabled = false;
-
-  /**
-   * Maximum number of agents to process in a single batch operation.
-   *
-   * <p>Larger batch sizes reduce Redis round-trips but increase memory usage and potential lock
-   * contention.
-   *
-   * <p>This setting applies to:
-   *
-   * <ul>
-   *   <li>Agent acquisition operations
-   *   <li>Zombie cleanup operations
-   *   <li>Orphan cleanup operations
-   * </ul>
-   *
-   * <p>Default: 50 agents per batch
-   */
-  private int batchOperationsBatchSize = 50;
+  private BatchOperations batchOperations = new BatchOperations();
 
   /**
    * How long to cache Redis server time to reduce TIME command calls (milliseconds). Higher values
-   * reduce Redis calls but may drift from server time.
+   * reduce Redis calls but may drift from server time. Config key: {@code
+   * redis.scheduler.time-cache-duration-ms}
    */
   private long timeCacheDurationMs = 10000L; // 10 seconds
 
@@ -116,28 +102,12 @@ public class PrioritySchedulerProperties {
     this.orphanCleanup = orphanCleanup;
   }
 
-  public boolean isBatchOperationsEnabled() {
-    return batchOperationsEnabled;
+  public BatchOperations getBatchOperations() {
+    return batchOperations;
   }
 
-  public void setBatchOperationsEnabled(boolean enabled) {
-    this.batchOperationsEnabled = enabled;
-  }
-
-  public int getBatchOperationsBatchSize() {
-    return batchOperationsBatchSize;
-  }
-
-  public void setBatchOperationsBatchSize(int batchSize) {
-    this.batchOperationsBatchSize = batchSize;
-  }
-
-  public int getAgentAcquisitionBatchSize() {
-    return batchOperationsBatchSize;
-  }
-
-  public void setAgentAcquisitionBatchSize(int batchSize) {
-    this.batchOperationsBatchSize = batchSize;
+  public void setBatchOperations(BatchOperations batchOperations) {
+    this.batchOperations = batchOperations;
   }
 
   public long getTimeCacheDurationMs() {
@@ -154,6 +124,41 @@ public class PrioritySchedulerProperties {
 
   public void setPool(RedisThreadPoolProperties pool) {
     this.pool = pool;
+  }
+
+  /**
+   * Batch operations configuration block.
+   *
+   * <pre>
+   * redis:
+   *   scheduler:
+   *     batch-operations:
+   *       enabled: true
+   *       batch-size: 50
+   * </pre>
+   */
+  public static class BatchOperations {
+    /** Enable batch operations globally (acquisition, cleanup, completion, repopulation). */
+    private boolean enabled = false;
+
+    /** Maximum number of items to process in a single batch. Default: 50. */
+    private int batchSize = 50;
+
+    public boolean isEnabled() {
+      return enabled;
+    }
+
+    public void setEnabled(boolean enabled) {
+      this.enabled = enabled;
+    }
+
+    public int getBatchSize() {
+      return batchSize;
+    }
+
+    public void setBatchSize(int batchSize) {
+      this.batchSize = batchSize;
+    }
   }
 
   public int getThreadPoolCoreSize() {
@@ -178,10 +183,6 @@ public class PrioritySchedulerProperties {
 
   public long getZombieIntervalMs() {
     return zombieCleanup.getIntervalMs();
-  }
-
-  public int getZombieBatchSize() {
-    return batchOperationsBatchSize;
   }
 
   public boolean hasExceptionalAgents() {
@@ -209,10 +210,6 @@ public class PrioritySchedulerProperties {
     return orphanCleanup.getIntervalMs();
   }
 
-  public int getOrphanBatchSize() {
-    return batchOperationsBatchSize;
-  }
-
   public long getOrphanLeadershipTtlMs() {
     return orphanCleanup.getLeadershipTtlMs();
   }
@@ -223,16 +220,17 @@ public class PrioritySchedulerProperties {
 
   @PostConstruct
   void validate() {
-    validatePositive(intervalMs, "redis.scheduler.intervalMs");
-    validatePositive(refreshPeriodSeconds, "redis.scheduler.refreshPeriodSeconds");
-    validateNonNegative(batchOperationsBatchSize, "redis.scheduler.batchOperationsBatchSize");
+    validatePositive(intervalMs, "redis.scheduler.interval-ms");
+    validatePositive(refreshPeriodSeconds, "redis.scheduler.refresh-period-seconds");
+    validateNonNegative(
+        batchOperations.getBatchSize(), "redis.scheduler.batch-operations.batch-size");
 
     // Pool bounds sanity
     if (pool.getCoreSize() <= 0) {
-      throw new IllegalArgumentException("redis.scheduler.pool.coreSize must be > 0");
+      throw new IllegalArgumentException("redis.scheduler.pool.core-size must be > 0");
     }
     if (pool.getMaxSize() < pool.getCoreSize()) {
-      throw new IllegalArgumentException("redis.scheduler.pool.maxSize must be >= coreSize");
+      throw new IllegalArgumentException("redis.scheduler.pool.max-size must be >= core-size");
     }
   }
 
@@ -258,11 +256,20 @@ public class PrioritySchedulerProperties {
 /**
  * Zombie cleanup configuration properties for stuck agents.
  *
- * <p>Configuration example: redis: scheduler: zombieCleanup: enabled: true # Default: zombie
- * detection enabled thresholdMs: 30000 # Default: 30 seconds (30 * 1000) intervalMs: 300000 #
- * Default: 5 minutes (5 * 60 * 1000) batchSize: 50 # Default: process 50 zombies per batch
- * exceptionalAgents: pattern: ".*BigQuery.*" # Example: Regex pattern for agent names thresholdMs:
- * 3600000 # Different threshold for matching agents (60 * 60 * 1000)
+ * <p>Configuration example (kebab-case):
+ *
+ * <pre>
+ * redis:
+ *   scheduler:
+ *     zombie-cleanup:
+ *       enabled: true
+ *       threshold-ms: 30000       # 30s buffer
+ *       interval-ms: 300000       # 5m cadence
+ *       batch-size: 50
+ *       exceptional-agents:
+ *         pattern: ".*BigQuery.*"
+ *         threshold-ms: 3600000   # 60m for exceptional agents
+ * </pre>
  */
 class ZombieCleanupProperties {
 
@@ -373,7 +380,7 @@ class OrphanCleanupProperties {
 
   /**
    * TTL for distributed cleanup leadership lock (milliseconds). Only one pod gets cleanup
-   * leadership at a time.
+   * leadership at a time. Config key: {@code redis.scheduler.orphan-cleanup.leadership-ttl-ms}
    */
   private long leadershipTtlMs = 120000L; // 2 minutes
 
@@ -429,22 +436,26 @@ class RedisThreadPoolProperties {
 
   /**
    * Thread pool core size for agent execution. Defaults to 10, which works for most deployments.
+   * Config key: {@code redis.scheduler.pool.core-size}
    */
   private int coreSize = 10;
 
   /**
    * Thread pool maximum size for agent execution. Defaults to 50, increase for high-throughput
-   * deployments.
+   * deployments. Config key: {@code redis.scheduler.pool.max-size}
    */
   private int maxSize = 50;
 
-  /** Thread keep-alive time in seconds. */
+  /**
+   * Thread keep-alive time in seconds. Config key: {@code redis.scheduler.pool.keep-alive-seconds}
+   */
   private long keepAliveSeconds = 60L;
 
   /**
    * When true, use a SynchronousQueue for direct handoff (no internal queue). This applies strong
    * backpressure to the scheduler once all workers are busy and up to max threads are in use. New
-   * tasks will run in the caller via CallerRunsPolicy, eliminating memory build-up.
+   * tasks will run in the caller via CallerRunsPolicy, eliminating memory build-up. Config key:
+   * {@code redis.scheduler.pool.use-synchronous-queue}
    */
   private boolean useSynchronousQueue = false;
 

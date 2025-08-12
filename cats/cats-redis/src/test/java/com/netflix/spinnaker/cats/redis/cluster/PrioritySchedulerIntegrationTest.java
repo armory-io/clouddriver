@@ -177,6 +177,81 @@ public class PrioritySchedulerIntegrationTest {
   }
 
   @Nested
+  @DisplayName("Backpressure Behavior Tests")
+  class BackpressureBehaviorTests {
+
+    private PrioritySchedulerProperties createSlowSynchronousQueueProps() {
+      PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      props.setIntervalMs(1000L);
+      props.setRefreshPeriodSeconds(30);
+      props.getBatchOperations().setEnabled(true);
+      props.getBatchOperations().setBatchSize(50);
+      props.getPool().setCoreSize(2);
+      props.getPool().setMaxSize(2);
+      props.getPool().setUseSynchronousQueue(true);
+      return props;
+    }
+
+    @Test
+    @DisplayName("SynchronousQueue backpressure prevents scheduler spin under saturation")
+    void synchronousQueueBackpressurePreventsSpin() throws Exception {
+      PrioritySchedulerProperties slowProps = createSlowSynchronousQueueProps();
+      PriorityAgentProperties agentProps = new PriorityAgentProperties();
+      agentProps.setEnabledPattern(".*");
+      agentProps.setDisabledPattern("");
+      agentProps.setMaxConcurrentAgents(10);
+
+      NodeStatusProvider nodeStatusProvider = mock(NodeStatusProvider.class);
+      when(nodeStatusProvider.isNodeEnabled()).thenReturn(true);
+
+      AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
+      when(intervalProvider.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(0L, 5000L));
+
+      ShardingFilter shardingFilter = mock(ShardingFilter.class);
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
+
+      PriorityAgentScheduler sched =
+          new PriorityAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProps,
+              slowProps);
+
+      AgentExecution exec = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      // Simulate slow execution to saturate tiny pool
+      org.mockito.Mockito.doAnswer(
+              inv -> {
+                try {
+                  Thread.sleep(200);
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                }
+                return null;
+              })
+          .when(exec)
+          .executeAgent(any());
+
+      for (int i = 0; i < 20; i++) {
+        Agent a = createMockAgent("slow-" + i, "test");
+        sched.schedule(a, exec, instr);
+      }
+
+      long start = System.currentTimeMillis();
+      sched.run();
+      long durationMs = System.currentTimeMillis() - start;
+
+      // If the scheduler spun rapidly while submitting into a full SynchronousQueue, duration would
+      // be near-zero. Assert a small lower bound to indicate backpressure took effect without
+      // making this test flaky on fast CI runners.
+      assertThat(durationMs).isGreaterThanOrEqualTo(10L);
+    }
+  }
+
+  @Nested
   @DisplayName("Configuration Tests")
   class ConfigurationTests {
 
@@ -432,7 +507,7 @@ public class PrioritySchedulerIntegrationTest {
     props.getZombieCleanup().setIntervalMs(300000L); // 5 minutes
     props.getOrphanCleanup().setThresholdMs(7200000L); // 2 hours
     props.getOrphanCleanup().setIntervalMs(3600000L); // 1 hour
-    props.setBatchOperationsEnabled(false);
+    props.getBatchOperations().setEnabled(false);
     return props;
   }
 

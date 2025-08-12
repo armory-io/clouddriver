@@ -81,7 +81,11 @@ public class PrioritySchedulerComplexScenariosTest {
     // Setup scheduler properties with proper thread pool configuration
     when(mockSchedulerProperties.getIntervalMs()).thenReturn(1000L);
     when(mockSchedulerProperties.getRefreshPeriodSeconds()).thenReturn(30);
-    when(mockSchedulerProperties.isBatchOperationsEnabled()).thenReturn(false);
+    PrioritySchedulerProperties.BatchOperations mockBatch =
+        new PrioritySchedulerProperties.BatchOperations();
+    mockBatch.setEnabled(false);
+    mockBatch.setBatchSize(50);
+    when(mockSchedulerProperties.getBatchOperations()).thenReturn(mockBatch);
     when(mockSchedulerProperties.getTimeCacheDurationMs()).thenReturn(10000L);
 
     // Mock nested thread pool properties

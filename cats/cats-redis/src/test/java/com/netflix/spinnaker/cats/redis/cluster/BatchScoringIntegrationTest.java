@@ -95,9 +95,8 @@ class BatchScoringIntegrationTest {
 
     schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setRefreshPeriodSeconds(10);
-    schedulerProperties.setBatchOperationsEnabled(true);
-    schedulerProperties.setBatchOperationsBatchSize(50);
-    schedulerProperties.setAgentAcquisitionBatchSize(50);
+    schedulerProperties.getBatchOperations().setEnabled(true);
+    schedulerProperties.getBatchOperations().setBatchSize(50);
 
     executorService = Executors.newFixedThreadPool(5);
 
@@ -368,7 +367,7 @@ class BatchScoringIntegrationTest {
       }
 
       // Test batch mode
-      schedulerProperties.setBatchOperationsEnabled(true);
+      schedulerProperties.getBatchOperations().setEnabled(true);
       long batchStartTime = System.currentTimeMillis();
       acquisitionService.saturatePool(0L, new Semaphore(0), executorService);
       long batchDuration = System.currentTimeMillis() - batchStartTime;
@@ -381,7 +380,7 @@ class BatchScoringIntegrationTest {
       }
 
       // Test individual mode for comparison
-      schedulerProperties.setBatchOperationsEnabled(false);
+      schedulerProperties.getBatchOperations().setEnabled(false);
       long individualStartTime = System.currentTimeMillis();
       acquisitionService.saturatePool(0L, new Semaphore(0), executorService);
       long individualDuration = System.currentTimeMillis() - individualStartTime;
@@ -417,7 +416,7 @@ class BatchScoringIntegrationTest {
       }
 
       Semaphore runningAgents = new Semaphore(100);
-      schedulerProperties.setBatchOperationsEnabled(true);
+      schedulerProperties.getBatchOperations().setEnabled(true);
       acquisitionService.saturatePool(0L, runningAgents, executorService);
 
       // Wait for agent executions to complete

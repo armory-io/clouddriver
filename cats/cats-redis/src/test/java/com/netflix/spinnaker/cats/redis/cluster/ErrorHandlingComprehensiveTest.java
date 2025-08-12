@@ -218,8 +218,8 @@ public class ErrorHandlingComprehensiveTest {
     @DisplayName("Should fallback to individual mode when batch script fails")
     void shouldFallbackWhenBatchScriptFails() throws Exception {
       // Enable batch operations to trigger the batch path
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(5);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(5);
 
       // Create a spy on the real script manager so we can make just the batch script fail
       RedisScriptManager spyScriptManager = spy(scriptManager);
@@ -265,8 +265,8 @@ public class ErrorHandlingComprehensiveTest {
     @Test
     @DisplayName("Should handle partial batch failure gracefully")
     void shouldHandlePartialBatchFailure() throws Exception {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(2);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(2);
 
       // Register agents
       for (int i = 1; i <= 3; i++) {
@@ -292,8 +292,8 @@ public class ErrorHandlingComprehensiveTest {
     @Test
     @DisplayName("Should handle zero batch size configuration")
     void shouldHandleZeroBatchSize() {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(0);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(0);
 
       AgentAcquisitionService serviceWithZeroBatch =
           new AgentAcquisitionService(
@@ -321,8 +321,8 @@ public class ErrorHandlingComprehensiveTest {
     @Test
     @DisplayName("Should handle negative batch size configuration")
     void shouldHandleNegativeBatchSize() {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(-1);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(-1);
 
       AgentAcquisitionService serviceWithNegativeBatch =
           new AgentAcquisitionService(
@@ -351,8 +351,8 @@ public class ErrorHandlingComprehensiveTest {
     @DisplayName("Should handle extreme batch size configurations")
     void shouldHandleExtremeBatchSizes() {
       // Test with very large batch size
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(Integer.MAX_VALUE);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(Integer.MAX_VALUE);
 
       AgentAcquisitionService serviceWithLargeBatch =
           new AgentAcquisitionService(

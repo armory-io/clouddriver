@@ -40,7 +40,7 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 @Testcontainers
-@DisplayName("Acquisition ready-scan is capped by min(availableSlots, batchSize)")
+@DisplayName("Acquisition fills to available slots using chunked scans")
 class AcquisitionScanLimitIntegrationTest {
 
   @Container
@@ -79,8 +79,8 @@ class AcquisitionScanLimitIntegrationTest {
 
     schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setRefreshPeriodSeconds(1);
-    schedulerProperties.setBatchOperationsEnabled(true);
-    schedulerProperties.setAgentAcquisitionBatchSize(10); // larger than concurrency
+    schedulerProperties.getBatchOperations().setEnabled(true);
+    schedulerProperties.getBatchOperations().setBatchSize(10); // larger than concurrency
 
     acquisitionService =
         new AgentAcquisitionService(
@@ -109,8 +109,8 @@ class AcquisitionScanLimitIntegrationTest {
   }
 
   @Test
-  @DisplayName("Initial ready scan acquires at most min(maxConcurrent, batchSize)")
-  void initialReadyScanIsCapped() {
+  @DisplayName("Initial acquisition fills up to maxConcurrent in chunked batches")
+  void initialAcquisitionFillsToSlots() {
     // Register many agents so WAITZ will contain far more than the cap
     AgentExecution execution = mock(AgentExecution.class);
     ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
@@ -118,17 +118,66 @@ class AcquisitionScanLimitIntegrationTest {
       acquisitionService.registerAgent(createAgent("agent-" + i), execution, instrumentation);
     }
 
-    int expectedCap =
-        Math.min(
-            agentProperties.getMaxConcurrentAgents(),
-            schedulerProperties.getAgentAcquisitionBatchSize());
+    int expectedCap = agentProperties.getMaxConcurrentAgents();
 
     // Run one cycle that includes repopulation and acquisition
     int acquired = acquisitionService.saturatePool(0L, null, agentWorkPool);
 
     assertThat(acquired)
-        .as("acquired must be capped to min(maxConcurrent, batchSize)")
+        .as("acquired must fill up to available slots (maxConcurrent)")
         .isEqualTo(expectedCap);
+  }
+
+  @Test
+  @DisplayName(
+      "Multi-chunk acquisition issues multiple zrangeByScore scans when batch-size < slots")
+  void multiChunkAcquisitionUsesMultipleScans() {
+    // Given: maxConcurrent=3, batchSize=2 ensures at least 2 scans if 3+ ready
+    agentProperties.setMaxConcurrentAgents(3);
+    schedulerProperties.getBatchOperations().setEnabled(true);
+    schedulerProperties.getBatchOperations().setBatchSize(2);
+
+    // Spy on Jedis and JedisPool to count zrangeByScore calls
+    Jedis spyJedis = org.mockito.Mockito.spy(jedisPool.getResource());
+    JedisPool spyPool = org.mockito.Mockito.spy(jedisPool);
+    org.mockito.Mockito.doReturn(spyJedis).when(spyPool).getResource();
+    RedisScriptManager spyScripts = org.mockito.Mockito.spy(scriptManager);
+    AgentAcquisitionService service =
+        new AgentAcquisitionService(
+            spyPool,
+            spyScripts,
+            intervalProvider,
+            shardingFilter,
+            agentProperties,
+            schedulerProperties);
+
+    // Register 5 agents so WAITZ has enough ready entries
+    AgentExecution execution = mock(AgentExecution.class);
+    ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+    for (int i = 1; i <= 5; i++) {
+      service.registerAgent(createAgent("chunk-agent-" + i), execution, instrumentation);
+    }
+
+    // When
+    int acquired = service.saturatePool(0L, null, agentWorkPool);
+
+    // Then: acquire up to slots=3 and perform at least two zrangeByScore(count=2) scans
+    assertThat(acquired).isEqualTo(3);
+    org.mockito.Mockito.verify(spyJedis, org.mockito.Mockito.atLeast(2))
+        .zrangeByScore(
+            org.mockito.Mockito.eq("WAITZ"),
+            org.mockito.Mockito.eq("-inf"),
+            org.mockito.Mockito.anyString(),
+            org.mockito.Mockito.eq(0),
+            org.mockito.Mockito.anyInt());
+    // And specifically, the second chunk should request count=1 (remaining slots)
+    org.mockito.Mockito.verify(spyJedis, org.mockito.Mockito.atLeast(1))
+        .zrangeByScore(
+            org.mockito.Mockito.eq("WAITZ"),
+            org.mockito.Mockito.eq("-inf"),
+            org.mockito.Mockito.anyString(),
+            org.mockito.Mockito.eq(0),
+            org.mockito.Mockito.eq(1));
   }
 
   private Agent createAgent(String name) {

@@ -82,9 +82,8 @@ class RepopulationPresenceIntegrationTest {
 
     schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setRefreshPeriodSeconds(1); // repopulate frequently
-    schedulerProperties.setBatchOperationsEnabled(true);
-    schedulerProperties.setBatchOperationsBatchSize(100);
-    schedulerProperties.setAgentAcquisitionBatchSize(50);
+    schedulerProperties.getBatchOperations().setEnabled(true);
+    schedulerProperties.getBatchOperations().setBatchSize(100);
 
     acquisitionService =
         new AgentAcquisitionService(

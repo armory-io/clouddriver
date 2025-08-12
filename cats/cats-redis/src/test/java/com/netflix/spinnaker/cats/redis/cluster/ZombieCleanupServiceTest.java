@@ -456,8 +456,8 @@ class ZombieCleanupServiceTest {
     @DisplayName("Should respect batch size configuration for large zombie counts")
     void shouldRespectBatchSizeConfiguration() {
       // Enable batch operations with specific batch size
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setBatchOperationsBatchSize(5);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(5);
       zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Given - More zombies than batch size
@@ -798,8 +798,8 @@ class ZombieCleanupServiceTest {
     @DisplayName("Should use batch cleanup when enabled and multiple zombies exist")
     void shouldUseBatchCleanupWhenEnabled() {
       // Update scheduler properties to enable batch operations for this test
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setBatchOperationsBatchSize(5);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(5);
       zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Given - Multiple zombie agents
@@ -837,7 +837,7 @@ class ZombieCleanupServiceTest {
     @DisplayName("Should fallback to individual cleanup when batch operations disabled")
     void shouldFallbackToIndividualWhenBatchDisabled() {
       // Ensure batch operations are disabled (default)
-      schedulerProperties.setBatchOperationsEnabled(false);
+      schedulerProperties.getBatchOperations().setEnabled(false);
       zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Given - Multiple zombie agents

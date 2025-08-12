@@ -689,7 +689,7 @@ class AgentAcquisitionServiceTest {
     @DisplayName("Warn when acquisition stall occurs (backlog but no ready agents)")
     void shouldWarnOnAcquisitionStall() throws Exception {
       // Use a tiny batch size to simplify
-      schedulerProperties.setBatchOperationsEnabled(false);
+      schedulerProperties.getBatchOperations().setEnabled(false);
       recreateAcquisitionService();
 
       // Register an agent but give it a future score so it's not ready
@@ -890,8 +890,10 @@ class AgentAcquisitionServiceTest {
     @BeforeEach
     void setUpBatchTests() {
       // Enable batch operations for these tests
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(10); // Allow all test agents in single batch
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties
+          .getBatchOperations()
+          .setBatchSize(10); // Allow all test agents in single batch
       recreateAcquisitionService();
     }
 
@@ -1271,7 +1273,7 @@ class AgentAcquisitionServiceTest {
     @DisplayName("Should respect batch size limits")
     void shouldRespectBatchSizeLimits() throws Exception {
       // Set very small batch size
-      schedulerProperties.setAgentAcquisitionBatchSize(2);
+      schedulerProperties.getBatchOperations().setBatchSize(2);
       recreateAcquisitionService();
 
       // Register 5 agents (more than batch size)
@@ -1308,7 +1310,7 @@ class AgentAcquisitionServiceTest {
     @DisplayName("Should disable batch operations when configured")
     void shouldDisableBatchWhenConfigured() throws Exception {
       // Disable batch operations
-      schedulerProperties.setBatchOperationsEnabled(false);
+      schedulerProperties.getBatchOperations().setEnabled(false);
       recreateAcquisitionService();
 
       // Register agents

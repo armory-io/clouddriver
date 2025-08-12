@@ -272,8 +272,8 @@ public class OrphanCleanupService {
       return 0;
     }
 
-    int batchSize = schedulerProperties.getOrphanBatchSize();
-    boolean batchOperationsEnabled = schedulerProperties.isBatchOperationsEnabled();
+    int batchSize = schedulerProperties.getBatchOperations().getBatchSize();
+    boolean batchOperationsEnabled = schedulerProperties.getBatchOperations().isEnabled();
     int totalCleaned = 0;
 
     if (WAITING_SET.equals(setName)) {

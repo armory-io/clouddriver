@@ -217,7 +217,7 @@ public class ZombieCleanupService {
         zombieAgentTypes.stream().limit(5).collect(java.util.stream.Collectors.toList()));
 
     // Check if batch operations are enabled (disabled by default for safety)
-    boolean batchOperationsEnabled = schedulerProperties.isBatchOperationsEnabled();
+    boolean batchOperationsEnabled = schedulerProperties.getBatchOperations().isEnabled();
     int totalCleaned = 0;
 
     try (Jedis jedis = jedisPool.getResource()) {
@@ -240,7 +240,9 @@ public class ZombieCleanupService {
       } else {
         // Use batch cleanup with fallback to individual operations
         List<String> zombieBatch = new ArrayList<>();
-        int batchSize = Math.min(schedulerProperties.getZombieBatchSize(), zombieAgentTypes.size());
+        int batchSize =
+            Math.min(
+                schedulerProperties.getBatchOperations().getBatchSize(), zombieAgentTypes.size());
         if (log.isDebugEnabled()) {
           log.debug(
               "Processing {} zombie agents in batches of {} with fallback",

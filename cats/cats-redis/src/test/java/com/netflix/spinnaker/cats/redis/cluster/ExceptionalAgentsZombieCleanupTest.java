@@ -355,8 +355,8 @@ class ExceptionalAgentsZombieCleanupTest {
       // Given - Properties with batch operations enabled
       PrioritySchedulerProperties props =
           createTestPropertiesWithExceptionalAgents(".*BigQuery.*", 10000L, 5000L);
-      props.setBatchOperationsEnabled(true);
-      props.setBatchOperationsBatchSize(10);
+      props.getBatchOperations().setEnabled(true);
+      props.getBatchOperations().setBatchSize(10);
 
       zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
 
@@ -441,7 +441,7 @@ class ExceptionalAgentsZombieCleanupTest {
 
   private PrioritySchedulerProperties createPropertiesWithPattern(String pattern) {
     PrioritySchedulerProperties props = new PrioritySchedulerProperties();
-    props.setBatchOperationsEnabled(true);
+    props.getBatchOperations().setEnabled(true);
     props.setIntervalMs(1000L);
     props.setRefreshPeriodSeconds(30);
 
@@ -455,7 +455,7 @@ class ExceptionalAgentsZombieCleanupTest {
   private PrioritySchedulerProperties createTestPropertiesWithExceptionalAgents(
       String pattern, long exceptionalThresholdMs, long defaultThresholdMs) {
     PrioritySchedulerProperties props = new PrioritySchedulerProperties();
-    props.setBatchOperationsEnabled(true);
+    props.getBatchOperations().setEnabled(true);
     props.setIntervalMs(100L); // Short interval for testing
     props.setRefreshPeriodSeconds(30);
 
@@ -463,7 +463,7 @@ class ExceptionalAgentsZombieCleanupTest {
     props.getZombieCleanup().setEnabled(true);
     props.getZombieCleanup().setThresholdMs(defaultThresholdMs);
     props.getZombieCleanup().setIntervalMs(100L); // Short interval for testing
-    props.setBatchOperationsBatchSize(50);
+    props.getBatchOperations().setBatchSize(50);
 
     // Configure exceptional agents
     props.getZombieCleanup().getExceptionalAgents().setPattern(pattern);

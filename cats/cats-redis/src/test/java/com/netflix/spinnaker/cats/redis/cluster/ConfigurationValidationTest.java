@@ -44,54 +44,49 @@ public class ConfigurationValidationTest {
     @Test
     @DisplayName("Should have sensible default values")
     void shouldHaveSensibleDefaultValues() {
-      assertThat(properties.isBatchOperationsEnabled()).isFalse(); // Conservative default
-      assertThat(properties.getBatchOperationsBatchSize()).isEqualTo(50); // Reasonable default
-      assertThat(properties.getAgentAcquisitionBatchSize())
-          .isEqualTo(50); // Uses unified batch size
+      assertThat(properties.getBatchOperations().isEnabled()).isFalse(); // Conservative default
+      assertThat(properties.getBatchOperations().getBatchSize())
+          .isEqualTo(50); // Reasonable default
     }
 
     @Test
     @DisplayName("Should allow enabling batch operations")
     void shouldAllowEnablingBatchOperations() {
-      properties.setBatchOperationsEnabled(true);
-      assertThat(properties.isBatchOperationsEnabled()).isTrue();
+      properties.getBatchOperations().setEnabled(true);
+      assertThat(properties.getBatchOperations().isEnabled()).isTrue();
     }
 
     @Test
     @DisplayName("Should allow setting valid batch sizes")
     void shouldAllowSettingValidBatchSizes() {
-      properties.setBatchOperationsBatchSize(25);
-      assertThat(properties.getBatchOperationsBatchSize()).isEqualTo(25);
-
-      properties.setAgentAcquisitionBatchSize(200);
-      assertThat(properties.getAgentAcquisitionBatchSize()).isEqualTo(200);
+      properties.getBatchOperations().setBatchSize(25);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(25);
     }
 
     @Test
     @DisplayName("Should handle zero batch size")
     void shouldHandleZeroBatchSize() {
-      properties.setBatchOperationsBatchSize(0);
-      assertThat(properties.getBatchOperationsBatchSize()).isEqualTo(0);
+      properties.getBatchOperations().setBatchSize(0);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(0);
       // Zero batch size should still return sensible values from convenience methods
-      assertThat(properties.getZombieBatchSize()).isEqualTo(0);
-      assertThat(properties.getOrphanBatchSize()).isEqualTo(0);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(0);
     }
 
     @Test
     @DisplayName("Should handle negative batch size")
     void shouldHandleNegativeBatchSize() {
-      properties.setBatchOperationsBatchSize(-1);
-      assertThat(properties.getBatchOperationsBatchSize()).isEqualTo(-1);
+      properties.getBatchOperations().setBatchSize(-1);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(-1);
       // Negative values should still be returned as-is for error handling at runtime
-      assertThat(properties.getZombieBatchSize()).isEqualTo(-1);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(-1);
     }
 
     @Test
     @DisplayName("Should handle extremely large batch sizes")
     void shouldHandleExtremelyLargeBatchSizes() {
-      properties.setBatchOperationsBatchSize(Integer.MAX_VALUE);
-      assertThat(properties.getBatchOperationsBatchSize()).isEqualTo(Integer.MAX_VALUE);
-      assertThat(properties.getZombieBatchSize()).isEqualTo(Integer.MAX_VALUE);
+      properties.getBatchOperations().setBatchSize(Integer.MAX_VALUE);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(Integer.MAX_VALUE);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(Integer.MAX_VALUE);
     }
   }
 
@@ -102,10 +97,10 @@ public class ConfigurationValidationTest {
     @Test
     @DisplayName("Should provide zombie cleanup convenience methods")
     void shouldProvideZombieCleanupConvenienceMethods() {
-      properties.setBatchOperationsBatchSize(75);
+      properties.getBatchOperations().setBatchSize(75);
 
       // Convenience methods should return the unified batch size
-      assertThat(properties.getZombieBatchSize()).isEqualTo(75);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(75);
 
       // Other zombie properties should still work
       properties.getZombieCleanup().setThresholdMs(45000L);
@@ -116,10 +111,10 @@ public class ConfigurationValidationTest {
     @Test
     @DisplayName("Should provide orphan cleanup convenience methods")
     void shouldProvideOrphanCleanupConvenienceMethods() {
-      properties.setBatchOperationsBatchSize(125);
+      properties.getBatchOperations().setBatchSize(125);
 
       // Convenience methods should return the unified batch size
-      assertThat(properties.getOrphanBatchSize()).isEqualTo(125);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(125);
 
       // Other orphan properties should still work
       properties.getOrphanCleanup().setThresholdMs(3600000L);
@@ -240,40 +235,33 @@ public class ConfigurationValidationTest {
     @DisplayName("Should maintain consistency between batch size properties")
     void shouldMaintainConsistencyBetweenBatchSizeProperties() {
       int testBatchSize = 75;
-      properties.setBatchOperationsBatchSize(testBatchSize);
+      properties.getBatchOperations().setBatchSize(testBatchSize);
 
       // All convenience getters should return the same unified value
-      assertThat(properties.getZombieBatchSize()).isEqualTo(testBatchSize);
-      assertThat(properties.getOrphanBatchSize()).isEqualTo(testBatchSize);
-      assertThat(properties.getBatchOperationsBatchSize()).isEqualTo(testBatchSize);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(testBatchSize);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(testBatchSize);
     }
 
     @Test
     @DisplayName("Should use unified batch size for all operations")
     void shouldUseUnifiedBatchSizeForAllOperations() {
-      properties.setBatchOperationsBatchSize(75);
+      properties.getBatchOperations().setBatchSize(75);
 
       // All batch operations should use the same unified batch size
-      assertThat(properties.getAgentAcquisitionBatchSize()).isEqualTo(75);
-      assertThat(properties.getZombieBatchSize()).isEqualTo(75);
-      assertThat(properties.getOrphanBatchSize()).isEqualTo(75);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(75);
     }
 
     @Test
     @DisplayName("Should validate that agent acquisition batch size affects unified batch size")
     void shouldValidateAgentAcquisitionBatchSizeAffectsUnified() {
-      // Set batch operations batch size first
-      properties.setBatchOperationsBatchSize(25);
-      assertThat(properties.getAgentAcquisitionBatchSize()).isEqualTo(25);
-
-      // Setting agent acquisition batch size should update the unified batch size
-      properties.setAgentAcquisitionBatchSize(150);
-      assertThat(properties.getBatchOperationsBatchSize()).isEqualTo(150);
-      assertThat(properties.getAgentAcquisitionBatchSize()).isEqualTo(150);
+      // Set and update unified batch size
+      properties.getBatchOperations().setBatchSize(25);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(25);
+      properties.getBatchOperations().setBatchSize(150);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(150);
 
       // Cleanup operations should use the unified batch size
-      assertThat(properties.getZombieBatchSize()).isEqualTo(150);
-      assertThat(properties.getOrphanBatchSize()).isEqualTo(150);
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(150);
     }
   }
 
@@ -316,9 +304,8 @@ public class ConfigurationValidationTest {
                 properties.getTimeCacheDurationMs();
 
                 // Batch operations
-                properties.isBatchOperationsEnabled();
-                properties.getBatchOperationsBatchSize();
-                properties.getAgentAcquisitionBatchSize();
+                properties.getBatchOperations().isEnabled();
+                properties.getBatchOperations().getBatchSize();
 
                 // Thread pool
                 properties.getPool().getCoreSize();
@@ -329,13 +316,13 @@ public class ConfigurationValidationTest {
                 properties.isZombieCleanupEnabled();
                 properties.getZombieThresholdMs();
                 properties.getZombieIntervalMs();
-                properties.getZombieBatchSize();
+                properties.getBatchOperations().getBatchSize();
 
                 // Orphan cleanup
                 properties.isOrphanCleanupEnabled();
                 properties.getOrphanThresholdMs();
                 properties.getOrphanIntervalMs();
-                properties.getOrphanBatchSize();
+                properties.getBatchOperations().getBatchSize();
                 properties.getOrphanLeadershipTtlMs();
                 properties.isOrphanForceAllPods();
               })

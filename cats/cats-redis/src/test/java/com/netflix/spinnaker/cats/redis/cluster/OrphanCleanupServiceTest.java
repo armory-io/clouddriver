@@ -87,7 +87,7 @@ class OrphanCleanupServiceTest {
     schedulerProperties.getOrphanCleanup().setThresholdMs(60000L); // 1 minute
     schedulerProperties.getOrphanCleanup().setIntervalMs(30000L); // 30 seconds
     schedulerProperties.getOrphanCleanup().setEnabled(true);
-    schedulerProperties.setBatchOperationsBatchSize(50);
+    schedulerProperties.getBatchOperations().setBatchSize(50);
 
     orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
   }
@@ -347,7 +347,7 @@ class OrphanCleanupServiceTest {
     @DisplayName("Should respect batch size configuration")
     void shouldRespectBatchSizeConfiguration() {
       // Given - Set small batch size
-      schedulerProperties.setBatchOperationsBatchSize(2);
+      schedulerProperties.getBatchOperations().setBatchSize(2);
       orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
 
       // Add more orphans than batch size

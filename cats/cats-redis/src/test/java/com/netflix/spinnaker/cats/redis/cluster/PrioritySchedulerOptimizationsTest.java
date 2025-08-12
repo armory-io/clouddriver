@@ -127,7 +127,7 @@ public class PrioritySchedulerOptimizationsTest {
     long intervalMs = schedulerProperties.getIntervalMs();
     int maxConcurrent = agentProperties.getMaxConcurrentAgents();
     long zombieThreshold = schedulerProperties.getZombieCleanup().getThresholdMs();
-    boolean batchOpsEnabled = schedulerProperties.isBatchOperationsEnabled();
+    boolean batchOpsEnabled = schedulerProperties.getBatchOperations().isEnabled();
 
     // Then - Should return cached values instantly (no service calls)
     assertThat(intervalMs).isEqualTo(500L); // Fast scheduling
@@ -227,7 +227,7 @@ public class PrioritySchedulerOptimizationsTest {
     props.getZombieCleanup().setIntervalMs(120000L); // 2 minutes
     props.getOrphanCleanup().setThresholdMs(3600000L); // 1 hour
     props.getOrphanCleanup().setIntervalMs(1800000L); // 30 minutes
-    props.setBatchOperationsEnabled(true); // Enable batch operations
+    props.getBatchOperations().setEnabled(true); // Enable batch operations
     return props;
   }
 

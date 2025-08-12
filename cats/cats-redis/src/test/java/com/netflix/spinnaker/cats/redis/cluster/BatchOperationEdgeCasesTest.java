@@ -116,8 +116,8 @@ public class BatchOperationEdgeCasesTest {
     void shouldHandleLargeBatchOfAgentsEfficiently() throws Exception {
       // Simulate 5K+ AWS accounts scenario (scaled down for test)
       int agentCount = 500; // Scaled down but still significant
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(50);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(50);
 
       // Register many agents
       for (int i = 1; i <= agentCount; i++) {
@@ -143,8 +143,10 @@ public class BatchOperationEdgeCasesTest {
     @DisplayName("Should handle memory pressure with many agents")
     void shouldHandleMemoryPressureWithManyAgents() throws Exception {
       int agentCount = 1000;
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(25); // Smaller batches for memory efficiency
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties
+          .getBatchOperations()
+          .setBatchSize(25); // Smaller batches for memory efficiency
 
       // Register agents with various execution times
       for (int i = 1; i <= agentCount; i++) {
@@ -176,7 +178,7 @@ public class BatchOperationEdgeCasesTest {
     @Test
     @DisplayName("Should handle Redis connection timeout during batch operation")
     void shouldHandleRedisConnectionTimeoutDuringBatchOperation() throws Exception {
-      schedulerProperties.setBatchOperationsEnabled(true);
+      schedulerProperties.getBatchOperations().setEnabled(true);
 
       // Register agents
       for (int i = 1; i <= 5; i++) {
@@ -224,7 +226,7 @@ public class BatchOperationEdgeCasesTest {
     @Test
     @DisplayName("Should handle Redis script execution failure with proper fallback")
     void shouldHandleRedisScriptExecutionFailureWithProperFallback() throws Exception {
-      schedulerProperties.setBatchOperationsEnabled(true);
+      schedulerProperties.getBatchOperations().setEnabled(true);
 
       // Mock script manager that simulates script execution failure
       RedisScriptManager mockScriptManager = spy(scriptManager);
@@ -264,8 +266,8 @@ public class BatchOperationEdgeCasesTest {
     @DisplayName("Should handle batch size equal to agent count")
     void shouldHandleBatchSizeEqualToAgentCount() throws Exception {
       int agentCount = 5;
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(agentCount); // Exact match
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(agentCount); // Exact match
 
       for (int i = 1; i <= agentCount; i++) {
         Agent agent = createMockAgent("exact-batch-agent-" + i, "test");
@@ -282,8 +284,8 @@ public class BatchOperationEdgeCasesTest {
     @DisplayName("Should handle batch size larger than agent count")
     void shouldHandleBatchSizeLargerThanAgentCount() throws Exception {
       int agentCount = 3;
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(10); // Much larger than agent count
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(10); // Much larger than agent count
 
       for (int i = 1; i <= agentCount; i++) {
         Agent agent = createMockAgent("small-count-agent-" + i, "test");
@@ -299,8 +301,8 @@ public class BatchOperationEdgeCasesTest {
     @Test
     @DisplayName("Should handle single agent with batch operations enabled")
     void shouldHandleSingleAgentWithBatchOperationsEnabled() throws Exception {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(10);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(10);
 
       Agent agent = createMockAgent("single-batch-agent", "test");
       AgentExecution execution = mock(AgentExecution.class);
@@ -319,8 +321,8 @@ public class BatchOperationEdgeCasesTest {
     @Test
     @DisplayName("Should handle concurrent batch operations safely")
     void shouldHandleConcurrentBatchOperationsSafely() throws Exception {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(5);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(5);
 
       // Register agents
       for (int i = 1; i <= 20; i++) {
@@ -356,8 +358,8 @@ public class BatchOperationEdgeCasesTest {
     @Test
     @DisplayName("Should handle agent registration during batch operation")
     void shouldHandleAgentRegistrationDuringBatchOperation() throws Exception {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(5);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(5);
 
       // Register initial agents
       for (int i = 1; i <= 5; i++) {
@@ -410,8 +412,8 @@ public class BatchOperationEdgeCasesTest {
     @Test
     @DisplayName("Should handle large number of zombie agents efficiently")
     void shouldHandleLargeNumberOfZombieAgentsEfficiently() {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setBatchOperationsBatchSize(50);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(50);
 
       // Create many zombie agents
       Map<String, String> activeAgents = new ConcurrentHashMap<>();
@@ -443,8 +445,8 @@ public class BatchOperationEdgeCasesTest {
     @Test
     @DisplayName("Should handle mixed zombie ages in batch")
     void shouldHandleMixedZombieAgesInBatch() {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setBatchOperationsBatchSize(10);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(10);
 
       Map<String, String> activeAgents = new ConcurrentHashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new ConcurrentHashMap<>();
@@ -485,8 +487,8 @@ public class BatchOperationEdgeCasesTest {
     @Test
     @DisplayName("Should handle Redis memory pressure gracefully")
     void shouldHandleRedisMemoryPressureGracefully() throws Exception {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(100);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(100);
 
       // Fill Redis with data to simulate memory pressure
       try (Jedis jedis = jedisPool.getResource()) {
@@ -515,8 +517,8 @@ public class BatchOperationEdgeCasesTest {
     @Test
     @DisplayName("Should handle semaphore exhaustion in batch mode")
     void shouldHandleSemaphoreExhaustionInBatchMode() throws Exception {
-      schedulerProperties.setBatchOperationsEnabled(true);
-      schedulerProperties.setAgentAcquisitionBatchSize(10);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(10);
 
       // Create very limited semaphore
       Semaphore limitedSemaphore = new Semaphore(2);

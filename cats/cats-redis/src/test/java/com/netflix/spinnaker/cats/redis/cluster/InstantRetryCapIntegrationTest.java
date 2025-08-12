@@ -42,7 +42,7 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 @Testcontainers
-@DisplayName("Instant-retry scan is capped by the same ready-scan limit")
+@DisplayName("Chunked acquisition fills up to available slots")
 class InstantRetryCapIntegrationTest {
 
   @Container
@@ -81,8 +81,8 @@ class InstantRetryCapIntegrationTest {
 
     schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setRefreshPeriodSeconds(30); // avoid repop triggering
-    schedulerProperties.setBatchOperationsEnabled(true);
-    schedulerProperties.setAgentAcquisitionBatchSize(2); // very small cap to observe retry cap
+    schedulerProperties.getBatchOperations().setEnabled(true);
+    schedulerProperties.getBatchOperations().setBatchSize(2); // very small cap to observe retry cap
 
     acquisitionService =
         new AgentAcquisitionService(
@@ -111,8 +111,8 @@ class InstantRetryCapIntegrationTest {
   }
 
   @Test
-  @DisplayName("Instant retry respects the same scan limit as initial ready scan")
-  void instantRetryIsCapped() throws Exception {
+  @DisplayName("Chunked acquisition fills to min(availableSlots, ready)")
+  void chunkedAcquisitionFillsToSlots() throws Exception {
     // Register 6 agents; cap is 2
     AgentExecution execution = mock(AgentExecution.class);
     ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
@@ -159,8 +159,9 @@ class InstantRetryCapIntegrationTest {
 
     competitor.join(1000);
 
-    // Cap is min(availableSlots, batchSize) = min(5, 2) = 2
-    assertThat(acquired).isEqualTo(2);
+    // With chunked acquisition, we fill available slots across multiple chunks
+    // availableSlots = 5, ready >= 5 => expect 5
+    assertThat(acquired).isEqualTo(5);
     assertThat(competingMoved.get()).isTrue();
   }
 
