@@ -667,6 +667,10 @@ class OrphanCleanupServiceTest {
       when(mockAcquisitionService.getRegisteredAgent("valid-agent")).thenReturn(mockValidAgent);
       when(mockAcquisitionService.getRegisteredAgent("invalid-agent")).thenReturn(null);
 
+      // New shard-gating behavior: by default, consider these agents as belonging to this shard
+      when(mockAcquisitionService.belongsToThisShard("valid-agent")).thenReturn(true);
+      when(mockAcquisitionService.belongsToThisShard("invalid-agent")).thenReturn(true);
+
       // Set the acquisition service reference for complex logic
       orphanService.setAcquisitionService(mockAcquisitionService);
     }
@@ -703,7 +707,7 @@ class OrphanCleanupServiceTest {
     }
 
     @Test
-    @DisplayName("Should completely remove invalid orphaned agents from Redis")
+    @DisplayName("Should completely remove invalid orphaned agents from Redis (shard-owned)")
     void shouldRemoveInvalidOrphanedAgents() {
       // Given - Add invalid orphaned agent to WORKZ
       long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
@@ -713,6 +717,9 @@ class OrphanCleanupServiceTest {
       }
 
       // When
+      // Ensure this shard claims ownership so invalid removal proceeds
+      when(mockAcquisitionService.belongsToThisShard("invalid-agent")).thenReturn(true);
+
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then - Agent should be removed completely, not moved to WAITZ
@@ -727,7 +734,7 @@ class OrphanCleanupServiceTest {
     }
 
     @Test
-    @DisplayName("Should handle mixed valid and invalid orphaned agents correctly")
+    @DisplayName("Should handle mixed valid and invalid orphaned agents correctly (shard-owned)")
     void shouldHandleMixedValidAndInvalidOrphans() {
       // Given - Add both valid and invalid orphaned agents
       long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
@@ -742,6 +749,10 @@ class OrphanCleanupServiceTest {
       when(mockAcquisitionService.getRegisteredAgent("another-invalid")).thenReturn(null);
 
       // When
+      // Ensure this shard claims ownership for invalid agents
+      when(mockAcquisitionService.belongsToThisShard("invalid-agent")).thenReturn(true);
+      when(mockAcquisitionService.belongsToThisShard("another-invalid")).thenReturn(true);
+
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
       // Then - All agents processed, but different handling for valid vs invalid

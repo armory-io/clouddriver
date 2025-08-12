@@ -542,40 +542,50 @@ public class OrphanCleanupService {
                   (long) score);
             }
           } else {
-            // For invalid agents or agents in WAITZ, completely remove them using individual script
-            Object result =
-                scriptManager.evalshaWithSelfHeal(
-                    jedis,
-                    RedisScriptManager.REMOVE_AGENT,
-                    java.util.Arrays.asList("WORKZ", "WAITZ"),
-                    java.util.Collections.singletonList(agentName));
+            // For invalid agents, removal is shard-aware unless explicitly forced for all pods
+            boolean forceAllPods = schedulerProperties.getOrphanCleanup().isForceAllPods();
 
-            // REMOVE_AGENT returns 1 for success
-            boolean removed = result != null && ((Long) result).intValue() == 1;
-            if (removed) {
-              cleaned++;
-              if (isStillValid) {
-                log.info(
-                    "Successfully removed orphaned agent {} (original score: {}) from {} set.",
-                    agentName,
-                    (long) score,
-                    setName);
+            if (forceAllPods || belongsToThisShard) {
+              // Remove invalid agent using individual script
+              Object result =
+                  scriptManager.evalshaWithSelfHeal(
+                      jedis,
+                      RedisScriptManager.REMOVE_AGENT,
+                      java.util.Arrays.asList("WORKZ", "WAITZ"),
+                      java.util.Collections.singletonList(agentName));
+
+              // REMOVE_AGENT returns 1 for success
+              boolean removed = result != null && ((Long) result).intValue() == 1;
+              if (removed) {
+                cleaned++;
+                if (isStillValid) {
+                  log.info(
+                      "Successfully removed orphaned agent {} (original score: {}) from {} set.",
+                      agentName,
+                      (long) score,
+                      setName);
+                } else {
+                  log.info(
+                      "Successfully removed invalid orphaned agent {} (original score: {}) from {} set{}.",
+                      agentName,
+                      (long) score,
+                      setName,
+                      forceAllPods ? " (forceAllPods)" : "");
+                }
+
+                // Also clean up local state if needed
+                removeActiveAgent(agentName);
               } else {
-                log.info(
-                    "Successfully removed invalid orphaned agent {} (original score: {}) from {} set and local registry.",
+                log.debug(
+                    "Failed to remove orphaned agent {} (score: {}) from {} set. It might have been removed by another process.",
                     agentName,
                     (long) score,
                     setName);
               }
-
-              // Also clean up local state if needed
-              removeActiveAgent(agentName);
             } else {
               log.debug(
-                  "Failed to remove orphaned agent {} (score: {}) from {} set. It might have been removed by another process.",
-                  agentName,
-                  (long) score,
-                  setName);
+                  "Preserving invalid WORKZ agent {} due to shard gating (belongsToThisShard=false)",
+                  agentName);
             }
           }
         } else if (WAITING_SET.equals(setName)) {
