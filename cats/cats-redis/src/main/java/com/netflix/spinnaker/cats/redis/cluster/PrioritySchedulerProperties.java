@@ -77,6 +77,13 @@ public class PrioritySchedulerProperties {
    */
   private FailureBackoffProperties failureBackoff = new FailureBackoffProperties();
 
+  /**
+   * Optional jitter applied when initially registering new agents (in seconds). A positive value
+   * spreads first execution across the window to reduce thundering herds. Default: 0 (disabled).
+   * Config key: {@code redis.scheduler.initial-registration-jitter-seconds}
+   */
+  private int initialRegistrationJitterSeconds = 0;
+
   // Getters and setters
 
   public long getIntervalMs() {
@@ -154,6 +161,14 @@ public class PrioritySchedulerProperties {
    */
   public void setFailureBackoff(FailureBackoffProperties failureBackoff) {
     this.failureBackoff = failureBackoff;
+  }
+
+  public int getInitialRegistrationJitterSeconds() {
+    return initialRegistrationJitterSeconds;
+  }
+
+  public void setInitialRegistrationJitterSeconds(int initialRegistrationJitterSeconds) {
+    this.initialRegistrationJitterSeconds = Math.max(0, initialRegistrationJitterSeconds);
   }
 
   /**

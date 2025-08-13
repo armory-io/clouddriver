@@ -522,6 +522,23 @@ public class AgentAcquisitionService {
     }
   }
 
+  /**
+   * Public helper to perform only the periodic Redis repopulation when due, without attempting any
+   * acquisition. Intended for schedulers that want to separate repopulation from acquisition within
+   * a single run cycle.
+   *
+   * @param runCount current scheduler cycle number
+   */
+  public void repopulateIfDue(long runCount) {
+    try (Jedis jedis = jedisPool.getResource()) {
+      if (runCount % redisRefreshPeriod == 0) {
+        repopulateRedisAgents(jedis);
+      }
+    } catch (Exception e) {
+      log.warn("Repopulation attempt failed: {}", e.getMessage());
+    }
+  }
+
   private static boolean shouldWarnNow(AtomicLong lastEpochMs, long minPeriodMs) {
     long now = System.currentTimeMillis();
     long last = lastEpochMs.get();
@@ -1279,7 +1296,8 @@ public class AgentAcquisitionService {
       AgentWorker worker = agents.get(agentType);
       if (worker != null) {
         batchArgs.add(agentType);
-        batchArgs.add(score(jedis, 0L)); // New agents get immediate execution
+        long jitterSec = computeInitialRegistrationJitterSeconds();
+        batchArgs.add(score(jedis, jitterSec * 1000L));
       }
     }
 
@@ -1312,7 +1330,8 @@ public class AgentAcquisitionService {
     for (String agentType : agentsToAdd) {
       AgentWorker worker = agents.get(agentType);
       if (worker != null) {
-        String newScore = score(jedis, 0L); // New agents get immediate execution
+        long jitterSec = computeInitialRegistrationJitterSeconds();
+        String newScore = score(jedis, jitterSec * 1000L);
         try {
           Object result =
               jedis.evalsha(
@@ -1328,6 +1347,20 @@ public class AgentAcquisitionService {
       }
     }
     log.debug("Individual added {} missing agents to Redis", added);
+  }
+
+  /**
+   * Compute a non-negative jitter in seconds for initial registration of new agents. Returns 0 when
+   * jitter is disabled.
+   */
+  private long computeInitialRegistrationJitterSeconds() {
+    int window = schedulerProperties.getInitialRegistrationJitterSeconds();
+    if (window <= 0) {
+      return 0L;
+    }
+    // Use [1, window] inclusive to avoid zero-second placements that may appear slightly in the
+    // past due to server/client second-boundary races when observed immediately after insert.
+    return java.util.concurrent.ThreadLocalRandom.current().nextInt(1, window + 1);
   }
 
   /**

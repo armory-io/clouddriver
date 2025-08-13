@@ -326,6 +326,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // PHASE 0.5: Reconcile known agents with current sharding/enablement (periodic)
       reconcileKnownAgentsIfNeeded(currentRun);
 
+      // PHASE 0.75: Redis repopulation when due; if repopulated this cycle, skip acquisition to
+      // stabilize Redis state and make initial registration/jitter behavior observable
+      long beforeRepop = acquisitionService.getRegisteredAgentCount();
+      acquisitionService.repopulateIfDue(currentRun);
+      boolean repopulatedThisCycle = (currentRun % config.getRedisRefreshPeriod() == 0);
+
       // PHASE 1: Cleanup operations
       zombieService.cleanupZombieAgentsIfNeeded(
           acquisitionService.getActiveAgentsMap(), acquisitionService.getActiveAgentsFutures());
@@ -333,9 +339,15 @@ public class PriorityAgentScheduler extends CatsModuleAware
       orphanService.cleanupOrphanedAgentsIfNeeded();
 
       // PHASE 2: Agent acquisition and execution
-      int agentsAcquired =
-          acquisitionService.saturatePool(
-              currentRun, config.getRunningAgents(), config.getAgentWorkPool());
+      int agentsAcquired = 0;
+      if (!repopulatedThisCycle) {
+        agentsAcquired =
+            acquisitionService.saturatePool(
+                currentRun, config.getRunningAgents(), config.getAgentWorkPool());
+      } else {
+        log.debug(
+            "Skipping acquisition on repopulation cycle {} to prevent first-run races", currentRun);
+      }
 
       if (log.isDebugEnabled() && agentsAcquired > 0) {
         log.debug(

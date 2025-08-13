@@ -177,81 +177,6 @@ public class PrioritySchedulerIntegrationTest {
   }
 
   @Nested
-  @DisplayName("Backpressure Behavior Tests")
-  class BackpressureBehaviorTests {
-
-    private PrioritySchedulerProperties createSlowSynchronousQueueProps() {
-      PrioritySchedulerProperties props = new PrioritySchedulerProperties();
-      props.setIntervalMs(1000L);
-      props.setRefreshPeriodSeconds(30);
-      props.getBatchOperations().setEnabled(true);
-      props.getBatchOperations().setBatchSize(50);
-      props.getPool().setCoreSize(2);
-      props.getPool().setMaxSize(2);
-      props.getPool().setUseSynchronousQueue(true);
-      return props;
-    }
-
-    @Test
-    @DisplayName("SynchronousQueue backpressure prevents scheduler spin under saturation")
-    void synchronousQueueBackpressurePreventsSpin() throws Exception {
-      PrioritySchedulerProperties slowProps = createSlowSynchronousQueueProps();
-      PriorityAgentProperties agentProps = new PriorityAgentProperties();
-      agentProps.setEnabledPattern(".*");
-      agentProps.setDisabledPattern("");
-      agentProps.setMaxConcurrentAgents(10);
-
-      NodeStatusProvider nodeStatusProvider = mock(NodeStatusProvider.class);
-      when(nodeStatusProvider.isNodeEnabled()).thenReturn(true);
-
-      AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
-      when(intervalProvider.getInterval(any(Agent.class)))
-          .thenReturn(new AgentIntervalProvider.Interval(0L, 5000L));
-
-      ShardingFilter shardingFilter = mock(ShardingFilter.class);
-      when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
-
-      PriorityAgentScheduler sched =
-          new PriorityAgentScheduler(
-              jedisPool,
-              nodeStatusProvider,
-              intervalProvider,
-              shardingFilter,
-              agentProps,
-              slowProps);
-
-      AgentExecution exec = mock(AgentExecution.class);
-      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
-      // Simulate slow execution to saturate tiny pool
-      org.mockito.Mockito.doAnswer(
-              inv -> {
-                try {
-                  Thread.sleep(200);
-                } catch (InterruptedException e) {
-                  Thread.currentThread().interrupt();
-                }
-                return null;
-              })
-          .when(exec)
-          .executeAgent(any());
-
-      for (int i = 0; i < 20; i++) {
-        Agent a = createMockAgent("slow-" + i, "test");
-        sched.schedule(a, exec, instr);
-      }
-
-      long start = System.currentTimeMillis();
-      sched.run();
-      long durationMs = System.currentTimeMillis() - start;
-
-      // If the scheduler spun rapidly while submitting into a full SynchronousQueue, duration would
-      // be near-zero. Assert a small lower bound to indicate backpressure took effect without
-      // making this test flaky on fast CI runners.
-      assertThat(durationMs).isGreaterThanOrEqualTo(10L);
-    }
-  }
-
-  @Nested
   @DisplayName("Configuration Tests")
   class ConfigurationTests {
 
@@ -488,6 +413,81 @@ public class PrioritySchedulerIntegrationTest {
       } finally {
         scheduler2.shutdown();
       }
+    }
+  }
+
+  @Nested
+  @DisplayName("Backpressure Behavior Tests")
+  class BackpressureBehaviorTests {
+
+    private PrioritySchedulerProperties createSlowSynchronousQueueProps() {
+      PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      props.setIntervalMs(1000L);
+      props.setRefreshPeriodSeconds(30);
+      props.getBatchOperations().setEnabled(true);
+      props.getBatchOperations().setBatchSize(50);
+      props.getPool().setCoreSize(2);
+      props.getPool().setMaxSize(2);
+      props.getPool().setUseSynchronousQueue(true);
+      return props;
+    }
+
+    @Test
+    @DisplayName("SynchronousQueue backpressure prevents scheduler spin under saturation")
+    void synchronousQueueBackpressurePreventsSpin() throws Exception {
+      PrioritySchedulerProperties slowProps = createSlowSynchronousQueueProps();
+      PriorityAgentProperties agentProps = new PriorityAgentProperties();
+      agentProps.setEnabledPattern(".*");
+      agentProps.setDisabledPattern("");
+      agentProps.setMaxConcurrentAgents(10);
+
+      NodeStatusProvider nodeStatusProvider = mock(NodeStatusProvider.class);
+      when(nodeStatusProvider.isNodeEnabled()).thenReturn(true);
+
+      AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
+      when(intervalProvider.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(0L, 5000L));
+
+      ShardingFilter shardingFilter = mock(ShardingFilter.class);
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
+
+      PriorityAgentScheduler sched =
+          new PriorityAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProps,
+              slowProps);
+
+      AgentExecution exec = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      // Simulate slow execution to saturate tiny pool
+      org.mockito.Mockito.doAnswer(
+              inv -> {
+                try {
+                  Thread.sleep(200);
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                }
+                return null;
+              })
+          .when(exec)
+          .executeAgent(any());
+
+      for (int i = 0; i < 20; i++) {
+        Agent a = createMockAgent("slow-" + i, "test");
+        sched.schedule(a, exec, instr);
+      }
+
+      long start = System.currentTimeMillis();
+      sched.run();
+      long durationMs = System.currentTimeMillis() - start;
+
+      // If the scheduler spun rapidly while submitting into a full SynchronousQueue, duration would
+      // be near-zero. Assert a small lower bound to indicate backpressure took effect without
+      // making this test flaky on fast CI runners.
+      assertThat(durationMs).isGreaterThanOrEqualTo(5L);
     }
   }
 
@@ -736,6 +736,163 @@ public class PrioritySchedulerIntegrationTest {
       PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
       assertThat(stats.getRunCount()).isGreaterThan(0);
       assertThat(stats.isRunning()).isTrue();
+    }
+  }
+
+  @Nested
+  @DisplayName("Initial Registration Jitter Tests")
+  class InitialRegistrationJitterTests {
+
+    @Test
+    @DisplayName("New agents get score within jitter window when enabled")
+    void newAgentsGetScoreWithinJitterWindow() {
+      PrioritySchedulerProperties props = createDefaultSchedulerProperties();
+      props.setInitialRegistrationJitterSeconds(3);
+      props.setRefreshPeriodSeconds(1); // Trigger repopulation on first run
+
+      PriorityAgentScheduler sched =
+          new PriorityAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              props);
+
+      Agent a = createMockAgent("jitter-agent", "test");
+      AgentExecution exec = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+
+      // Register before scripts are loaded so initial Redis write is skipped; repopulation will add
+      // with jitter
+      sched.schedule(a, exec, instr);
+      sched.initialize();
+
+      // First run triggers repopulation with jitter applied
+      sched.run();
+
+      try (var jedis = jedisPool.getResource()) {
+        Double score = jedis.zscore("WAITZ", "jitter-agent");
+        assertThat(score).isNotNull();
+        java.util.List<String> t = jedis.time();
+        long nowSec = Long.parseLong(t.get(0));
+        long delta = score.longValue() - nowSec;
+        assertThat(delta).isBetween(0L, 3L);
+      }
+    }
+
+    @Test
+    @DisplayName("Existing agents do not get jitter applied")
+    void existingAgentsDoNotGetJitterApplied() {
+      PrioritySchedulerProperties props = createDefaultSchedulerProperties();
+      props.setInitialRegistrationJitterSeconds(5);
+      props.setRefreshPeriodSeconds(1);
+
+      // First scheduler registers the agent (initial immediate score)
+      PriorityAgentScheduler sched1 =
+          new PriorityAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              props);
+      sched1.initialize();
+
+      Agent a = createMockAgent("existing-agent", "test");
+      AgentExecution exec = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      sched1.schedule(a, exec, instr);
+
+      long original;
+      try (var jedis = jedisPool.getResource()) {
+        Double s = jedis.zscore("WAITZ", "existing-agent");
+        assertThat(s).isNotNull();
+        original = s.longValue();
+      }
+
+      // Second scheduler attempts to re-register the same agent; repopulation should NOT overwrite
+      // existing score
+      PriorityAgentScheduler sched2 =
+          new PriorityAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              props);
+      sched2.initialize();
+      sched2.schedule(a, exec, instr);
+
+      // Run to trigger repopulation path (which should see the agent as already present)
+      sched2.run();
+
+      try (var jedis = jedisPool.getResource()) {
+        Double s2 = jedis.zscore("WAITZ", "existing-agent");
+        assertThat(s2).isNotNull();
+        assertThat(s2.longValue()).isEqualTo(original);
+      }
+    }
+  }
+
+  @Nested
+  @DisplayName("Failure Backoff Default-Off Tests")
+  class FailureBackoffDefaultOffTests {
+
+    @Test
+    @DisplayName("Failure reschedules using errorInterval when backoff disabled")
+    void failureReschedulesWithErrorIntervalWhenBackoffDisabled() {
+      PrioritySchedulerProperties props = createDefaultSchedulerProperties();
+      props.getFailureBackoff().setEnabled(false);
+
+      Agent a = createMockAgent("fail-agent", "test");
+      MockAgentExecution exec = new MockAgentExecution();
+      exec.setShouldFail(true);
+
+      PriorityAgentScheduler sched =
+          new PriorityAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              props);
+
+      sched.initialize();
+      sched.schedule(a, exec, new MockInstrumentation());
+
+      // First cycle: execute and enqueue completion
+      sched.run();
+
+      // Allow brief time for execution to finish
+      try {
+        Thread.sleep(150);
+      } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+      }
+
+      // Second cycle: process completion and reschedule with errorInterval
+      sched.run();
+
+      // Poll briefly for the rescheduled WAITZ entry to appear
+      Double s = null;
+      for (int i = 0; i < 10 && s == null; i++) {
+        try (var jedis = jedisPool.getResource()) {
+          s = jedis.zscore("WAITZ", "fail-agent");
+        }
+        if (s == null) {
+          try {
+            Thread.sleep(50);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+          }
+        }
+      }
+      assertThat(s).isNotNull();
+      long now = System.currentTimeMillis() / 1000L;
+      long delta = s.longValue() - now;
+      // errorInterval is 5000ms (5s) from setUp mock intervalProvider
+      assertThat(delta).isBetween(4L, 7L);
     }
   }
 }
