@@ -171,7 +171,7 @@ class ShutdownBehaviorTest {
         long beforeWaitzSize = jedis.zcard("WAITZ");
 
         // Simulate graceful shutdown re-queuing
-        acquisitionService.conditionalReleaseAgent(slowAgent, "test-score", false);
+        acquisitionService.conditionalReleaseAgent(slowAgent, "test-score", false, null, null);
 
         // Allow agent to complete normally (this would also try to re-queue)
         allowCompletion.countDown();
@@ -209,7 +209,7 @@ class ShutdownBehaviorTest {
 
       // When - Trigger shutdown and re-queue agent
       acquisitionService.setShuttingDown(true);
-      acquisitionService.conditionalReleaseAgent(agent, "test-score", false);
+      acquisitionService.conditionalReleaseAgent(agent, "test-score", false, null, null);
 
       // Then - Detect the Redis TIME sync bug (far future timestamps)
       try (Jedis jedis = jedisPool.getResource()) {
@@ -386,7 +386,7 @@ class ShutdownBehaviorTest {
 
       // When - Try to re-queue existing agent (should get null result)
       // This should not crash or cause issues
-      acquisitionService.conditionalReleaseAgent(agent, "test-score", false);
+      acquisitionService.conditionalReleaseAgent(agent, "test-score", false, null, null);
 
       // Then - System should remain stable
       try (Jedis jedis = jedisPool.getResource()) {

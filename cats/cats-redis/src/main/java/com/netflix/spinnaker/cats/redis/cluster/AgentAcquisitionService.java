@@ -135,18 +135,54 @@ public class AgentAcquisitionService {
   private final ConcurrentLinkedQueue<AgentCompletion> completionQueue =
       new ConcurrentLinkedQueue<>();
 
+  /**
+   * Local, per-pod failure streaks used for exponential backoff without extra Redis keys.
+   *
+   * <p>Streaks reset on success and increment on failure. This map is intentionally ephemeral and
+   * will reset on pod restarts or resharding events.
+   */
+  private final java.util.concurrent.ConcurrentHashMap<String, Integer> failureStreaks =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  // Failure classification for error-aware scheduling decisions.
+  private enum FailureClass {
+    PERMANENT_FORBIDDEN,
+    THROTTLED,
+    TRANSIENT,
+    SERVER_ERROR,
+    UNKNOWN
+  }
+
   /** Represents an agent completion waiting to be processed in the next scheduler cycle. */
   private static class AgentCompletion {
     final Agent agent;
     final String acquireScore;
     final boolean success;
     final long timestamp;
+    final FailureClass failureClass; // null when success
+    final String throwableClassName; // optional; may be null
 
     AgentCompletion(Agent agent, String acquireScore, boolean success) {
       this.agent = agent;
       this.acquireScore = acquireScore;
       this.success = success;
       this.timestamp = System.currentTimeMillis();
+      this.failureClass = null;
+      this.throwableClassName = null;
+    }
+
+    AgentCompletion(
+        Agent agent,
+        String acquireScore,
+        boolean success,
+        FailureClass failureClass,
+        String throwableClassName) {
+      this.agent = agent;
+      this.acquireScore = acquireScore;
+      this.success = success;
+      this.timestamp = System.currentTimeMillis();
+      this.failureClass = failureClass;
+      this.throwableClassName = throwableClassName;
     }
   }
 
@@ -1461,10 +1497,18 @@ public class AgentAcquisitionService {
    * Calculate scheduling offset based on completion success and shutdown state. Maintains the same
    * logic as the original conditionalReleaseAgent method.
    */
+  /**
+   * Compute the scheduling offset for a completed agent run.
+   *
+   * <p>Success: attempts to preserve cadence relative to the original acquire time; falls back to
+   * scheduling after the agent's interval.
+   *
+   * <p>Failure: delegates to {@link #computeFailureOffsetAndUpdateStreak(AgentCompletion)} which
+   * applies class-based backoff when enabled; otherwise uses the agent's {@code errorInterval}.
+   */
   private long getSchedulingOffset(AgentCompletion completion) {
-    // Failed executions get immediate retry
     if (!completion.success) {
-      return 0L;
+      return computeFailureOffsetAndUpdateStreak(completion);
     }
 
     // Compute next schedule based on original acquire score when possible to preserve cadence.
@@ -1472,20 +1516,15 @@ public class AgentAcquisitionService {
       AgentIntervalProvider.Interval interval = intervalProvider.getInterval(completion.agent);
       long intervalMs = interval.getInterval();
 
-      // If acquireScore is available, attempt to keep consistent cadence relative to the original
-      // acquisition time. The acquireScore stored on completion represents the completion deadline
-      // (acquireTime + timeout) in seconds. We approximate the original acquisition moment by
-      // subtracting the timeout from this score, then add the normal interval to get the ideal next
-      // execution time. If any part of this calculation fails, we simply fall back to intervalMs.
+      // Reset failure streak on success
+      failureStreaks.remove(completion.agent.getAgentType());
+
       if (completion.acquireScore != null) {
         try {
           long acquireScoreSeconds = Long.parseLong(completion.acquireScore);
           long agentTimeoutMs = interval.getTimeout();
           long originalAcquireMs = (acquireScoreSeconds * 1000L) - agentTimeoutMs;
           long desiredNextRunMs = originalAcquireMs + intervalMs;
-          // Use server-synchronized 'now' to keep desired next run in the same time basis as
-          // acquireScore (which is derived from Redis server time). This avoids client/server clock
-          // skew showing up as multi-second drift in tests and scheduling.
           long nowMs = System.currentTimeMillis() + serverClientOffset.get();
           long offsetMs = desiredNextRunMs - nowMs;
           return Math.max(offsetMs, 0L);
@@ -1498,9 +1537,162 @@ public class AgentAcquisitionService {
       return intervalMs;
     } catch (Exception e) {
       log.warn(
-          "Failed to calculate scheduling offset for agent {}, using immediate scheduling",
+          "Failed to calculate scheduling offset for agent {}, using default interval",
           completion.agent.getAgentType(),
           e);
+      try {
+        return intervalProvider.getInterval(completion.agent).getInterval();
+      } catch (Exception ignored) {
+        return 0L;
+      }
+    }
+  }
+
+  /**
+   * Compute the delay for a failed run and update the local failure streak.
+   *
+   * <p>Behavior: - If failure-aware backoff is disabled, returns {@code errorInterval}. -
+   * PERMANENT_FORBIDDEN → fixed long backoff (configured). - THROTTLED → exponential backoff (base
+   * × multiplier^(streak-1), capped). - TRANSIENT/SERVER_ERROR → immediate retry for the first N
+   * attempts (config), else {@code errorInterval}. - UNKNOWN → {@code errorInterval}.
+   *
+   * <p>Applies jitter to non-zero delays when configured.
+   */
+  private long computeFailureOffsetAndUpdateStreak(AgentCompletion completion) {
+    final String agentType = completion.agent.getAgentType();
+    final FailureBackoffProperties backoffCfg = schedulerProperties.getFailureBackoff();
+
+    FailureClass fclass =
+        completion.failureClass != null ? completion.failureClass : FailureClass.UNKNOWN;
+
+    // Increment streak locally
+    int streak = failureStreaks.merge(agentType, 1, Integer::sum);
+
+    long offsetMs = 0L;
+    try {
+      AgentIntervalProvider.Interval interval = intervalProvider.getInterval(completion.agent);
+
+      if (!backoffCfg.isEnabled()) {
+        // Minimal safe behavior: use errorInterval for any failure
+        offsetMs = interval.getErrorInterval();
+      } else {
+        switch (fclass) {
+          case PERMANENT_FORBIDDEN:
+            offsetMs = backoffCfg.getPermanentForbiddenBackoffMs();
+            break;
+          case THROTTLED:
+            offsetMs = computeExponentialBackoffMs(backoffCfg, streak);
+            break;
+          case SERVER_ERROR:
+          case TRANSIENT:
+            if (streak <= backoffCfg.getMaxImmediateRetries()) {
+              offsetMs = 0L;
+            } else {
+              offsetMs = interval.getErrorInterval();
+            }
+            break;
+          case UNKNOWN:
+          default:
+            offsetMs = interval.getErrorInterval();
+        }
+      }
+
+      // Apply jitter if configured and offset > 0
+      if (offsetMs > 0L) {
+        offsetMs = applyJitter(offsetMs, backoffCfg.getJitterRatio());
+      }
+    } catch (Exception e) {
+      log.warn(
+          "Failed to compute failure backoff for agent {} (class: {}, streak: {}), defaulting to 0",
+          agentType,
+          fclass,
+          streak,
+          e);
+      offsetMs = 0L;
+    }
+
+    if (completion.throwableClassName != null) {
+      log.warn(
+          "Agent {} failed with {} -> applying backoff {} ms (class={}, streak={})",
+          agentType,
+          completion.throwableClassName,
+          offsetMs,
+          fclass,
+          streak);
+    } else {
+      log.warn(
+          "Agent {} failed -> applying backoff {} ms (class={}, streak={})",
+          agentType,
+          offsetMs,
+          fclass,
+          streak);
+    }
+
+    return Math.max(0L, offsetMs);
+  }
+
+  /**
+   * Compute exponential backoff for throttled failures.
+   *
+   * @param backoffCfg throttled policy (base, multiplier, cap)
+   * @param streak current failure streak (1-based)
+   * @return backoff in milliseconds (capped)
+   */
+  private long computeExponentialBackoffMs(FailureBackoffProperties backoffCfg, int streak) {
+    long base = backoffCfg.getThrottled().getBaseMs();
+    double multiplier = backoffCfg.getThrottled().getMultiplier();
+    long cap = backoffCfg.getThrottled().getCapMs();
+    double factor = Math.pow(multiplier, Math.max(0, streak - 1));
+    long raw = (long) Math.round(base * factor);
+    return Math.min(raw, cap);
+  }
+
+  /**
+   * Apply symmetric jitter in the range [-ratio, +ratio] to a positive base delay.
+   *
+   * @param baseMs base delay in milliseconds
+   * @param jitterRatio ratio in [0.0, 1.0]
+   * @return jittered delay (>= 0), coerced to at least 1ms if base > 0
+   */
+  private long applyJitter(long baseMs, double jitterRatio) {
+    if (jitterRatio <= 0.0) {
+      return baseMs;
+    }
+    double r = Math.max(0.0, Math.min(1.0, jitterRatio));
+    java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
+    double delta = (rnd.nextDouble() * 2.0 * r) - r; // [-r, +r]
+    double jittered = baseMs * (1.0 + delta);
+    if (jittered < 0.0) {
+      return 0L;
+    }
+    long result = (long) Math.round(jittered);
+    return result == 0L ? 1L : result;
+  }
+
+  /**
+   * Fast backoff computation for fallback paths (queueing failure). Uses a conservative mapping
+   * without streaks and without jitter.
+   */
+  private long computeFailureOffsetFast(Agent agent, FailureClass failureClass) {
+    try {
+      AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
+      FailureBackoffProperties backoffCfg = schedulerProperties.getFailureBackoff();
+      if (!backoffCfg.isEnabled()) {
+        return interval.getErrorInterval();
+      }
+      switch (failureClass != null ? failureClass : FailureClass.UNKNOWN) {
+        case PERMANENT_FORBIDDEN:
+          return backoffCfg.getPermanentForbiddenBackoffMs();
+        case THROTTLED:
+          return backoffCfg.getThrottled().getBaseMs();
+        case SERVER_ERROR:
+        case TRANSIENT:
+          return interval.getErrorInterval();
+        case UNKNOWN:
+        default:
+          return interval.getErrorInterval();
+      }
+    } catch (Exception e) {
       return 0L;
     }
   }
@@ -1861,15 +2053,24 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Conditionally releases an agent back to the waiting queue based on execution status. This is
-   * critical for handling failures and shutdown scenarios properly.
+   * Queue or immediately schedule an agent after execution completes.
    *
-   * @param agent The agent that finished execution
-   * @param acquireScore The completion deadline when the agent was acquired (current_time +
-   *     timeout)
-   * @param success Whether the agent execution was successful
+   * <p>Successes preserve cadence for the next run when possible. Failures are queued with failure
+   * metadata that will be used to compute a class-based backoff offset before re-scheduling the
+   * agent into WAITZ.
+   *
+   * @param agent the agent that finished
+   * @param acquireScore the acquire deadline score (WORKZ) captured at acquisition time
+   * @param success whether execution completed successfully
+   * @param failureClass coarse classification for failures (ignored on success)
+   * @param cause the original failure (optional; used for logging)
    */
-  public void conditionalReleaseAgent(Agent agent, String acquireScore, boolean success) {
+  public void conditionalReleaseAgent(
+      Agent agent,
+      String acquireScore,
+      boolean success,
+      FailureClass failureClass,
+      Throwable cause) {
     String agentType = agent.getAgentType();
 
     try {
@@ -1881,8 +2082,22 @@ public class AgentAcquisitionService {
       }
 
       // Queue completion for batch processing in next scheduler cycle
-      completionQueue.offer(new AgentCompletion(agent, acquireScore, success));
-      log.debug("Queued completion for agent {}: success={}", agentType, success);
+      if (!success) {
+        completionQueue.offer(
+            new AgentCompletion(
+                agent,
+                acquireScore,
+                false,
+                failureClass != null ? failureClass : FailureClass.UNKNOWN,
+                cause != null ? cause.getClass().getName() : null));
+      } else {
+        completionQueue.offer(new AgentCompletion(agent, acquireScore, true));
+      }
+      log.debug(
+          "Queued completion for agent {}: success={}, failureClass={}",
+          agentType,
+          success,
+          failureClass);
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
       log.warn(
@@ -1895,7 +2110,8 @@ public class AgentAcquisitionService {
       // Fallback to immediate scheduling on queue failure
       try {
         if (!success) {
-          scheduleAgentInRedis(agent, 0L);
+          long fallbackOffset = computeFailureOffsetFast(agent, failureClass);
+          scheduleAgentInRedis(agent, Math.max(0L, fallbackOffset));
         } else {
           AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
           scheduleAgentInRedis(agent, interval.getInterval());
@@ -2145,6 +2361,8 @@ public class AgentAcquisitionService {
       String agentType = agent.getAgentType();
       long startTimeMs = System.currentTimeMillis();
       boolean success = false;
+      FailureClass failureClass = null;
+      Throwable capturedCause = null;
 
       try {
         log.debug("Starting execution of agent {}", agentType);
@@ -2169,13 +2387,16 @@ public class AgentAcquisitionService {
 
         acquisitionService.agentsFailed.incrementAndGet(); // Track failed executions
         executionInstrumentation.executionFailed(agent, cause, elapsedTimeMs(startTimeMs));
+        capturedCause = cause;
+        failureClass = acquisitionService.classifyFailure(cause);
       } finally {
         // Always clean up agent tracking when execution completes (success or failure)
         // This removes the agent from activeAgents map and WORKZ Redis set
         acquisitionService.removeActiveAgent(agentType);
 
         // Handle conditional agent release (re-queuing on failure/shutdown)
-        acquisitionService.conditionalReleaseAgent(agent, acquireScore, success);
+        acquisitionService.conditionalReleaseAgent(
+            agent, acquireScore, success, failureClass, capturedCause);
 
         // CRITICAL: Release semaphore permit to allow new agent acquisitions
         if (runningAgents != null) {
@@ -2213,6 +2434,87 @@ public class AgentAcquisitionService {
     void setRunningAgents(Semaphore runningAgents) {
       this.runningAgents = runningAgents;
     }
+  }
+
+  /**
+   * Classify a failure throwable into a coarse-grained {@code FailureClass} without introducing
+   * provider SDK dependencies.
+   *
+   * <p>Heuristics: - InterruptedException -> TRANSIENT (handled earlier by restoring interrupt) -
+   * IO/connectivity/timeouts -> TRANSIENT - AWS AmazonServiceException (via reflection): 403 ->
+   * PERMANENT_FORBIDDEN (AccessDenied or similar) 429 -> THROTTLED 5xx -> SERVER_ERROR - Messages
+   * containing throttling hints -> THROTTLED - Otherwise -> UNKNOWN
+   */
+  FailureClass classifyFailure(Throwable cause) {
+    if (cause == null) {
+      return FailureClass.UNKNOWN;
+    }
+
+    if (cause instanceof InterruptedException) {
+      return FailureClass.TRANSIENT;
+    }
+
+    if (cause instanceof java.net.SocketTimeoutException
+        || cause instanceof java.net.ConnectException
+        || cause instanceof java.net.SocketException
+        || cause instanceof java.io.IOException) {
+      return FailureClass.TRANSIENT;
+    }
+
+    try {
+      Class<?> aseClass = Class.forName("com.amazonaws.AmazonServiceException");
+      if (aseClass.isAssignableFrom(cause.getClass())) {
+        Integer status = null;
+        String errorCode = null;
+        try {
+          java.lang.reflect.Method getStatusCode = aseClass.getMethod("getStatusCode");
+          Object sc = getStatusCode.invoke(cause);
+          if (sc instanceof Integer) {
+            status = (Integer) sc;
+          }
+        } catch (Exception ignored) {
+        }
+        try {
+          java.lang.reflect.Method getErrorCode = aseClass.getMethod("getErrorCode");
+          Object ec = getErrorCode.invoke(cause);
+          if (ec instanceof String) {
+            errorCode = (String) ec;
+          }
+        } catch (Exception ignored) {
+        }
+
+        if (status != null) {
+          if (status == 403) {
+            if (errorCode != null
+                && errorCode.toLowerCase(java.util.Locale.ROOT).contains("accessdenied")) {
+              return FailureClass.PERMANENT_FORBIDDEN;
+            }
+            return FailureClass.PERMANENT_FORBIDDEN;
+          }
+          if (status == 429) {
+            return FailureClass.THROTTLED;
+          }
+          if (status >= 500 && status < 600) {
+            return FailureClass.SERVER_ERROR;
+          }
+          if (status >= 400 && status < 500) {
+            return FailureClass.UNKNOWN;
+          }
+        }
+        return FailureClass.UNKNOWN;
+      }
+    } catch (ClassNotFoundException ignored) {
+      // AWS SDK not present in this module
+    }
+
+    String msg = String.valueOf(cause.getMessage()).toLowerCase(java.util.Locale.ROOT);
+    if (msg.contains("throttl")
+        || msg.contains("rate exceeded")
+        || msg.contains("too many requests")) {
+      return FailureClass.THROTTLED;
+    }
+
+    return FailureClass.UNKNOWN;
   }
 
   /**

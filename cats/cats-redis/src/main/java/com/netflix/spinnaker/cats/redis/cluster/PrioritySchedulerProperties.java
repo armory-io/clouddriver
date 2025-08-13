@@ -68,6 +68,15 @@ public class PrioritySchedulerProperties {
   /** Thread pool configuration for agent execution. */
   private RedisThreadPoolProperties pool = new RedisThreadPoolProperties();
 
+  /**
+   * Failure-aware backoff configuration for agent failures.
+   *
+   * <p>This block controls how the scheduler delays subsequent executions after an agent run fails.
+   * It enables class-based backoff (e.g., permanent forbidden, throttled, transient/server errors)
+   * and optional jitter to avoid synchronized retries across pods.
+   */
+  private FailureBackoffProperties failureBackoff = new FailureBackoffProperties();
+
   // Getters and setters
 
   public long getIntervalMs() {
@@ -124,6 +133,27 @@ public class PrioritySchedulerProperties {
 
   public void setPool(RedisThreadPoolProperties pool) {
     this.pool = pool;
+  }
+
+  /**
+   * Returns the failure-aware backoff configuration. Never returns null.
+   *
+   * @return the current failure backoff configuration
+   */
+  public FailureBackoffProperties getFailureBackoff() {
+    if (failureBackoff == null) {
+      failureBackoff = new FailureBackoffProperties();
+    }
+    return failureBackoff;
+  }
+
+  /**
+   * Sets the failure-aware backoff configuration.
+   *
+   * @param failureBackoff a non-null configuration object controlling failure backoff behavior
+   */
+  public void setFailureBackoff(FailureBackoffProperties failureBackoff) {
+    this.failureBackoff = failureBackoff;
   }
 
   /**
@@ -249,6 +279,148 @@ public class PrioritySchedulerProperties {
   private static void validateNonNegative(int v, String name) {
     if (v < 0) {
       throw new IllegalArgumentException(name + " must be >= 0 (was " + v + ")");
+    }
+  }
+}
+
+/**
+ * Failure-aware backoff configuration properties.
+ *
+ * <p>Controls how the scheduler backs off agents after failures. Backoff is applied by scheduling
+ * the agent into the WAITZ set with a future score equal to the computed delay.
+ */
+class FailureBackoffProperties {
+  /** Master switch for failure-aware backoff. */
+  private boolean enabled = false;
+
+  /**
+   * Jitter ratio applied to non-zero backoff delays. 0.1 means +/-10% randomization to avoid
+   * synchronized retries.
+   */
+  private double jitterRatio = 0.1d;
+
+  /** Number of immediate retries before applying errorInterval for transient/server errors. */
+  private int maxImmediateRetries = 0;
+
+  /** Fixed backoff for permanent forbidden errors (e.g., 403/AccessDenied). */
+  private long permanentForbiddenBackoffMs = java.util.concurrent.TimeUnit.MINUTES.toMillis(30);
+
+  /** Throttled backoff policy parameters. */
+  private ThrottledPolicy throttled = new ThrottledPolicy();
+
+  /** @return true if failure-aware backoff is enabled; false to fallback to legacy behavior */
+  public boolean isEnabled() {
+    return enabled;
+  }
+
+  /**
+   * Enables or disables failure-aware backoff.
+   *
+   * @param enabled whether failure-aware backoff should be enabled
+   */
+  public void setEnabled(boolean enabled) {
+    this.enabled = enabled;
+  }
+
+  /** @return jitter ratio applied to positive backoff delays */
+  public double getJitterRatio() {
+    return jitterRatio;
+  }
+
+  /**
+   * Sets jitter ratio applied to positive backoff delays. For example, 0.1 means +/-10%.
+   *
+   * @param jitterRatio a value in [0.0, 1.0]
+   */
+  public void setJitterRatio(double jitterRatio) {
+    this.jitterRatio = jitterRatio;
+  }
+
+  /**
+   * @return number of immediate retries allowed before applying errorInterval for transient/server
+   *     errors
+   */
+  public int getMaxImmediateRetries() {
+    return maxImmediateRetries;
+  }
+
+  /**
+   * Sets number of immediate retries before applying errorInterval for transient/server errors.
+   *
+   * @param maxImmediateRetries immediate retry count (>= 0)
+   */
+  public void setMaxImmediateRetries(int maxImmediateRetries) {
+    this.maxImmediateRetries = maxImmediateRetries;
+  }
+
+  /** @return fixed backoff applied to permanent forbidden failures (e.g., 403/AccessDenied) */
+  public long getPermanentForbiddenBackoffMs() {
+    return permanentForbiddenBackoffMs;
+  }
+
+  /**
+   * Sets fixed backoff applied to permanent forbidden failures (e.g., 403/AccessDenied).
+   *
+   * @param permanentForbiddenBackoffMs delay in milliseconds
+   */
+  public void setPermanentForbiddenBackoffMs(long permanentForbiddenBackoffMs) {
+    this.permanentForbiddenBackoffMs = permanentForbiddenBackoffMs;
+  }
+
+  /** @return throttled backoff policy parameters */
+  public ThrottledPolicy getThrottled() {
+    if (throttled == null) {
+      throttled = new ThrottledPolicy();
+    }
+    return throttled;
+  }
+
+  /**
+   * Sets throttled backoff policy parameters.
+   *
+   * @param throttled policy (base, multiplier, cap)
+   */
+  public void setThrottled(ThrottledPolicy throttled) {
+    this.throttled = throttled;
+  }
+
+  /** Parameters controlling exponential backoff for throttled failures. */
+  static class ThrottledPolicy {
+    /** Starting backoff for throttled errors. */
+    private long baseMs = java.util.concurrent.TimeUnit.SECONDS.toMillis(30);
+    /** Exponential multiplier for throttled errors. */
+    private double multiplier = 2.0d;
+    /** Upper cap for throttled exponential backoff. */
+    private long capMs = java.util.concurrent.TimeUnit.MINUTES.toMillis(10);
+
+    /** @return starting backoff for throttled errors (milliseconds) */
+    public long getBaseMs() {
+      return baseMs;
+    }
+
+    /** Sets starting backoff for throttled errors (milliseconds). */
+    public void setBaseMs(long baseMs) {
+      this.baseMs = baseMs;
+    }
+
+    /** @return exponential multiplier for throttled errors */
+    public double getMultiplier() {
+      return multiplier;
+    }
+
+    /** Sets exponential multiplier for throttled errors. */
+    public void setMultiplier(double multiplier) {
+      this.multiplier = multiplier;
+    }
+
+    /** @return upper cap for throttled exponential backoff (milliseconds) */
+    public long getCapMs() {
+      return capMs;
+    }
+
+    /** Sets upper cap for throttled exponential backoff (milliseconds). */
+    public void setCapMs(long capMs) {
+      this.capMs = capMs;
     }
   }
 }
