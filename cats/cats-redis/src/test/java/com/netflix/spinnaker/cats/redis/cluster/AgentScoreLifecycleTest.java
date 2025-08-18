@@ -86,6 +86,9 @@ class AgentScoreLifecycleTest {
 
     schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setRefreshPeriodSeconds(30);
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
+    schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
 
     executorService = Executors.newCachedThreadPool();
 
@@ -117,7 +120,7 @@ class AgentScoreLifecycleTest {
   }
 
   @Test
-  @DisplayName("Registration schedules WAITZ with score≈now")
+  @DisplayName("Registration schedules waiting with score≈now")
   void registrationSchedulesImmediate() {
     Agent agent = mkAgent("reg-agent");
     acquisitionService.registerAgent(
@@ -125,7 +128,7 @@ class AgentScoreLifecycleTest {
 
     long nowSec = System.currentTimeMillis() / 1000;
     try (Jedis j = jedisPool.getResource()) {
-      Double s = j.zscore("WAITZ", "reg-agent");
+      Double s = j.zscore("waiting", "reg-agent");
       assertThat(s).isNotNull();
       // Within [-3s, +3s] of now
       assertThat(Math.abs(s.longValue() - nowSec)).isLessThanOrEqualTo(3);
@@ -133,11 +136,11 @@ class AgentScoreLifecycleTest {
   }
 
   @Test
-  @DisplayName("Acquisition moves WAITZ→WORKZ with deadline = now + timeout")
+  @DisplayName("Acquisition moves waiting→working with deadline = now + timeout")
   void acquisitionSetsDeadline() {
     Agent agent = mkAgent("acq-agent");
     AgentExecution exec = mock(AgentExecution.class);
-    // Slow execution slightly so WORKZ entry is observable before completion clears it
+    // Slow execution slightly so working entry is observable before completion clears it
     doAnswer(
             inv -> {
               Thread.sleep(150);
@@ -153,7 +156,7 @@ class AgentScoreLifecycleTest {
 
     long nowSec = System.currentTimeMillis() / 1000;
     try (Jedis j = jedisPool.getResource()) {
-      Double workScore = j.zscore("WORKZ", "acq-agent");
+      Double workScore = j.zscore("working", "acq-agent");
       assertThat(workScore).isNotNull();
       long delta = workScore.longValue() - nowSec;
       // timeout=5s ±2s tolerance
@@ -188,14 +191,14 @@ class AgentScoreLifecycleTest {
     // expected next = (acquireScoreSec*1000 - timeoutMs) + intervalMs
     long timeoutMs = intervalProvider.getInterval(agent).getTimeout();
     long intervalMs = intervalProvider.getInterval(agent).getInterval();
-    // derive original acquire from WORKZ deadline recorded earlier by reading Redis history is
+    // derive original acquire from working deadline recorded earlier by reading Redis history is
     // hard;
     // instead approximate using now + interval, which matches agentScore() for working agents.
     long desiredNextMs = System.currentTimeMillis() + intervalMs;
     long desiredNextSec = desiredNextMs / 1000L;
 
     try (Jedis j = jedisPool.getResource()) {
-      Double waitScore = j.zscore("WAITZ", "cadence-agent");
+      Double waitScore = j.zscore("waiting", "cadence-agent");
       assertThat(waitScore).isNotNull();
       long actual = waitScore.longValue();
       // allow ±3s jitter for CI timing
@@ -220,7 +223,7 @@ class AgentScoreLifecycleTest {
 
     long nowSec = System.currentTimeMillis() / 1000;
     try (Jedis j = jedisPool.getResource()) {
-      Double s = j.zscore("WAITZ", "fail-agent");
+      Double s = j.zscore("waiting", "fail-agent");
       assertThat(s).isNotNull();
       assertThat(Math.abs(s.longValue() - nowSec)).isLessThanOrEqualTo(3);
     }
@@ -232,7 +235,7 @@ class AgentScoreLifecycleTest {
     Agent agent = mkAgent("shutdown-agent");
     AgentExecution exec = mock(AgentExecution.class);
 
-    // Slow a bit to keep in WORKZ
+    // Slow a bit to keep in working
     doAnswer(
             inv -> {
               Thread.sleep(200);
@@ -249,25 +252,25 @@ class AgentScoreLifecycleTest {
     String acquireScore = acquisitionService.getActiveAgentsMap().get("shutdown-agent");
     assertThat(acquireScore).isNotNull();
 
-    // Correct expected score → move to WAITZ
+    // Correct expected score → move to waiting
     acquisitionService.forceRequeueAgentForShutdown(agent, acquireScore);
     try (Jedis j = jedisPool.getResource()) {
-      assertThat(j.zscore("WAITZ", "shutdown-agent")).isNotNull();
+      assertThat(j.zscore("waiting", "shutdown-agent")).isNotNull();
     }
 
-    // Put back into WORKZ and try with wrong score → should not swap
+    // Put back into working and try with wrong score → should not swap
     try (Jedis j = jedisPool.getResource()) {
       long nowSec = System.currentTimeMillis() / 1000 + 10;
-      j.zrem("WAITZ", "shutdown-agent");
-      j.zadd("WORKZ", nowSec, "shutdown-agent");
+      j.zrem("waiting", "shutdown-agent");
+      j.zadd("working", nowSec, "shutdown-agent");
     }
 
     acquisitionService.forceRequeueAgentForShutdown(
         agent, Long.toString((System.currentTimeMillis() / 1000) + 999));
 
     try (Jedis j = jedisPool.getResource()) {
-      // Still in WORKZ since expected score mismatched
-      assertThat(j.zscore("WORKZ", "shutdown-agent")).isNotNull();
+      // Still in working since expected score mismatched
+      assertThat(j.zscore("working", "shutdown-agent")).isNotNull();
     }
   }
 }

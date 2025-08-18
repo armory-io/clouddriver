@@ -84,6 +84,9 @@ class OrphanCleanupServiceTest {
     scriptManager.initializeScripts();
 
     schedulerProperties = new PrioritySchedulerProperties();
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
+    schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
     schedulerProperties.getOrphanCleanup().setThresholdMs(60000L); // 1 minute
     schedulerProperties.getOrphanCleanup().setIntervalMs(30000L); // 30 seconds
     schedulerProperties.getOrphanCleanup().setEnabled(true);
@@ -104,10 +107,10 @@ class OrphanCleanupServiceTest {
       long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000; // 2 minutes ago
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
-        jedis.del("WORKZ", "WAITZ");
+        jedis.del("working", "waiting");
 
-        jedis.zadd("WORKZ", oldScoreSeconds, "orphan-1");
-        jedis.zadd("WORKZ", oldScoreSeconds - 1, "orphan-2");
+        jedis.zadd("working", oldScoreSeconds, "orphan-1");
+        jedis.zadd("working", oldScoreSeconds - 1, "orphan-2");
       }
 
       // When
@@ -119,24 +122,27 @@ class OrphanCleanupServiceTest {
 
       // Verify agents were removed from Redis
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        assertThat(jedis.zcard("working")).isEqualTo(0);
       }
     }
 
     @Test
-    @DisplayName("WAITZ purge preserves valid entries; removes only invalid ones")
-    void waitzCleanupRemovesOnlyInvalid() {
+    @DisplayName("waiting purge preserves valid entries; removes only invalid ones")
+    void waitingCleanupRemovesOnlyInvalid() {
       // Given - Add two agents; one valid (registered), one invalid (unregistered)
       long oldScoreSeconds = (System.currentTimeMillis() - 150000) / 1000; // 2.5 minutes ago
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.del("WORKZ", "WAITZ");
-        jedis.zadd("WAITZ", oldScoreSeconds, "valid-agent");
-        jedis.zadd("WAITZ", oldScoreSeconds - 1, "invalid-agent");
+        jedis.del("working", "waiting");
+        jedis.zadd("waiting", oldScoreSeconds, "valid-agent");
+        jedis.zadd("waiting", oldScoreSeconds - 1, "invalid-agent");
       }
 
       // Register only the valid agent via a minimal acquisition service to mark it valid
       PriorityAgentProperties agentProps = new PriorityAgentProperties();
       PrioritySchedulerProperties schedulerProps = new PrioritySchedulerProperties();
+      schedulerProps.getKeys().setWaitingSet("waiting");
+      schedulerProps.getKeys().setWorkingSet("working");
+      schedulerProps.getKeys().setCleanupLeaderKey("cleanup-leader");
       AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
       when(intervalProvider.getInterval(any(Agent.class)))
           .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
@@ -160,29 +166,32 @@ class OrphanCleanupServiceTest {
       // When
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then - Only invalid agent is removed; valid remains in WAITZ
+      // Then - Only invalid agent is removed; valid remains in waiting
       assertThat(cleaned).isEqualTo(1);
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WAITZ", "valid-agent")).isNotNull();
-        assertThat(jedis.zscore("WAITZ", "invalid-agent")).isNull();
+        assertThat(jedis.zscore("waiting", "valid-agent")).isNotNull();
+        assertThat(jedis.zscore("waiting", "invalid-agent")).isNull();
       }
     }
 
     @Test
-    @DisplayName("WAITZ cleanup should not remove invalid entries belonging to other shards")
-    void waitzCleanupPreservesOtherShardInvalidEntries() {
+    @DisplayName("waiting cleanup should not remove invalid entries belonging to other shards")
+    void waitingCleanupPreservesOtherShardInvalidEntries() {
       // Given - Add an old invalid agent that belongs to another shard
       long oldScoreSeconds = (System.currentTimeMillis() - 4 * 60 * 1000) / 1000; // 4 minutes ago
       String foreignInvalid = "acct/foreign-invalid-B"; // shard tag: -B
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.del("WORKZ", "WAITZ");
-        jedis.zadd("WAITZ", oldScoreSeconds, foreignInvalid);
+        jedis.del("working", "waiting");
+        jedis.zadd("waiting", oldScoreSeconds, foreignInvalid);
       }
 
       // Build acquisition service with sharding filter that claims ownership only for "-A"
       PriorityAgentProperties agentProps = new PriorityAgentProperties();
       PrioritySchedulerProperties schedulerProps = new PrioritySchedulerProperties();
+      schedulerProps.getKeys().setWaitingSet("waiting");
+      schedulerProps.getKeys().setWorkingSet("working");
+      schedulerProps.getKeys().setCleanupLeaderKey("cleanup-leader");
       AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
       when(intervalProvider.getInterval(any(Agent.class)))
           .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
@@ -202,7 +211,7 @@ class OrphanCleanupServiceTest {
       // Then - invalid but foreign entry should be preserved by this shard
       assertThat(cleaned).isEqualTo(0);
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WAITZ", foreignInvalid)).isNotNull();
+        assertThat(jedis.zscore("waiting", foreignInvalid)).isNotNull();
       }
     }
 
@@ -212,7 +221,7 @@ class OrphanCleanupServiceTest {
       // Given - Add recent agents to WORKING set
       long recentScore = System.currentTimeMillis() - 30000; // 30 seconds ago
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", recentScore, "recent-agent");
+        jedis.zadd("working", recentScore, "recent-agent");
       }
 
       // When
@@ -223,7 +232,7 @@ class OrphanCleanupServiceTest {
 
       // Verify agent was NOT removed
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WORKZ", "recent-agent")).isEqualTo(recentScore);
+        assertThat(jedis.zscore("working", "recent-agent")).isEqualTo(recentScore);
       }
     }
 
@@ -233,15 +242,18 @@ class OrphanCleanupServiceTest {
       // Given - Add agent to WAITING set whose score is within threshold (10s ago)
       long recentScore = (System.currentTimeMillis() - 10000) / 1000; // 10 seconds ago
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.del("WORKZ", "WAITZ");
-        jedis.zadd("WAITZ", recentScore, "waiting-recent");
+        jedis.del("working", "waiting");
+        jedis.zadd("waiting", recentScore, "waiting-recent");
       }
 
-      // Provide acquisition service so WAITZ validity checks preserve entries
+      // Provide acquisition service so waiting validity checks preserve entries
       PriorityAgentProperties agentProps = new PriorityAgentProperties();
       agentProps.setEnabledPattern(".*");
       agentProps.setDisabledPattern("");
       PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      props.getKeys().setWaitingSet("waiting");
+      props.getKeys().setWorkingSet("working");
+      props.getKeys().setCleanupLeaderKey("cleanup-leader");
       AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
       when(intervalProvider.getInterval(any(Agent.class)))
           .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
@@ -264,27 +276,30 @@ class OrphanCleanupServiceTest {
 
       // Verify agent was NOT removed
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WAITZ", "waiting-recent")).isEqualTo(recentScore);
+        assertThat(jedis.zscore("waiting", "waiting-recent")).isEqualTo(recentScore);
       }
     }
 
     @Test
-    @DisplayName("Should clean WORKZ and remove only invalid from WAITZ in one run")
-    void shouldCleanWorkzAndRemoveOnlyInvalidFromWaitz() {
-      // Given - Add orphans to both sets; register only the WAITZ valid agent
+    @DisplayName("Should clean working and remove only invalid from waiting in one run")
+    void shouldCleanWorkingAndRemoveOnlyInvalidFromWaiting() {
+      // Given - Add orphans to both sets; register only the waiting valid agent
       long workingOrphanScoreSeconds = (System.currentTimeMillis() - 120000) / 1000; // 2 minutes
       long waitingOrphanScoreSeconds = (System.currentTimeMillis() - 180000) / 1000; // 3 minutes
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.del("WORKZ", "WAITZ");
-        jedis.zadd("WORKZ", workingOrphanScoreSeconds, "working-orphan");
-        jedis.zadd("WAITZ", waitingOrphanScoreSeconds, "valid-waiting");
-        jedis.zadd("WAITZ", waitingOrphanScoreSeconds - 1, "invalid-waiting");
+        jedis.del("working", "waiting");
+        jedis.zadd("working", workingOrphanScoreSeconds, "working-orphan");
+        jedis.zadd("waiting", waitingOrphanScoreSeconds, "valid-waiting");
+        jedis.zadd("waiting", waitingOrphanScoreSeconds - 1, "invalid-waiting");
       }
 
       // Register only the valid waiting agent
       PriorityAgentProperties agentProps = new PriorityAgentProperties();
       PrioritySchedulerProperties schedulerProps = new PrioritySchedulerProperties();
+      schedulerProps.getKeys().setWaitingSet("waiting");
+      schedulerProps.getKeys().setWorkingSet("working");
+      schedulerProps.getKeys().setCleanupLeaderKey("cleanup-leader");
       AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
       when(intervalProvider.getInterval(any(Agent.class)))
           .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
@@ -306,12 +321,12 @@ class OrphanCleanupServiceTest {
       // When
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then - 1 from WORKZ + 1 invalid from WAITZ = 2 cleaned; valid remains
+      // Then - 1 from working + 1 invalid from waiting = 2 cleaned; valid remains
       assertThat(cleaned).isEqualTo(2);
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
-        assertThat(jedis.zscore("WAITZ", "valid-waiting")).isNotNull();
-        assertThat(jedis.zscore("WAITZ", "invalid-waiting")).isNull();
+        assertThat(jedis.zcard("working")).isEqualTo(0);
+        assertThat(jedis.zscore("waiting", "valid-waiting")).isNotNull();
+        assertThat(jedis.zscore("waiting", "invalid-waiting")).isNull();
       }
     }
   }
@@ -331,7 +346,7 @@ class OrphanCleanupServiceTest {
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "orphan");
+        jedis.zadd("working", oldScoreSeconds, "orphan");
       }
 
       // When
@@ -339,7 +354,7 @@ class OrphanCleanupServiceTest {
 
       // Then - Agent should still be there
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WORKZ", "orphan")).isEqualTo(oldScoreSeconds);
+        assertThat(jedis.zscore("working", "orphan")).isEqualTo(oldScoreSeconds);
       }
     }
 
@@ -355,10 +370,10 @@ class OrphanCleanupServiceTest {
       long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
-        jedis.del("WORKZ", "WAITZ");
+        jedis.del("working", "waiting");
 
         for (int i = 0; i < 5; i++) {
-          jedis.zadd("WORKZ", oldScoreSeconds - i, "orphan-" + i);
+          jedis.zadd("working", oldScoreSeconds - i, "orphan-" + i);
         }
       }
 
@@ -369,7 +384,7 @@ class OrphanCleanupServiceTest {
       assertThat(cleaned).isEqualTo(5);
 
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        assertThat(jedis.zcard("working")).isEqualTo(0);
       }
     }
 
@@ -385,9 +400,9 @@ class OrphanCleanupServiceTest {
       long oldScoreSeconds = (System.currentTimeMillis() - 10000) / 1000; // 10 seconds ago
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
-        jedis.del("WORKZ", "WAITZ");
+        jedis.del("working", "waiting");
 
-        jedis.zadd("WORKZ", oldScoreSeconds, "short-threshold-orphan");
+        jedis.zadd("working", oldScoreSeconds, "short-threshold-orphan");
       }
 
       // When
@@ -482,7 +497,7 @@ class OrphanCleanupServiceTest {
 
       // Add orphaned agent
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", System.currentTimeMillis() - 120000, "orphan");
+        jedis.zadd("working", System.currentTimeMillis() - 120000, "orphan");
       }
 
       // When
@@ -507,12 +522,14 @@ class OrphanCleanupServiceTest {
 
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
-        jedis.del("WORKZ", "WAITZ");
+        jedis.del("working", "waiting");
 
         for (int i = 0; i < orphanCount / 2; i++) {
-          jedis.zadd("WORKZ", oldScoreSeconds - i, "working-orphan-" + i);
+          jedis.zadd("working", oldScoreSeconds - i, "working-orphan-" + i);
           jedis.zadd(
-              "WAITZ", oldScoreSeconds - 120 - i, "waiting-orphan-" + i); // Even older for WAITING
+              "waiting",
+              oldScoreSeconds - 120 - i,
+              "waiting-orphan-" + i); // Even older for WAITING
         }
       }
 
@@ -529,8 +546,8 @@ class OrphanCleanupServiceTest {
 
       // Verify both sets cleaned
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
+        assertThat(jedis.zcard("working")).isEqualTo(0);
+        assertThat(jedis.zcard("waiting")).isEqualTo(0);
       }
     }
 
@@ -545,11 +562,11 @@ class OrphanCleanupServiceTest {
       try (Jedis jedis = jedisPool.getResource()) {
         // Add orphaned agents (all old enough to be orphans)
         for (int i = 0; i < 250; i++) {
-          jedis.zadd("WORKZ", orphanScoreSeconds - i, "orphan-" + i);
+          jedis.zadd("working", orphanScoreSeconds - i, "orphan-" + i);
         }
         // Add active agents (all recent enough to not be orphans)
         for (int i = 0; i < 250; i++) {
-          jedis.zadd("WORKZ", activeScoreSeconds + i, "active-" + i);
+          jedis.zadd("working", activeScoreSeconds + i, "active-" + i);
         }
       }
 
@@ -561,7 +578,7 @@ class OrphanCleanupServiceTest {
 
       // Verify only active agents remain
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(250);
+        assertThat(jedis.zcard("working")).isEqualTo(250);
       }
     }
   }
@@ -576,13 +593,13 @@ class OrphanCleanupServiceTest {
       // Given
       // Ensure clean state
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.del("WORKZ", "WAITZ");
+        jedis.del("working", "waiting");
       }
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "orphan-1");
-        jedis.zadd("WORKZ", oldScoreSeconds - 1, "orphan-2");
+        jedis.zadd("working", oldScoreSeconds, "orphan-1");
+        jedis.zadd("working", oldScoreSeconds - 1, "orphan-2");
       }
 
       long initialCount = orphanService.getOrphansCleanedUp();
@@ -615,8 +632,8 @@ class OrphanCleanupServiceTest {
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "batch1-orphan-1");
-        jedis.zadd("WORKZ", oldScoreSeconds - 1, "batch1-orphan-2");
+        jedis.zadd("working", oldScoreSeconds, "batch1-orphan-1");
+        jedis.zadd("working", oldScoreSeconds - 1, "batch1-orphan-2");
       }
 
       // When - First cleanup
@@ -625,9 +642,9 @@ class OrphanCleanupServiceTest {
 
       // Add second batch
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "batch2-orphan-1");
-        jedis.zadd("WORKZ", oldScoreSeconds - 1, "batch2-orphan-2");
-        jedis.zadd("WORKZ", oldScoreSeconds - 2, "batch2-orphan-3");
+        jedis.zadd("working", oldScoreSeconds, "batch2-orphan-1");
+        jedis.zadd("working", oldScoreSeconds - 1, "batch2-orphan-2");
+        jedis.zadd("working", oldScoreSeconds - 2, "batch2-orphan-3");
       }
 
       // Second cleanup
@@ -652,7 +669,7 @@ class OrphanCleanupServiceTest {
     void setupComplexTests() {
       // Clean up any existing state
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.del("WORKZ", "WAITZ");
+        jedis.del("working", "waiting");
       }
 
       // Create mock AgentAcquisitionService for testing complex logic
@@ -682,38 +699,38 @@ class OrphanCleanupServiceTest {
     }
 
     @Test
-    @DisplayName("Should move valid orphaned agents from WORKZ to WAITZ for rescheduling")
-    void shouldMoveValidOrphanedAgentsToWAITZ() {
-      // Given - Add valid orphaned agent to WORKZ
+    @DisplayName("Should move valid orphaned agents from working to waiting for rescheduling")
+    void shouldMoveValidOrphanedAgentsToWaiting() {
+      // Given - Add valid orphaned agent to working
       long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "valid-agent");
+        jedis.zadd("working", oldScoreSeconds, "valid-agent");
       }
 
       // When
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then - Agent should be moved to WAITZ, not removed completely
+      // Then - Agent should be moved to waiting, not removed completely
       assertThat(cleaned).isEqualTo(1);
 
       try (Jedis jedis = jedisPool.getResource()) {
-        // Agent removed from WORKZ
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
-        // Agent added to WAITZ for rescheduling
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(1);
-        assertThat(jedis.zscore("WAITZ", "valid-agent")).isNotNull();
+        // Agent removed from working
+        assertThat(jedis.zcard("working")).isEqualTo(0);
+        // Agent added to waiting for rescheduling
+        assertThat(jedis.zcard("waiting")).isEqualTo(1);
+        assertThat(jedis.zscore("waiting", "valid-agent")).isNotNull();
       }
     }
 
     @Test
     @DisplayName("Should completely remove invalid orphaned agents from Redis (shard-owned)")
     void shouldRemoveInvalidOrphanedAgents() {
-      // Given - Add invalid orphaned agent to WORKZ
+      // Given - Add invalid orphaned agent to working
       long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "invalid-agent");
+        jedis.zadd("working", oldScoreSeconds, "invalid-agent");
       }
 
       // When
@@ -722,14 +739,14 @@ class OrphanCleanupServiceTest {
 
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then - Agent should be removed completely, not moved to WAITZ
+      // Then - Agent should be removed completely, not moved to waiting
       assertThat(cleaned).isEqualTo(1);
 
       try (Jedis jedis = jedisPool.getResource()) {
-        // Agent removed from WORKZ
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
-        // Agent NOT added to WAITZ
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
+        // Agent removed from working
+        assertThat(jedis.zcard("working")).isEqualTo(0);
+        // Agent NOT added to waiting
+        assertThat(jedis.zcard("waiting")).isEqualTo(0);
       }
     }
 
@@ -740,9 +757,9 @@ class OrphanCleanupServiceTest {
       long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "valid-agent");
-        jedis.zadd("WORKZ", oldScoreSeconds - 1, "invalid-agent");
-        jedis.zadd("WORKZ", oldScoreSeconds - 2, "another-invalid");
+        jedis.zadd("working", oldScoreSeconds, "valid-agent");
+        jedis.zadd("working", oldScoreSeconds - 1, "invalid-agent");
+        jedis.zadd("working", oldScoreSeconds - 2, "another-invalid");
       }
 
       // Configure another invalid agent
@@ -759,26 +776,26 @@ class OrphanCleanupServiceTest {
       assertThat(cleaned).isEqualTo(3);
 
       try (Jedis jedis = jedisPool.getResource()) {
-        // All agents removed from WORKZ
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
-        // Only valid agent moved to WAITZ
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(1);
-        assertThat(jedis.zscore("WAITZ", "valid-agent")).isNotNull();
-        assertThat(jedis.zscore("WAITZ", "invalid-agent")).isNull();
-        assertThat(jedis.zscore("WAITZ", "another-invalid")).isNull();
+        // All agents removed from working
+        assertThat(jedis.zcard("working")).isEqualTo(0);
+        // Only valid agent moved to waiting
+        assertThat(jedis.zcard("waiting")).isEqualTo(1);
+        assertThat(jedis.zscore("waiting", "valid-agent")).isNotNull();
+        assertThat(jedis.zscore("waiting", "invalid-agent")).isNull();
+        assertThat(jedis.zscore("waiting", "another-invalid")).isNull();
       }
     }
 
     @Test
-    @DisplayName("Without acquisition service, WORKZ orphan is conservatively moved to WAITZ")
-    void shouldConservativelyMoveWorkzOrphanWithoutAcquisitionService() {
+    @DisplayName("Without acquisition service, working orphan is conservatively moved to waiting")
+    void shouldConservativelyMoveWorkingOrphanWithoutAcquisitionService() {
       // Given - Reset to no acquisition service (test environment behavior)
       orphanService.setAcquisitionService(null);
 
       long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000; // 30 min ago
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "some-agent");
+        jedis.zadd("working", oldScoreSeconds, "some-agent");
       }
 
       // When
@@ -788,21 +805,21 @@ class OrphanCleanupServiceTest {
       assertThat(cleaned).isEqualTo(1);
 
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(0);
+        assertThat(jedis.zcard("working")).isEqualTo(0);
+        assertThat(jedis.zcard("waiting")).isEqualTo(0);
       }
     }
 
     @Test
-    @DisplayName("WAITZ cleanup removes only invalid entries and preserves valid ones")
-    void shouldRemoveOnlyInvalidOrphansFromWAITZSet() {
-      // Given - Add orphaned agents to WAITZ (valid-agent registered, invalid-agent not)
+    @DisplayName("waiting cleanup removes only invalid entries and preserves valid ones")
+    void shouldRemoveOnlyInvalidOrphansFromWaitingSet() {
+      // Given - Add orphaned agents to waiting (valid-agent registered, invalid-agent not)
       long oldScoreSeconds =
           (System.currentTimeMillis() - 4 * 60 * 60 * 1000) / 1000; // 4 hours ago
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WAITZ", oldScoreSeconds, "valid-agent");
-        jedis.zadd("WAITZ", oldScoreSeconds - 1, "invalid-agent");
+        jedis.zadd("waiting", oldScoreSeconds, "valid-agent");
+        jedis.zadd("waiting", oldScoreSeconds - 1, "invalid-agent");
       }
 
       // Register only the valid agent to mark it as valid
@@ -810,6 +827,9 @@ class OrphanCleanupServiceTest {
       agentProps.setEnabledPattern(".*");
       agentProps.setDisabledPattern("");
       PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      props.getKeys().setWaitingSet("waiting");
+      props.getKeys().setWorkingSet("working");
+      props.getKeys().setCleanupLeaderKey("cleanup-leader");
       AgentIntervalProvider intervalProvider = mock(AgentIntervalProvider.class);
       when(intervalProvider.getInterval(any(Agent.class)))
           .thenReturn(new AgentIntervalProvider.Interval(60000L, 120000L));
@@ -830,30 +850,30 @@ class OrphanCleanupServiceTest {
       assertThat(cleaned).isEqualTo(1);
 
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WAITZ", "valid-agent")).isNotNull();
-        assertThat(jedis.zscore("WAITZ", "invalid-agent")).isNull();
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        assertThat(jedis.zscore("waiting", "valid-agent")).isNotNull();
+        assertThat(jedis.zscore("waiting", "invalid-agent")).isNull();
+        assertThat(jedis.zcard("working")).isEqualTo(0);
       }
     }
 
     @Test
     @DisplayName("Should verify Redis TIME-based score generation for rescheduling")
     void shouldUseRedisTimeForRescheduling() {
-      // Given - Add valid orphaned agent to WORKZ
+      // Given - Add valid orphaned agent to working
       long oldScoreSeconds = (System.currentTimeMillis() - 30 * 60 * 1000) / 1000;
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "valid-agent");
+        jedis.zadd("working", oldScoreSeconds, "valid-agent");
       }
 
       // When
       int cleaned = orphanService.forceCleanupOrphanedAgents();
 
-      // Then - Agent moved to WAITZ with current Redis time-based score
+      // Then - Agent moved to waiting with current Redis time-based score
       assertThat(cleaned).isEqualTo(1);
 
       try (Jedis jedis = jedisPool.getResource()) {
-        Double newScore = jedis.zscore("WAITZ", "valid-agent");
+        Double newScore = jedis.zscore("waiting", "valid-agent");
         assertThat(newScore).isNotNull();
 
         // New score should be recent (within last few seconds)
@@ -878,7 +898,7 @@ class OrphanCleanupServiceTest {
       doNothing().when(mockAcquisitionService).removeActiveAgent("valid-agent");
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "valid-agent");
+        jedis.zadd("working", oldScoreSeconds, "valid-agent");
       }
 
       // When
@@ -952,13 +972,13 @@ class OrphanCleanupServiceTest {
     void shouldHandleOrphanCleanupWithOldAgents() throws Exception {
       // GIVEN: Agents from previous shutdown exist in Redis with old timestamps
       try (var jedis = jedisPool.getResource()) {
-        jedis.del("WAITZ", "WORKZ"); // Clean slate
+        jedis.del("waiting", "working"); // Clean slate
 
         // Add old agents that would be considered orphans (old timestamps)
         long oldTimestamp = System.currentTimeMillis() / 1000 - 1000; // 1000 seconds ago
-        jedis.zadd("WAITZ", oldTimestamp, "agent-from-previous-shutdown-1");
-        jedis.zadd("WAITZ", oldTimestamp, "agent-from-previous-shutdown-2");
-        jedis.zadd("WAITZ", oldTimestamp, "agent-from-previous-shutdown-3");
+        jedis.zadd("waiting", oldTimestamp, "agent-from-previous-shutdown-1");
+        jedis.zadd("waiting", oldTimestamp, "agent-from-previous-shutdown-2");
+        jedis.zadd("waiting", oldTimestamp, "agent-from-previous-shutdown-3");
       }
 
       // WHEN: Orphan cleanup runs
@@ -970,7 +990,7 @@ class OrphanCleanupServiceTest {
       try (var jedis = jedisPool.getResource()) {
         // Verify that the cleanup ran without errors
         // The exact number of remaining agents depends on the orphan threshold
-        long remainingAgents = jedis.zcard("WAITZ");
+        long remainingAgents = jedis.zcard("waiting");
         assertThat(remainingAgents)
             .as("Orphan cleanup should process agents according to threshold")
             .isGreaterThanOrEqualTo(0);
@@ -982,13 +1002,13 @@ class OrphanCleanupServiceTest {
     void shouldRunOrphanCleanupWithMixedAgents() throws Exception {
       // GIVEN: Some agents from previous shutdown + one we'll register locally
       try (var jedis = jedisPool.getResource()) {
-        jedis.del("WAITZ", "WORKZ"); // Clean slate
+        jedis.del("waiting", "working"); // Clean slate
 
         // Use old timestamps to ensure they're considered orphans
         long oldTimestamp = System.currentTimeMillis() / 1000 - 2;
-        jedis.zadd("WAITZ", oldTimestamp, "unregistered-agent-1");
-        jedis.zadd("WAITZ", oldTimestamp, "unregistered-agent-2");
-        jedis.zadd("WAITZ", oldTimestamp, "registered-agent"); // This one we'll register
+        jedis.zadd("waiting", oldTimestamp, "unregistered-agent-1");
+        jedis.zadd("waiting", oldTimestamp, "unregistered-agent-2");
+        jedis.zadd("waiting", oldTimestamp, "registered-agent"); // This one we'll register
       }
 
       // WHEN: We register one agent locally
@@ -1004,7 +1024,7 @@ class OrphanCleanupServiceTest {
       // The registered agent should be updated with a new score, unregistered ones may be cleaned
       try (var jedis = jedisPool.getResource()) {
         // Verify that the cleanup ran without errors
-        long remainingAgents = jedis.zcard("WAITZ");
+        long remainingAgents = jedis.zcard("waiting");
         assertThat(remainingAgents)
             .as("Orphan cleanup should process agents according to registration status")
             .isGreaterThanOrEqualTo(0);
@@ -1016,17 +1036,17 @@ class OrphanCleanupServiceTest {
     void shouldPreserveNewlyRegisteredAgentsWhileCleaningStaleOnes() throws Exception {
       // GIVEN: Simulate agents from previous shutdown with very old timestamps
       try (var jedis = jedisPool.getResource()) {
-        jedis.del("WAITZ", "WORKZ"); // Clean slate
+        jedis.del("waiting", "working"); // Clean slate
 
         // Use very old timestamp to ensure they're considered orphans (beyond threshold)
         long veryOldTimestamp = System.currentTimeMillis() / 1000 - 3600; // 1 hour ago
         // Simulate 10 agents from previous shutdown with stale scores
         for (int i = 1; i <= 10; i++) {
-          jedis.zadd("WAITZ", veryOldTimestamp, "stale-agent-" + i);
+          jedis.zadd("waiting", veryOldTimestamp, "stale-agent-" + i);
         }
 
         // Verify initial state
-        assertThat(jedis.zcard("WAITZ")).as("Should start with 10 stale agents").isEqualTo(10);
+        assertThat(jedis.zcard("waiting")).as("Should start with 10 stale agents").isEqualTo(10);
       }
 
       // WHEN: Some agents are re-registered (this gives them fresh scores)
@@ -1040,12 +1060,12 @@ class OrphanCleanupServiceTest {
 
       // Verify agents were registered with fresh scores and debug the scores
       try (var jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WAITZ"))
+        assertThat(jedis.zcard("waiting"))
             .as("Should have agents after registration")
             .isGreaterThan(0);
 
         // Debug: Print all agents and their scores
-        Set<Tuple> agentsWithScores = jedis.zrangeWithScores("WAITZ", 0, -1);
+        Set<Tuple> agentsWithScores = jedis.zrangeWithScores("waiting", 0, -1);
         System.out.println("Agents after registration:");
         for (Tuple tuple : agentsWithScores) {
           System.out.println("  " + tuple.getElement() + " -> score: " + tuple.getScore());
@@ -1059,10 +1079,10 @@ class OrphanCleanupServiceTest {
 
       // THEN: Newly registered agents should be preserved, stale ones may be cleaned
       try (var jedis = jedisPool.getResource()) {
-        Set<String> remainingAgents = jedis.zrange("WAITZ", 0, -1);
+        Set<String> remainingAgents = jedis.zrange("waiting", 0, -1);
 
         // Debug: Print remaining agents after cleanup
-        Set<Tuple> remainingWithScores = jedis.zrangeWithScores("WAITZ", 0, -1);
+        Set<Tuple> remainingWithScores = jedis.zrangeWithScores("waiting", 0, -1);
         System.out.println("Agents after cleanup:");
         for (Tuple tuple : remainingWithScores) {
           System.out.println("  " + tuple.getElement() + " -> score: " + tuple.getScore());
@@ -1096,7 +1116,7 @@ class OrphanCleanupServiceTest {
     void shouldHandleMultipleAgentRegistrations() throws Exception {
       // GIVEN: Clean slate
       try (var jedis = jedisPool.getResource()) {
-        jedis.del("WAITZ", "WORKZ");
+        jedis.del("waiting", "working");
       }
 
       // WHEN: Multiple agents are registered
@@ -1108,10 +1128,10 @@ class OrphanCleanupServiceTest {
 
       // THEN: All agents should be properly registered in Redis
       try (var jedis = jedisPool.getResource()) {
-        long agentCount = jedis.zcard("WAITZ");
+        long agentCount = jedis.zcard("waiting");
         assertThat(agentCount).as("All registered agents should be present in Redis").isEqualTo(3);
 
-        Set<String> agentNames = jedis.zrange("WAITZ", 0, -1);
+        Set<String> agentNames = jedis.zrange("waiting", 0, -1);
         assertThat(agentNames)
             .as("Agent names should match registered agents")
             .containsExactlyInAnyOrder("test-agent-1", "test-agent-2", "test-agent-3");
@@ -1124,13 +1144,13 @@ class OrphanCleanupServiceTest {
 
       // GIVEN: Large number of agents from previous shutdown exist in Redis
       try (var jedis = jedisPool.getResource()) {
-        jedis.del("WAITZ", "WORKZ"); // Clean slate
+        jedis.del("waiting", "working"); // Clean slate
 
         // Simulate 1000 agents from previous graceful shutdown
         for (int i = 1; i <= 1000; i++) {
           // Old timestamp - would normally be considered "orphans"
           long oldTimestamp = System.currentTimeMillis() / 1000 - 3600; // 1 hour ago
-          jedis.zadd("WAITZ", oldTimestamp, "agent-from-previous-shutdown-" + i);
+          jedis.zadd("waiting", oldTimestamp, "agent-from-previous-shutdown-" + i);
         }
       }
 
@@ -1140,7 +1160,7 @@ class OrphanCleanupServiceTest {
 
       // THEN: System should handle large dataset efficiently
       try (var jedis = jedisPool.getResource()) {
-        long remainingAgents = jedis.zcard("WAITZ");
+        long remainingAgents = jedis.zcard("waiting");
         assertThat(remainingAgents)
             .as("System should handle large number of agents efficiently")
             .isGreaterThanOrEqualTo(0);

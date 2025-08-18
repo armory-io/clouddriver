@@ -80,6 +80,8 @@ class ZombieCleanupServiceTest {
     scriptManager.initializeScripts();
 
     schedulerProperties = new PrioritySchedulerProperties();
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
     schedulerProperties.getZombieCleanup().setThresholdMs(30000L); // 30 seconds
     schedulerProperties.getZombieCleanup().setIntervalMs(10000L); // 10 seconds
 
@@ -99,7 +101,7 @@ class ZombieCleanupServiceTest {
 
       // Also add to Redis for cleanup to work properly
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "zombie-agent");
+        jedis.zadd("working", oldScoreSeconds, "zombie-agent");
       }
 
       // Populate the local activeAgents map with the zombie agent
@@ -119,7 +121,7 @@ class ZombieCleanupServiceTest {
 
       // Verify agent was removed from Redis
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WORKZ", "zombie-agent")).isNull();
+        assertThat(jedis.zscore("working", "zombie-agent")).isNull();
       }
     }
 
@@ -130,7 +132,7 @@ class ZombieCleanupServiceTest {
       long recentScore =
           System.currentTimeMillis() - 10000; // 10 seconds ago (within 30s threshold)
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", recentScore, "recent-agent");
+        jedis.zadd("working", recentScore, "recent-agent");
       }
 
       Map<String, String> activeAgents = new HashMap<>();
@@ -144,7 +146,7 @@ class ZombieCleanupServiceTest {
 
       // Verify agent was NOT removed from Redis
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WORKZ", "recent-agent")).isEqualTo(recentScore);
+        assertThat(jedis.zscore("working", "recent-agent")).isEqualTo(recentScore);
       }
     }
 
@@ -156,11 +158,11 @@ class ZombieCleanupServiceTest {
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
-        jedis.del("WORKZ", "WAITZ");
+        jedis.del("working", "waiting");
 
-        jedis.zadd("WORKZ", oldScoreSeconds, "zombie-1");
-        jedis.zadd("WORKZ", oldScoreSeconds - 1, "zombie-2");
-        jedis.zadd("WORKZ", oldScoreSeconds - 2, "zombie-3");
+        jedis.zadd("working", oldScoreSeconds, "zombie-1");
+        jedis.zadd("working", oldScoreSeconds - 1, "zombie-2");
+        jedis.zadd("working", oldScoreSeconds - 2, "zombie-3");
       }
 
       // Populate local activeAgents map with zombie agents
@@ -184,7 +186,7 @@ class ZombieCleanupServiceTest {
 
       // Verify all agents were removed
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        assertThat(jedis.zcard("working")).isEqualTo(0);
       }
     }
   }
@@ -200,7 +202,7 @@ class ZombieCleanupServiceTest {
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "zombie-agent");
+        jedis.zadd("working", oldScoreSeconds, "zombie-agent");
       }
 
       Map<String, String> activeAgents = new HashMap<>();
@@ -229,7 +231,7 @@ class ZombieCleanupServiceTest {
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "zombie-agent");
+        jedis.zadd("working", oldScoreSeconds, "zombie-agent");
       }
 
       // Populate local activeAgents map with zombie agent
@@ -368,7 +370,7 @@ class ZombieCleanupServiceTest {
 
       try (Jedis jedis = jedisPool.getResource()) {
         for (int i = 0; i < zombieCount; i++) {
-          jedis.zadd("WORKZ", oldScoreSeconds - i, "zombie-" + i);
+          jedis.zadd("working", oldScoreSeconds - i, "zombie-" + i);
         }
       }
 
@@ -396,7 +398,7 @@ class ZombieCleanupServiceTest {
 
       // Verify all zombies were cleaned
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        assertThat(jedis.zcard("working")).isEqualTo(0);
       }
     }
 
@@ -414,11 +416,11 @@ class ZombieCleanupServiceTest {
       try (Jedis jedis = jedisPool.getResource()) {
         // Add zombie agents (past completion deadlines)
         for (int i = 0; i < 500; i++) {
-          jedis.zadd("WORKZ", zombieDeadlineSeconds - i, "zombie-" + i);
+          jedis.zadd("working", zombieDeadlineSeconds - i, "zombie-" + i);
         }
         // Add active agents (future completion deadlines)
         for (int i = 0; i < 500; i++) {
-          jedis.zadd("WORKZ", activeDeadlineSeconds + i, "active-" + i);
+          jedis.zadd("working", activeDeadlineSeconds + i, "active-" + i);
         }
       }
 
@@ -448,7 +450,7 @@ class ZombieCleanupServiceTest {
 
       // Verify only active agents remain
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(500);
+        assertThat(jedis.zcard("working")).isEqualTo(500);
       }
     }
 
@@ -470,7 +472,7 @@ class ZombieCleanupServiceTest {
       try (Jedis jedis = jedisPool.getResource()) {
         for (int i = 1; i <= totalZombies; i++) {
           String agentType = "batch-size-zombie-" + i;
-          jedis.zadd("WORKZ", oldScoreSeconds, agentType);
+          jedis.zadd("working", oldScoreSeconds, agentType);
 
           activeAgents.put(agentType, String.valueOf(oldScoreSeconds));
           activeAgentsFutures.put(agentType, mock(Future.class));
@@ -487,7 +489,7 @@ class ZombieCleanupServiceTest {
 
       // Verify Redis cleanup
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        assertThat(jedis.zcard("working")).isEqualTo(0);
       }
     }
   }
@@ -503,8 +505,8 @@ class ZombieCleanupServiceTest {
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "zombie-1");
-        jedis.zadd("WORKZ", oldScoreSeconds - 1, "zombie-2");
+        jedis.zadd("working", oldScoreSeconds, "zombie-1");
+        jedis.zadd("working", oldScoreSeconds - 1, "zombie-2");
       }
 
       // Populate local activeAgents map with zombie agents
@@ -550,7 +552,7 @@ class ZombieCleanupServiceTest {
       // Redis scores are stored as seconds since epoch, not milliseconds
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "stuck-agent");
+        jedis.zadd("working", oldScoreSeconds, "stuck-agent");
       }
 
       // Simulate active agent with future
@@ -572,7 +574,7 @@ class ZombieCleanupServiceTest {
 
       // Verify agent was removed from Redis
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WORKZ", "stuck-agent")).isNull();
+        assertThat(jedis.zscore("working", "stuck-agent")).isNull();
       }
     }
   }
@@ -588,8 +590,8 @@ class ZombieCleanupServiceTest {
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000; // 1 minute ago
 
       try (Jedis jedis = jedisPool.getResource()) {
-        // Add agent to Redis WORKZ
-        jedis.zadd("WORKZ", oldScoreSeconds, "redis-only-agent");
+        // Add agent to Redis working
+        jedis.zadd("working", oldScoreSeconds, "redis-only-agent");
       }
 
       // Local activeAgents map is empty (agent not tracked locally)
@@ -604,7 +606,7 @@ class ZombieCleanupServiceTest {
 
       // Agent should still exist in Redis (not cleaned)
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WORKZ", "redis-only-agent")).isNotNull();
+        assertThat(jedis.zscore("working", "redis-only-agent")).isNotNull();
       }
     }
 
@@ -621,9 +623,9 @@ class ZombieCleanupServiceTest {
       activeAgents.put("local-only-zombie", String.valueOf(oldScoreSeconds));
       activeAgentsFutures.put("local-only-zombie", mock(Future.class));
 
-      // Redis WORKZ is empty
+      // Redis working is empty
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.del("WORKZ");
+        jedis.del("working");
       }
 
       // When - Run zombie cleanup
@@ -654,7 +656,7 @@ class ZombieCleanupServiceTest {
 
       // Also add to Redis for complete cleanup
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "zombie-with-future");
+        jedis.zadd("working", oldScoreSeconds, "zombie-with-future");
       }
 
       // When - Run zombie cleanup
@@ -693,10 +695,10 @@ class ZombieCleanupServiceTest {
 
       // Add all to Redis with completion deadlines
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", zombieDeadlineSeconds, "zombie-1");
-        jedis.zadd("WORKZ", zombieDeadlineSeconds - 5, "zombie-2");
-        jedis.zadd("WORKZ", activeDeadlineSeconds, "active-1");
-        jedis.zadd("WORKZ", activeDeadlineSeconds + 10, "active-2");
+        jedis.zadd("working", zombieDeadlineSeconds, "zombie-1");
+        jedis.zadd("working", zombieDeadlineSeconds - 5, "zombie-2");
+        jedis.zadd("working", activeDeadlineSeconds, "active-1");
+        jedis.zadd("working", activeDeadlineSeconds + 10, "active-2");
       }
 
       // When - Run zombie cleanup
@@ -719,8 +721,8 @@ class ZombieCleanupServiceTest {
 
       // Zombies removed from Redis
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WORKZ", "zombie-1")).isNull();
-        assertThat(jedis.zscore("WORKZ", "zombie-2")).isNull();
+        assertThat(jedis.zscore("working", "zombie-1")).isNull();
+        assertThat(jedis.zscore("working", "zombie-2")).isNull();
         // Active agents might still be in Redis (that's normal)
       }
     }
@@ -812,7 +814,7 @@ class ZombieCleanupServiceTest {
       try (Jedis jedis = jedisPool.getResource()) {
         for (int i = 1; i <= 3; i++) {
           String agentType = "batch-zombie-" + i;
-          jedis.zadd("WORKZ", oldScoreSeconds, agentType);
+          jedis.zadd("working", oldScoreSeconds, agentType);
 
           activeAgents.put(agentType, String.valueOf(oldScoreSeconds));
           activeAgentsFutures.put(agentType, mock(Future.class));
@@ -829,7 +831,7 @@ class ZombieCleanupServiceTest {
 
       // Verify Redis cleanup
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        assertThat(jedis.zcard("working")).isEqualTo(0);
       }
     }
 
@@ -848,8 +850,8 @@ class ZombieCleanupServiceTest {
 
       // Add agents to both Redis and local tracking
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WORKZ", oldScoreSeconds, "individual-zombie-1");
-        jedis.zadd("WORKZ", oldScoreSeconds, "individual-zombie-2");
+        jedis.zadd("working", oldScoreSeconds, "individual-zombie-1");
+        jedis.zadd("working", oldScoreSeconds, "individual-zombie-2");
       }
 
       activeAgents.put("individual-zombie-1", String.valueOf(oldScoreSeconds));
@@ -867,7 +869,7 @@ class ZombieCleanupServiceTest {
 
       // Verify Redis cleanup
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WORKZ")).isEqualTo(0);
+        assertThat(jedis.zcard("working")).isEqualTo(0);
       }
     }
 

@@ -78,6 +78,13 @@ class AgentAcquisitionServiceConcurrencyTest {
     when(mockScriptManager.getScriptSha(anyString())).thenReturn("mock-sha");
     when(mockScriptManager.isInitialized()).thenReturn(true);
 
+    // Provide non-null keys to avoid NPEs in service initialization
+    PrioritySchedulerProperties.Keys keys = new PrioritySchedulerProperties.Keys();
+    keys.setWaitingSet("waiting");
+    keys.setWorkingSet("working");
+    keys.setCleanupLeaderKey("cleanup-leader");
+    when(mockSchedulerProperties.getKeys()).thenReturn(keys);
+
     // Mock Pipeline operations to prevent null pointer exceptions
     when(mockJedis.pipelined()).thenReturn(mockPipeline);
     Response<Double> mockResponse = mock(Response.class);

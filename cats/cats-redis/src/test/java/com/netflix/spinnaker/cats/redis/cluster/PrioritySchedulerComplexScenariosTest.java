@@ -87,6 +87,12 @@ public class PrioritySchedulerComplexScenariosTest {
     mockBatch.setBatchSize(50);
     when(mockSchedulerProperties.getBatchOperations()).thenReturn(mockBatch);
     when(mockSchedulerProperties.getTimeCacheDurationMs()).thenReturn(10000L);
+    // Provide non-null keys for scheduler configuration
+    PrioritySchedulerProperties.Keys keys = new PrioritySchedulerProperties.Keys();
+    keys.setWaitingSet("waiting");
+    keys.setWorkingSet("working");
+    keys.setCleanupLeaderKey("cleanup-leader");
+    when(mockSchedulerProperties.getKeys()).thenReturn(keys);
 
     // Mock nested thread pool properties
     RedisThreadPoolProperties threadPoolProps = mock(RedisThreadPoolProperties.class);

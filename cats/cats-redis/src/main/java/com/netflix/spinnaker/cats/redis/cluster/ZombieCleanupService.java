@@ -43,15 +43,15 @@ import redis.clients.jedis.JedisPool;
  *   <li>Uses batch removal scripts for efficient cleanup if enabled (otherwise falls back to
  *       individual cleanup)
  *   <li>Cancels any local Future references to zombie executions
- *   <li>Updates both Redis WORKING and WAITING sets to reflect cleanup
+ *   <li>Updates both Redis working and waiting sets to reflect cleanup
  * </ul>
  */
 @Component
 public class ZombieCleanupService {
   private static final Logger log = LoggerFactory.getLogger(ZombieCleanupService.class);
 
-  private static final String WORKING_SET = "WORKZ";
-  private static final String WAITING_SET = "WAITZ";
+  private final String WORKING_SET;
+  private final String WAITING_SET;
 
   private final JedisPool jedisPool;
   private final RedisScriptManager scriptManager;
@@ -79,6 +79,13 @@ public class ZombieCleanupService {
     this.scriptManager = scriptManager;
     this.schedulerProperties = schedulerProperties;
     compileExceptionalAgentsPattern();
+
+    PrioritySchedulerProperties.Keys keysCfg = schedulerProperties.getKeys();
+    String hash = keysCfg.getHashTag();
+    String brace = (hash != null && !hash.isEmpty()) ? ("{" + hash + "}") : "";
+    String prefix = keysCfg.getPrefix() != null ? keysCfg.getPrefix() : "";
+    this.WAITING_SET = prefix + keysCfg.getWaitingSet() + brace;
+    this.WORKING_SET = prefix + keysCfg.getWorkingSet() + brace;
   }
 
   /**
@@ -156,7 +163,7 @@ public class ZombieCleanupService {
    * <p>This cleanup mechanism is important for preventing resource exhaustion on the local
    * instance. It works by checking the local activeAgents map for agents that have exceeded their
    * completion deadline (current_time + agent_timeout), then performs cleanup in Redis to remove
-   * the agents from both WORKING and WAITING sets.
+   * the agents from both working and waiting sets.
    *
    * @param activeAgents Map of active agents (agentType -> completionDeadline)
    * @param activeAgentsFutures Map of agent futures for cancellation
@@ -340,11 +347,11 @@ public class ZombieCleanupService {
         }
 
         if (!batchArgs.isEmpty()) {
-          // Execute Lua script to batch cleanup zombie agents from Redis WORKING set
+          // Execute Lua script to batch cleanup zombie agents from Redis working set
           Object result =
               jedis.evalsha(
                   scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL),
-                  java.util.Collections.singletonList(WORKING_SET), // Redis key (WORKZ)
+                  java.util.Collections.singletonList(WORKING_SET), // Redis key (working)
                   batchArgs); // [agent1, score1, agent2, score2, ...]
 
           // Parse Lua script return value: [numCleaned, [cleanedAgent1, cleanedAgent2, ...]]
@@ -477,17 +484,16 @@ public class ZombieCleanupService {
         log.info("Cancelled zombie agent execution: {}", agentType);
       }
 
-      // Remove from Redis using REMOVE_AGENT_SCRIPT (removes from both WORKZ and WAITZ)
+      // Remove from Redis using REMOVE_AGENT_SCRIPT (removes from both working and waiting)
       Object result =
           jedis.evalsha(
               scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
-              java.util.Arrays.asList(WORKING_SET, "WAITZ"), // KEYS[1] and KEYS[2]
-              java.util.Collections.singletonList(agentType) // ARGV[1] - only agent name needed
-              );
+              java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+              java.util.Collections.singletonList(agentType));
 
       boolean removed = result != null && ((Long) result).intValue() == 1;
       if (removed) {
-        log.debug("Removed zombie agent {} from Redis WORKING_SET", agentType);
+        log.debug("Removed zombie agent {} from Redis working set", agentType);
       } else {
         log.debug("Zombie agent {} was not cleaned (may have been updated): {}", agentType, result);
       }

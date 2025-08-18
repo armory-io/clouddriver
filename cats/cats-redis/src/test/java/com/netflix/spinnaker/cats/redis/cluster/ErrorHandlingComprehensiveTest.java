@@ -77,6 +77,9 @@ public class ErrorHandlingComprehensiveTest {
     scriptManager.initializeScripts();
 
     schedulerProperties = new PrioritySchedulerProperties();
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
+    schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
     agentProperties = new PriorityAgentProperties();
     agentProperties.setMaxConcurrentAgents(10);
 

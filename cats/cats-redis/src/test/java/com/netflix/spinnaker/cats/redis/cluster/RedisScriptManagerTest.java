@@ -221,23 +221,23 @@ class RedisScriptManagerTest {
         String score = "100";
 
         // Clean up any existing agent first
-        jedis.zrem("WORKZ", agentType);
-        jedis.zrem("WAITZ", agentType);
+        jedis.zrem("working", agentType);
+        jedis.zrem("waiting", agentType);
 
         // When - Execute ADD_AGENTS_SCRIPT
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
                 2, // Key count
-                "WORKZ",
-                "WAITZ",
+                "working",
+                "waiting",
                 agentType,
                 score);
 
         // Then - Expect [count, [addedAgents]] format
         assertThat(result)
             .isEqualTo(java.util.Arrays.asList(1L, java.util.Arrays.asList("test-agent")));
-        assertThat(jedis.zscore("WAITZ", agentType)).isEqualTo(100.0);
+        assertThat(jedis.zscore("waiting", agentType)).isEqualTo(100.0);
       }
     }
 
@@ -246,7 +246,7 @@ class RedisScriptManagerTest {
     void shouldExecuteMoveAgentsScriptCorrectly() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Given - Add agent to WAITING set first
-        jedis.zadd("WAITZ", 100, "test-agent");
+        jedis.zadd("waiting", 100, "test-agent");
 
         String newScore = "200";
 
@@ -254,13 +254,13 @@ class RedisScriptManagerTest {
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("test-agent", newScore));
 
         // Then - MOVE_AGENTS returns the score on success
         assertThat(result).isEqualTo(newScore);
-        assertThat(jedis.zscore("WORKZ", "test-agent")).isEqualTo(200.0);
-        assertThat(jedis.zscore("WAITZ", "test-agent")).isNull();
+        assertThat(jedis.zscore("working", "test-agent")).isEqualTo(200.0);
+        assertThat(jedis.zscore("waiting", "test-agent")).isNull();
       }
     }
 
@@ -269,14 +269,14 @@ class RedisScriptManagerTest {
     void shouldExecuteValidScoreScriptCorrectly() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Given - Add agent to WORKING set
-        jedis.zadd("WORKZ", 150, "test-agent");
+        jedis.zadd("working", 150, "test-agent");
 
         // When - Check valid score
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.VALIDATE_OWNERSHIP),
                 1, // Key count
-                "WORKZ",
+                "working",
                 "test-agent",
                 "150");
 
@@ -290,14 +290,14 @@ class RedisScriptManagerTest {
     void shouldReturnNullForInvalidScoreInValidScoreScript() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Given - Add agent with different score
-        jedis.zadd("WORKZ", 150, "test-agent");
+        jedis.zadd("working", 150, "test-agent");
 
         // When - Check with wrong score
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.VALIDATE_OWNERSHIP),
                 1, // Key count
-                "WORKZ",
+                "working",
                 "test-agent",
                 "999");
 
@@ -316,17 +316,17 @@ class RedisScriptManagerTest {
 
       try (Jedis jedis = jedisPool.getResource()) {
         // Add agent to WORKING set
-        jedis.zadd("WORKZ", workingScore, agentType);
+        jedis.zadd("working", workingScore, agentType);
 
         // Verify Redis stores it as double but we can retrieve as long
-        Double retrievedScore = jedis.zscore("WORKZ", agentType);
+        Double retrievedScore = jedis.zscore("working", agentType);
         assertThat(retrievedScore).isEqualTo(12345.0); // Redis returns double
 
         // When - Execute conditional swap with string representation (how Java passes it)
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList(
                     agentType,
                     String.valueOf(workingScore), // "12345" - Java passes as string
@@ -335,19 +335,19 @@ class RedisScriptManagerTest {
 
         // Then - Should succeed thanks to tonumber() conversion
         assertThat(result).isEqualTo("swapped");
-        assertThat(jedis.zscore("WORKZ", agentType)).isNull();
-        assertThat(jedis.zscore("WAITZ", agentType)).isEqualTo(newScore);
+        assertThat(jedis.zscore("working", agentType)).isNull();
+        assertThat(jedis.zscore("waiting", agentType)).isEqualTo(newScore);
 
         // Cleanup for next test
-        jedis.zrem("WAITZ", agentType);
+        jedis.zrem("waiting", agentType);
 
         // Test failure case - wrong score
-        jedis.zadd("WORKZ", workingScore, agentType);
+        jedis.zadd("working", workingScore, agentType);
 
         result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList(
                     agentType,
                     String.valueOf(99999L), // Wrong expected score
@@ -355,8 +355,8 @@ class RedisScriptManagerTest {
 
         // Should fail - ownership verification failed
         assertThat(result).isNull();
-        assertThat(jedis.zscore("WORKZ", agentType)).isEqualTo(workingScore); // Still in WORKZ
-        assertThat(jedis.zscore("WAITZ", agentType)).isNull();
+        assertThat(jedis.zscore("working", agentType)).isEqualTo(workingScore); // Still in working
+        assertThat(jedis.zscore("waiting", agentType)).isNull();
       }
     }
   }
@@ -381,23 +381,23 @@ class RedisScriptManagerTest {
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("test-agent", "100"));
 
         // Then - Returns 1 for success
         assertThat(result).isEqualTo(1L);
-        assertThat(jedis.zscore("WAITZ", "test-agent")).isEqualTo(100.0);
+        assertThat(jedis.zscore("waiting", "test-agent")).isEqualTo(100.0);
 
         // When - Try to add same agent again
         result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("test-agent", "200"));
 
         // Then - Returns 0 for already exists
         assertThat(result).isEqualTo(0L);
-        assertThat(jedis.zscore("WAITZ", "test-agent")).isEqualTo(100.0); // Score unchanged
+        assertThat(jedis.zscore("waiting", "test-agent")).isEqualTo(100.0); // Score unchanged
       }
     }
 
@@ -406,21 +406,21 @@ class RedisScriptManagerTest {
     void shouldExecuteRemoveAgentScriptCorrectly() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Given - Add agents to both sets
-        jedis.zadd("WORKZ", 100, "agent1");
-        jedis.zadd("WAITZ", 200, "agent2");
+        jedis.zadd("working", 100, "agent1");
+        jedis.zadd("waiting", 200, "agent2");
 
         // When - Remove agent
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("agent1"));
 
         // Then - Returns 1 and removes from both sets
         assertThat(result).isEqualTo(1L);
-        assertThat(jedis.zscore("WORKZ", "agent1")).isNull();
-        assertThat(jedis.zscore("WAITZ", "agent1")).isNull();
-        assertThat(jedis.zscore("WAITZ", "agent2")).isEqualTo(200.0); // Other agent untouched
+        assertThat(jedis.zscore("working", "agent1")).isNull();
+        assertThat(jedis.zscore("waiting", "agent1")).isNull();
+        assertThat(jedis.zscore("waiting", "agent2")).isEqualTo(200.0); // Other agent untouched
       }
     }
 
@@ -429,30 +429,30 @@ class RedisScriptManagerTest {
     void shouldExecuteMoveAgentScriptCorrectly() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Given - Add agent to WAITING set
-        jedis.zadd("WAITZ", 100, "test-agent");
+        jedis.zadd("waiting", 100, "test-agent");
 
         // When - Move agent to WORKING set
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENT),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("test-agent", "150"));
 
         // Then - Returns 1 and moves agent
         assertThat(result).isEqualTo(1L);
-        assertThat(jedis.zscore("WAITZ", "test-agent")).isNull(); // Removed from WAITING
-        assertThat(jedis.zscore("WORKZ", "test-agent")).isEqualTo(150.0); // Added to WORKING
+        assertThat(jedis.zscore("waiting", "test-agent")).isNull(); // Removed from WAITING
+        assertThat(jedis.zscore("working", "test-agent")).isEqualTo(150.0); // Added to WORKING
 
         // When - Try to move agent that's not in WAITING set
         result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENT),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("nonexistent-agent", "200"));
 
         // Then - Returns 0 for failure
         assertThat(result).isEqualTo(0L);
-        assertThat(jedis.zscore("WORKZ", "nonexistent-agent")).isNull(); // Not added to WORKING
+        assertThat(jedis.zscore("working", "nonexistent-agent")).isNull(); // Not added to WORKING
       }
     }
   }
@@ -474,7 +474,7 @@ class RedisScriptManagerTest {
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("agent1", "100", "agent2", "200", "agent3", "300"));
 
         // Then
@@ -485,9 +485,9 @@ class RedisScriptManagerTest {
         assertThat(resultList.get(0)).isEqualTo(3L); // Count of added agents
 
         // Verify agents were added to WAITING set
-        assertThat(jedis.zscore("WAITZ", "agent1")).isEqualTo(100.0);
-        assertThat(jedis.zscore("WAITZ", "agent2")).isEqualTo(200.0);
-        assertThat(jedis.zscore("WAITZ", "agent3")).isEqualTo(300.0);
+        assertThat(jedis.zscore("waiting", "agent1")).isEqualTo(100.0);
+        assertThat(jedis.zscore("waiting", "agent2")).isEqualTo(200.0);
+        assertThat(jedis.zscore("waiting", "agent3")).isEqualTo(300.0);
       }
     }
 
@@ -496,14 +496,14 @@ class RedisScriptManagerTest {
     void shouldExecuteRemoveAgentsConditionalScriptCorrectly() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Given - Add orphaned agents to WORKING set
-        jedis.zadd("WORKZ", 100, "orphan1");
-        jedis.zadd("WORKZ", 200, "orphan2");
+        jedis.zadd("working", 100, "orphan1");
+        jedis.zadd("working", 200, "orphan2");
 
         // When - Execute conditional removal
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL),
-                java.util.Collections.singletonList("WORKZ"),
+                java.util.Collections.singletonList("working"),
                 java.util.Arrays.asList("orphan1", "100", "orphan2", "200"));
 
         // Then
@@ -514,8 +514,8 @@ class RedisScriptManagerTest {
         assertThat(resultList.get(0)).isEqualTo(2L); // Count of removed agents
 
         // Verify agents were removed
-        assertThat(jedis.zscore("WORKZ", "orphan1")).isNull();
-        assertThat(jedis.zscore("WORKZ", "orphan2")).isNull();
+        assertThat(jedis.zscore("working", "orphan1")).isNull();
+        assertThat(jedis.zscore("working", "orphan2")).isNull();
       }
     }
 
@@ -591,8 +591,8 @@ class RedisScriptManagerTest {
           jedis.evalsha(
               scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
               2,
-              "WORKZ",
-              "WAITZ",
+              "working",
+              "waiting",
               "agent-" + i,
               String.valueOf(i));
         }
@@ -601,7 +601,7 @@ class RedisScriptManagerTest {
 
         // Then - Should complete within reasonable time
         assertThat(duration).isLessThan(5000); // Less than 5 seconds
-        assertThat(jedis.zcard("WAITZ")).isEqualTo(iterations);
+        assertThat(jedis.zcard("waiting")).isEqualTo(iterations);
       }
     }
   }
@@ -627,12 +627,12 @@ class RedisScriptManagerTest {
             scriptManager.evalshaWithSelfHeal(
                 jedis,
                 RedisScriptManager.ADD_AGENTS,
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("agent-a", "100"));
 
         assertThat(first)
             .isEqualTo(java.util.Arrays.asList(1L, java.util.Arrays.asList("agent-a")));
-        assertThat(jedis.zscore("WAITZ", "agent-a")).isEqualTo(100.0);
+        assertThat(jedis.zscore("waiting", "agent-a")).isEqualTo(100.0);
 
         // Flush scripts to force NOSCRIPT
         jedis.scriptFlush();
@@ -642,7 +642,7 @@ class RedisScriptManagerTest {
                 () ->
                     jedis.evalsha(
                         scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
-                        java.util.Arrays.asList("WORKZ", "WAITZ"),
+                        java.util.Arrays.asList("working", "waiting"),
                         java.util.Arrays.asList("agent-b", "200")))
             .isInstanceOf(redis.clients.jedis.exceptions.JedisDataException.class)
             .hasMessageContaining("NOSCRIPT");
@@ -652,12 +652,12 @@ class RedisScriptManagerTest {
             scriptManager.evalshaWithSelfHeal(
                 jedis,
                 RedisScriptManager.ADD_AGENTS,
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("agent-b", "200"));
 
         assertThat(second)
             .isEqualTo(java.util.Arrays.asList(1L, java.util.Arrays.asList("agent-b")));
-        assertThat(jedis.zscore("WAITZ", "agent-b")).isEqualTo(200.0);
+        assertThat(jedis.zscore("waiting", "agent-b")).isEqualTo(200.0);
       }
     }
 
@@ -697,12 +697,12 @@ class RedisScriptManagerTest {
         Object res =
             jedis.eval(
                 body,
-                java.util.Arrays.asList("WORKZ", "WAITZ"),
+                java.util.Arrays.asList("working", "waiting"),
                 java.util.Arrays.asList("body-agent", "350"));
 
         assertThat(res)
             .isEqualTo(java.util.Arrays.asList(1L, java.util.Arrays.asList("body-agent")));
-        assertThat(jedis.zscore("WAITZ", "body-agent")).isEqualTo(350.0);
+        assertThat(jedis.zscore("waiting", "body-agent")).isEqualTo(350.0);
       }
     }
   }
@@ -726,12 +726,12 @@ class RedisScriptManagerTest {
         // Directly add agents to WAITING set using current time in seconds (correct format)
         long currentTimeSeconds = System.currentTimeMillis() / 1000;
 
-        jedis.zadd("WAITZ", currentTimeSeconds, "test-agent-1");
-        jedis.zadd("WAITZ", currentTimeSeconds + 10, "test-agent-2");
+        jedis.zadd("waiting", currentTimeSeconds, "test-agent-1");
+        jedis.zadd("waiting", currentTimeSeconds + 10, "test-agent-2");
 
         // Get all scores from WAITING set
         java.util.Set<redis.clients.jedis.Tuple> waitingAgents =
-            jedis.zrangeByScoreWithScores("WAITZ", 0, Double.MAX_VALUE);
+            jedis.zrangeByScoreWithScores("waiting", 0, Double.MAX_VALUE);
 
         // Verify all scores are in seconds format (not milliseconds)
         assertThat(waitingAgents).isNotEmpty();
@@ -774,14 +774,14 @@ class RedisScriptManagerTest {
         long currentTimeMillis = System.currentTimeMillis();
 
         // Add agent with correct seconds format
-        jedis.zadd("WAITZ", currentTimeSeconds, "seconds-agent");
+        jedis.zadd("waiting", currentTimeSeconds, "seconds-agent");
 
         // Simulate bug: add agent with milliseconds format
-        jedis.zadd("WAITZ", currentTimeMillis, "milliseconds-agent");
+        jedis.zadd("waiting", currentTimeMillis, "milliseconds-agent");
 
         // Verify we can detect the inconsistency
         java.util.Set<redis.clients.jedis.Tuple> allAgents =
-            jedis.zrangeByScoreWithScores("WAITZ", 0, Double.MAX_VALUE);
+            jedis.zrangeByScoreWithScores("waiting", 0, Double.MAX_VALUE);
 
         boolean hasSecondsFormat = false;
         boolean hasMillisecondsFormat = false;

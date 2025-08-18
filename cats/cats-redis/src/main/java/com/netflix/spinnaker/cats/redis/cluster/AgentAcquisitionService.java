@@ -52,8 +52,8 @@ import redis.clients.jedis.Tuple;
 /**
  * Service responsible for acquiring agents from Redis and executing them.
  *
- * <p>This service handles the core scheduling logic of moving agents from WAITING → WORKING and
- * executing them. It includes:
+ * <p>This service handles the core scheduling logic of moving agents from the waiting set to the
+ * working set and executing them. It includes:
  *
  * <ul>
  *   <li>Finding agents ready for execution based on priority (Redis scores)
@@ -67,9 +67,9 @@ import redis.clients.jedis.Tuple;
 public class AgentAcquisitionService {
   private static final Logger log = LoggerFactory.getLogger(AgentAcquisitionService.class);
 
-  // Redis set names
-  private static final String WAITING_SET = "WAITZ";
-  private static final String WORKING_SET = "WORKZ";
+  // Redis key names (injected via properties)
+  private final String WAITING_SET;
+  private final String WORKING_SET;
 
   private final JedisPool jedisPool;
   private final RedisScriptManager scriptManager;
@@ -109,7 +109,8 @@ public class AgentAcquisitionService {
    * Health evaluation notes:
    *
    * <ul>
-   *   <li>Queue lag is computed from WAITZ only; WORKZ overruns (zombies) are handled elsewhere.
+   *   <li>Queue lag is computed based on the scores of agents in the waiting set; working-set
+   *       overruns (zombies) are handled by the zombie cleanup.
    *   <li>Degradation is config-free: oldest_overdue_seconds > min enabled-agent interval on this
    *       pod.
    *   <li>WARNs are rate-limited to once per 10 minutes to avoid flooding.
@@ -200,6 +201,14 @@ public class AgentAcquisitionService {
     this.agentProperties = agentProperties;
     this.schedulerProperties = schedulerProperties;
 
+    // Resolve configured key names at construction time
+    PrioritySchedulerProperties.Keys keysCfg = schedulerProperties.getKeys();
+    String hash = keysCfg.getHashTag();
+    String brace = (hash != null && !hash.isEmpty()) ? ("{" + hash + "}") : "";
+    String prefix = keysCfg.getPrefix() != null ? keysCfg.getPrefix() : "";
+    this.WAITING_SET = prefix + keysCfg.getWaitingSet() + brace;
+    this.WORKING_SET = prefix + keysCfg.getWorkingSet() + brace;
+
     // Initialize runtime configuration
     this.enabledAgentPattern = Pattern.compile(agentProperties.getEnabledPattern());
 
@@ -263,11 +272,12 @@ public class AgentAcquisitionService {
       }
 
       if (readyCountForDiagnostics == 0L) {
-        // Detect acquisition stall: WAITZ has backlog but none are ready (e.g., future-scored)
+        // Detect acquisition stall: waiting set has backlog but none are ready (e.g.,
+        // future-scored)
         try {
-          long waitzBacklog = jedis.zcard(WAITING_SET);
+          long waitingBacklog = jedis.zcard(WAITING_SET);
 
-          if (waitzBacklog > 0) {
+          if (waitingBacklog > 0) {
             // Compute current time from Redis score if possible
             long nowSec;
             try {
@@ -276,17 +286,17 @@ public class AgentAcquisitionService {
               nowSec = System.currentTimeMillis() / 1000L;
             }
 
-            // Find the earliest local-enabled WAITZ entry
+            // Find the earliest local-enabled waiting entry
             final int window =
                 Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
-            Long earliestLocalWaitzScore = null;
+            Long earliestLocalWaitingScore = null;
             try {
               Set<Tuple> earliest = jedis.zrangeWithScores(WAITING_SET, 0, Math.max(0, window - 1));
               for (Tuple t : earliest) {
                 String agentType = t.getElement();
                 AgentWorker local = agents.get(agentType);
                 if (local != null && isAgentEnabled(local.getAgent())) {
-                  earliestLocalWaitzScore = (long) t.getScore();
+                  earliestLocalWaitingScore = (long) t.getScore();
                   break;
                 }
               }
@@ -312,14 +322,14 @@ public class AgentAcquisitionService {
             // Warn only if the next local-ready time is significantly in the future compared to
             // the minimal rescheduling threshold (minIntervalSec). This indicates a likely stall
             // due to future-scored entries.
-            if (earliestLocalWaitzScore != null
+            if (earliestLocalWaitingScore != null
                 && minIntervalSec > 0L
-                && (earliestLocalWaitzScore - nowSec) > minIntervalSec
+                && (earliestLocalWaitingScore - nowSec) > minIntervalSec
                 && shouldWarnNow(lastStallWarnEpochMs, 300_000)) {
-              long nextReadyInSec = Math.max(0L, earliestLocalWaitzScore - nowSec);
+              long nextReadyInSec = Math.max(0L, earliestLocalWaitingScore - nowSec);
               log.warn(
-                  "Acquisition stall detected: ready=0, waitz_backlog={}, next_local_ready_in={}s > min_interval={}s, pool_active={}, pool_waiters={}",
-                  waitzBacklog,
+                  "Acquisition stall detected: ready=0, waiting_backlog={}, next_local_ready_in={}s > min_interval={}s, pool_active={}, pool_waiters={}",
+                  waitingBacklog,
                   nextReadyInSec,
                   minIntervalSec,
                   jedisPool.getNumActive(),
@@ -387,9 +397,9 @@ public class AgentAcquisitionService {
               : (int) Math.min(availableSlotsForNewAgents, Math.max(0L, readyCount));
 
       // Evaluate health/degradation and rate-limited WARNing.
-      // Avoid false positives by excluding known-orphan/zombie cases: we base the decision purely
-      // on WAITZ queue lag (oldest_overdueSec) and local agent cadences. WORKZ overruns are managed
-      // by Zombie cleanup and are not considered in this decision.
+      // Avoid false positives by excluding known-orphan/zombie cases: the decision is based purely
+      // on queue lag in the waiting set (via agent scores) and local agent cadences. Working-set
+      // overruns are handled by the zombie cleanup and are not considered here.
       long minIntervalSec = 0L;
       try {
         minIntervalSec =
@@ -950,11 +960,11 @@ public class AgentAcquisitionService {
       // CRITICAL: Remove from Redis sets - behavior depends on shutdown state
       try (Jedis jedis = jedisPool.getResource()) {
         if (shuttingDown.get()) {
-          // During shutdown: Only remove from WORKZ to preserve WAITZ entries
-          // Agents in WAITZ were put there by graceful shutdown for restart
+          // During shutdown: Only remove from working to preserve waiting entries
+          // Agents in waiting were put there by graceful shutdown for restart
           jedis.zrem(WORKING_SET, agentType);
           log.debug(
-              "Removed agent {} from active tracking and WORKZ (preserving WAITZ during shutdown)",
+              "Removed agent {} from active tracking and working (preserving waiting during shutdown)",
               agentType);
         } else {
           // Normal operation: Remove from both sets
@@ -1066,9 +1076,9 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Conditionally re-queue an agent during graceful shutdown if it's still in WORKZ. This approach
-   * respects agents that completed during shutdown and avoids race conditions. Uses ownership
-   * verification to ensure we only move agents this instance actually owns.
+   * Conditionally re-queue an agent during graceful shutdown if it's still in working. This
+   * approach respects agents that completed during shutdown and avoids race conditions. Uses
+   * ownership verification to ensure we only move agents this instance actually owns.
    */
   public void forceRequeueAgentForShutdown(Agent agent, String expectedScore) {
     String agentType = agent.getAgentType();
@@ -1086,12 +1096,14 @@ public class AgentAcquisitionService {
       Double currentWorkzScore = jedis.zscore(WORKING_SET, agentType);
       Double currentWaitzScore = jedis.zscore(WAITING_SET, agentType);
       log.debug(
-          "Redis state before swap: {} WORKZ={} WAITZ={}",
+          "Redis state before swap: {} {}={} {}={}",
           agentType,
+          WORKING_SET,
           currentWorkzScore,
+          WAITING_SET,
           currentWaitzScore);
 
-      // Use MOVE_AGENTS_CONDITIONAL - only moves if agent is in WORKZ with expected score
+      // Use MOVE_AGENTS_CONDITIONAL - only moves if agent is in working with expected score
       Object result =
           jedis.evalsha(
               scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
@@ -1102,9 +1114,11 @@ public class AgentAcquisitionService {
       Double finalWorkzScore = jedis.zscore(WORKING_SET, agentType);
       Double finalWaitzScore = jedis.zscore(WAITING_SET, agentType);
       log.debug(
-          "Redis state after swap: {} WORKZ={} WAITZ={} result={}",
+          "Redis state after swap: {} {}={} {}={} result={}",
           agentType,
+          WORKING_SET,
           finalWorkzScore,
+          WAITING_SET,
           finalWaitzScore,
           result);
 
@@ -1227,7 +1241,7 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Gets all agent names currently in both Redis sets (WORKZ and WAITZ) using pipelining. This
+   * Gets all agent names currently in both Redis sets (working and waiting) using pipelining. This
    * method retrieves all agents from both Redis sorted sets in a single operation.
    *
    * @param jedis Redis connection to use
@@ -1824,7 +1838,7 @@ public class AgentAcquisitionService {
       long agentTimeout = intervalProvider.getInterval(agent).getTimeout();
       String acquireScore = score(jedis, agentTimeout);
 
-      // Atomically try to move agent from WAITING → WORKING using Lua script
+      // Atomically try to move agent from waiting → working using Lua script
       // Script ensures only one instance can successfully acquire each agent
       // Args: [WORKING_SET, WAITING_SET, agentType, acquireScore]
       Object result =
@@ -2090,10 +2104,10 @@ public class AgentAcquisitionService {
    *
    * <p>Successes preserve cadence for the next run when possible. Failures are queued with failure
    * metadata that will be used to compute a class-based backoff offset before re-scheduling the
-   * agent into WAITZ.
+   * agent into waiting.
    *
    * @param agent the agent that finished
-   * @param acquireScore the acquire deadline score (WORKZ) captured at acquisition time
+   * @param acquireScore the acquire deadline score (working) captured at acquisition time
    * @param success whether execution completed successfully
    * @param failureClass coarse classification for failures (ignored on success)
    * @param cause the original failure (optional; used for logging)
@@ -2291,7 +2305,7 @@ public class AgentAcquisitionService {
 
   /**
    * Sets the graceful shutdown flag to coordinate agent re-queuing during shutdown. When enabled,
-   * active agents are moved back to the WAITZ set with immediate execution scores to ensure they
+   * active agents are moved back to the waiting set with immediate execution scores to ensure they
    * run after service restart.
    *
    * @param gracefulShutdown true to enable graceful shutdown mode, false otherwise
@@ -2424,7 +2438,7 @@ public class AgentAcquisitionService {
         failureClass = acquisitionService.classifyFailure(cause);
       } finally {
         // Always clean up agent tracking when execution completes (success or failure)
-        // This removes the agent from activeAgents map and WORKZ Redis set
+        // This removes the agent from activeAgents map and working Redis set
         acquisitionService.removeActiveAgent(agentType);
 
         // Handle conditional agent release (re-queuing on failure/shutdown)

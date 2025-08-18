@@ -84,6 +84,9 @@ class RepopulationPresenceIntegrationTest {
     schedulerProperties.setRefreshPeriodSeconds(1); // repopulate frequently
     schedulerProperties.getBatchOperations().setEnabled(true);
     schedulerProperties.getBatchOperations().setBatchSize(100);
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
+    schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
 
     acquisitionService =
         new AgentAcquisitionService(
@@ -126,30 +129,30 @@ class RepopulationPresenceIntegrationTest {
     try (Jedis j = jedisPool.getResource()) {
       // Preload Redis with a lot of non-local agents to ensure presence check doesn't scan all
       for (int i = 1; i <= 100; i++) {
-        j.zadd("WAITZ", 0, "B" + i);
+        j.zadd("waiting", 0, "B" + i);
       }
       // Remove local entries to simulate missing registration in Redis
       for (String a : locals) {
-        j.zrem("WAITZ", a);
-        j.zrem("WORKZ", a);
+        j.zrem("waiting", a);
+        j.zrem("working", a);
       }
     }
 
     // Run one cycle at the refresh boundary to trigger repopulation
     acquisitionService.saturatePool(1L, new Semaphore(0), agentWorkPool);
 
-    // Expect all local agents present in either WAITZ or WORKZ, non-locals unchanged
+    // Expect all local agents present in either waiting or working, non-locals unchanged
     try (Jedis j = jedisPool.getResource()) {
       long localsPresent = 0;
       for (String a : locals) {
-        Double w = j.zscore("WAITZ", a);
-        Double x = j.zscore("WORKZ", a);
+        Double w = j.zscore("waiting", a);
+        Double x = j.zscore("working", a);
         if (w != null || x != null) localsPresent++;
       }
       assertThat(localsPresent).isEqualTo(locals.size());
 
       // Non-locals still present, count remains 100
-      assertThat(j.zcard("WAITZ")).isGreaterThanOrEqualTo(100);
+      assertThat(j.zcard("waiting")).isGreaterThanOrEqualTo(100);
     }
   }
 

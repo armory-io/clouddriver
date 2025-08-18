@@ -60,6 +60,9 @@ class PrioritySchedulerConfigurationTest {
     schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setIntervalMs(1000L);
     schedulerProperties.setRefreshPeriodSeconds(30);
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
+    schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
 
     // Setup zombie cleanup configuration
     schedulerProperties.getZombieCleanup().setEnabled(true);

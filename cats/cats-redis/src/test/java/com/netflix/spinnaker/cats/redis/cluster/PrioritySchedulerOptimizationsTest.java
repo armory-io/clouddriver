@@ -223,6 +223,9 @@ public class PrioritySchedulerOptimizationsTest {
     PrioritySchedulerProperties props = new PrioritySchedulerProperties();
     props.setIntervalMs(500L); // Faster scheduling interval
     props.setRefreshPeriodSeconds(15); // More frequent refresh
+    props.getKeys().setWaitingSet("waiting");
+    props.getKeys().setWorkingSet("working");
+    props.getKeys().setCleanupLeaderKey("cleanup-leader");
     props.getZombieCleanup().setThresholdMs(1200000L); // 20 minutes
     props.getZombieCleanup().setIntervalMs(120000L); // 2 minutes
     props.getOrphanCleanup().setThresholdMs(3600000L); // 1 hour

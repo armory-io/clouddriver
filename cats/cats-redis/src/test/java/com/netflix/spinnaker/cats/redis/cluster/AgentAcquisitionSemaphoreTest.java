@@ -118,7 +118,7 @@ public class AgentAcquisitionSemaphoreTest {
   void shouldAcquireSemaphorePermitWhenAgentIsScheduled() throws Exception {
     // Given: Add agent to Redis WAITING set (ready for acquisition)
     try (Jedis jedis = jedisPool.getResource()) {
-      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent"); // Ready now
+      jedis.zadd("waiting", System.currentTimeMillis() / 1000 - 10, "test-agent"); // Ready now
     }
 
     // Initial semaphore state
@@ -136,9 +136,9 @@ public class AgentAcquisitionSemaphoreTest {
   void shouldNotAcquireAgentWhenSemaphoreIsExhausted() throws Exception {
     // Given: Add multiple agents to Redis WAITING set
     try (Jedis jedis = jedisPool.getResource()) {
-      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent-1");
-      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent-2");
-      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent-3");
+      jedis.zadd("waiting", System.currentTimeMillis() / 1000 - 10, "test-agent-1");
+      jedis.zadd("waiting", System.currentTimeMillis() / 1000 - 10, "test-agent-2");
+      jedis.zadd("waiting", System.currentTimeMillis() / 1000 - 10, "test-agent-3");
     }
 
     // Register additional agents
@@ -279,9 +279,9 @@ public class AgentAcquisitionSemaphoreTest {
 
     // Add agents to Redis WAITING set
     try (Jedis jedis = jedisPool.getResource()) {
-      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "agent-1");
-      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "agent-2");
-      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "agent-3");
+      jedis.zadd("waiting", System.currentTimeMillis() / 1000 - 10, "agent-1");
+      jedis.zadd("waiting", System.currentTimeMillis() / 1000 - 10, "agent-2");
+      jedis.zadd("waiting", System.currentTimeMillis() / 1000 - 10, "agent-3");
     }
 
     // Setup execution to complete quickly
@@ -316,7 +316,7 @@ public class AgentAcquisitionSemaphoreTest {
   void shouldHandleNullSemaphoreGracefully() throws Exception {
     // Given: Add agent to Redis WAITING set
     try (Jedis jedis = jedisPool.getResource()) {
-      jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 - 10, "test-agent");
+      jedis.zadd("waiting", System.currentTimeMillis() / 1000 - 10, "test-agent");
     }
 
     // When: Saturate pool with null semaphore (no concurrency control)

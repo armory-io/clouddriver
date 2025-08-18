@@ -81,6 +81,9 @@ class AcquisitionScanLimitIntegrationTest {
     schedulerProperties.setRefreshPeriodSeconds(1);
     schedulerProperties.getBatchOperations().setEnabled(true);
     schedulerProperties.getBatchOperations().setBatchSize(10); // larger than concurrency
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
+    schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
 
     acquisitionService =
         new AgentAcquisitionService(
@@ -111,7 +114,7 @@ class AcquisitionScanLimitIntegrationTest {
   @Test
   @DisplayName("Initial acquisition fills up to maxConcurrent in chunked batches")
   void initialAcquisitionFillsToSlots() {
-    // Register many agents so WAITZ will contain far more than the cap
+    // Register many agents so waiting will contain far more than the cap
     AgentExecution execution = mock(AgentExecution.class);
     ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
     for (int i = 1; i <= 20; i++) {
@@ -151,7 +154,7 @@ class AcquisitionScanLimitIntegrationTest {
             agentProperties,
             schedulerProperties);
 
-    // Register 5 agents so WAITZ has enough ready entries
+    // Register 5 agents so waiting has enough ready entries
     AgentExecution execution = mock(AgentExecution.class);
     ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
     for (int i = 1; i <= 5; i++) {
@@ -165,7 +168,7 @@ class AcquisitionScanLimitIntegrationTest {
     assertThat(acquired).isEqualTo(3);
     org.mockito.Mockito.verify(spyJedis, org.mockito.Mockito.atLeast(2))
         .zrangeByScore(
-            org.mockito.Mockito.eq("WAITZ"),
+            org.mockito.Mockito.eq("waiting"),
             org.mockito.Mockito.eq("-inf"),
             org.mockito.Mockito.anyString(),
             org.mockito.Mockito.eq(0),
@@ -173,7 +176,7 @@ class AcquisitionScanLimitIntegrationTest {
     // And specifically, the second chunk should request count=1 (remaining slots)
     org.mockito.Mockito.verify(spyJedis, org.mockito.Mockito.atLeast(1))
         .zrangeByScore(
-            org.mockito.Mockito.eq("WAITZ"),
+            org.mockito.Mockito.eq("waiting"),
             org.mockito.Mockito.eq("-inf"),
             org.mockito.Mockito.anyString(),
             org.mockito.Mockito.eq(0),

@@ -422,6 +422,9 @@ public class PrioritySchedulerIntegrationTest {
 
     private PrioritySchedulerProperties createSlowSynchronousQueueProps() {
       PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      props.getKeys().setWaitingSet("waiting");
+      props.getKeys().setWorkingSet("working");
+      props.getKeys().setCleanupLeaderKey("cleanup-leader");
       props.setIntervalMs(1000L);
       props.setRefreshPeriodSeconds(30);
       props.getBatchOperations().setEnabled(true);
@@ -503,6 +506,9 @@ public class PrioritySchedulerIntegrationTest {
     PrioritySchedulerProperties props = new PrioritySchedulerProperties();
     props.setIntervalMs(1000L);
     props.setRefreshPeriodSeconds(30);
+    props.getKeys().setWaitingSet("waiting");
+    props.getKeys().setWorkingSet("working");
+    props.getKeys().setCleanupLeaderKey("cleanup-leader");
     props.getZombieCleanup().setThresholdMs(1800000L); // 30 minutes
     props.getZombieCleanup().setIntervalMs(300000L); // 5 minutes
     props.getOrphanCleanup().setThresholdMs(7200000L); // 2 hours
@@ -772,7 +778,7 @@ public class PrioritySchedulerIntegrationTest {
       sched.run();
 
       try (var jedis = jedisPool.getResource()) {
-        Double score = jedis.zscore("WAITZ", "jitter-agent");
+        Double score = jedis.zscore("waiting", "jitter-agent");
         assertThat(score).isNotNull();
         java.util.List<String> t = jedis.time();
         long nowSec = Long.parseLong(t.get(0));
@@ -806,7 +812,7 @@ public class PrioritySchedulerIntegrationTest {
 
       long original;
       try (var jedis = jedisPool.getResource()) {
-        Double s = jedis.zscore("WAITZ", "existing-agent");
+        Double s = jedis.zscore("waiting", "existing-agent");
         assertThat(s).isNotNull();
         original = s.longValue();
       }
@@ -828,7 +834,7 @@ public class PrioritySchedulerIntegrationTest {
       sched2.run();
 
       try (var jedis = jedisPool.getResource()) {
-        Double s2 = jedis.zscore("WAITZ", "existing-agent");
+        Double s2 = jedis.zscore("waiting", "existing-agent");
         assertThat(s2).isNotNull();
         assertThat(s2.longValue()).isEqualTo(original);
       }
@@ -874,11 +880,11 @@ public class PrioritySchedulerIntegrationTest {
       // Second cycle: process completion and reschedule with errorInterval
       sched.run();
 
-      // Poll briefly for the rescheduled WAITZ entry to appear
+      // Poll briefly for the rescheduled waiting entry to appear
       Double s = null;
       for (int i = 0; i < 10 && s == null; i++) {
         try (var jedis = jedisPool.getResource()) {
-          s = jedis.zscore("WAITZ", "fail-agent");
+          s = jedis.zscore("waiting", "fail-agent");
         }
         if (s == null) {
           try {
@@ -889,8 +895,12 @@ public class PrioritySchedulerIntegrationTest {
         }
       }
       assertThat(s).isNotNull();
-      long now = System.currentTimeMillis() / 1000L;
-      long delta = s.longValue() - now;
+      long nowSec;
+      try (var jedis = jedisPool.getResource()) {
+        java.util.List<String> times = jedis.time();
+        nowSec = Long.parseLong(times.get(0));
+      }
+      long delta = s.longValue() - nowSec;
       // errorInterval is 5000ms (5s) from setUp mock intervalProvider
       assertThat(delta).isBetween(4L, 7L);
     }

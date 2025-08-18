@@ -77,6 +77,9 @@ public class BatchOperationEdgeCasesTest {
     scriptManager.initializeScripts();
 
     schedulerProperties = new PrioritySchedulerProperties();
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
+    schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
     agentProperties = new PriorityAgentProperties();
     agentProperties.setMaxConcurrentAgents(50);
 
@@ -423,7 +426,7 @@ public class BatchOperationEdgeCasesTest {
       try (Jedis jedis = jedisPool.getResource()) {
         for (int i = 1; i <= 50; i++) {
           String agentType = "large-zombie-" + i;
-          jedis.zadd("WORKZ", oldScoreSeconds, agentType);
+          jedis.zadd("working", oldScoreSeconds, agentType);
           activeAgents.put(agentType, String.valueOf(oldScoreSeconds));
           activeAgentsFutures.put(agentType, mock(Future.class));
         }
@@ -458,14 +461,14 @@ public class BatchOperationEdgeCasesTest {
           // Old zombies (should be cleaned)
           String zombieType = "old-zombie-" + i;
           long oldScore = (currentTime - 120000) / 1000; // 2 minutes ago
-          jedis.zadd("WORKZ", oldScore, zombieType);
+          jedis.zadd("working", oldScore, zombieType);
           activeAgents.put(zombieType, String.valueOf(oldScore));
           activeAgentsFutures.put(zombieType, mock(Future.class));
 
           // Recent agents (should NOT be cleaned)
           String recentType = "recent-agent-" + i;
           long recentScore = (currentTime - 10000) / 1000; // 10 seconds ago
-          jedis.zadd("WORKZ", recentScore, recentType);
+          jedis.zadd("working", recentScore, recentType);
           activeAgents.put(recentType, String.valueOf(recentScore));
           activeAgentsFutures.put(recentType, mock(Future.class));
         }

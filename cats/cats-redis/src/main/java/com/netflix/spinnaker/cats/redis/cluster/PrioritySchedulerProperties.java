@@ -84,6 +84,16 @@ public class PrioritySchedulerProperties {
    */
   private int initialRegistrationJitterSeconds = 0;
 
+  /**
+   * Configurable Redis key names and namespacing for the scheduler's data structures.
+   *
+   * <p>Includes base names for the waiting/working sets and the cleanup leadership key, plus
+   * optional prefix and hash-tag. When {@code hashTag} is set (non-empty), the final Redis keys
+   * will include the value wrapped in braces to ensure all keys hash to the same slot on Redis
+   * Cluster (e.g., {@code waiting{ps}}, {@code working{ps}}, {@code cleanup-leader{ps}}).
+   */
+  private Keys keys = new Keys();
+
   // Getters and setters
 
   public long getIntervalMs() {
@@ -169,6 +179,16 @@ public class PrioritySchedulerProperties {
 
   public void setInitialRegistrationJitterSeconds(int initialRegistrationJitterSeconds) {
     this.initialRegistrationJitterSeconds = Math.max(0, initialRegistrationJitterSeconds);
+  }
+
+  /** Returns the configured Redis key naming and namespacing options. */
+  public Keys getKeys() {
+    return keys;
+  }
+
+  /** Sets the Redis key naming and namespacing options. */
+  public void setKeys(Keys keys) {
+    this.keys = keys != null ? keys : new Keys();
   }
 
   /**
@@ -277,6 +297,21 @@ public class PrioritySchedulerProperties {
     if (pool.getMaxSize() < pool.getCoreSize()) {
       throw new IllegalArgumentException("redis.scheduler.pool.max-size must be >= core-size");
     }
+
+    // Keys validation: non-empty base names
+    if (keys == null) {
+      keys = new Keys();
+    }
+    if (isBlank(keys.waitingSet)) {
+      throw new IllegalArgumentException("redis.scheduler.keys.waiting-set must not be empty");
+    }
+    if (isBlank(keys.workingSet)) {
+      throw new IllegalArgumentException("redis.scheduler.keys.working-set must not be empty");
+    }
+    if (isBlank(keys.cleanupLeaderKey)) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.keys.cleanup-leader-key must not be empty");
+    }
   }
 
   private static void validatePositive(long v, String name) {
@@ -296,13 +331,79 @@ public class PrioritySchedulerProperties {
       throw new IllegalArgumentException(name + " must be >= 0 (was " + v + ")");
     }
   }
+
+  private static boolean isBlank(String s) {
+    return s == null || s.trim().isEmpty();
+  }
+
+  /**
+   * Redis key naming configuration.
+   *
+   * <p>Defaults use lowercase, function-oriented names and preserve the historical leadership key
+   * name for compatibility.
+   */
+  public static class Keys {
+    /** Base name of the waiting/ready set. Default: "waiting". */
+    private String waitingSet = "waiting";
+    /** Base name of the working/leased set. Default: "working". */
+    private String workingSet = "working";
+    /** Leadership key used for orphan cleanup coordination. Default: "cleanup-leader". */
+    private String cleanupLeaderKey = "cleanup-leader";
+    /** Optional prefix added to all keys. Default: empty. */
+    private String prefix = "";
+    /**
+     * Optional hash-tag value to force all keys into the same Redis Cluster slot. When non-empty,
+     * the final keys will include the value wrapped in braces (e.g., "{ps}").
+     */
+    private String hashTag = "";
+
+    public String getWaitingSet() {
+      return waitingSet;
+    }
+
+    public void setWaitingSet(String waitingSet) {
+      this.waitingSet = waitingSet;
+    }
+
+    public String getWorkingSet() {
+      return workingSet;
+    }
+
+    public void setWorkingSet(String workingSet) {
+      this.workingSet = workingSet;
+    }
+
+    public String getCleanupLeaderKey() {
+      return cleanupLeaderKey;
+    }
+
+    public void setCleanupLeaderKey(String cleanupLeaderKey) {
+      this.cleanupLeaderKey = cleanupLeaderKey;
+    }
+
+    public String getPrefix() {
+      return prefix;
+    }
+
+    public void setPrefix(String prefix) {
+      this.prefix = prefix != null ? prefix : "";
+    }
+
+    public String getHashTag() {
+      return hashTag;
+    }
+
+    public void setHashTag(String hashTag) {
+      this.hashTag = hashTag != null ? hashTag : "";
+    }
+  }
 }
 
 /**
  * Failure-aware backoff configuration properties.
  *
  * <p>Controls how the scheduler backs off agents after failures. Backoff is applied by scheduling
- * the agent into the WAITZ set with a future score equal to the computed delay.
+ * the agent into the waiting set with a future score equal to the computed delay.
  */
 class FailureBackoffProperties {
   /** Master switch for failure-aware backoff. */
@@ -555,10 +656,10 @@ class OrphanCleanupProperties {
   private boolean enabled = true;
 
   /**
-   * Additional time buffer beyond completion deadlines (WORKZ) or execution times (WAITZ) before
-   * considering an agent orphaned (milliseconds). WORKZ orphans are agents past completion deadline
-   * + buffer. WAITZ orphans are agents with execution times older than current time - buffer. This
-   * buffer accounts for network partitions and Redis latency.
+   * Additional time buffer beyond completion deadlines (working) or execution times (waiting)
+   * before considering an agent orphaned (milliseconds). working orphans are agents past completion
+   * deadline + buffer. waiting orphans are agents with execution times older than current time -
+   * buffer. This buffer accounts for network partitions and Redis latency.
    */
   private long thresholdMs = 600000L; // 10 minutes
 

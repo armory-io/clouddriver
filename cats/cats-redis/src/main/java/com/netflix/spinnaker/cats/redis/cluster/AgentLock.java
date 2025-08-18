@@ -21,8 +21,9 @@ import com.netflix.spinnaker.cats.agent.Agent;
 public class AgentLock extends com.netflix.spinnaker.cats.agent.AgentLock {
   // The score the agent was acquired with (Used to ensure we own this agent on release).
   private final String acquireScore;
-  // The score the agent was release from the WAITING set with (Used to ensure it is readded to the
-  // WAITING set with the right score).
+  // The score the agent was released from the waiting set with (used to ensure it is re-added to
+  // the
+  // waiting set with the right score).
   private final String releaseScore;
 
   /**
@@ -30,7 +31,7 @@ public class AgentLock extends com.netflix.spinnaker.cats.agent.AgentLock {
    *
    * @param agent The agent associated with this lock
    * @param acquireScore The score the agent was acquired with
-   * @param releaseScore The score the agent was released from the WAITING set with
+   * @param releaseScore The score the agent was released from the waiting set with
    */
   public AgentLock(Agent agent, String acquireScore, String releaseScore) {
     super(agent);

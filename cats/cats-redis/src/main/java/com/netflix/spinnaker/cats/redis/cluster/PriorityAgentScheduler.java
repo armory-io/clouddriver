@@ -47,9 +47,9 @@ import redis.clients.jedis.JedisPool;
  * <p>Core Architecture:
  *
  * <ul>
- *   <li><strong>WAITING_SET (WAITZ):</strong> Agents ready for execution, scored by next run time
- *   <li><strong>WORKING_SET (WORKZ):</strong> Agents currently executing, scored by completion
- *       deadline (current_time + agent_timeout)
+ *   <li><strong>waiting set:</strong> Agents ready for execution, scored by next run time
+ *   <li><strong>working set:</strong> Agents currently executing, scored by completion deadline
+ *       (current_time + agent_timeout)
  *   <li><strong>Atomic Operations:</strong> Lua scripts ensure race-free state transitions
  *   <li><strong>Priority Scheduling:</strong> Lower scores = higher priority execution
  *   <li><strong>Agent-Specific Timeouts:</strong> Each agent type gets appropriate timeout handling
@@ -59,13 +59,16 @@ import redis.clients.jedis.JedisPool;
  *
  * <ul>
  *   <li>Re-scheduling: On success, re-schedule for the next cadence (prefer original acquire-based
- *       cadence; else now + interval). On failure, immediate retry.
- *   <li>WAITZ preservation: Do not purge valid WAITZ entries by age; preserve FIFO under backlog.
- *   <li>WORKZ orphans: Skip locally active entries; move valid stale entries back to WAITZ using
- *       conditional move; remove invalid ones.
- *   <li>Health logging: Every 10 minutes, emit HEALTHY/DEGRADED and queue lag in seconds (0 if
- *       none). DEGRADED when oldest_overdue_seconds > minimum enabled-agent interval on this pod.
- *       WARNs are rate-limited to avoid flooding.
+ *       cadence; else now + interval). On failure: immediate retry unless failure-aware backoff is
+ *       enabled (then class-based delays are applied).
+ *   <li>Waiting set preservation: Do not purge valid waiting entries by age; preserve FIFO under
+ *       backlog.
+ *   <li>Working orphans: Skip locally active entries; move valid stale entries back to waiting
+ *       using conditional move; remove invalid ones.
+ *   <li>Health logging: Every 10 minutes, emit HEALTHY/DEGRADED and queue lag (seconds). Queue lag
+ *       is computed from the scores of agents in the waiting set. DEGRADED when
+ *       oldest_overdue_seconds > minimum enabled-agent interval on this pod. WARNs are rate-limited
+ *       to avoid flooding.
  * </ul>
  *
  * <h2>Configuration Properties</h2>
@@ -160,9 +163,9 @@ import redis.clients.jedis.JedisPool;
  *   <li><strong>enabled:</strong> Controls cleanup of agents from crashed instances. Manages the
  *       removal of agents left behind by pods that no longer exist.
  *   <li><strong>thresholdMs:</strong> Time buffer for orphan detection. Defines how long to wait
- *       before considering an agent as orphaned. Different logic applies for agents in the WORKZ vs
- *       WAITZ sets: - WORKZ orphans: agents past completion deadline + buffer. - WAITZ orphans:
- *       agents with execution times older than current time - buffer.
+ *       before considering an agent as orphaned. Different logic applies for agents in the working
+ *       vs waiting sets: - working orphans: agents past completion deadline + buffer. - waiting
+ *       orphans: agents with execution times older than current time - buffer.
  *   <li><strong>intervalMs:</strong> Orphan cleanup frequency. Controls how often the system checks
  *       for and removes orphaned agents.
  *   <li><strong>batchSize:</strong> Number of orphans processed per cleanup cycle. Controls how
@@ -303,8 +306,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
    * <p>Key Scheduling Decisions:
    *
    * <ul>
-   *   <li>Agents are acquired from WAITZ set based on their next execution time
-   *   <li>When acquired, agents are moved to WORKZ set with a completion deadline (current_time +
+   *   <li>Agents are acquired from waiting set based on their next execution time
+   *   <li>When acquired, agents are moved to working set with a completion deadline (current_time +
    *       agent_timeout)
    *   <li>Agent timeouts are agent-specific
    *   <li>Completion deadlines are used for zombie detection and orphan cleanup
@@ -545,9 +548,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
   /**
    * Gracefully re-queues agents owned by this instance during shutdown.
    *
-   * <p>Process: 1) Interrupt running futures and release permits 2) Conditionally move owned WORKZ
-   * entries back to WAITZ if still owned (score match) 3) Perform a best-effort wait and log
-   * outcomes
+   * <p>Process: 1) Interrupt running futures and release permits 2) Conditionally move owned
+   * working entries back to waiting if still owned (score match) 3) Perform a best-effort wait and
+   * log outcomes
    */
   private void gracefullyReleaseActiveAgents() {
     // Get count of agents this instance is actively working on
@@ -608,7 +611,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         try {
           Agent agent = acquisitionService.getAgentByType(agentType);
           if (agent != null) {
-            // Conditionally re-queue - only if agent still in WORKZ with expected score
+            // Conditionally re-queue - only if agent still in working with expected score
             acquisitionService.forceRequeueAgentForShutdown(agent, expectedScore);
             released++;
             log.debug(
@@ -800,7 +803,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
   /**
    * Statistics holder for scheduler metrics.
    *
-   * <p>Includes a config-free health state derived from WAITZ queue lag relative to the minimum
+   * <p>Includes a config-free health state derived from waiting queue lag relative to the minimum
    * enabled-agent interval on this pod. Queue lag is emitted in seconds even when HEALTHY to aid
    * sizing and performance diagnostics.
    */

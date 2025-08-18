@@ -83,6 +83,12 @@ public class InstantRetryTest {
     mockBatch.setEnabled(true);
     mockBatch.setBatchSize(50);
     when(mockSchedulerProperties.getBatchOperations()).thenReturn(mockBatch);
+    // Provide non-null keys and align with new defaults
+    PrioritySchedulerProperties.Keys keys = new PrioritySchedulerProperties.Keys();
+    keys.setWaitingSet("waiting");
+    keys.setWorkingSet("working");
+    keys.setCleanupLeaderKey("cleanup-leader");
+    when(mockSchedulerProperties.getKeys()).thenReturn(keys);
     when(mockScriptManager.getScriptSha(anyString())).thenReturn("mock-sha");
     when(mockScriptManager.isInitialized()).thenReturn(true);
 
@@ -131,15 +137,15 @@ public class InstantRetryTest {
     try (var jedis = jedisPool.getResource()) {
       jedis.flushDB();
 
-      // Add agents to WAITZ (waiting set) with score 0 (ready now)
-      jedis.zadd("WAITZ", 0, "ReadyAgent-1");
-      jedis.zadd("WAITZ", 0, "ReadyAgent-2");
-      jedis.zadd("WAITZ", 0, "ReadyAgent-3");
+      // Add agents to waiting set with score 0 (ready now)
+      jedis.zadd("waiting", 0, "ReadyAgent-1");
+      jedis.zadd("waiting", 0, "ReadyAgent-2");
+      jedis.zadd("waiting", 0, "ReadyAgent-3");
 
-      System.out.println("Setup: Added 3 agents to WAITZ with score 0 (ready immediately)");
+      System.out.println("Setup: Added 3 agents to waiting with score 0 (ready immediately)");
 
       // Verify initial state
-      var initialReady = jedis.zrangeByScore("WAITZ", 0, Double.MAX_VALUE);
+      var initialReady = jedis.zrangeByScore("waiting", 0, Double.MAX_VALUE);
       System.out.println("Initial ready agents: " + initialReady);
       assertThat(initialReady).hasSize(3);
     }
@@ -165,19 +171,19 @@ public class InstantRetryTest {
                 Thread.sleep(50); // Let saturatePool start and do initial query
 
                 try (var jedis = jedisPool.getResource()) {
-                  // Simulate: Original agents got taken by another pod (move to WORKZ)
-                  jedis.zrem("WAITZ", "ReadyAgent-1", "ReadyAgent-2", "ReadyAgent-3");
-                  jedis.zadd("WORKZ", System.currentTimeMillis(), "ReadyAgent-1");
-                  jedis.zadd("WORKZ", System.currentTimeMillis(), "ReadyAgent-2");
-                  jedis.zadd("WORKZ", System.currentTimeMillis(), "ReadyAgent-3");
+                  // Simulate: Original agents got taken by another pod (move to working)
+                  jedis.zrem("waiting", "ReadyAgent-1", "ReadyAgent-2", "ReadyAgent-3");
+                  jedis.zadd("working", System.currentTimeMillis(), "ReadyAgent-1");
+                  jedis.zadd("working", System.currentTimeMillis(), "ReadyAgent-2");
+                  jedis.zadd("working", System.currentTimeMillis(), "ReadyAgent-3");
 
                   // Add new agents that should be picked up by instant retry
-                  jedis.zadd("WAITZ", 0, "RetryAgent-1");
-                  jedis.zadd("WAITZ", 0, "RetryAgent-2");
+                  jedis.zadd("waiting", 0, "RetryAgent-1");
+                  jedis.zadd("waiting", 0, "RetryAgent-2");
 
                   newAgentsAdded.set(2);
                   System.out.println(
-                      "Background: Moved original agents to WORKZ, added 2 new agents to WAITZ");
+                      "Background: Moved original agents to working, added 2 new agents to waiting");
                 }
               } catch (Exception e) {
                 System.err.println("Background thread error: " + e.getMessage());
@@ -201,11 +207,11 @@ public class InstantRetryTest {
 
     // STEP 5: Verify that Redis state shows the retry scenario occurred
     try (var jedis = jedisPool.getResource()) {
-      var finalWaiting = jedis.zrangeByScore("WAITZ", 0, Double.MAX_VALUE);
-      var finalWorking = jedis.zrangeByScore("WORKZ", 0, Double.MAX_VALUE);
+      var finalWaiting = jedis.zrangeByScore("waiting", 0, Double.MAX_VALUE);
+      var finalWorking = jedis.zrangeByScore("working", 0, Double.MAX_VALUE);
 
-      System.out.println("Final WAITZ agents: " + finalWaiting);
-      System.out.println("Final WORKZ agents: " + finalWorking);
+      System.out.println("Final waiting agents: " + finalWaiting);
+      System.out.println("Final working agents: " + finalWorking);
 
       // VERIFICATION: Instant retry conditions were met
       System.out.println("\n=== Instant Retry Test Results ===");

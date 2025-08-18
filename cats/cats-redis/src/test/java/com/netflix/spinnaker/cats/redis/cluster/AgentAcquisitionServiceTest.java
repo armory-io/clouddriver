@@ -104,6 +104,9 @@ class AgentAcquisitionServiceTest {
 
     schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.setRefreshPeriodSeconds(10);
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
+    schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
 
     executorService = Executors.newCachedThreadPool();
 
@@ -384,7 +387,7 @@ class AgentAcquisitionServiceTest {
 
       // Add agent to Redis with future score (not ready yet)
       try (redis.clients.jedis.Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WAITZ", System.currentTimeMillis() + 60000, "future-agent");
+        jedis.zadd("waiting", System.currentTimeMillis() + 60000, "future-agent");
       }
 
       // When
@@ -413,10 +416,10 @@ class AgentAcquisitionServiceTest {
       // When
       acquisitionService.registerAgent(agent, execution, instrumentation);
 
-      // Then - Not registered locally and not written to WAITZ
+      // Then - Not registered locally and not written to waiting
       assertThat(acquisitionService.getRegisteredAgentCount()).isEqualTo(0);
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("WAITZ", agent.getAgentType())).isNull();
+        assertThat(jedis.zscore("waiting", agent.getAgentType())).isNull();
       }
     }
 
@@ -527,10 +530,10 @@ class AgentAcquisitionServiceTest {
       ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
 
       acquisitionService.registerAgent(agent, execution, instrumentation);
-      // Simulate agent missing in Redis by clearing WAITZ/WORKZ sets after registration
+      // Simulate agent missing in Redis by clearing waiting/working sets after registration
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zrem("WAITZ", "missing-agent");
-        jedis.zrem("WORKZ", "missing-agent");
+        jedis.zrem("waiting", "missing-agent");
+        jedis.zrem("working", "missing-agent");
       }
 
       // When
@@ -611,7 +614,7 @@ class AgentAcquisitionServiceTest {
   class HealthSignalTests {
 
     @Test
-    @DisplayName("Should remain HEALTHY when no overdue agents in WAITZ")
+    @DisplayName("Should remain HEALTHY when no overdue agents in waiting")
     void shouldRemainHealthyWhenNoOverdueAgents() throws Exception {
       // Given
       Agent a1 = createMockAgent("agent-healthy-1", "test");
@@ -623,11 +626,11 @@ class AgentAcquisitionServiceTest {
       acquisitionService.registerAgent(a1, execution, instr);
       acquisitionService.registerAgent(a2, execution, instr);
 
-      // Put both agents in WAITZ with future scores (not overdue)
+      // Put both agents in waiting with future scores (not overdue)
       try (Jedis jedis = jedisPool.getResource()) {
         long nowSec = System.currentTimeMillis() / 1000;
-        jedis.zadd("WAITZ", nowSec + 60, "agent-healthy-1");
-        jedis.zadd("WAITZ", nowSec + 120, "agent-healthy-2");
+        jedis.zadd("waiting", nowSec + 60, "agent-healthy-1");
+        jedis.zadd("waiting", nowSec + 120, "agent-healthy-2");
       }
 
       // When
@@ -649,7 +652,7 @@ class AgentAcquisitionServiceTest {
 
       try (Jedis jedis = jedisPool.getResource()) {
         long nowSec = System.currentTimeMillis() / 1000;
-        jedis.zadd("WAITZ", nowSec - 90, "agent-degraded-1");
+        jedis.zadd("waiting", nowSec - 90, "agent-degraded-1");
       }
 
       // When
@@ -663,9 +666,9 @@ class AgentAcquisitionServiceTest {
 
     @Test
     @DisplayName(
-        "Should avoid false positives by ignoring WORKZ overruns (zombies handled elsewhere)")
-    void shouldAvoidFalsePositivesFromWorkzOverruns() throws Exception {
-      // Given: place a recent WAITZ entry (no overdue) and an ancient WORKZ entry
+        "Should avoid false positives by ignoring working overruns (zombies handled elsewhere)")
+    void shouldAvoidFalsePositivesFromWorkingOverruns() throws Exception {
+      // Given: place a recent waiting entry (no overdue) and an ancient working entry
       Agent a1 = createMockAgent("agent-ok", "test");
       AgentExecution execution = mock(AgentExecution.class);
       ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
@@ -673,14 +676,14 @@ class AgentAcquisitionServiceTest {
 
       try (Jedis jedis = jedisPool.getResource()) {
         long nowSec = System.currentTimeMillis() / 1000;
-        jedis.zadd("WAITZ", nowSec + 30, "agent-ok"); // not overdue
-        jedis.zadd("WORKZ", nowSec - 3600, "stale-workz"); // overrun in WORKZ
+        jedis.zadd("waiting", nowSec + 30, "agent-ok"); // not overdue
+        jedis.zadd("working", nowSec - 3600, "stale-working"); // overrun in working
       }
 
       // When
       acquisitionService.saturatePool(1L, null, executorService);
 
-      // Then: HEALTHY since WAITZ has no overdue entries; WORKZ overrun is zombie domain
+      // Then: HEALTHY since waiting has no overdue entries; working overrun is zombie domain
       assertThat(acquisitionService.getOldestOverdueSeconds()).isEqualTo(0L);
       assertThat(acquisitionService.isDegraded()).isFalse();
     }
@@ -708,13 +711,13 @@ class AgentAcquisitionServiceTest {
 
       try (Jedis jedis = jedisPool.getResource()) {
         long nowSec = System.currentTimeMillis() / 1000;
-        jedis.zadd("WAITZ", nowSec + 600, "stall-agent"); // backlog but not ready
+        jedis.zadd("waiting", nowSec + 600, "stall-agent"); // backlog but not ready
       }
 
       int acquired = acquisitionService.saturatePool(1L, null, executorService);
       assertThat(acquired).isEqualTo(0);
       try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("WAITZ")).isGreaterThan(0);
+        assertThat(jedis.zcard("waiting")).isGreaterThan(0);
       }
 
       // Assert the stall path executed by verifying the rate-limiter timestamp updated
@@ -930,10 +933,10 @@ class AgentAcquisitionServiceTest {
 
       // NOW verify Redis state - agents should be back in WAITING after completion processing
       try (var jedis = jedisPool.getResource()) {
-        long workingAgents = jedis.zcard("WORKZ");
-        long waitingAgents = jedis.zcard("WAITZ");
+        long workingAgents = jedis.zcard("working");
+        long waitingAgents = jedis.zcard("waiting");
         long totalAgents = workingAgents + waitingAgents;
-        System.out.println("FINAL STATE: WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+        System.out.println("FINAL STATE: working=" + workingAgents + ", waiting=" + waitingAgents);
 
         if (totalAgents != 5) {
           throw new AssertionError("Expected 5 total agents in Redis, but got " + totalAgents);
@@ -988,11 +991,11 @@ class AgentAcquisitionServiceTest {
 
       // Verify Redis state - all 5 agents should be tracked somewhere
       try (var jedis = jedisPool.getResource()) {
-        long workingAgents = jedis.zcard("WORKZ");
-        long waitingAgents = jedis.zcard("WAITZ");
+        long workingAgents = jedis.zcard("working");
+        long waitingAgents = jedis.zcard("waiting");
         long totalAgents = workingAgents + waitingAgents;
         System.out.println(
-            "After concurrency test: WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+            "After concurrency test: working=" + workingAgents + ", waiting=" + waitingAgents);
 
         if (totalAgents != 5) {
           throw new AssertionError("Expected 5 total agents in Redis, but got " + totalAgents);
@@ -1038,7 +1041,7 @@ class AgentAcquisitionServiceTest {
       System.out.println("Permits properly released: " + permits);
 
       // Process completion queue with second cycle - this will:
-      // 1) Process completions for the first 2 agents (putting them in WAITZ)
+      // 1) Process completions for the first 2 agents (putting them in waiting)
       // 2) Acquire the remaining 2 agents with the now-available semaphore permits
       System.out.println(
           "SEMAPHORE TEST: Processing first batch of completions and acquiring second batch...");
@@ -1056,11 +1059,11 @@ class AgentAcquisitionServiceTest {
 
       // Verify Redis state - all 4 agents should be tracked
       try (var jedis = jedisPool.getResource()) {
-        long workingAgents = jedis.zcard("WORKZ");
-        long waitingAgents = jedis.zcard("WAITZ");
+        long workingAgents = jedis.zcard("working");
+        long waitingAgents = jedis.zcard("waiting");
         long totalAgents = workingAgents + waitingAgents;
         System.out.println(
-            "After semaphore test: WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+            "After semaphore test: working=" + workingAgents + ", waiting=" + waitingAgents);
 
         if (totalAgents != 4) {
           throw new AssertionError("Expected 4 total agents in Redis, but got " + totalAgents);
@@ -1148,11 +1151,11 @@ class AgentAcquisitionServiceTest {
 
       // Verify Redis state - all agents should be tracked somewhere
       try (var jedis = jedisPool.getResource()) {
-        long workingAgents = jedis.zcard("WORKZ");
-        long waitingAgents = jedis.zcard("WAITZ");
+        long workingAgents = jedis.zcard("working");
+        long waitingAgents = jedis.zcard("waiting");
         long totalAgents = workingAgents + waitingAgents;
         System.out.println(
-            "After race condition test: WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+            "After race condition test: working=" + workingAgents + ", waiting=" + waitingAgents);
 
         // Note: Both pods repopulate Redis, so we may have more agents than expected
         // The key is that the system doesn't crash and maintains consistency
@@ -1201,17 +1204,17 @@ class AgentAcquisitionServiceTest {
 
       // Verify all agents were processed correctly
       try (var jedis = jedisPool.getResource()) {
-        long workingAgents = jedis.zcard("WORKZ");
-        long waitingAgents = jedis.zcard("WAITZ");
+        long workingAgents = jedis.zcard("working");
+        long waitingAgents = jedis.zcard("waiting");
         long totalAgents = workingAgents + waitingAgents;
-        System.out.println("WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+        System.out.println("working=" + workingAgents + ", waiting=" + waitingAgents);
 
         if (totalAgents != 3) {
           throw new AssertionError("Expected 3 total agents in Redis, but got " + totalAgents);
         }
 
         // Check that agents have valid scores (agents will be back in WAITING after execution)
-        var waitingAgentsWithScores = jedis.zrangeWithScores("WAITZ", 0, -1);
+        var waitingAgentsWithScores = jedis.zrangeWithScores("waiting", 0, -1);
         if (!waitingAgentsWithScores.isEmpty()) {
           long currentTime = System.currentTimeMillis() / 1000;
           for (var agentScore : waitingAgentsWithScores) {
@@ -1347,10 +1350,11 @@ class AgentAcquisitionServiceTest {
 
       // Verify Redis state is still correct
       try (var jedis = jedisPool.getResource()) {
-        long workingAgents = jedis.zcard("WORKZ");
-        long waitingAgents = jedis.zcard("WAITZ");
+        long workingAgents = jedis.zcard("working");
+        long waitingAgents = jedis.zcard("waiting");
         long totalAgents = workingAgents + waitingAgents;
-        System.out.println("Individual mode - WORKZ=" + workingAgents + ", WAITZ=" + waitingAgents);
+        System.out.println(
+            "Individual mode - working=" + workingAgents + ", waiting=" + waitingAgents);
 
         if (totalAgents != 3) {
           throw new AssertionError(
@@ -1409,14 +1413,14 @@ class AgentAcquisitionServiceTest {
       // Let's also debug Redis state
       try (var jedis = jedisPool.getResource()) {
         System.out.println("=== DEBUG: Redis state ===");
-        System.out.println("WAITING_SET (WAITZ) size: " + jedis.zcard("WAITZ"));
-        System.out.println("WORKING_SET (WORKZ) size: " + jedis.zcard("WORKZ"));
+        System.out.println("WAITING_SET (waiting) size: " + jedis.zcard("waiting"));
+        System.out.println("WORKING_SET (working) size: " + jedis.zcard("working"));
 
-        var waitingAgents = jedis.zrange("WAITZ", 0, -1);
-        System.out.println("Agents in WAITZ: " + waitingAgents);
+        var waitingAgents = jedis.zrange("waiting", 0, -1);
+        System.out.println("Agents in waiting: " + waitingAgents);
 
-        var workingAgents = jedis.zrange("WORKZ", 0, -1);
-        System.out.println("Agents in WORKZ: " + workingAgents);
+        var workingAgents = jedis.zrange("working", 0, -1);
+        System.out.println("Agents in working: " + workingAgents);
       }
 
       // The test will fail if we don't acquire any agents, but it should give us debug info
@@ -1456,9 +1460,9 @@ class AgentAcquisitionServiceTest {
       long lowPriorityScore = currentTimeSeconds + 600; // 10 minutes in future (not ready yet)
 
       try (Jedis jedis = jedisPool.getResource()) {
-        // Put agents in WAITZ with future scores (so they won't be immediately executed)
-        jedis.zadd("WAITZ", highPriorityScore, "high-priority-agent");
-        jedis.zadd("WAITZ", lowPriorityScore, "low-priority-agent");
+        // Put agents in waiting with future scores (so they won't be immediately executed)
+        jedis.zadd("waiting", highPriorityScore, "high-priority-agent");
+        jedis.zadd("waiting", lowPriorityScore, "low-priority-agent");
 
         System.out.println("Set up future agents in Redis (to prevent immediate execution):");
         System.out.println("- high-priority-agent: score=" + highPriorityScore + " (5 min future)");
@@ -1480,9 +1484,9 @@ class AgentAcquisitionServiceTest {
 
       // Verify scores after repopulation
       try (Jedis jedis = jedisPool.getResource()) {
-        Double highPriorityNewScore = jedis.zscore("WAITZ", "high-priority-agent");
-        Double lowPriorityNewScore = jedis.zscore("WAITZ", "low-priority-agent");
-        Double newAgentScore = jedis.zscore("WAITZ", "new-agent");
+        Double highPriorityNewScore = jedis.zscore("waiting", "high-priority-agent");
+        Double lowPriorityNewScore = jedis.zscore("waiting", "low-priority-agent");
+        Double newAgentScore = jedis.zscore("waiting", "new-agent");
 
         System.out.println("\nScores after repopulation:");
         System.out.println("- high-priority-agent: " + highPriorityNewScore);
@@ -1497,7 +1501,7 @@ class AgentAcquisitionServiceTest {
             .as("Low priority agent should keep original score")
             .isEqualTo((double) lowPriorityScore);
 
-        // New agent should have been executed (not in WAITZ anymore) or get immediate execution
+        // New agent should have been executed (not in waiting anymore) or get immediate execution
         if (newAgentScore != null) {
           assertThat(newAgentScore)
               .as("New agent should get immediate execution")
@@ -1537,23 +1541,23 @@ class AgentAcquisitionServiceTest {
       acquisitionService.registerAgent(overdueAgent, execution, instrumentation);
       System.out.println("Registered overdue agent");
 
-      // Set up an overdue agent in WAITZ using repopulation
+      // Set up an overdue agent in waiting using repopulation
       long currentTimeSeconds = System.currentTimeMillis() / 1000;
       long overdueScore = currentTimeSeconds - 120; // 2 minutes overdue
 
       // First, populate Redis with the agent using repopulation
       acquisitionService.saturatePool(0L, new Semaphore(0), executorService); // Repopulate
 
-      // Now manually set the agent as overdue in WAITZ
+      // Now manually set the agent as overdue in waiting
       try (Jedis jedis = jedisPool.getResource()) {
-        // Remove from wherever it was placed and put it in WAITZ with overdue score
-        jedis.zrem("WAITZ", "overdue-agent");
-        jedis.zrem("WORKZ", "overdue-agent");
-        jedis.zadd("WAITZ", overdueScore, "overdue-agent");
+        // Remove from wherever it was placed and put it in waiting with overdue score
+        jedis.zrem("waiting", "overdue-agent");
+        jedis.zrem("working", "overdue-agent");
+        jedis.zadd("waiting", overdueScore, "overdue-agent");
 
-        Double confirmedScore = jedis.zscore("WAITZ", "overdue-agent");
+        Double confirmedScore = jedis.zscore("waiting", "overdue-agent");
         System.out.println(
-            "Set up overdue agent in WAITZ with score: "
+            "Set up overdue agent in waiting with score: "
                 + confirmedScore
                 + " (overdue by "
                 + (currentTimeSeconds - confirmedScore)
@@ -1578,12 +1582,12 @@ class AgentAcquisitionServiceTest {
 
       // Check the final state - the important thing is that overdue agents are selectable
       try (Jedis jedis = jedisPool.getResource()) {
-        boolean stillInWaitz = jedis.zscore("WAITZ", "overdue-agent") != null;
-        boolean movedToWorkz = jedis.zscore("WORKZ", "overdue-agent") != null;
+        boolean stillInWaiting = jedis.zscore("waiting", "overdue-agent") != null;
+        boolean movedToWorking = jedis.zscore("working", "overdue-agent") != null;
 
         System.out.println("Final agent status:");
-        System.out.println("- Still in WAITZ: " + stillInWaitz);
-        System.out.println("- Moved to WORKZ: " + movedToWorkz);
+        System.out.println("- Still in waiting: " + stillInWaiting);
+        System.out.println("- Moved to working: " + movedToWorking);
 
         // The critical test: verify that the overdue agent logic is working correctly
         System.out.println("\n=== Core Functionality Verification ===");
@@ -1591,7 +1595,7 @@ class AgentAcquisitionServiceTest {
         // Test 1: Verify overdue agents are detectable by scheduler query
         String currentScoreStr = String.valueOf(System.currentTimeMillis() / 1000);
         Set<String> readyAgents =
-            jedis.zrangeByScore("WAITZ", 0, Double.parseDouble(currentScoreStr));
+            jedis.zrangeByScore("waiting", 0, Double.parseDouble(currentScoreStr));
         boolean overdueAgentIsReady = readyAgents.contains("overdue-agent");
 
         System.out.println("Current time score: " + currentScoreStr);
@@ -1600,8 +1604,8 @@ class AgentAcquisitionServiceTest {
 
         // Test 2: Verify the core scheduler logic - overdue agents with scores < current time are
         // selectable
-        if (stillInWaitz) {
-          Double agentScore = jedis.zscore("WAITZ", "overdue-agent");
+        if (stillInWaiting) {
+          Double agentScore = jedis.zscore("waiting", "overdue-agent");
           double currentTime = Double.parseDouble(currentScoreStr);
           boolean agentIsOverdue = agentScore != null && agentScore < currentTime;
 
@@ -1610,14 +1614,14 @@ class AgentAcquisitionServiceTest {
 
           // The fundamental test: overdue agents (score < currentTime) should be in ready list
           if (agentIsOverdue) {
-            // If the agent is overdue and in WAITZ, it should appear in ready queries
+            // If the agent is overdue and in waiting, it should appear in ready queries
             // This is the core logic we're testing
             System.out.println("✓ Agent is overdue and properly detectable by scheduler");
           } else {
             System.out.println("Note: Agent score was updated during test execution");
           }
-        } else if (movedToWorkz) {
-          System.out.println("✓ Overdue agent was successfully acquired and moved to WORKZ");
+        } else if (movedToWorking) {
+          System.out.println("✓ Overdue agent was successfully acquired and moved to working");
         } else {
           System.out.println("✓ Overdue agent was processed completely");
         }
@@ -1649,7 +1653,7 @@ class AgentAcquisitionServiceTest {
         long overdueScore = currentTimeSeconds - (300 - i * 30); // 5min, 4.5min, 4min, etc.
 
         try (Jedis jedis = jedisPool.getResource()) {
-          jedis.zadd("WAITZ", overdueScore, agentName);
+          jedis.zadd("waiting", overdueScore, agentName);
           System.out.println("Set up " + agentName + " with score: " + overdueScore);
         }
       }
@@ -1659,7 +1663,7 @@ class AgentAcquisitionServiceTest {
 
       // Verify all agents maintain their relative priority ordering
       try (Jedis jedis = jedisPool.getResource()) {
-        var agentsWithScores = jedis.zrangeWithScores("WAITZ", 0, -1);
+        var agentsWithScores = jedis.zrangeWithScores("waiting", 0, -1);
 
         System.out.println("\nAgent scores after repopulation (should maintain ordering):");
 

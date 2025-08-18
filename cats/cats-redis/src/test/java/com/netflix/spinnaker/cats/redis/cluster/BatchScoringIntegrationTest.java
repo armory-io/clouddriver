@@ -97,6 +97,9 @@ class BatchScoringIntegrationTest {
     schedulerProperties.setRefreshPeriodSeconds(10);
     schedulerProperties.getBatchOperations().setEnabled(true);
     schedulerProperties.getBatchOperations().setBatchSize(50);
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
+    schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
 
     executorService = Executors.newFixedThreadPool(5);
 
@@ -128,10 +131,10 @@ class BatchScoringIntegrationTest {
     @DisplayName("Batch agent score script should execute correctly")
     void batchAgentScoreScriptShouldExecuteCorrectly() {
       try (var jedis = jedisPool.getResource()) {
-        jedis.del("WORKZ", "WAITZ");
+        jedis.del("working", "waiting");
 
-        jedis.zadd("WORKZ", 1000, "agent1");
-        jedis.zadd("WAITZ", 2000, "agent2");
+        jedis.zadd("working", 1000, "agent1");
+        jedis.zadd("waiting", 2000, "agent2");
 
         List<String> agentNames = Arrays.asList("agent1", "agent2", "agent3");
 
@@ -140,7 +143,7 @@ class BatchScoringIntegrationTest {
             (List<String>)
                 jedis.evalsha(
                     scriptManager.getScriptSha(RedisScriptManager.SCORE_AGENTS),
-                    Arrays.asList("WORKZ", "WAITZ"),
+                    Arrays.asList("working", "waiting"),
                     agentNames);
 
         assertThat(results).hasSize(9);
@@ -184,7 +187,7 @@ class BatchScoringIntegrationTest {
       long overdueScore = currentTimeSeconds - 300;
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.zadd("WAITZ", overdueScore, "overdue-agent");
+        jedis.zadd("waiting", overdueScore, "overdue-agent");
       }
 
       Method agentScoreMethod =
@@ -205,8 +208,8 @@ class BatchScoringIntegrationTest {
       Agent overdueAgent = createMockAgent("overdue-agent", "test-provider");
 
       try (Jedis jedis = jedisPool.getResource()) {
-        jedis.del("WAITZ", "WORKZ");
-        jedis.zadd("WAITZ", overdueScore, "overdue-agent");
+        jedis.del("waiting", "working");
+        jedis.zadd("waiting", overdueScore, "overdue-agent");
 
         Method agentScoreMethod =
             AgentAcquisitionService.class.getDeclaredMethod("agentScore", Agent.class);
@@ -309,8 +312,8 @@ class BatchScoringIntegrationTest {
       assertThat(registeredCount).isGreaterThan(0);
 
       try (var jedis = jedisPool.getResource()) {
-        jedis.del("WAITZ", "WORKZ");
-        long totalBefore = jedis.zcard("WAITZ") + jedis.zcard("WORKZ");
+        jedis.del("waiting", "working");
+        long totalBefore = jedis.zcard("waiting") + jedis.zcard("working");
         assertThat(totalBefore).isEqualTo(0);
       }
 
@@ -318,22 +321,22 @@ class BatchScoringIntegrationTest {
       acquisitionService.saturatePool(0L, new Semaphore(0), executorService);
 
       try (var jedis = jedisPool.getResource()) {
-        long waitzCount = jedis.zcard("WAITZ");
-        long workzCount = jedis.zcard("WORKZ");
+        long waitzCount = jedis.zcard("waiting");
+        long workzCount = jedis.zcard("working");
         long totalAfter = waitzCount + workzCount;
 
         if (totalAfter > 0) {
           assertThat(totalAfter).isEqualTo(registeredCount);
 
           // Verify we can inspect agent details
-          var waitzMembers = jedis.zrange("WAITZ", 0, 2);
-          var workzMembers = jedis.zrange("WORKZ", 0, 2);
+          var waitzMembers = jedis.zrange("waiting", 0, 2);
+          var workzMembers = jedis.zrange("working", 0, 2);
           assertThat(waitzMembers.size() + workzMembers.size()).isGreaterThan(0);
         } else {
           // Fallback test: try with runCount=30 to force repopulation
           acquisitionService.saturatePool(30L, new Semaphore(0), executorService);
 
-          long totalAfter2 = jedis.zcard("WAITZ") + jedis.zcard("WORKZ");
+          long totalAfter2 = jedis.zcard("waiting") + jedis.zcard("working");
           assertThat(totalAfter2).isGreaterThan(0);
         }
       }
@@ -363,7 +366,7 @@ class BatchScoringIntegrationTest {
       final int expectedAgentCount = actuallyRegistered;
 
       try (var jedis = jedisPool.getResource()) {
-        jedis.del("WAITZ", "WORKZ");
+        jedis.del("waiting", "working");
       }
 
       // Test batch mode
@@ -374,9 +377,9 @@ class BatchScoringIntegrationTest {
 
       long agentsInRedisAfterBatch;
       try (var jedis = jedisPool.getResource()) {
-        agentsInRedisAfterBatch = jedis.zcard("WAITZ") + jedis.zcard("WORKZ");
+        agentsInRedisAfterBatch = jedis.zcard("waiting") + jedis.zcard("working");
         assertThat(agentsInRedisAfterBatch).isEqualTo(expectedAgentCount);
-        jedis.del("WAITZ", "WORKZ");
+        jedis.del("waiting", "working");
       }
 
       // Test individual mode for comparison
@@ -386,7 +389,7 @@ class BatchScoringIntegrationTest {
       long individualDuration = System.currentTimeMillis() - individualStartTime;
 
       try (var jedis = jedisPool.getResource()) {
-        long agentsInRedisAfterIndividual = jedis.zcard("WAITZ") + jedis.zcard("WORKZ");
+        long agentsInRedisAfterIndividual = jedis.zcard("waiting") + jedis.zcard("working");
         assertThat(agentsInRedisAfterIndividual).isEqualTo(expectedAgentCount);
       }
 
@@ -409,10 +412,10 @@ class BatchScoringIntegrationTest {
       acquisitionService.registerAgent(newAgent, execution, instrumentation);
 
       try (var jedis = jedisPool.getResource()) {
-        jedis.del("WAITZ", "WORKZ");
+        jedis.del("waiting", "working");
 
-        jedis.zadd("WORKZ", System.currentTimeMillis() / 1000 + 3600, "WorkingAgent");
-        jedis.zadd("WAITZ", System.currentTimeMillis() / 1000 + 1800, "WaitingAgent");
+        jedis.zadd("working", System.currentTimeMillis() / 1000 + 3600, "WorkingAgent");
+        jedis.zadd("waiting", System.currentTimeMillis() / 1000 + 1800, "WaitingAgent");
       }
 
       Semaphore runningAgents = new Semaphore(100);
@@ -429,11 +432,11 @@ class BatchScoringIntegrationTest {
       acquisitionService.saturatePool(1L, runningAgents, executorService);
 
       try (var jedis = jedisPool.getResource()) {
-        Double workingScore = jedis.zscore("WORKZ", "WorkingAgent");
-        Double waitingScore = jedis.zscore("WAITZ", "WaitingAgent");
-        Double newScore = jedis.zscore("WAITZ", "NewAgent");
+        Double workingScore = jedis.zscore("working", "WorkingAgent");
+        Double waitingScore = jedis.zscore("waiting", "WaitingAgent");
+        Double newScore = jedis.zscore("waiting", "NewAgent");
         if (newScore == null) {
-          newScore = jedis.zscore("WORKZ", "NewAgent");
+          newScore = jedis.zscore("working", "NewAgent");
         }
 
         assertThat(workingScore).as("WorkingAgent should be in WORKING set").isNotNull();

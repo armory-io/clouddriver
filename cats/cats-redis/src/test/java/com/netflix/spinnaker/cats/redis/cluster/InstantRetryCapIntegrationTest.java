@@ -83,6 +83,9 @@ class InstantRetryCapIntegrationTest {
     schedulerProperties.setRefreshPeriodSeconds(30); // avoid repop triggering
     schedulerProperties.getBatchOperations().setEnabled(true);
     schedulerProperties.getBatchOperations().setBatchSize(2); // very small cap to observe retry cap
+    // Ensure tests use the configured key names explicitly (match new defaults)
+    schedulerProperties.getKeys().setWaitingSet("waiting");
+    schedulerProperties.getKeys().setWorkingSet("working");
 
     acquisitionService =
         new AgentAcquisitionService(
@@ -120,15 +123,15 @@ class InstantRetryCapIntegrationTest {
       acquisitionService.registerAgent(createAgent("A" + i), execution, instrumentation);
     }
 
-    // Preload WAITZ with 2 ready agents that will be stolen by a competing pod
+    // Preload waiting with 2 ready agents that will be stolen by a competing pod
     try (Jedis j = jedisPool.getResource()) {
-      j.zadd("WAITZ", 0, "A1");
-      j.zadd("WAITZ", 0, "A2");
+      j.zadd("waiting", 0, "A1");
+      j.zadd("waiting", 0, "A2");
     }
 
     AtomicBoolean competingMoved = new AtomicBoolean(false);
 
-    // Background thread simulates another pod moving A1/A2 to WORKZ and adding 5 new ready
+    // Background thread simulates another pod moving A1/A2 to working and adding 5 new ready
     Thread competitor =
         new Thread(
             () -> {
@@ -136,16 +139,16 @@ class InstantRetryCapIntegrationTest {
                 Thread.sleep(50); // allow initial scan to happen
                 try (Jedis j = jedisPool.getResource()) {
                   // steal the initial ready agents so batch acquisition returns 0
-                  j.zrem("WAITZ", "A1", "A2");
-                  j.zadd("WORKZ", System.currentTimeMillis() / 1000.0, "A1");
-                  j.zadd("WORKZ", System.currentTimeMillis() / 1000.0, "A2");
+                  j.zrem("waiting", "A1", "A2");
+                  j.zadd("working", System.currentTimeMillis() / 1000.0, "A1");
+                  j.zadd("working", System.currentTimeMillis() / 1000.0, "A2");
 
                   // add more than the cap to ensure retry must limit
-                  j.zadd("WAITZ", 0, "A3");
-                  j.zadd("WAITZ", 0, "A4");
-                  j.zadd("WAITZ", 0, "A5");
-                  j.zadd("WAITZ", 0, "A6");
-                  j.zadd("WAITZ", 0, "A7");
+                  j.zadd("waiting", 0, "A3");
+                  j.zadd("waiting", 0, "A4");
+                  j.zadd("waiting", 0, "A5");
+                  j.zadd("waiting", 0, "A6");
+                  j.zadd("waiting", 0, "A7");
                 }
                 competingMoved.set(true);
               } catch (InterruptedException ignored) {
