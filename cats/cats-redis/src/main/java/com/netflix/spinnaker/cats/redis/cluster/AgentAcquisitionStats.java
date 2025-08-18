@@ -21,6 +21,7 @@ package com.netflix.spinnaker.cats.redis.cluster;
  *
  * <p>Provides detailed metrics for operational monitoring of the agent scheduling system.
  */
+@lombok.Getter
 public class AgentAcquisitionStats {
   private final long registeredAgents;
   private final long activeAgents;
@@ -42,60 +43,6 @@ public class AgentAcquisitionStats {
     this.agentsExecuted = agentsExecuted;
     this.agentsFailed = agentsFailed;
     this.futuresTracked = futuresTracked;
-  }
-
-  /**
-   * Get the number of registered agents.
-   *
-   * @return The number of registered agents
-   */
-  public long getRegisteredAgents() {
-    return registeredAgents;
-  }
-
-  /**
-   * Get the number of active agents.
-   *
-   * @return The number of active agents
-   */
-  public long getActiveAgents() {
-    return activeAgents;
-  }
-
-  /**
-   * Get the number of agents acquired.
-   *
-   * @return The number of agents acquired
-   */
-  public long getAgentsAcquired() {
-    return agentsAcquired;
-  }
-
-  /**
-   * Get the number of agents executed.
-   *
-   * @return The number of agents executed
-   */
-  public long getAgentsExecuted() {
-    return agentsExecuted;
-  }
-
-  /**
-   * Get the number of agents failed.
-   *
-   * @return The number of agents failed
-   */
-  public long getAgentsFailed() {
-    return agentsFailed;
-  }
-
-  /**
-   * Get the number of futures tracked.
-   *
-   * @return The number of futures tracked
-   */
-  public long getFuturesTracked() {
-    return futuresTracked;
   }
 
   /**

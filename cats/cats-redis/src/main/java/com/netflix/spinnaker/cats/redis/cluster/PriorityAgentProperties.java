@@ -18,6 +18,8 @@ package com.netflix.spinnaker.cats.redis.cluster;
 
 import java.util.regex.Pattern;
 import javax.annotation.PostConstruct;
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -29,6 +31,8 @@ import org.springframework.stereotype.Component;
  */
 @Component
 @ConfigurationProperties(prefix = "redis.agent")
+@Getter
+@Setter
 public class PriorityAgentProperties {
 
   /** Regex pattern for enabled agents. Only agents matching this pattern will be scheduled. */
@@ -43,60 +47,6 @@ public class PriorityAgentProperties {
 
   /** Maximum number of agents that can run concurrently. */
   private int maxConcurrentAgents = 100;
-
-  /**
-   * Get the enabled pattern for agents.
-   *
-   * @return The enabled pattern
-   */
-  public String getEnabledPattern() {
-    return enabledPattern;
-  }
-
-  /**
-   * Set the enabled pattern for agents.
-   *
-   * @param enabledPattern The enabled pattern
-   */
-  public void setEnabledPattern(String enabledPattern) {
-    this.enabledPattern = enabledPattern;
-  }
-
-  /**
-   * Get the disabled pattern for agents.
-   *
-   * @return The disabled pattern
-   */
-  public String getDisabledPattern() {
-    return disabledPattern;
-  }
-
-  /**
-   * Set the disabled pattern for agents.
-   *
-   * @param disabledPattern The disabled pattern
-   */
-  public void setDisabledPattern(String disabledPattern) {
-    this.disabledPattern = disabledPattern;
-  }
-
-  /**
-   * Get the maximum number of concurrent agents.
-   *
-   * @return The maximum number of concurrent agents
-   */
-  public int getMaxConcurrentAgents() {
-    return maxConcurrentAgents;
-  }
-
-  /**
-   * Set the maximum number of concurrent agents.
-   *
-   * @param maxConcurrentAgents The maximum number of concurrent agents
-   */
-  public void setMaxConcurrentAgents(int maxConcurrentAgents) {
-    this.maxConcurrentAgents = maxConcurrentAgents;
-  }
 
   @PostConstruct
   void validate() {

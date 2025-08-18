@@ -23,8 +23,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
@@ -69,8 +68,8 @@ import redis.clients.jedis.params.SetParams;
  * </ul>
  */
 @Component
+@Slf4j
 public class OrphanCleanupService {
-  private static final Logger log = LoggerFactory.getLogger(OrphanCleanupService.class);
 
   // Redis key names derived from configuration
   private final String WORKING_SET;

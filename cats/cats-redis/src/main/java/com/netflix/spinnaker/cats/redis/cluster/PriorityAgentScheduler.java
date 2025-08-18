@@ -32,8 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.JedisPool;
 
@@ -197,10 +196,9 @@ import redis.clients.jedis.JedisPool;
  * </ul>
  */
 @Component
+@Slf4j
 public class PriorityAgentScheduler extends CatsModuleAware
     implements AgentScheduler<AgentLock>, Runnable {
-
-  private static final Logger log = LoggerFactory.getLogger(PriorityAgentScheduler.class);
 
   // Core services
   private final RedisScriptManager scriptManager;
@@ -807,6 +805,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
    * enabled-agent interval on this pod. Queue lag is emitted in seconds even when HEALTHY to aid
    * sizing and performance diagnostics.
    */
+  @lombok.Getter
   public static class SchedulerStats {
     private final long runCount;
     private final int registeredAgents;
@@ -837,42 +836,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
       this.degraded = degraded;
       this.degradedReason = degradedReason == null ? "" : degradedReason;
       this.oldestOverdueSeconds = oldestOverdueSeconds;
-    }
-
-    public long getRunCount() {
-      return runCount;
-    }
-
-    public int getRegisteredAgents() {
-      return registeredAgents;
-    }
-
-    public int getActiveAgents() {
-      return activeAgents;
-    }
-
-    public long getZombiesCleanedUp() {
-      return zombiesCleanedUp;
-    }
-
-    public long getOrphansCleanedUp() {
-      return orphansCleanedUp;
-    }
-
-    public boolean isRunning() {
-      return running;
-    }
-
-    public boolean isDegraded() {
-      return degraded;
-    }
-
-    public String getDegradedReason() {
-      return degradedReason;
-    }
-
-    public long getOldestOverdueSeconds() {
-      return oldestOverdueSeconds;
     }
 
     @Override

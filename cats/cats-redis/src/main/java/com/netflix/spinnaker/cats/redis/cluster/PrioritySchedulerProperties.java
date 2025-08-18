@@ -17,6 +17,9 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import javax.annotation.PostConstruct;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -28,6 +31,8 @@ import org.springframework.stereotype.Component;
  */
 @Component
 @ConfigurationProperties(prefix = "redis.scheduler")
+@Getter
+@Setter
 public class PrioritySchedulerProperties {
 
   /**
@@ -74,14 +79,23 @@ public class PrioritySchedulerProperties {
    * <p>This block controls how the scheduler delays subsequent executions after an agent run fails.
    * It enables class-based backoff (e.g., permanent forbidden, throttled, transient/server errors)
    * and optional jitter to avoid synchronized retries across pods.
+   *
+   * <p>Lombok disabled: getter is custom (lazy non-null initialization), setter is custom. We must
+   * guarantee a non-null FailureBackoffProperties instance when read, and preserve explicit control
+   * on writes.
    */
+  @Getter(AccessLevel.NONE)
+  @Setter(AccessLevel.NONE)
   private FailureBackoffProperties failureBackoff = new FailureBackoffProperties();
 
   /**
    * Optional jitter applied when initially registering new agents (in seconds). A positive value
    * spreads first execution across the window to reduce thundering herds. Default: 0 (disabled).
    * Config key: {@code redis.scheduler.initial-registration-jitter-seconds}
+   *
+   * <p>Lombok disabled: setter is custom and clamps to non-negative values.
    */
+  @Setter(AccessLevel.NONE)
   private int initialRegistrationJitterSeconds = 0;
 
   /**
@@ -91,66 +105,11 @@ public class PrioritySchedulerProperties {
    * optional prefix and hash-tag. When {@code hashTag} is set (non-empty), the final Redis keys
    * will include the value wrapped in braces to ensure all keys hash to the same slot on Redis
    * Cluster (e.g., {@code waiting{ps}}, {@code working{ps}}, {@code cleanup-leader{ps}}).
+   *
+   * <p>Lombok disabled: setter is custom and null-coalesces to a default Keys instance.
    */
+  @Setter(AccessLevel.NONE)
   private Keys keys = new Keys();
-
-  // Getters and setters
-
-  public long getIntervalMs() {
-    return intervalMs;
-  }
-
-  public void setIntervalMs(long intervalMs) {
-    this.intervalMs = intervalMs;
-  }
-
-  public int getRefreshPeriodSeconds() {
-    return refreshPeriodSeconds;
-  }
-
-  public void setRefreshPeriodSeconds(int refreshPeriodSeconds) {
-    this.refreshPeriodSeconds = refreshPeriodSeconds;
-  }
-
-  public ZombieCleanupProperties getZombieCleanup() {
-    return zombieCleanup;
-  }
-
-  public void setZombieCleanup(ZombieCleanupProperties zombieCleanup) {
-    this.zombieCleanup = zombieCleanup;
-  }
-
-  public OrphanCleanupProperties getOrphanCleanup() {
-    return orphanCleanup;
-  }
-
-  public void setOrphanCleanup(OrphanCleanupProperties orphanCleanup) {
-    this.orphanCleanup = orphanCleanup;
-  }
-
-  public BatchOperations getBatchOperations() {
-    return batchOperations;
-  }
-
-  public void setBatchOperations(BatchOperations batchOperations) {
-    this.batchOperations = batchOperations;
-  }
-
-  public long getTimeCacheDurationMs() {
-    return timeCacheDurationMs;
-  }
-
-  public void setTimeCacheDurationMs(long timeCacheDurationMs) {
-    this.timeCacheDurationMs = timeCacheDurationMs;
-  }
-
-  public RedisThreadPoolProperties getPool() {
-    return pool;
-  }
-
-  public void setPool(RedisThreadPoolProperties pool) {
-    this.pool = pool;
-  }
 
   /**
    * Returns the failure-aware backoff configuration. Never returns null.
@@ -173,19 +132,11 @@ public class PrioritySchedulerProperties {
     this.failureBackoff = failureBackoff;
   }
 
-  public int getInitialRegistrationJitterSeconds() {
-    return initialRegistrationJitterSeconds;
-  }
-
   public void setInitialRegistrationJitterSeconds(int initialRegistrationJitterSeconds) {
     this.initialRegistrationJitterSeconds = Math.max(0, initialRegistrationJitterSeconds);
   }
 
   /** Returns the configured Redis key naming and namespacing options. */
-  public Keys getKeys() {
-    return keys;
-  }
-
   /** Sets the Redis key naming and namespacing options. */
   public void setKeys(Keys keys) {
     this.keys = keys != null ? keys : new Keys();
@@ -202,28 +153,14 @@ public class PrioritySchedulerProperties {
    *       batch-size: 50
    * </pre>
    */
+  @Getter
+  @Setter
   public static class BatchOperations {
     /** Enable batch operations globally (acquisition, cleanup, completion, repopulation). */
     private boolean enabled = false;
 
     /** Maximum number of items to process in a single batch. Default: 50. */
     private int batchSize = 50;
-
-    public boolean isEnabled() {
-      return enabled;
-    }
-
-    public void setEnabled(boolean enabled) {
-      this.enabled = enabled;
-    }
-
-    public int getBatchSize() {
-      return batchSize;
-    }
-
-    public void setBatchSize(int batchSize) {
-      this.batchSize = batchSize;
-    }
   }
 
   public int getThreadPoolCoreSize() {
@@ -342,6 +279,8 @@ public class PrioritySchedulerProperties {
    * <p>Defaults use lowercase, function-oriented names and preserve the historical leadership key
    * name for compatibility.
    */
+  @Getter
+  @Setter
   public static class Keys {
     /** Base name of the waiting/ready set. Default: "waiting". */
     private String waitingSet = "waiting";
@@ -349,48 +288,24 @@ public class PrioritySchedulerProperties {
     private String workingSet = "working";
     /** Leadership key used for orphan cleanup coordination. Default: "cleanup-leader". */
     private String cleanupLeaderKey = "cleanup-leader";
-    /** Optional prefix added to all keys. Default: empty. */
+    /**
+     * Optional prefix added to all keys. Default: empty.
+     *
+     * <p>Lombok disabled: setter is custom to normalize null to empty string.
+     */
+    @Setter(AccessLevel.NONE)
     private String prefix = "";
     /**
      * Optional hash-tag value to force all keys into the same Redis Cluster slot. When non-empty,
      * the final keys will include the value wrapped in braces (e.g., "{ps}").
+     *
+     * <p>Lombok disabled: setter is custom to normalize null to empty string.
      */
+    @Setter(AccessLevel.NONE)
     private String hashTag = "";
-
-    public String getWaitingSet() {
-      return waitingSet;
-    }
-
-    public void setWaitingSet(String waitingSet) {
-      this.waitingSet = waitingSet;
-    }
-
-    public String getWorkingSet() {
-      return workingSet;
-    }
-
-    public void setWorkingSet(String workingSet) {
-      this.workingSet = workingSet;
-    }
-
-    public String getCleanupLeaderKey() {
-      return cleanupLeaderKey;
-    }
-
-    public void setCleanupLeaderKey(String cleanupLeaderKey) {
-      this.cleanupLeaderKey = cleanupLeaderKey;
-    }
-
-    public String getPrefix() {
-      return prefix;
-    }
 
     public void setPrefix(String prefix) {
       this.prefix = prefix != null ? prefix : "";
-    }
-
-    public String getHashTag() {
-      return hashTag;
     }
 
     public void setHashTag(String hashTag) {
@@ -405,6 +320,8 @@ public class PrioritySchedulerProperties {
  * <p>Controls how the scheduler backs off agents after failures. Backoff is applied by scheduling
  * the agent into the waiting set with a future score equal to the computed delay.
  */
+@Getter
+@Setter
 class FailureBackoffProperties {
   /** Master switch for failure-aware backoff. */
   private boolean enabled = false;
@@ -424,65 +341,6 @@ class FailureBackoffProperties {
   /** Throttled backoff policy parameters. */
   private ThrottledPolicy throttled = new ThrottledPolicy();
 
-  /** @return true if failure-aware backoff is enabled; false to fallback to legacy behavior */
-  public boolean isEnabled() {
-    return enabled;
-  }
-
-  /**
-   * Enables or disables failure-aware backoff.
-   *
-   * @param enabled whether failure-aware backoff should be enabled
-   */
-  public void setEnabled(boolean enabled) {
-    this.enabled = enabled;
-  }
-
-  /** @return jitter ratio applied to positive backoff delays */
-  public double getJitterRatio() {
-    return jitterRatio;
-  }
-
-  /**
-   * Sets jitter ratio applied to positive backoff delays. For example, 0.1 means +/-10%.
-   *
-   * @param jitterRatio a value in [0.0, 1.0]
-   */
-  public void setJitterRatio(double jitterRatio) {
-    this.jitterRatio = jitterRatio;
-  }
-
-  /**
-   * @return number of immediate retries allowed before applying errorInterval for transient/server
-   *     errors
-   */
-  public int getMaxImmediateRetries() {
-    return maxImmediateRetries;
-  }
-
-  /**
-   * Sets number of immediate retries before applying errorInterval for transient/server errors.
-   *
-   * @param maxImmediateRetries immediate retry count (>= 0)
-   */
-  public void setMaxImmediateRetries(int maxImmediateRetries) {
-    this.maxImmediateRetries = maxImmediateRetries;
-  }
-
-  /** @return fixed backoff applied to permanent forbidden failures (e.g., 403/AccessDenied) */
-  public long getPermanentForbiddenBackoffMs() {
-    return permanentForbiddenBackoffMs;
-  }
-
-  /**
-   * Sets fixed backoff applied to permanent forbidden failures (e.g., 403/AccessDenied).
-   *
-   * @param permanentForbiddenBackoffMs delay in milliseconds
-   */
-  public void setPermanentForbiddenBackoffMs(long permanentForbiddenBackoffMs) {
-    this.permanentForbiddenBackoffMs = permanentForbiddenBackoffMs;
-  }
-
   /** @return throttled backoff policy parameters */
   public ThrottledPolicy getThrottled() {
     if (throttled == null) {
@@ -501,6 +359,8 @@ class FailureBackoffProperties {
   }
 
   /** Parameters controlling exponential backoff for throttled failures. */
+  @Getter
+  @Setter
   static class ThrottledPolicy {
     /** Starting backoff for throttled errors. */
     private long baseMs = java.util.concurrent.TimeUnit.SECONDS.toMillis(30);
@@ -508,36 +368,6 @@ class FailureBackoffProperties {
     private double multiplier = 2.0d;
     /** Upper cap for throttled exponential backoff. */
     private long capMs = java.util.concurrent.TimeUnit.MINUTES.toMillis(10);
-
-    /** @return starting backoff for throttled errors (milliseconds) */
-    public long getBaseMs() {
-      return baseMs;
-    }
-
-    /** Sets starting backoff for throttled errors (milliseconds). */
-    public void setBaseMs(long baseMs) {
-      this.baseMs = baseMs;
-    }
-
-    /** @return exponential multiplier for throttled errors */
-    public double getMultiplier() {
-      return multiplier;
-    }
-
-    /** Sets exponential multiplier for throttled errors. */
-    public void setMultiplier(double multiplier) {
-      this.multiplier = multiplier;
-    }
-
-    /** @return upper cap for throttled exponential backoff (milliseconds) */
-    public long getCapMs() {
-      return capMs;
-    }
-
-    /** Sets upper cap for throttled exponential backoff (milliseconds). */
-    public void setCapMs(long capMs) {
-      this.capMs = capMs;
-    }
   }
 }
 
@@ -559,6 +389,8 @@ class FailureBackoffProperties {
  *         threshold-ms: 3600000   # 60m for exceptional agents
  * </pre>
  */
+@Getter
+@Setter
 class ZombieCleanupProperties {
 
   /** Whether zombie cleanup is enabled. Can be disabled for debugging or during maintenance. */
@@ -579,30 +411,6 @@ class ZombieCleanupProperties {
   /** Configuration for exceptional agents that require different zombie thresholds. */
   private ExceptionalAgentsProperties exceptionalAgents = new ExceptionalAgentsProperties();
 
-  public boolean isEnabled() {
-    return enabled;
-  }
-
-  public void setEnabled(boolean enabled) {
-    this.enabled = enabled;
-  }
-
-  public long getThresholdMs() {
-    return thresholdMs;
-  }
-
-  public void setThresholdMs(long thresholdMs) {
-    this.thresholdMs = thresholdMs;
-  }
-
-  public long getIntervalMs() {
-    return intervalMs;
-  }
-
-  public void setIntervalMs(long intervalMs) {
-    this.intervalMs = intervalMs;
-  }
-
   public ExceptionalAgentsProperties getExceptionalAgents() {
     if (exceptionalAgents == null) {
       exceptionalAgents = new ExceptionalAgentsProperties();
@@ -616,6 +424,8 @@ class ZombieCleanupProperties {
 }
 
 /** Configuration properties for exceptional agents that require different zombie thresholds. */
+@Getter
+@Setter
 class ExceptionalAgentsProperties {
 
   /**
@@ -631,25 +441,11 @@ class ExceptionalAgentsProperties {
    * exceptional agents that may need longer processing time.
    */
   private long thresholdMs = 3600000L; // 60 minutes
-
-  public String getPattern() {
-    return pattern;
-  }
-
-  public void setPattern(String pattern) {
-    this.pattern = pattern;
-  }
-
-  public long getThresholdMs() {
-    return thresholdMs;
-  }
-
-  public void setThresholdMs(long thresholdMs) {
-    this.thresholdMs = thresholdMs;
-  }
 }
 
 /** Orphan cleanup configuration properties for agents from crashed instances. */
+@Getter
+@Setter
 class OrphanCleanupProperties {
 
   /** Whether orphan cleanup is enabled. Can be disabled for debugging or during maintenance. */
@@ -677,49 +473,11 @@ class OrphanCleanupProperties {
    * safety.
    */
   private boolean forceAllPods = false;
-
-  public boolean isEnabled() {
-    return enabled;
-  }
-
-  public void setEnabled(boolean enabled) {
-    this.enabled = enabled;
-  }
-
-  public long getThresholdMs() {
-    return thresholdMs;
-  }
-
-  public void setThresholdMs(long thresholdMs) {
-    this.thresholdMs = thresholdMs;
-  }
-
-  public long getIntervalMs() {
-    return intervalMs;
-  }
-
-  public void setIntervalMs(long intervalMs) {
-    this.intervalMs = intervalMs;
-  }
-
-  public long getLeadershipTtlMs() {
-    return leadershipTtlMs;
-  }
-
-  public void setLeadershipTtlMs(long leadershipTtlMs) {
-    this.leadershipTtlMs = leadershipTtlMs;
-  }
-
-  public boolean isForceAllPods() {
-    return forceAllPods;
-  }
-
-  public void setForceAllPods(boolean forceAllPods) {
-    this.forceAllPods = forceAllPods;
-  }
 }
 
 /** Thread pool configuration properties for Redis scheduler. */
+@Getter
+@Setter
 class RedisThreadPoolProperties {
 
   /**
@@ -746,36 +504,4 @@ class RedisThreadPoolProperties {
    * {@code redis.scheduler.pool.use-synchronous-queue}
    */
   private boolean useSynchronousQueue = false;
-
-  public int getCoreSize() {
-    return coreSize;
-  }
-
-  public void setCoreSize(int coreSize) {
-    this.coreSize = coreSize;
-  }
-
-  public int getMaxSize() {
-    return maxSize;
-  }
-
-  public void setMaxSize(int maxSize) {
-    this.maxSize = maxSize;
-  }
-
-  public long getKeepAliveSeconds() {
-    return keepAliveSeconds;
-  }
-
-  public void setKeepAliveSeconds(long keepAliveSeconds) {
-    this.keepAliveSeconds = keepAliveSeconds;
-  }
-
-  public boolean isUseSynchronousQueue() {
-    return useSynchronousQueue;
-  }
-
-  public void setUseSynchronousQueue(boolean useSynchronousQueue) {
-    this.useSynchronousQueue = useSynchronousQueue;
-  }
 }

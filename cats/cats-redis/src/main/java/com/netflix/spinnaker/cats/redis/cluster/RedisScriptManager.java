@@ -20,8 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
@@ -94,8 +93,8 @@ import redis.clients.jedis.JedisPool;
  * intervention.
  */
 @Component
+@Slf4j
 public class RedisScriptManager {
-  private static final Logger log = LoggerFactory.getLogger(RedisScriptManager.class);
 
   // Script name constants for Redis Lua operations
 
