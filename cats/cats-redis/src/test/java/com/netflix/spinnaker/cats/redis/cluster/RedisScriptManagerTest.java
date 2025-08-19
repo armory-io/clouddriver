@@ -68,7 +68,10 @@ class RedisScriptManagerTest {
 
     jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @Nested

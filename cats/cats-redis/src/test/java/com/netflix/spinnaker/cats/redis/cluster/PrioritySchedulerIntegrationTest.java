@@ -98,7 +98,8 @@ public class PrioritySchedulerIntegrationTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @Nested
@@ -134,7 +135,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               testProps,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent disabledAgent = createMockAgent("disabled-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
@@ -194,7 +196,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               testProps,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent testAgent = createMockAgent("test-agent", "test-provider");
       Agent prodAgent = createMockAgent("prod-agent", "prod-provider");
@@ -248,7 +251,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              customProps);
+              customProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // When & Then - Scheduler created successfully with custom config
       assertThat(customScheduler).isNotNull();
@@ -274,10 +278,22 @@ public class PrioritySchedulerIntegrationTest {
 
       PriorityAgentScheduler schedA =
           new PriorityAgentScheduler(
-              jedisPool, nodeStatusProvider, interval, shardA, agentProps, schedulerProps);
+              jedisPool,
+              nodeStatusProvider,
+              interval,
+              shardA,
+              agentProps,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       PriorityAgentScheduler schedB =
           new PriorityAgentScheduler(
-              jedisPool, nodeStatusProvider, interval, shardB, agentProps, schedulerProps);
+              jedisPool,
+              nodeStatusProvider,
+              interval,
+              shardB,
+              agentProps,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       AgentExecution exec = mock(AgentExecution.class);
       ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
@@ -296,10 +312,22 @@ public class PrioritySchedulerIntegrationTest {
 
       PriorityAgentScheduler schedA2 =
           new PriorityAgentScheduler(
-              jedisPool, nodeStatusProvider, interval, newShardA, agentProps, schedulerProps);
+              jedisPool,
+              nodeStatusProvider,
+              interval,
+              newShardA,
+              agentProps,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       PriorityAgentScheduler schedB2 =
           new PriorityAgentScheduler(
-              jedisPool, nodeStatusProvider, interval, newShardB, agentProps, schedulerProps);
+              jedisPool,
+              nodeStatusProvider,
+              interval,
+              newShardB,
+              agentProps,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Re-register known agents on new schedulers to populate knownAgents
       schedA2.schedule(a1, exec, instr);
@@ -335,7 +363,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // When - Run scheduler cycle
       disabledScheduler.run();
@@ -380,7 +409,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       try {
         // Shared agent that both schedulers know about
@@ -461,7 +491,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProps,
-              slowProps);
+              slowProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       AgentExecution exec = mock(AgentExecution.class);
       ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
@@ -620,12 +651,23 @@ public class PrioritySchedulerIntegrationTest {
       // but allows sequential cleanup after leadership is released
 
       // Create multiple orphan cleanup services to simulate multiple instances
-      RedisScriptManager scriptManager = new RedisScriptManager(jedisPool);
+      RedisScriptManager scriptManager =
+          new RedisScriptManager(
+              jedisPool,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       scriptManager.initializeScripts();
       OrphanCleanupService service1 =
-          new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       OrphanCleanupService service2 =
-          new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       java.util.concurrent.atomic.AtomicInteger simultaneousCleanups =
           new java.util.concurrent.atomic.AtomicInteger(0);
@@ -763,7 +805,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              props);
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent a = createMockAgent("jitter-agent", "test");
       AgentExecution exec = mock(AgentExecution.class);
@@ -802,7 +845,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              props);
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       sched1.initialize();
 
       Agent a = createMockAgent("existing-agent", "test");
@@ -826,7 +870,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              props);
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       sched2.initialize();
       sched2.schedule(a, exec, instr);
 
@@ -862,7 +907,8 @@ public class PrioritySchedulerIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              props);
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       sched.initialize();
       sched.schedule(a, exec, new MockInstrumentation());

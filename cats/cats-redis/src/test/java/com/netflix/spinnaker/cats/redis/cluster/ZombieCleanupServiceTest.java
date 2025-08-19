@@ -76,7 +76,10 @@ class ZombieCleanupServiceTest {
       jedis.flushAll();
     }
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     schedulerProperties = new PrioritySchedulerProperties();
@@ -85,7 +88,12 @@ class ZombieCleanupServiceTest {
     schedulerProperties.getZombieCleanup().setThresholdMs(30000L); // 30 seconds
     schedulerProperties.getZombieCleanup().setIntervalMs(10000L); // 10 seconds
 
-    zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
+    zombieService =
+        new ZombieCleanupService(
+            jedisPool,
+            scriptManager,
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @Nested
@@ -280,7 +288,12 @@ class ZombieCleanupServiceTest {
     void shouldPerformCleanupAfterIntervalHasElapsed() throws InterruptedException {
       // Given - Set very short interval for testing
       schedulerProperties.getZombieCleanup().setIntervalMs(100L); // 100ms
-      zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
+      zombieService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
@@ -343,7 +356,11 @@ class ZombieCleanupServiceTest {
           .thenReturn("invalid-sha");
 
       ZombieCleanupService invalidService =
-          new ZombieCleanupService(jedisPool, invalidScriptManager, schedulerProperties);
+          new ZombieCleanupService(
+              jedisPool,
+              invalidScriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
@@ -460,7 +477,12 @@ class ZombieCleanupServiceTest {
       // Enable batch operations with specific batch size
       schedulerProperties.getBatchOperations().setEnabled(true);
       schedulerProperties.getBatchOperations().setBatchSize(5);
-      zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
+      zombieService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Given - More zombies than batch size
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
@@ -802,7 +824,12 @@ class ZombieCleanupServiceTest {
       // Update scheduler properties to enable batch operations for this test
       schedulerProperties.getBatchOperations().setEnabled(true);
       schedulerProperties.getBatchOperations().setBatchSize(5);
-      zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
+      zombieService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Given - Multiple zombie agents
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000; // 1 minute ago
@@ -840,7 +867,12 @@ class ZombieCleanupServiceTest {
     void shouldFallbackToIndividualWhenBatchDisabled() {
       // Ensure batch operations are disabled (default)
       schedulerProperties.getBatchOperations().setEnabled(false);
-      zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
+      zombieService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Given - Multiple zombie agents
       long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;

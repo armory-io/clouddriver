@@ -79,6 +79,7 @@ public class OrphanCleanupService {
   private final JedisPool jedisPool;
   private final RedisScriptManager scriptManager;
   private final PrioritySchedulerProperties schedulerProperties;
+  private final PrioritySchedulerMetrics metrics;
   private final AtomicLong orphansCleanedUp = new AtomicLong(0);
 
   // Reference to access agent state for orphan identification
@@ -91,10 +92,12 @@ public class OrphanCleanupService {
   public OrphanCleanupService(
       JedisPool jedisPool,
       RedisScriptManager scriptManager,
-      PrioritySchedulerProperties schedulerProperties) {
+      PrioritySchedulerProperties schedulerProperties,
+      PrioritySchedulerMetrics metrics) {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.schedulerProperties = schedulerProperties;
+    this.metrics = metrics;
 
     PrioritySchedulerProperties.Keys keysCfg = schedulerProperties.getKeys();
     String hash = keysCfg.getHashTag();
@@ -115,6 +118,7 @@ public class OrphanCleanupService {
 
   /** Cleanup orphaned agents if needed, with configurable intervals and leadership coordination. */
   public void cleanupOrphanedAgentsIfNeeded() {
+    long start = System.currentTimeMillis();
     if (!schedulerProperties.getOrphanCleanup().isEnabled()) {
       return;
     }
@@ -148,6 +152,10 @@ public class OrphanCleanupService {
             totalCleaned,
             workingCleaned,
             waitingCleaned);
+      }
+      if (metrics != null) {
+        metrics.recordCleanupTime("orphan", System.currentTimeMillis() - start);
+        metrics.incrementCleanupCleaned("orphan", totalCleaned);
       }
       // Update the last cleanup timestamp
       lastOrphanCleanup = System.currentTimeMillis();

@@ -97,7 +97,8 @@ class BatchOperationsTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @Nested
@@ -159,7 +160,8 @@ class BatchOperationsTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              zombieProps);
+              zombieProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // When - Run scheduler cycle (includes zombie cleanup)
       zombieScheduler.run();
@@ -193,7 +195,8 @@ class BatchOperationsTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              exceptionalProps);
+              exceptionalProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // When - Run scheduler cycle with exceptional agents configuration
       exceptionalScheduler.run();
@@ -222,7 +225,8 @@ class BatchOperationsTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              props);
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Create agents that match and don't match the pattern
       Agent bigQueryAgent = createMockAgent("BigQueryCachingAgent", "gcp-provider");

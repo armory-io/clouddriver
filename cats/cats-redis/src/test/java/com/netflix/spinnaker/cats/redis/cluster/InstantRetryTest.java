@@ -103,7 +103,8 @@ public class InstantRetryTest {
             mockIntervalProvider,
             mockShardingFilter,
             mockAgentProperties,
-            mockSchedulerProperties);
+            mockSchedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
     testExecutor = Executors.newFixedThreadPool(5);
     agentWorkPool = Executors.newFixedThreadPool(20);

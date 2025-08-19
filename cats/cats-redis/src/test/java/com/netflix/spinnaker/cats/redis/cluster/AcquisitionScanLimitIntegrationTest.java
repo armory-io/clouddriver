@@ -62,7 +62,10 @@ class AcquisitionScanLimitIntegrationTest {
     config.setMaxTotal(32);
     jedisPool = new JedisPool(config, redis.getHost(), redis.getFirstMappedPort());
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     intervalProvider = mock(AgentIntervalProvider.class);
@@ -92,7 +95,8 @@ class AcquisitionScanLimitIntegrationTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
     agentWorkPool = Executors.newFixedThreadPool(8);
 
@@ -152,7 +156,8 @@ class AcquisitionScanLimitIntegrationTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
     // Register 5 agents so waiting has enough ready entries
     AgentExecution execution = mock(AgentExecution.class);

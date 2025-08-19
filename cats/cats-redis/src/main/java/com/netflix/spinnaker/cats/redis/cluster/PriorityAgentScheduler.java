@@ -16,6 +16,7 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import com.netflix.spectator.api.DefaultRegistry;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.AgentScheduler;
@@ -202,6 +203,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
   // Core services
   private final RedisScriptManager scriptManager;
+  private final PrioritySchedulerMetrics metrics;
   private final AgentAcquisitionService acquisitionService;
   private final ZombieCleanupService zombieService;
   private final OrphanCleanupService orphanService;
@@ -244,10 +246,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
       AgentIntervalProvider intervalProvider,
       ShardingFilter shardingFilter,
       PriorityAgentProperties agentProperties,
-      PrioritySchedulerProperties schedulerProperties) {
+      PrioritySchedulerProperties schedulerProperties,
+      PrioritySchedulerMetrics metrics) {
 
     // Initialize services
-    this.scriptManager = new RedisScriptManager(jedisPool);
+    this.metrics =
+        (metrics != null) ? metrics : new PrioritySchedulerMetrics(new DefaultRegistry());
+    this.scriptManager = new RedisScriptManager(jedisPool, this.metrics);
     this.config = new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
     this.acquisitionService =
         new AgentAcquisitionService(
@@ -256,9 +261,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
-    this.zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
-    this.orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
+            schedulerProperties,
+            this.metrics);
+    this.zombieService =
+        new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties, metrics);
+    this.orphanService =
+        new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties, metrics);
 
     // Set up service references for advanced cleanup processing
     this.orphanService.setAcquisitionService(this.acquisitionService);
@@ -267,6 +275,37 @@ public class PriorityAgentScheduler extends CatsModuleAware
     this.nodeStatusProvider = nodeStatusProvider;
     this.intervalProvider = intervalProvider;
     this.shardingFilter = shardingFilter;
+
+    // Register shared gauges once
+    try {
+      this.metrics.registerGauges(
+          jedisPool,
+          () -> (double) acquisitionService.getRegisteredAgentCount(),
+          () -> (double) acquisitionService.getActiveAgentCount(),
+          () -> (double) acquisitionService.getReadyCountSnapshot(),
+          () -> (double) acquisitionService.getOldestOverdueSeconds(),
+          () -> acquisitionService.isDegraded() ? 1 : 0,
+          () -> (double) acquisitionService.getCapacityPerCycleSnapshot(),
+          () -> {
+            if (config.getAgentWorkPool() instanceof java.util.concurrent.ThreadPoolExecutor) {
+              return (double)
+                  ((java.util.concurrent.ThreadPoolExecutor) config.getAgentWorkPool())
+                      .getQueue()
+                      .size();
+            }
+            return -1d;
+          },
+          () ->
+              config.getRunningAgents() != null ? config.getRunningAgents().availablePermits() : -1,
+          () -> (double) acquisitionService.getCompletionQueueSize(),
+          () -> (double) acquisitionService.getServerClientOffsetMs(),
+          () -> {
+            double cap = acquisitionService.getCapacityPerCycleSnapshot();
+            double ready = acquisitionService.getReadyCountSnapshot();
+            return cap > 0 ? (ready / cap) : 0;
+          });
+    } catch (Throwable ignore) {
+    }
 
     log.info("PriorityAgentScheduler initialized successfully");
   }
@@ -318,6 +357,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     }
 
     try {
+      long start = System.currentTimeMillis();
       long currentRun = runCount.incrementAndGet();
       log.debug("Starting scheduler run cycle {}", currentRun);
 
@@ -358,8 +398,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // Log periodic operational health summary based on time (not cycle count)
       maybeLogHealthSummary();
 
+      metrics.recordRunCycle(true, System.currentTimeMillis() - start);
+
     } catch (Throwable t) {
       log.error("Critical error in scheduler run cycle {}", runCount.get(), t);
+      metrics.incrementRunFailure(t.getClass().getSimpleName());
+      metrics.recordRunCycle(false, 0);
       // Don't rethrow - let scheduler continue and try again next cycle
     }
   }

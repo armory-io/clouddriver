@@ -24,6 +24,7 @@ import com.netflix.spinnaker.cats.redis.cluster.ClusteredAgentScheduler;
 import com.netflix.spinnaker.cats.redis.cluster.ClusteredSortAgentScheduler;
 import com.netflix.spinnaker.cats.redis.cluster.PriorityAgentProperties;
 import com.netflix.spinnaker.cats.redis.cluster.PriorityAgentScheduler;
+import com.netflix.spinnaker.cats.redis.cluster.PrioritySchedulerMetrics;
 import com.netflix.spinnaker.cats.redis.cluster.PrioritySchedulerProperties;
 import com.netflix.spinnaker.clouddriver.core.RedisConfigurationProperties;
 import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
@@ -46,8 +47,8 @@ public class AgentSchedulerConfig {
   private static final Logger log = LoggerFactory.getLogger(AgentSchedulerConfig.class);
 
   /**
-   * Creates the legacy "default" Redis agent scheduler. This bean is only created if
-   * redis.scheduler.type is "default" or not specified.
+   * Creates the "default" Redis agent scheduler. This bean is only created if redis.scheduler.type
+   * is "default" or not specified.
    */
   @Bean
   @ConditionalOnProperty(
@@ -79,8 +80,8 @@ public class AgentSchedulerConfig {
   }
 
   /**
-   * Creates the legacy "sort" Redis agent scheduler. This bean is only created if
-   * redis.scheduler.type is "sort".
+   * Creates the "sort" Redis agent scheduler. This bean is only created if redis.scheduler.type is
+   * "sort".
    */
   @Bean
   @ConditionalOnProperty(value = "redis.scheduler.type", havingValue = "sort")
@@ -116,9 +117,8 @@ public class AgentSchedulerConfig {
   }
 
   /**
-   * Creates the modern "priority" Redis agent scheduler. This bean is only created if
-   * redis.scheduler.type is "priority". Uses proper Spring dependency injection for configuration
-   * properties.
+   * Creates the "priority" Redis agent scheduler. This bean is only created if redis.scheduler.type
+   * is "priority". Uses Spring dependency injection for configuration properties.
    */
   @Bean
   @ConditionalOnProperty(value = "redis.scheduler.type", havingValue = "priority")
@@ -130,6 +130,7 @@ public class AgentSchedulerConfig {
       ShardingFilter shardingFilter,
       PriorityAgentProperties agentProperties,
       PrioritySchedulerProperties schedulerProperties,
+      PrioritySchedulerMetrics metrics,
       RedisConfigurationProperties redisConfigurationProperties) {
     log.info("Creating PriorityAgentScheduler (priority)");
 
@@ -151,10 +152,12 @@ public class AgentSchedulerConfig {
 
     // Log scheduler configuration for operational visibility
     log.info(
-        "PriorityAgentScheduler configuration: maxConcurrentAgents={}, schedulerIntervalMs={}, refreshPeriodSeconds={}",
+        "PriorityAgentScheduler configuration: maxConcurrentAgents={}, schedulerIntervalMs={}, refreshPeriodSeconds={}, timeCacheDurationMs={}, initialRegistrationJitterSeconds={}",
         agentProperties.getMaxConcurrentAgents(),
         schedulerProperties.getIntervalMs(),
-        schedulerProperties.getRefreshPeriodSeconds());
+        schedulerProperties.getRefreshPeriodSeconds(),
+        schedulerProperties.getTimeCacheDurationMs(),
+        schedulerProperties.getInitialRegistrationJitterSeconds());
 
     log.info(
         "PriorityAgentScheduler thread pool: coreSize={}, maxSize={}, keepAliveSeconds={}",
@@ -193,12 +196,25 @@ public class AgentSchedulerConfig {
         schedulerProperties.getBatchOperations().isEnabled(),
         schedulerProperties.getBatchOperations().getBatchSize());
 
+    // Redis key namespacing configuration
+    log.info(
+        "PriorityAgentScheduler Redis keys: prefix='{}', hashTag='{}', waitingSet='{}', workingSet='{}', cleanupLeaderKey='{}'",
+        schedulerProperties.getKeys().getPrefix(),
+        schedulerProperties.getKeys().getHashTag(),
+        schedulerProperties.getKeys().getWaitingSet(),
+        schedulerProperties.getKeys().getWorkingSet(),
+        schedulerProperties.getKeys().getCleanupLeaderKey());
+
+    // Failure-aware backoff configuration intentionally not expanded here because nested
+    // property types are package-private; see docs for details.
+
     return new PriorityAgentScheduler(
         jedisPool,
         nodeStatusProvider,
         agentIntervalProvider,
         shardingFilter,
         agentProperties,
-        schedulerProperties);
+        schedulerProperties,
+        metrics);
   }
 }

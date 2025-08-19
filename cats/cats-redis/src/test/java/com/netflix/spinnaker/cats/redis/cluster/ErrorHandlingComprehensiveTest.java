@@ -73,7 +73,10 @@ public class ErrorHandlingComprehensiveTest {
       jedis.flushAll();
     }
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     schedulerProperties = new PrioritySchedulerProperties();
@@ -95,7 +98,8 @@ public class ErrorHandlingComprehensiveTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @AfterEach
@@ -165,7 +169,10 @@ public class ErrorHandlingComprehensiveTest {
       when(mockJedis.scriptLoad(anyString()))
           .thenThrow(new RuntimeException("Script compilation error"));
 
-      RedisScriptManager failingScriptManager = new RedisScriptManager(mockPool);
+      RedisScriptManager failingScriptManager =
+          new RedisScriptManager(
+              mockPool,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Script loading should wrap the exception in AgentSchedulingException - this is expected
       // behavior
@@ -185,7 +192,10 @@ public class ErrorHandlingComprehensiveTest {
     @DisplayName("Should validate script names and throw for unknown scripts")
     void shouldValidateScriptNamesAndThrowForUnknownScripts() {
       // Test that accessing unknown script SHA throws appropriate exception
-      RedisScriptManager manager = new RedisScriptManager(jedisPool);
+      RedisScriptManager manager =
+          new RedisScriptManager(
+              jedisPool,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       manager.initializeScripts();
 
       assertThatThrownBy(
@@ -239,7 +249,8 @@ public class ErrorHandlingComprehensiveTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Register some agents
       for (int i = 1; i <= 3; i++) {
@@ -305,7 +316,8 @@ public class ErrorHandlingComprehensiveTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent agent = createMockAgent("zero-batch-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
@@ -334,7 +346,8 @@ public class ErrorHandlingComprehensiveTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent agent = createMockAgent("negative-batch-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
@@ -364,7 +377,8 @@ public class ErrorHandlingComprehensiveTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent agent = createMockAgent("large-batch-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);

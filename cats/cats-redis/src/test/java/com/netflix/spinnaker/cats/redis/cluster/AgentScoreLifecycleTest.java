@@ -67,7 +67,10 @@ class AgentScoreLifecycleTest {
     config.setMaxTotal(10);
     jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     // Defaults
@@ -99,7 +102,8 @@ class AgentScoreLifecycleTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @AfterEach
@@ -154,13 +158,16 @@ class AgentScoreLifecycleTest {
     int acquired = acquisitionService.saturatePool(0L, null, executorService);
     assertThat(acquired).isEqualTo(1);
 
-    long nowSec = System.currentTimeMillis() / 1000;
     try (Jedis j = jedisPool.getResource()) {
+      // Use Redis server time to avoid host/container clock skew and second-boundary flakiness
+      java.util.List<String> t = j.time();
+      long redisNowSec = Long.parseLong(t.get(0));
+
       Double workScore = j.zscore("working", "acq-agent");
       assertThat(workScore).isNotNull();
-      long delta = workScore.longValue() - nowSec;
-      // timeout=5s ±2s tolerance
-      assertThat(delta).isBetween(3L, 7L);
+      long delta = workScore.longValue() - redisNowSec;
+      // timeout=5s with a slightly wider tolerance (±3s) to account for second rounding and jitter
+      assertThat(delta).isBetween(2L, 8L);
     }
   }
 

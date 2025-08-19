@@ -55,6 +55,7 @@ public class ZombieCleanupService {
   private final JedisPool jedisPool;
   private final RedisScriptManager scriptManager;
   private final PrioritySchedulerProperties schedulerProperties;
+  private final PrioritySchedulerMetrics metrics;
 
   // Tracking for zombie cleanup
   private final AtomicLong zombiesCleanedUp = new AtomicLong(0);
@@ -73,10 +74,12 @@ public class ZombieCleanupService {
   public ZombieCleanupService(
       JedisPool jedisPool,
       RedisScriptManager scriptManager,
-      PrioritySchedulerProperties schedulerProperties) {
+      PrioritySchedulerProperties schedulerProperties,
+      PrioritySchedulerMetrics metrics) {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.schedulerProperties = schedulerProperties;
+    this.metrics = metrics;
     compileExceptionalAgentsPattern();
 
     PrioritySchedulerProperties.Keys keysCfg = schedulerProperties.getKeys();
@@ -170,6 +173,7 @@ public class ZombieCleanupService {
    */
   public int cleanupZombieAgents(
       Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
+    long start = System.currentTimeMillis();
     long currentTime = System.currentTimeMillis();
     List<String> zombieAgentTypes = new ArrayList<>();
 
@@ -273,6 +277,10 @@ public class ZombieCleanupService {
       }
 
       zombiesCleanedUp.addAndGet(totalCleaned);
+      if (metrics != null) {
+        metrics.recordCleanupTime("zombie", System.currentTimeMillis() - start);
+        metrics.incrementCleanupCleaned("zombie", totalCleaned);
+      }
       if (log.isDebugEnabled()) {
         log.debug("Zombie cleanup completed: {} agents cleaned up", totalCleaned);
       }
@@ -280,6 +288,9 @@ public class ZombieCleanupService {
 
     } catch (Exception e) {
       log.error("Error during zombie agent cleanup", e);
+      if (metrics != null) {
+        metrics.recordCleanupTime("zombie", System.currentTimeMillis() - start);
+      }
       return 0;
     }
   }

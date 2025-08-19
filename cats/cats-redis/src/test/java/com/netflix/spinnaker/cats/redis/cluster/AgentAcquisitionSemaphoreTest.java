@@ -74,7 +74,10 @@ public class AgentAcquisitionSemaphoreTest {
     }
 
     // Initialize script manager with real Redis
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     // Mock other dependencies
@@ -107,7 +110,8 @@ public class AgentAcquisitionSemaphoreTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
     // Create test agent
     testAgent = createMockAgent("test-agent", "test-provider");

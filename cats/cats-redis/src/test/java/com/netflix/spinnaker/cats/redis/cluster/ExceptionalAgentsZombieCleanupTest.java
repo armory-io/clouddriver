@@ -88,7 +88,10 @@ class ExceptionalAgentsZombieCleanupTest {
     jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
 
     // Create script manager and initialize scripts
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts(); // Initialize scripts for zombie cleanup
 
     // Mock dependencies
@@ -116,7 +119,12 @@ class ExceptionalAgentsZombieCleanupTest {
       PrioritySchedulerProperties props = createPropertiesWithPattern(".*BigQuery.*");
 
       // When - Create service (triggers pattern compilation)
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Then - Service should be created successfully
       assertThat(zombieCleanupService).isNotNull();
@@ -129,7 +137,12 @@ class ExceptionalAgentsZombieCleanupTest {
       PrioritySchedulerProperties props = createPropertiesWithPattern("");
 
       // When - Create service
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Then - Should work with no exceptional agents
       assertThat(zombieCleanupService).isNotNull();
@@ -142,7 +155,12 @@ class ExceptionalAgentsZombieCleanupTest {
       PrioritySchedulerProperties props = createPropertiesWithPattern("[invalid regex");
 
       // When - Create service (should handle gracefully)
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Then - Service should still be created (pattern will be null internally)
       assertThat(zombieCleanupService).isNotNull();
@@ -153,7 +171,12 @@ class ExceptionalAgentsZombieCleanupTest {
     void shouldRefreshPatternConfigurationAtRuntime() {
       // Given - Service with initial pattern
       PrioritySchedulerProperties props = createPropertiesWithPattern(".*Old.*");
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // When - Update pattern and refresh
       props.getZombieCleanup().getExceptionalAgents().setPattern(".*New.*");
@@ -175,7 +198,12 @@ class ExceptionalAgentsZombieCleanupTest {
       PrioritySchedulerProperties props =
           createTestPropertiesWithExceptionalAgents(
               ".*BigQuery.*", 10000L, 5000L); // 10s exceptional, 5s default
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Simulate agents past default threshold but before exceptional threshold
       Map<String, String> activeAgents = new HashMap<>();
@@ -203,7 +231,12 @@ class ExceptionalAgentsZombieCleanupTest {
       PrioritySchedulerProperties props =
           createTestPropertiesWithExceptionalAgents(
               ".*BigQuery.*", 10000L, 5000L); // 10s exceptional, 5s default
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
@@ -232,7 +265,12 @@ class ExceptionalAgentsZombieCleanupTest {
       PrioritySchedulerProperties props =
           createTestPropertiesWithExceptionalAgents(
               ".*BigQuery.*", 8000L, 5000L); // 8s exceptional, 5s default
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
@@ -263,7 +301,12 @@ class ExceptionalAgentsZombieCleanupTest {
       // Given - Pattern that matches agents containing "BigQuery"
       PrioritySchedulerProperties props =
           createTestPropertiesWithExceptionalAgents(".*BigQuery.*", 10000L, 5000L);
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Test agents with different names
       Map<String, String> activeAgents = new HashMap<>();
@@ -294,7 +337,12 @@ class ExceptionalAgentsZombieCleanupTest {
       // Given - Pattern that matches agents starting with AWS or GCP
       PrioritySchedulerProperties props =
           createTestPropertiesWithExceptionalAgents("^(AWS|GCP).*", 10000L, 5000L);
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
@@ -322,7 +370,12 @@ class ExceptionalAgentsZombieCleanupTest {
       // Given - Pattern that matches agents ending with "Provider"
       PrioritySchedulerProperties props =
           createTestPropertiesWithExceptionalAgents(".*Provider$", 10000L, 5000L);
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
@@ -358,7 +411,12 @@ class ExceptionalAgentsZombieCleanupTest {
       props.getBatchOperations().setEnabled(true);
       props.getBatchOperations().setBatchSize(10);
 
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Create a scheduler to add some agents to Redis
       PriorityAgentScheduler scheduler =
@@ -368,7 +426,8 @@ class ExceptionalAgentsZombieCleanupTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              props);
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Add some agents
       Agent regularAgent = createMockAgent("RegularAgent", "test-provider");
@@ -397,7 +456,12 @@ class ExceptionalAgentsZombieCleanupTest {
               "(.*BigQuery.*|.*Provider$)",
               12000L,
               5000L); // Matches BigQuery or ending with Provider
-      zombieCleanupService = new ZombieCleanupService(jedisPool, scriptManager, props);
+      zombieCleanupService =
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Map<String, String> activeAgents = new HashMap<>();
       Map<String, Future<?>> activeAgentsFutures = new HashMap<>();

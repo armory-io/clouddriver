@@ -76,6 +76,7 @@ public class AgentAcquisitionService {
   private final ShardingFilter shardingFilter;
   private final PriorityAgentProperties agentProperties;
   private final PrioritySchedulerProperties schedulerProperties;
+  private final PrioritySchedulerMetrics metrics;
 
   // Agent tracking
   private final Map<String, AgentWorker> agents = new ConcurrentHashMap<>();
@@ -192,13 +193,15 @@ public class AgentAcquisitionService {
       AgentIntervalProvider intervalProvider,
       ShardingFilter shardingFilter,
       PriorityAgentProperties agentProperties,
-      PrioritySchedulerProperties schedulerProperties) {
+      PrioritySchedulerProperties schedulerProperties,
+      PrioritySchedulerMetrics metrics) {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.intervalProvider = intervalProvider;
     this.shardingFilter = shardingFilter;
     this.agentProperties = agentProperties;
     this.schedulerProperties = schedulerProperties;
+    this.metrics = metrics;
 
     // Resolve configured key names at construction time
     PrioritySchedulerProperties.Keys keysCfg = schedulerProperties.getKeys();
@@ -238,6 +241,10 @@ public class AgentAcquisitionService {
    */
   public int saturatePool(long runCount, Semaphore runningAgents, ExecutorService agentWorkPool) {
     log.debug("Starting agent acquisition cycle {}, known agents: {}", runCount, agents.size());
+    if (metrics != null) {
+      metrics.incrementAcquireAttempts();
+    }
+    long acquireStartMs = System.currentTimeMillis();
 
     try (Jedis jedis = jedisPool.getResource()) {
       // Check concurrent agent limits before processing
@@ -333,6 +340,9 @@ public class AgentAcquisitionService {
                   minIntervalSec,
                   jedisPool.getNumActive(),
                   jedisPool.getNumWaiters());
+              if (metrics != null) {
+                metrics.incrementStallDetected();
+              }
             }
           }
         } catch (Exception ignore) {
@@ -512,6 +522,9 @@ public class AgentAcquisitionService {
       } catch (Exception e) {
         log.error(
             "Error submitting agents for execution, but returning acquisition count anyway", e);
+        if (metrics != null) {
+          metrics.incrementSubmissionFailure(e.getClass().getSimpleName());
+        }
         // Don't return 0 here - agents were successfully acquired from Redis
         // The submission error is a separate issue and shouldn't affect the acquisition count
       }
@@ -520,13 +533,23 @@ public class AgentAcquisitionService {
           "Completed agent acquisition cycle: {} agents acquired and submitted for execution",
           agentsAcquiredThisCycle);
 
+      if (metrics != null) {
+        metrics.incrementAcquired(agentsAcquiredThisCycle);
+        metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
+      }
       return agentsAcquiredThisCycle;
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
       log.warn("Redis connection error during agent acquisition: {}", e.getMessage());
+      if (metrics != null) {
+        metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
+      }
       return 0;
     } catch (Exception e) {
       log.error("Error during agent acquisition cycle", e);
+      if (metrics != null) {
+        metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
+      }
       return 0;
     }
   }
@@ -539,12 +562,20 @@ public class AgentAcquisitionService {
    * @param runCount current scheduler cycle number
    */
   public void repopulateIfDue(long runCount) {
+    long start = System.currentTimeMillis();
     try (Jedis jedis = jedisPool.getResource()) {
       if (runCount % redisRefreshPeriod == 0) {
         repopulateRedisAgents(jedis);
+        if (metrics != null) {
+          metrics.recordRepopulateTime(System.currentTimeMillis() - start);
+        }
       }
     } catch (Exception e) {
       log.warn("Repopulation attempt failed: {}", e.getMessage());
+      if (metrics != null) {
+        metrics.incrementRepopulateError(e.getClass().getSimpleName());
+        metrics.recordRepopulateTime(System.currentTimeMillis() - start);
+      }
     }
   }
 
@@ -1054,6 +1085,26 @@ public class AgentAcquisitionService {
     return lastOldestOverdueSeconds.get();
   }
 
+  /** Snapshot of last computed ready count. */
+  public long getReadyCountSnapshot() {
+    return lastReadyCount.get();
+  }
+
+  /** Snapshot of last computed capacity per cycle. */
+  public long getCapacityPerCycleSnapshot() {
+    return lastCapacityPerCycle.get();
+  }
+
+  /** Size of the completion queue. */
+  public int getCompletionQueueSize() {
+    return completionQueue.size();
+  }
+
+  /** Current Redis server-client offset in milliseconds (positive => server ahead). */
+  public long getServerClientOffsetMs() {
+    return serverClientOffset.get();
+  }
+
   public boolean isDegraded() {
     return lastDegraded.get();
   }
@@ -1325,6 +1376,9 @@ public class AgentAcquisitionService {
                     batchArgs);
         int added = result.size() >= 1 ? ((Long) result.get(0)).intValue() : 0;
         log.debug("Batch added {} missing agents to Redis", added);
+        if (metrics != null && added > 0) {
+          metrics.incrementRepopulateAdded(added);
+        }
       } catch (Exception e) {
         log.warn("Batch add failed, using individual mode: {}", e.getMessage());
         addMissingAgentsIndividual(jedis, agentsToAdd);
@@ -1360,6 +1414,9 @@ public class AgentAcquisitionService {
       }
     }
     log.debug("Individual added {} missing agents to Redis", added);
+    if (metrics != null && added > 0) {
+      metrics.incrementRepopulateAdded(added);
+    }
   }
 
   /**
@@ -1463,6 +1520,9 @@ public class AgentAcquisitionService {
 
       log.debug(
           "Repopulated Redis with {} agents ({} actually added/updated)", totalAgents, totalAdded);
+      if (metrics != null && totalAdded > 0) {
+        metrics.incrementRepopulateAdded(totalAdded);
+      }
 
     } catch (Exception e) {
       log.error(

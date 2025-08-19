@@ -138,7 +138,8 @@ public class PrioritySchedulerComplexScenariosTest {
             mockIntervalProvider,
             mockShardingFilter,
             mockAgentProperties,
-            mockSchedulerProperties);
+            mockSchedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
     testExecutor = Executors.newFixedThreadPool(10);
   }

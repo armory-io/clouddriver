@@ -65,7 +65,10 @@ class RepopulationPresenceIntegrationTest {
     config.setMaxTotal(32);
     jedisPool = new JedisPool(config, redis.getHost(), redis.getFirstMappedPort());
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     intervalProvider = mock(AgentIntervalProvider.class);
@@ -95,7 +98,8 @@ class RepopulationPresenceIntegrationTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
     agentWorkPool = Executors.newFixedThreadPool(8);
 

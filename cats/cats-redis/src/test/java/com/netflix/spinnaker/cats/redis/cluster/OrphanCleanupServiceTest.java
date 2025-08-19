@@ -80,7 +80,10 @@ class OrphanCleanupServiceTest {
     config.setMaxTotal(10);
     jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     schedulerProperties = new PrioritySchedulerProperties();
@@ -92,7 +95,12 @@ class OrphanCleanupServiceTest {
     schedulerProperties.getOrphanCleanup().setEnabled(true);
     schedulerProperties.getBatchOperations().setBatchSize(50);
 
-    orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
+    orphanService =
+        new OrphanCleanupService(
+            jedisPool,
+            scriptManager,
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @Nested
@@ -155,7 +163,8 @@ class OrphanCleanupServiceTest {
               intervalProvider,
               shardingFilter,
               agentProps,
-              schedulerProps);
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent valid = mock(Agent.class);
       when(valid.getAgentType()).thenReturn("valid-agent");
@@ -200,7 +209,13 @@ class OrphanCleanupServiceTest {
 
       AgentAcquisitionService acq =
           new AgentAcquisitionService(
-              jedisPool, scriptManager, intervalProvider, shardA, agentProps, schedulerProps);
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardA,
+              agentProps,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Wire acquisition service so orphan cleanup can evaluate shard ownership
       orphanService.setAcquisitionService(acq);
@@ -261,7 +276,13 @@ class OrphanCleanupServiceTest {
       when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
       AgentAcquisitionService acq =
           new AgentAcquisitionService(
-              jedisPool, scriptManager, intervalProvider, shardingFilter, agentProps, props);
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardingFilter,
+              agentProps,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       Agent waitingRecent = mock(Agent.class);
       when(waitingRecent.getAgentType()).thenReturn("waiting-recent");
       acq.registerAgent(
@@ -312,7 +333,8 @@ class OrphanCleanupServiceTest {
               intervalProvider,
               shardingFilter,
               agentProps,
-              schedulerProps);
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       Agent valid = mock(Agent.class);
       when(valid.getAgentType()).thenReturn("valid-waiting");
       acq.registerAgent(valid, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
@@ -340,7 +362,12 @@ class OrphanCleanupServiceTest {
     void shouldSkipCleanupWhenDisabled() {
       // Given - Disable orphan cleanup
       schedulerProperties.getOrphanCleanup().setEnabled(false);
-      orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
+      orphanService =
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Add orphaned agents
       // Redis scores are stored as seconds since epoch, not milliseconds
@@ -363,7 +390,12 @@ class OrphanCleanupServiceTest {
     void shouldRespectBatchSizeConfiguration() {
       // Given - Set small batch size
       schedulerProperties.getBatchOperations().setBatchSize(2);
-      orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
+      orphanService =
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Add more orphans than batch size
       // Redis scores are stored as seconds since epoch, not milliseconds
@@ -393,7 +425,12 @@ class OrphanCleanupServiceTest {
     void shouldUseConfigurableThresholds() {
       // Given - Set very short threshold
       schedulerProperties.getOrphanCleanup().setThresholdMs(5000L); // 5 seconds
-      orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
+      orphanService =
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Add agent older than 5 seconds
       // Redis scores are stored as seconds since epoch, not milliseconds
@@ -437,7 +474,12 @@ class OrphanCleanupServiceTest {
     void shouldPerformCleanupAfterIntervalHasElapsed() throws InterruptedException {
       // Given - Set very short interval for testing
       schedulerProperties.getOrphanCleanup().setIntervalMs(100L); // 100 ms
-      orphanService = new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties);
+      orphanService =
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // First cleanup
       orphanService.cleanupOrphanedAgentsIfNeeded();
@@ -493,7 +535,11 @@ class OrphanCleanupServiceTest {
           .thenReturn("invalid-sha");
 
       OrphanCleanupService invalidService =
-          new OrphanCleanupService(jedisPool, invalidScriptManager, schedulerProperties);
+          new OrphanCleanupService(
+              jedisPool,
+              invalidScriptManager,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Add orphaned agent
       try (Jedis jedis = jedisPool.getResource()) {
@@ -837,7 +883,13 @@ class OrphanCleanupServiceTest {
       when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
       AgentAcquisitionService acq =
           new AgentAcquisitionService(
-              jedisPool, scriptManager, intervalProvider, shardingFilter, agentProps, props);
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardingFilter,
+              agentProps,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       Agent valid = mock(Agent.class);
       when(valid.getAgentType()).thenReturn("valid-agent");
       acq.registerAgent(valid, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
@@ -946,7 +998,8 @@ class OrphanCleanupServiceTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Wire the orphan cleanup service to use the real acquisition service
       orphanService.setAcquisitionService(acquisitionService);

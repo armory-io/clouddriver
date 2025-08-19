@@ -73,7 +73,10 @@ public class BatchOperationEdgeCasesTest {
       jedis.flushAll();
     }
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     schedulerProperties = new PrioritySchedulerProperties();
@@ -96,8 +99,14 @@ public class BatchOperationEdgeCasesTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
-    zombieService = new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+    zombieService =
+        new ZombieCleanupService(
+            jedisPool,
+            scriptManager,
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @AfterEach
@@ -205,7 +214,8 @@ public class BatchOperationEdgeCasesTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Copy agents to the new service
       for (int i = 1; i <= 5; i++) {
@@ -243,7 +253,8 @@ public class BatchOperationEdgeCasesTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Register agents
       for (int i = 1; i <= 3; i++) {

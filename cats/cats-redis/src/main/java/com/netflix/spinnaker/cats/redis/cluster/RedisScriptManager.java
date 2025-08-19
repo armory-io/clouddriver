@@ -19,6 +19,7 @@ package com.netflix.spinnaker.cats.redis.cluster;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -132,14 +133,16 @@ public class RedisScriptManager {
       "releaseLeadership"; // Distributed leadership release
 
   private final JedisPool jedisPool;
+  private final PrioritySchedulerMetrics metrics;
   private final Map<String, String> scriptShas = new ConcurrentHashMap<>();
   private final AtomicBoolean initialized = new AtomicBoolean(false);
 
   // Single source of truth for Lua bodies used by both scriptLoad and EVAL fallback
   private final Map<String, String> scriptBodies = new ConcurrentHashMap<>();
 
-  public RedisScriptManager(JedisPool jedisPool) {
+  public RedisScriptManager(JedisPool jedisPool, PrioritySchedulerMetrics metrics) {
     this.jedisPool = jedisPool;
+    this.metrics = metrics;
   }
 
   /**
@@ -212,24 +215,38 @@ public class RedisScriptManager {
    */
   public Object evalshaWithSelfHeal(
       Jedis jedis, String scriptName, java.util.List<String> keys, java.util.List<String> args) {
+    long start = System.nanoTime();
     try {
-      return jedis.evalsha(getScriptSha(scriptName), keys, args);
+      Object result = jedis.evalsha(getScriptSha(scriptName), keys, args);
+      metrics.recordScriptEval(
+          scriptName, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+      return result;
     } catch (redis.clients.jedis.exceptions.JedisDataException e) {
       String msg = e.getMessage();
       if (msg != null && msg.contains("NOSCRIPT")) {
         try {
           // Reload all scripts once
+          metrics.incrementScriptsReload();
           loadAllScripts(jedis);
           // Retry EVALSHA
-          return jedis.evalsha(getScriptSha(scriptName), keys, args);
+          long retryStart = System.nanoTime();
+          Object result = jedis.evalsha(getScriptSha(scriptName), keys, args);
+          metrics.recordScriptEval(
+              scriptName, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - retryStart));
+          return result;
         } catch (Exception retry) {
           // Final fallback: EVAL with body if available
           String body = getScriptBody(scriptName);
           if (body != null) {
-            return jedis.eval(body, keys, args);
+            long evalStart = System.nanoTime();
+            Object result = jedis.eval(body, keys, args);
+            metrics.recordScriptEval(
+                scriptName, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - evalStart));
+            return result;
           }
         }
       }
+      metrics.incrementScriptError(scriptName, e.getClass().getSimpleName());
       throw e;
     }
   }

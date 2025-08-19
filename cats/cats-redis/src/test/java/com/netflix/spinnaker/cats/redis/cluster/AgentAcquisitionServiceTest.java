@@ -83,7 +83,10 @@ class AgentAcquisitionServiceTest {
     config.setMaxTotal(10);
     jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     // Mock dependencies
@@ -117,7 +120,8 @@ class AgentAcquisitionServiceTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @AfterEach
@@ -155,7 +159,8 @@ class AgentAcquisitionServiceTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @Nested
@@ -199,7 +204,8 @@ class AgentAcquisitionServiceTest {
               intervalProvider,
               shardingFilter,
               testAgentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // When
       acquisitionService.registerAgent(agent, execution, instrumentation);
@@ -458,10 +464,22 @@ class AgentAcquisitionServiceTest {
 
       AgentAcquisitionService acqA =
           new AgentAcquisitionService(
-              jedisPool, scriptManager, intervalProvider, shardA, props, schedProps);
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardA,
+              props,
+              schedProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       AgentAcquisitionService acqB =
           new AgentAcquisitionService(
-              jedisPool, scriptManager, intervalProvider, shardB, props, schedProps);
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardB,
+              props,
+              schedProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       AgentExecution execution = mock(AgentExecution.class);
       ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
@@ -1107,7 +1125,8 @@ class AgentAcquisitionServiceTest {
               intervalProvider,
               shardingFilter,
               agentProperties,
-              schedulerProperties);
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       for (int i = 1; i <= 3; i++) {
         Agent agent = createMockAgent("race-agent-" + i, "test-provider");

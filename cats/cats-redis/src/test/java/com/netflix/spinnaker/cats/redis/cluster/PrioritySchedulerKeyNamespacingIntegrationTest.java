@@ -58,7 +58,10 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
     int redisPort = redis.getFirstMappedPort();
     jedisPool = new JedisPool(new JedisPoolConfig(), redisHost, redisPort);
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     intervalProvider = mock(AgentIntervalProvider.class);
@@ -100,7 +103,8 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProps,
-              schedulerProps);
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent agent = mock(Agent.class);
       when(agent.getAgentType()).thenReturn("TestAgent-Prefix");
@@ -119,7 +123,11 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
       // Verify orphan cleanup leadership uses prefixed key by acquiring and checking existence
       // briefly
       OrphanCleanupService orphanService =
-          new OrphanCleanupService(jedisPool, scriptManager, schedulerProps);
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       Method tryAcquire =
           OrphanCleanupService.class.getDeclaredMethod("tryAcquireCleanupLeadership");
       tryAcquire.setAccessible(true);
@@ -160,7 +168,8 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProps,
-              schedulerProps);
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent agent = mock(Agent.class);
       when(agent.getAgentType()).thenReturn("TestAgent-Hash");
@@ -184,7 +193,11 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
       schedulerProps.getKeys().setCleanupLeaderKey("cleanup-leader");
 
       OrphanCleanupService orphanService =
-          new OrphanCleanupService(jedisPool, scriptManager, schedulerProps);
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       Method tryAcquire =
           OrphanCleanupService.class.getDeclaredMethod("tryAcquireCleanupLeadership");
       tryAcquire.setAccessible(true);
@@ -226,7 +239,8 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProps,
-              schedulerProps);
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent agent = mock(Agent.class);
       when(agent.getAgentType()).thenReturn("TestAgent-Combo");
@@ -242,7 +256,11 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
 
       // Leadership key with prefix + hash-tag
       OrphanCleanupService orphanService =
-          new OrphanCleanupService(jedisPool, scriptManager, schedulerProps);
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       try {
         Method tryAcquire =
             OrphanCleanupService.class.getDeclaredMethod("tryAcquireCleanupLeadership");
@@ -280,7 +298,8 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProps,
-              schedulerProps);
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent agent = mock(Agent.class);
       when(agent.getAgentType()).thenReturn("Agent-Acq");
@@ -324,7 +343,11 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
       schedulerProps.getOrphanCleanup().setThresholdMs(60_000L);
 
       OrphanCleanupService orphanService =
-          new OrphanCleanupService(jedisPool, scriptManager, schedulerProps);
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Add an old working orphan to the prefixed key only
       long oldScoreSeconds = (System.currentTimeMillis() - 5 * 60 * 1000) / 1000; // 5 minutes ago
@@ -366,7 +389,8 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
               intervalProvider,
               shardingFilter,
               agentProps,
-              schedulerProps);
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       Agent agent = mock(Agent.class);
       when(agent.getAgentType()).thenReturn("Agent-Custom");
@@ -381,7 +405,11 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
       }
 
       OrphanCleanupService orphanService =
-          new OrphanCleanupService(jedisPool, scriptManager, schedulerProps);
+          new OrphanCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
       Method tryAcquire =
           OrphanCleanupService.class.getDeclaredMethod("tryAcquireCleanupLeadership");
       tryAcquire.setAccessible(true);
@@ -494,7 +522,11 @@ class PrioritySchedulerKeyNamespacingIntegrationTest {
       schedulerProps.getKeys().setHashTag("ps");
 
       ZombieCleanupService zombieService =
-          new ZombieCleanupService(jedisPool, scriptManager, schedulerProps);
+          new ZombieCleanupService(
+              jedisPool,
+              scriptManager,
+              schedulerProps,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
 
       // Prepare an overdue agent in the namespaced working set
       String agentType = "Zombie-A";

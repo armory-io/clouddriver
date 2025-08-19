@@ -76,7 +76,10 @@ class BatchScoringIntegrationTest {
     int redisPort = redis.getFirstMappedPort();
     jedisPool = new JedisPool(new JedisPoolConfig(), redisHost, redisPort);
 
-    scriptManager = new RedisScriptManager(jedisPool);
+    scriptManager =
+        new RedisScriptManager(
+            jedisPool,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
     scriptManager.initializeScripts();
 
     // Mock dependencies
@@ -110,7 +113,8 @@ class BatchScoringIntegrationTest {
             intervalProvider,
             shardingFilter,
             agentProperties,
-            schedulerProperties);
+            schedulerProperties,
+            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
   }
 
   @AfterEach
