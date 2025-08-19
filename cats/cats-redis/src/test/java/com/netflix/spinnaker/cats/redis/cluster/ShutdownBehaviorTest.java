@@ -296,14 +296,17 @@ class ShutdownBehaviorTest {
             .describedAs("Active agents should be re-queued in waiting")
             .contains("agent-1", "agent-2", "agent-3");
 
-        // Verify they have immediate execution scores (current time or very close)
-        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+        // Verify they have cadence-based next scores derived from acquire metadata
+        // interval=1s, timeout=5s (from setUp) → expected next ≈ completionDeadline - 4 seconds
+        long expectedNextSec = Long.parseLong(expectedScore) - 4L;
         for (String agentType : activeAgents) {
           Double score = jedis.zscore("waiting", agentType);
           assertThat(score)
-              .describedAs("Agent %s should have immediate execution score", agentType)
-              .isNotNull()
-              .isLessThanOrEqualTo(currentTimeSeconds + 60.0); // Within 1 minute
+              .describedAs("Agent %s should be scheduled near cadence", agentType)
+              .isNotNull();
+          long actual = score.longValue();
+          // Allow tolerance for TIME rounding and runtime variability
+          assertThat(actual).isBetween(expectedNextSec - 5L, expectedNextSec + 5L);
         }
 
         // Previously running agents should now be in waiting (moved from working)

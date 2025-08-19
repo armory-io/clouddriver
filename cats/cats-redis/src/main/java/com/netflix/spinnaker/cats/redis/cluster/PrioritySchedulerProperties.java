@@ -88,15 +88,9 @@ public class PrioritySchedulerProperties {
   @Setter(AccessLevel.NONE)
   private FailureBackoffProperties failureBackoff = new FailureBackoffProperties();
 
-  /**
-   * Optional jitter applied when initially registering new agents (in seconds). A positive value
-   * spreads first execution across the window to reduce thundering herds. Default: 0 (disabled).
-   * Config key: {@code redis.scheduler.initial-registration-jitter-seconds}
-   *
-   * <p>Lombok disabled: setter is custom and clamps to non-negative values.
-   */
+  /** Unified jitter configuration block (seconds-based for scheduling). */
   @Setter(AccessLevel.NONE)
-  private int initialRegistrationJitterSeconds = 0;
+  private JitterProperties jitter = new JitterProperties();
 
   /**
    * Configurable Redis key names and namespacing for the scheduler's data structures.
@@ -132,8 +126,15 @@ public class PrioritySchedulerProperties {
     this.failureBackoff = failureBackoff;
   }
 
-  public void setInitialRegistrationJitterSeconds(int initialRegistrationJitterSeconds) {
-    this.initialRegistrationJitterSeconds = Math.max(0, initialRegistrationJitterSeconds);
+  public JitterProperties getJitter() {
+    if (jitter == null) {
+      jitter = new JitterProperties();
+    }
+    return jitter;
+  }
+
+  public void setJitter(JitterProperties jitter) {
+    this.jitter = jitter != null ? jitter : new JitterProperties();
   }
 
   /** Returns the configured Redis key naming and namespacing options. */
@@ -249,6 +250,30 @@ public class PrioritySchedulerProperties {
       throw new IllegalArgumentException(
           "redis.scheduler.keys.cleanup-leader-key must not be empty");
     }
+
+    // Jitter validation
+    if (jitter == null) {
+      jitter = new JitterProperties();
+    }
+    if (jitter.getInitialRegistrationSeconds() < 0) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.jitter.initial-registration-seconds must be >= 0");
+    }
+    if (jitter.getShutdownSeconds() < 0) {
+      throw new IllegalArgumentException("redis.scheduler.jitter.shutdown-seconds must be >= 0");
+    }
+    if (jitter.getFailureBackoffRatio() < 0.0 || jitter.getFailureBackoffRatio() > 1.0) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.jitter.failure-backoff-ratio must be in [0.0, 1.0]");
+    }
+    if (jitter.getTimeSyncStartJitterMs() < 0) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.jitter.time-sync-start-jitter-ms must be >= 0");
+    }
+    if (jitter.getTiebreakHashSeconds() < 0) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.jitter.tiebreak-hash-seconds must be >= 0");
+    }
   }
 
   private static void validatePositive(long v, String name) {
@@ -326,12 +351,6 @@ class FailureBackoffProperties {
   /** Master switch for failure-aware backoff. */
   private boolean enabled = false;
 
-  /**
-   * Jitter ratio applied to non-zero backoff delays. 0.1 means +/-10% randomization to avoid
-   * synchronized retries.
-   */
-  private double jitterRatio = 0.1d;
-
   /** Number of immediate retries before applying errorInterval for transient/server errors. */
   private int maxImmediateRetries = 0;
 
@@ -369,6 +388,31 @@ class FailureBackoffProperties {
     /** Upper cap for throttled exponential backoff. */
     private long capMs = java.util.concurrent.TimeUnit.MINUTES.toMillis(10);
   }
+}
+
+/**
+ * Unified jitter configuration properties. All schedule-affecting jitters use whole seconds to
+ * match Redis ZSET score granularity.
+ */
+@Getter
+@Setter
+class JitterProperties {
+  /** One-shot whole-second spread for first insert (new/missing agents). Default: 0 (disabled). */
+  private int initialRegistrationSeconds = 0;
+
+  /** Fallback whole-second smoothing for shutdown requeue when cadence metadata is unavailable. */
+  private int shutdownSeconds = 0;
+
+  /** ±ratio applied to non-zero failure backoff delays. Range [0.0, 1.0]. Default: 0.1. */
+  private double failureBackoffRatio = 0.1d;
+
+  /** Infra-only: start jitter for the TIME sync ticker (milliseconds). */
+  private long timeSyncStartJitterMs = 500L;
+
+  /**
+   * Optional deterministic whole-second tie-breaker phase by stable hash. Default: 0 (disabled).
+   */
+  private int tiebreakHashSeconds = 0;
 }
 
 /**

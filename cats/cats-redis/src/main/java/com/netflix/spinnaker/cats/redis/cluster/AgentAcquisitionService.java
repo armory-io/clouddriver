@@ -1134,8 +1134,9 @@ public class AgentAcquisitionService {
     String agentType = agent.getAgentType();
 
     try (Jedis jedis = jedisPool.getResource()) {
-      // Calculate immediate execution score for restart (seconds since epoch)
-      String nextScore = score(jedis, 0L);
+      // Calculate cadence-based or jittered execution score for restart (seconds since epoch)
+      long offsetMs = computeShutdownRescheduleOffsetMs(agent, expectedScore);
+      String nextScore = score(jedis, offsetMs);
 
       log.debug(
           "Shutdown re-queue attempt: {} expected_score={} next_score={}",
@@ -1424,7 +1425,7 @@ public class AgentAcquisitionService {
    * jitter is disabled.
    */
   private long computeInitialRegistrationJitterSeconds() {
-    int window = schedulerProperties.getInitialRegistrationJitterSeconds();
+    int window = schedulerProperties.getJitter().getInitialRegistrationSeconds();
     if (window <= 0) {
       return 0L;
     }
@@ -1705,7 +1706,7 @@ public class AgentAcquisitionService {
 
       // Apply jitter if configured and offset > 0
       if (offsetMs > 0L) {
-        offsetMs = applyJitter(offsetMs, backoffCfg.getJitterRatio());
+        offsetMs = applyJitter(offsetMs, schedulerProperties.getJitter().getFailureBackoffRatio());
       }
     } catch (Exception e) {
       log.warn(
@@ -2180,10 +2181,16 @@ public class AgentAcquisitionService {
     String agentType = agent.getAgentType();
 
     try {
-      // During shutdown, immediately schedule (bypass queue for urgent shutdown handling)
+      // During shutdown, schedule using cadence-based next when possible; fallback to
+      // configured shutdown jitter (whole seconds) to avoid bursts.
       if (shuttingDown.get()) {
-        log.debug("Immediate re-queuing agent {} due to shutdown in progress", agentType);
-        scheduleAgentInRedis(agent, 0L); // Schedule for immediate pickup after restart
+        long shutdownOffsetMs = computeShutdownRescheduleOffsetMs(agent, acquireScore);
+        log.debug(
+            "Shutdown re-queue agent {} with offset {} ms (acquireScore={})",
+            agentType,
+            shutdownOffsetMs,
+            acquireScore);
+        scheduleAgentInRedis(agent, Math.max(0L, shutdownOffsetMs));
         return;
       }
 
@@ -2226,6 +2233,43 @@ public class AgentAcquisitionService {
         log.error("Failed fallback scheduling for agent {}", agentType, fallbackException);
       }
     }
+  }
+
+  /**
+   * Compute shutdown requeue offset using acquire-based cadence when available; fallback to a small
+   * whole-second jitter window from configuration.
+   */
+  private long computeShutdownRescheduleOffsetMs(Agent agent, String acquireScore) {
+    try {
+      AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
+      long intervalMs = interval.getInterval();
+      if (acquireScore != null) {
+        try {
+          long acquireScoreSeconds = Long.parseLong(acquireScore);
+          long agentTimeoutMs = interval.getTimeout();
+          long originalAcquireMs = (acquireScoreSeconds * 1000L) - agentTimeoutMs;
+          long desiredNextRunMs = originalAcquireMs + intervalMs;
+          long nowMs = System.currentTimeMillis() + serverClientOffset.get();
+          return Math.max(desiredNextRunMs - nowMs, 0L);
+        } catch (NumberFormatException ignored) {
+          // Fall through to jitter fallback
+        }
+      }
+    } catch (Exception e) {
+      // Ignore and use jitter fallback
+    }
+
+    int windowSec = 0;
+    try {
+      windowSec = Math.max(0, schedulerProperties.getJitter().getShutdownSeconds());
+    } catch (Exception ignored) {
+      windowSec = 0;
+    }
+    if (windowSec <= 0) {
+      return 0L;
+    }
+    int s = java.util.concurrent.ThreadLocalRandom.current().nextInt(1, windowSec + 1);
+    return s * 1000L;
   }
 
   /**
@@ -2319,11 +2363,13 @@ public class AgentAcquisitionService {
       List<AgentCompletion> completions = drainCompletionQueue();
       int processed = 0;
 
-      // Process each completion immediately with 0ms offset (instant execution on restart)
+      // Process each completion with cadence-based or jittered offset to avoid restart bursts
       for (AgentCompletion completion : completions) {
         try {
           String agentType = completion.agent.getAgentType();
-          String score = score(jedis, 0L); // Schedule for immediate execution after restart
+          long offsetMs =
+              computeShutdownRescheduleOffsetMs(completion.agent, completion.acquireScore);
+          String score = score(jedis, offsetMs);
 
           Object result =
               jedis.evalsha(

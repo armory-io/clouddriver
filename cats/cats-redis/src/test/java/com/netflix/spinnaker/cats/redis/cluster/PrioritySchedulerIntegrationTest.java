@@ -103,6 +103,159 @@ public class PrioritySchedulerIntegrationTest {
   }
 
   @Nested
+  @DisplayName("Shutdown Requeue Smoothing Tests")
+  class ShutdownRequeueSmoothingTests {
+
+    @Test
+    @DisplayName("forceRequeueAgentForShutdown uses cadence-based next when acquireScore available")
+    void forceRequeueUsesCadenceWhenAcquireScorePresent() throws Exception {
+      // Properties with small shutdown fallback (unused in this path)
+      PrioritySchedulerProperties props = createDefaultSchedulerProperties();
+      props.getJitter().setShutdownSeconds(2);
+
+      // Script manager and acquisition service (use a timeout matching the WORKZ deadline we
+      // insert)
+      PrioritySchedulerMetrics metrics =
+          new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry());
+      RedisScriptManager scriptManager = new RedisScriptManager(jedisPool, metrics);
+      scriptManager.initializeScripts();
+
+      AgentIntervalProvider intervalForTest = mock(AgentIntervalProvider.class);
+      when(intervalForTest.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(30000L, 5000L, 5000L));
+
+      AgentAcquisitionService acq =
+          new AgentAcquisitionService(
+              jedisPool,
+              scriptManager,
+              intervalForTest,
+              shardingFilter,
+              agentProperties,
+              props,
+              metrics);
+
+      Agent agent = createMockAgent("shutdown-cadence-agent", "test");
+
+      long nowSec;
+      try (var jedis = jedisPool.getResource()) {
+        java.util.List<String> t = jedis.time();
+        nowSec = Long.parseLong(t.get(0));
+        // Simulate agent currently in WORKZ with deadline = now + timeout (5s from setUp)
+        long deadlineSec = nowSec + 5L;
+        jedis.zadd("working", deadlineSec, agent.getAgentType());
+
+        // Call shutdown requeue with expected score
+        acq.forceRequeueAgentForShutdown(agent, Long.toString(deadlineSec));
+      }
+
+      // Verify the agent is re-queued into WAITZ near next cadence. With interval=30s and
+      // timeout=5s,
+      // desired next is originalAcquireMs + 30s. We inserted WORKZ deadline = now + 5s, so delta ≈
+      // 30s.
+      try (var jedis = jedisPool.getResource()) {
+        Double s = jedis.zscore("waiting", agent.getAgentType());
+        assertThat(s).isNotNull();
+        long delta = s.longValue() - nowSec;
+        assertThat(delta).isBetween(28L, 32L);
+      }
+    }
+
+    @Test
+    @DisplayName("conditionalReleaseAgent uses shutdownSeconds fallback when acquireScore is null")
+    void conditionalReleaseUsesShutdownSecondsFallback() {
+      PrioritySchedulerProperties props = createDefaultSchedulerProperties();
+      props.getJitter().setShutdownSeconds(3);
+
+      PrioritySchedulerMetrics metrics =
+          new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry());
+      RedisScriptManager scriptManager = new RedisScriptManager(jedisPool, metrics);
+      scriptManager.initializeScripts();
+
+      AgentAcquisitionService acq =
+          new AgentAcquisitionService(
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              props,
+              metrics);
+
+      // Force shutdown mode
+      acq.setShuttingDown(true);
+
+      Agent agent = createMockAgent("shutdown-fallback-agent", "test");
+      // Trigger conditional release with success=true and acquireScore=null
+      acq.conditionalReleaseAgent(agent, null, true, null, null);
+
+      try (var jedis = jedisPool.getResource()) {
+        Double s = jedis.zscore("waiting", agent.getAgentType());
+        assertThat(s).isNotNull();
+        java.util.List<String> t = jedis.time();
+        long nowSec = Long.parseLong(t.get(0));
+        long delta = s.longValue() - nowSec;
+        assertThat(delta).isBetween(1L, 3L);
+      }
+    }
+  }
+
+  @Nested
+  @DisplayName("Failure Backoff Jitter Enabled Tests")
+  class FailureBackoffJitterEnabledTests {
+
+    @Test
+    @DisplayName("Failure backoff applies ±ratio jitter and rounds to seconds")
+    void failureBackoffAppliesJitter() throws Exception {
+      PrioritySchedulerProperties props = createDefaultSchedulerProperties();
+      // Enable failure-aware backoff and set jitter ratio
+      props.getFailureBackoff().setEnabled(true);
+      props.getFailureBackoff().setMaxImmediateRetries(0);
+      props.getJitter().setFailureBackoffRatio(0.2d); // ±20%
+
+      Agent a = createMockAgent("fail-jitter-agent", "test");
+      MockAgentExecution exec = new MockAgentExecution();
+      exec.setShouldFail(true);
+
+      PriorityAgentScheduler sched =
+          new PriorityAgentScheduler(
+              jedisPool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              props,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+      sched.initialize();
+      sched.schedule(a, exec, new MockInstrumentation());
+
+      // First cycle: execute and enqueue completion
+      sched.run();
+      Thread.sleep(150);
+      // Second cycle: process completion and reschedule with jittered errorInterval
+      sched.run();
+
+      Double s = null;
+      for (int i = 0; i < 10 && s == null; i++) {
+        try (var jedis = jedisPool.getResource()) {
+          s = jedis.zscore("waiting", "fail-jitter-agent");
+        }
+        if (s == null) {
+          Thread.sleep(50);
+        }
+      }
+      assertThat(s).isNotNull();
+      long nowSec;
+      try (var jedis = jedisPool.getResource()) {
+        java.util.List<String> times = jedis.time();
+        nowSec = Long.parseLong(times.get(0));
+      }
+      long delta = s.longValue() - nowSec;
+      // errorInterval = 5s; ±20% => [4,6] seconds after rounding
+      assertThat(delta).isBetween(4L, 6L);
+    }
+  }
+
   @DisplayName("Agent Registration Tests")
   class AgentRegistrationTests {
 
@@ -795,7 +948,7 @@ public class PrioritySchedulerIntegrationTest {
     @DisplayName("New agents get score within jitter window when enabled")
     void newAgentsGetScoreWithinJitterWindow() {
       PrioritySchedulerProperties props = createDefaultSchedulerProperties();
-      props.setInitialRegistrationJitterSeconds(3);
+      props.getJitter().setInitialRegistrationSeconds(3);
       props.setRefreshPeriodSeconds(1); // Trigger repopulation on first run
 
       PriorityAgentScheduler sched =
@@ -834,7 +987,7 @@ public class PrioritySchedulerIntegrationTest {
     @DisplayName("Existing agents do not get jitter applied")
     void existingAgentsDoNotGetJitterApplied() {
       PrioritySchedulerProperties props = createDefaultSchedulerProperties();
-      props.setInitialRegistrationJitterSeconds(5);
+      props.getJitter().setInitialRegistrationSeconds(5);
       props.setRefreshPeriodSeconds(1);
 
       // First scheduler registers the agent (initial immediate score)

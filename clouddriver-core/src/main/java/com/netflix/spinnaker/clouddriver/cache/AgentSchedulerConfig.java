@@ -152,12 +152,11 @@ public class AgentSchedulerConfig {
 
     // Log scheduler configuration for operational visibility
     log.info(
-        "PriorityAgentScheduler configuration: maxConcurrentAgents={}, schedulerIntervalMs={}, refreshPeriodSeconds={}, timeCacheDurationMs={}, initialRegistrationJitterSeconds={}",
+        "PriorityAgentScheduler configuration: maxConcurrentAgents={}, schedulerIntervalMs={}, refreshPeriodSeconds={}, timeCacheDurationMs={}",
         agentProperties.getMaxConcurrentAgents(),
         schedulerProperties.getIntervalMs(),
         schedulerProperties.getRefreshPeriodSeconds(),
-        schedulerProperties.getTimeCacheDurationMs(),
-        schedulerProperties.getInitialRegistrationJitterSeconds());
+        schedulerProperties.getTimeCacheDurationMs());
 
     log.info(
         "PriorityAgentScheduler thread pool: coreSize={}, maxSize={}, keepAliveSeconds={}",
@@ -196,7 +195,6 @@ public class AgentSchedulerConfig {
         schedulerProperties.getBatchOperations().isEnabled(),
         schedulerProperties.getBatchOperations().getBatchSize());
 
-    // Redis key namespacing configuration
     log.info(
         "PriorityAgentScheduler Redis keys: prefix='{}', hashTag='{}', waitingSet='{}', workingSet='{}', cleanupLeaderKey='{}'",
         schedulerProperties.getKeys().getPrefix(),
