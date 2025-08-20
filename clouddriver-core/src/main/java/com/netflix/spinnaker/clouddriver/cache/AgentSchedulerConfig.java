@@ -15,6 +15,7 @@
  */
 package com.netflix.spinnaker.clouddriver.cache;
 
+import com.netflix.spectator.api.Registry;
 import com.netflix.spinnaker.cats.agent.AgentScheduler;
 import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.DefaultNodeIdentity;
@@ -45,6 +46,11 @@ import redis.clients.jedis.JedisPool;
 public class AgentSchedulerConfig {
 
   private static final Logger log = LoggerFactory.getLogger(AgentSchedulerConfig.class);
+
+  @Bean
+  public PrioritySchedulerMetrics prioritySchedulerMetrics(Registry registry) {
+    return new PrioritySchedulerMetrics(registry);
+  }
 
   /**
    * Creates the "default" Redis agent scheduler. This bean is only created if redis.scheduler.type
