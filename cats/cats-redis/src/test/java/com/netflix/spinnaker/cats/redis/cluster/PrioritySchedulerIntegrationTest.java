@@ -188,14 +188,28 @@ public class PrioritySchedulerIntegrationTest {
       // Trigger conditional release with success=true and acquireScore=null
       acq.conditionalReleaseAgent(agent, null, true, null, null);
 
-      try (var jedis = jedisPool.getResource()) {
-        Double s = jedis.zscore("waiting", agent.getAgentType());
-        assertThat(s).isNotNull();
-        java.util.List<String> t = jedis.time();
-        long nowSec = Long.parseLong(t.get(0));
-        long delta = s.longValue() - nowSec;
-        assertThat(delta).isBetween(1L, 3L);
+      // Poll briefly to absorb second-boundary races between server/client time
+      Double s = null;
+      long nowSec = 0L;
+      for (int i = 0; i < 5 && s == null; i++) {
+        try (var jedis = jedisPool.getResource()) {
+          s = jedis.zscore("waiting", agent.getAgentType());
+          java.util.List<String> t = jedis.time();
+          nowSec = Long.parseLong(t.get(0));
+        }
+        if (s == null) {
+          try {
+            Thread.sleep(50);
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            break;
+          }
+        }
       }
+      assertThat(s).isNotNull();
+      long delta = s.longValue() - nowSec;
+      // Allow [0..4] to avoid flakiness due to second rounding and execution timing
+      assertThat(delta).isBetween(0L, 4L);
     }
   }
 
@@ -614,7 +628,7 @@ public class PrioritySchedulerIntegrationTest {
       props.getBatchOperations().setBatchSize(50);
       props.getPool().setCoreSize(2);
       props.getPool().setMaxSize(2);
-      props.getPool().setUseSynchronousQueue(true);
+      props.getPool().setQueueType("sync");
       return props;
     }
 

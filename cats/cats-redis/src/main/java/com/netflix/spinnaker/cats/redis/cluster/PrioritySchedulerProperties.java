@@ -274,6 +274,29 @@ public class PrioritySchedulerProperties {
       throw new IllegalArgumentException(
           "redis.scheduler.jitter.tiebreak-hash-seconds must be >= 0");
     }
+
+    // Queue selection validation
+    String queueType = pool.getQueueType();
+    if (queueType == null) {
+      queueType = "linked"; // default
+      pool.setQueueType(queueType);
+    }
+    String normalized = queueType.toLowerCase();
+    if (!normalized.equals("linked") && !normalized.equals("array") && !normalized.equals("sync")) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.pool.queue-type must be one of {linked,array,sync} (was '"
+              + queueType
+              + "')");
+    }
+    if (normalized.equals("array")) {
+      // Capacity can be zero to indicate fallback; but must not be negative
+      if (pool.getQueueCapacity() < 0) {
+        throw new IllegalArgumentException(
+            "redis.scheduler.pool.queue-capacity must be >= 0 (was "
+                + pool.getQueueCapacity()
+                + ")");
+      }
+    }
   }
 
   private static void validatePositive(long v, String name) {
@@ -542,10 +565,22 @@ class RedisThreadPoolProperties {
   private long keepAliveSeconds = 60L;
 
   /**
-   * When true, use a SynchronousQueue for direct handoff (no internal queue). This applies strong
-   * backpressure to the scheduler once all workers are busy and up to max threads are in use. New
-   * tasks will run in the caller via CallerRunsPolicy, eliminating memory build-up. Config key:
-   * {@code redis.scheduler.pool.use-synchronous-queue}
+   * Queue type for the agent work pool. One of: linked | array | sync.
+   *
+   * <ul>
+   *   <li>linked → LinkedBlockingQueue (unbounded, parity with other schedulers)
+   *   <li>array → ArrayBlockingQueue (bounded by queueCapacity)
+   *   <li>sync → SynchronousQueue (direct handoff, strong backpressure)
+   * </ul>
+   *
+   * Config key: {@code redis.scheduler.pool.queue-type}
    */
-  private boolean useSynchronousQueue = false;
+  private String queueType = "linked";
+
+  /**
+   * Queue capacity for ArrayBlockingQueue when {@code queueType=array}. If <= 0, the implementation
+   * will default to using the pool's maxSize as the capacity. Ignored for other queue types. Config
+   * key: {@code redis.scheduler.pool.queue-capacity}
+   */
+  private int queueCapacity = 0;
 }

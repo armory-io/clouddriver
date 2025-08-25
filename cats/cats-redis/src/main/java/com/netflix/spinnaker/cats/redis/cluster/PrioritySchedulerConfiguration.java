@@ -314,12 +314,24 @@ public class PrioritySchedulerConfiguration {
         keepAliveTime);
 
     java.util.concurrent.BlockingQueue<Runnable> workQueue;
-    if (schedulerProperties.getPool().isUseSynchronousQueue()) {
-      // Direct handoff: no queuing. Strong backpressure via CallerRunsPolicy.
-      workQueue = new java.util.concurrent.SynchronousQueue<>();
-    } else {
-      // Default parity with other schedulers: unbounded queue
-      workQueue = new java.util.concurrent.LinkedBlockingQueue<>();
+    String queueType = String.valueOf(schedulerProperties.getPool().getQueueType()).toLowerCase();
+    switch (queueType) {
+      case "sync":
+        workQueue = new java.util.concurrent.SynchronousQueue<>();
+        break;
+      case "array":
+        int capacity = schedulerProperties.getPool().getQueueCapacity();
+        if (capacity <= 0) {
+          // Defensive default: cap to maximumPoolSize to avoid unbounded retention
+          capacity = maximumPoolSize;
+        }
+        workQueue = new java.util.concurrent.ArrayBlockingQueue<>(capacity);
+        break;
+      case "linked":
+      default:
+        // Parity with other schedulers: unbounded queue
+        workQueue = new java.util.concurrent.LinkedBlockingQueue<>();
+        break;
     }
 
     this.agentWorkPool =
@@ -333,8 +345,10 @@ public class PrioritySchedulerConfiguration {
             new ThreadPoolExecutor.CallerRunsPolicy()); // Backpressure to scheduler thread
   }
 
-  // No derived capacity logic: default is unbounded queue for parity; optional direct handoff via
-  // SynchronousQueue provides a single strong safety switch without extra knobs.
+  // Queue policy:
+  // - linked: unbounded LinkedBlockingQueue for legacy parity
+  // - array: bounded ArrayBlockingQueue with configurable capacity (defaults to max threads)
+  // - sync: SynchronousQueue for direct handoff and strongest backpressure
 
   /** Creates the scheduler executor service. */
   private void createSchedulerExecutorService() {

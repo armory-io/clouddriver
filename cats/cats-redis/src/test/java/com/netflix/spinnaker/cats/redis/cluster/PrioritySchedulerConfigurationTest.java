@@ -100,7 +100,7 @@ class PrioritySchedulerConfigurationTest {
       assertThat(threadPool.getMaximumPoolSize()).isEqualTo(20);
       assertThat(threadPool.getKeepAliveTime(TimeUnit.SECONDS)).isEqualTo(60);
 
-      // Should use unbounded queue (LinkedBlockingQueue without capacity)
+      // Should use unbounded queue (LinkedBlockingQueue without capacity) by default
       assertThat(threadPool.getQueue().remainingCapacity()).isEqualTo(Integer.MAX_VALUE);
     }
 
@@ -113,6 +113,63 @@ class PrioritySchedulerConfigurationTest {
       // Then
       assertThat(schedulerExecutor).isNotNull();
       assertThat(schedulerExecutor.isShutdown()).isFalse();
+    }
+
+    @Test
+    @DisplayName("Should use SynchronousQueue when queueType=sync")
+    void shouldUseSynchronousQueueWhenQueueTypeSync() {
+      // Given
+      schedulerProperties.getPool().setQueueType("sync");
+      PrioritySchedulerConfiguration cfg =
+          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
+
+      // When
+      ExecutorService workPool = cfg.getAgentWorkPool();
+
+      // Then
+      assertThat(workPool).isInstanceOf(ThreadPoolExecutor.class);
+      ThreadPoolExecutor threadPool = (ThreadPoolExecutor) workPool;
+      assertThat(threadPool.getQueue()).isInstanceOf(java.util.concurrent.SynchronousQueue.class);
+    }
+
+    @Test
+    @DisplayName("Should use ArrayBlockingQueue with configured capacity when queueType=array")
+    void shouldUseArrayBlockingQueueWithConfiguredCapacity() {
+      // Given
+      schedulerProperties.getPool().setQueueType("array");
+      schedulerProperties.getPool().setQueueCapacity(7);
+      PrioritySchedulerConfiguration cfg =
+          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
+
+      // When
+      ExecutorService workPool = cfg.getAgentWorkPool();
+
+      // Then
+      assertThat(workPool).isInstanceOf(ThreadPoolExecutor.class);
+      ThreadPoolExecutor threadPool = (ThreadPoolExecutor) workPool;
+      assertThat(threadPool.getQueue()).isInstanceOf(java.util.concurrent.ArrayBlockingQueue.class);
+      // Capacity when empty equals remainingCapacity
+      assertThat(threadPool.getQueue().remainingCapacity()).isEqualTo(7);
+    }
+
+    @Test
+    @DisplayName("ArrayBlockingQueue defaults capacity to maxSize when queueCapacity<=0")
+    void arrayQueueDefaultsCapacityToMaxSizeWhenZero() {
+      // Given
+      schedulerProperties.getPool().setQueueType("array");
+      schedulerProperties.getPool().setQueueCapacity(0); // fallback
+      schedulerProperties.getPool().setMaxSize(13);
+      PrioritySchedulerConfiguration cfg =
+          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
+
+      // When
+      ExecutorService workPool = cfg.getAgentWorkPool();
+
+      // Then
+      assertThat(workPool).isInstanceOf(ThreadPoolExecutor.class);
+      ThreadPoolExecutor threadPool = (ThreadPoolExecutor) workPool;
+      assertThat(threadPool.getQueue()).isInstanceOf(java.util.concurrent.ArrayBlockingQueue.class);
+      assertThat(threadPool.getQueue().remainingCapacity()).isEqualTo(13);
     }
   }
 

@@ -185,6 +185,8 @@ import redis.clients.jedis.JedisPool;
  *       coreSize: 10                   # Default: 10 core threads
  *       maxSize: 50                    # Default: 50 max threads
  *       keepAliveSeconds: 60           # Default: 60 second keep-alive
+ *       queueType: linked              # linked | array | sync
+ *       queueCapacity: 0               # for array; 0 ⇒ fallback to maxSize
  * </pre>
  *
  * <ul>
@@ -194,6 +196,17 @@ import redis.clients.jedis.JedisPool;
  *       upper limit of concurrent agent executions.
  *   <li><strong>keepAliveSeconds:</strong> Idle thread timeout. Controls how long non-core threads
  *       remain in the pool when idle.
+ *   <li><strong>queueType:</strong> Queue/backpressure strategy for the worker pool.
+ *       <ul>
+ *         <li>linked: Unbounded LinkedBlockingQueue (legacy parity). Fast submissions, risk of
+ *             deeper queues under heavy load.
+ *         <li>array: Bounded ArrayBlockingQueue. Set capacity via <code>queueCapacity</code> to cap
+ *             queued work and reduce OOM risk.
+ *         <li>sync: SynchronousQueue (no queue). Strong backpressure; with CallerRunsPolicy the
+ *             scheduler thread may execute work when saturated.
+ *       </ul>
+ *   <li><strong>queueCapacity:</strong> Capacity for array queue type. If ≤ 0, defaults to <code>
+ *       maxSize</code>.
  * </ul>
  */
 @Component
