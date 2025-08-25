@@ -306,8 +306,9 @@ public class OrphanCleanupService {
         if (!invalidArgs.isEmpty()) {
           try {
             Object result =
-                jedis.evalsha(
-                    scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL),
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
                     java.util.Collections.singletonList(WAITING_SET),
                     invalidArgs);
             if (result instanceof java.util.List) {
@@ -458,8 +459,9 @@ public class OrphanCleanupService {
     try (Jedis jedis = jedisPool.getResource()) {
       // Only delete the key if we own it (atomic check-and-delete)
       Object result =
-          jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP),
+          scriptManager.evalshaWithSelfHeal(
+              jedis,
+              RedisScriptManager.RELEASE_LEADERSHIP,
               java.util.Collections.singletonList(CLEANUP_LEADER_KEY),
               java.util.Collections.singletonList(currentLeadershipId));
 

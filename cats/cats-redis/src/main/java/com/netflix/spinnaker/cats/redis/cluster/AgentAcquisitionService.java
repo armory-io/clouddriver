@@ -1156,8 +1156,9 @@ public class AgentAcquisitionService {
 
       // Use MOVE_AGENTS_CONDITIONAL - only moves if agent is in working with expected score
       Object result =
-          jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
+          scriptManager.evalshaWithSelfHeal(
+              jedis,
+              RedisScriptManager.MOVE_AGENTS_CONDITIONAL,
               java.util.Arrays.asList(WORKING_SET, WAITING_SET),
               java.util.Arrays.asList(agentType, expectedScore, nextScore));
 
@@ -1309,8 +1310,9 @@ public class AgentAcquisitionService {
       @SuppressWarnings("unchecked")
       List<String> results =
           (List<String>)
-              jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.SCORE_AGENTS),
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.SCORE_AGENTS,
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   agentNames);
 
@@ -1371,8 +1373,9 @@ public class AgentAcquisitionService {
         @SuppressWarnings("unchecked")
         List<Object> result =
             (List<Object>)
-                jedis.evalsha(
-                    scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.ADD_AGENTS,
                     Arrays.asList(WORKING_SET, WAITING_SET),
                     batchArgs);
         int added = result.size() >= 1 ? ((Long) result.get(0)).intValue() : 0;
@@ -1402,8 +1405,9 @@ public class AgentAcquisitionService {
         String newScore = score(jedis, jitterSec * 1000L);
         try {
           Object result =
-              jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.ADD_AGENT,
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   Arrays.asList(agentType, newScore));
           if (result != null && ((Long) result).intValue() == 1) {
@@ -1476,8 +1480,9 @@ public class AgentAcquisitionService {
             @SuppressWarnings("unchecked")
             List<Object> result =
                 (List<Object>)
-                    jedis.evalsha(
-                        scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
+                    scriptManager.evalshaWithSelfHeal(
+                        jedis,
+                        RedisScriptManager.ADD_AGENTS,
                         Arrays.asList(WORKING_SET, WAITING_SET),
                         batchArgs);
 
@@ -1826,8 +1831,9 @@ public class AgentAcquisitionService {
       @SuppressWarnings("unchecked")
       List<Object> result =
           (List<Object>)
-              jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS),
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.ADD_AGENTS,
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   batchArgs);
 
@@ -1859,8 +1865,9 @@ public class AgentAcquisitionService {
     for (AgentCompletion completion : completions) {
       try {
         Object result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
+            scriptManager.evalshaWithSelfHeal(
+                jedis,
+                RedisScriptManager.ADD_AGENT,
                 Arrays.asList(WORKING_SET, WAITING_SET),
                 Arrays.asList(completion.agent.getAgentType(), offsetScore));
 
@@ -1902,8 +1909,9 @@ public class AgentAcquisitionService {
       // Script ensures only one instance can successfully acquire each agent
       // Args: [WORKING_SET, WAITING_SET, agentType, acquireScore]
       Object result =
-          jedis.evalsha(
-              scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS),
+          scriptManager.evalshaWithSelfHeal(
+              jedis,
+              RedisScriptManager.MOVE_AGENTS,
               Arrays.asList(WORKING_SET, WAITING_SET), // Redis keys
               Arrays.asList(agentType, acquireScore)); // Agent name and completion deadline
 
@@ -2005,8 +2013,9 @@ public class AgentAcquisitionService {
       @SuppressWarnings("unchecked")
       List<String> results =
           (List<String>)
-              jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.SCORE_AGENTS),
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.SCORE_AGENTS,
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   agentNames);
 
@@ -2297,8 +2306,9 @@ public class AgentAcquisitionService {
             retryCount + 1);
 
         Object result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
+            scriptManager.evalshaWithSelfHeal(
+                jedis,
+                RedisScriptManager.ADD_AGENT,
                 java.util.Arrays.asList(WORKING_SET, WAITING_SET),
                 java.util.Arrays.asList(agentType, nextScore));
 
@@ -2372,8 +2382,9 @@ public class AgentAcquisitionService {
           String score = score(jedis, offsetMs);
 
           Object result =
-              jedis.evalsha(
-                  scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.ADD_AGENT,
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   Arrays.asList(agentType, score));
 
