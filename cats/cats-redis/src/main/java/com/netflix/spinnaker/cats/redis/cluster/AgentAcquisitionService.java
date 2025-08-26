@@ -105,6 +105,9 @@ public class AgentAcquisitionService {
   private final java.util.concurrent.atomic.AtomicReference<String> lastDegradedReason =
       new java.util.concurrent.atomic.AtomicReference<>("");
 
+  // Cached minimal enabled-agent interval in seconds for diagnostics (0 disables checks)
+  private final AtomicLong cachedMinEnabledIntervalSec = new AtomicLong(0L);
+
   /**
    * Health evaluation notes:
    *
@@ -251,6 +254,17 @@ public class AgentAcquisitionService {
     long acquireStartMs = System.currentTimeMillis();
 
     try (Jedis jedis = jedisPool.getResource()) {
+      // Prune completed futures (best-effort) to keep tracking map small
+      try {
+        for (Map.Entry<String, Future<?>> entry : new ArrayList<>(activeAgentsFutures.entrySet())) {
+          Future<?> f = entry.getValue();
+          if (f != null && f.isDone()) {
+            activeAgentsFutures.remove(entry.getKey(), f);
+          }
+        }
+      } catch (Exception ignore) {
+        // Best-effort only
+      }
       // Check concurrent agent limits before processing
       int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
       int currentlyRunning = (int) activeAgentMapSize.get();
@@ -326,20 +340,8 @@ public class AgentAcquisitionService {
               // Best-effort; keep null on failure
             }
 
-            // Compute the minimal enabled-agent interval in seconds
-            long minIntervalSec = 0L;
-            try {
-              minIntervalSec =
-                  agents.values().stream()
-                      .map(AgentWorker::getAgent)
-                      .filter(this::isAgentEnabled)
-                      .mapToLong(a -> intervalProvider.getInterval(a).getInterval() / 1000L)
-                      .filter(v -> v > 0L)
-                      .min()
-                      .orElse(0L);
-            } catch (Exception e) {
-              // Keep 0 -> disables warning refinement if cannot compute
-            }
+            // Use cached minimal enabled-agent interval in seconds
+            long minIntervalSec = cachedMinEnabledIntervalSec.get();
 
             // Warn only if the next local-ready time is significantly in the future compared to
             // the minimal rescheduling threshold (minIntervalSec). This indicates a likely stall
@@ -409,10 +411,12 @@ public class AgentAcquisitionService {
           unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - currentlyRunning);
 
       if (!unbounded && availableSlotsForNewAgents <= 0) {
-        log.debug(
-            "No available slots to acquire new agents this cycle ({} running, {} max). Skipping acquisition phase.",
-            currentlyRunning,
-            maxConcurrentAgents);
+        if (log.isDebugEnabled()) {
+          log.debug(
+              "No available slots to acquire new agents this cycle ({} running, {} max). Skipping acquisition phase.",
+              currentlyRunning,
+              maxConcurrentAgents);
+        }
         return 0;
       }
 
@@ -425,19 +429,7 @@ public class AgentAcquisitionService {
       // Avoid false positives by excluding known-orphan/zombie cases: the decision is based purely
       // on queue lag in the waiting set (via agent scores) and local agent cadences. Working-set
       // overruns are handled by the zombie cleanup and are not considered here.
-      long minIntervalSec = 0L;
-      try {
-        minIntervalSec =
-            agents.values().stream()
-                .map(AgentWorker::getAgent)
-                .filter(this::isAgentEnabled)
-                .mapToLong(a -> intervalProvider.getInterval(a).getInterval() / 1000L)
-                .filter(v -> v > 0L)
-                .min()
-                .orElse(0L);
-      } catch (Exception e) {
-        // Keep 0 -> disables degradation if cannot compute
-      }
+      long minIntervalSec = cachedMinEnabledIntervalSec.get();
 
       boolean degraded = oldestOverdueSec > minIntervalSec && minIntervalSec > 0L;
       int capacityPerCycle = availableSlotsForNewAgents;
@@ -982,6 +974,19 @@ public class AgentAcquisitionService {
     agents.put(agent.getAgentType(), worker);
     agentMapSize.set(agents.size()); // Update statistics
 
+    // Update cached minimum interval based on this agent if enabled
+    try {
+      if (isAgentEnabled(agent)) {
+        long intervalSec = Math.max(0L, intervalProvider.getInterval(agent).getInterval() / 1000L);
+        if (intervalSec > 0L) {
+          cachedMinEnabledIntervalSec.getAndUpdate(
+              prev -> (prev == 0L) ? intervalSec : Math.min(prev, intervalSec));
+        }
+      }
+    } catch (Exception ignore) {
+      // Best-effort only
+    }
+
     // Log enhanced registration info with operational details
     AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
     String initialScore = agentScore(agent);
@@ -1029,6 +1034,21 @@ public class AgentAcquisitionService {
     }
 
     log.debug("Unregistered agent {} from scheduling", agentType);
+
+    // Recompute cached minimum interval conservatively when an agent is removed
+    try {
+      long minSec =
+          agents.values().stream()
+              .map(AgentWorker::getAgent)
+              .filter(this::isAgentEnabled)
+              .mapToLong(a -> intervalProvider.getInterval(a).getInterval() / 1000L)
+              .filter(v -> v > 0L)
+              .min()
+              .orElse(0L);
+      cachedMinEnabledIntervalSec.set(minSec);
+    } catch (Exception ignore) {
+      // Best-effort only
+    }
   }
 
   /**
@@ -1354,6 +1374,21 @@ public class AgentAcquisitionService {
 
       // Add missing agents from this instance
       addMissingAgents(jedis, toAdd);
+
+      // Update cached minimum interval after changes in the registered set
+      try {
+        long minSec =
+            agents.values().stream()
+                .map(AgentWorker::getAgent)
+                .filter(this::isAgentEnabled)
+                .mapToLong(a -> intervalProvider.getInterval(a).getInterval() / 1000L)
+                .filter(v -> v > 0L)
+                .min()
+                .orElse(0L);
+        cachedMinEnabledIntervalSec.set(minSec);
+      } catch (Exception ignore) {
+        // Best-effort only
+      }
 
     } catch (Exception e) {
       log.warn("Repopulation failed, falling back to full sync: {}", e.getMessage());

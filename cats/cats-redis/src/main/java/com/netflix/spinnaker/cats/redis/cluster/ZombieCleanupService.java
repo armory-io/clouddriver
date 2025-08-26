@@ -387,7 +387,9 @@ public class ZombieCleanupService {
     }
 
     // Batch operation failed, disabled, or single agent - fall back to individual cleanup
-    log.debug("Using individual cleanup for {} zombie agents", zombieAgentTypes.size());
+    if (log.isDebugEnabled()) {
+      log.debug("Using individual cleanup for {} zombie agents", zombieAgentTypes.size());
+    }
     int totalCleaned = 0;
     for (String agentType : zombieAgentTypes) {
       try {
@@ -447,10 +449,14 @@ public class ZombieCleanupService {
           if (future != null && !future.isDone()) {
             // Interrupt the thread executing this agent (force cleanup)
             boolean cancelled = future.cancel(true);
-            log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
+            if (log.isDebugEnabled()) {
+              log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
+            }
           }
 
-          log.debug("Cleaned up zombie agent: {}", agentType);
+          if (log.isDebugEnabled()) {
+            log.debug("Cleaned up zombie agent: {}", agentType);
+          }
         }
       } else {
         log.warn("Unexpected Lua script result format: expected [count, list], got: {}", result);
