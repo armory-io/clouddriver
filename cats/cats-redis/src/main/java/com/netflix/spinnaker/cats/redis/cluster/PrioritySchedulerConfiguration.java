@@ -370,7 +370,9 @@ public class PrioritySchedulerConfiguration {
       log.info("Created concurrency semaphore with {} permits", maxConcurrentAgents);
     } else {
       this.runningAgents = null;
-      log.info("Concurrency control disabled - running unlimited agents");
+      log.warn(
+          "Max concurrent agents is unbounded (redis.agent.max-concurrent-agents <= 0). "
+              + "This is not recommended for production; set an explicit bound to avoid overload.");
     }
   }
 }

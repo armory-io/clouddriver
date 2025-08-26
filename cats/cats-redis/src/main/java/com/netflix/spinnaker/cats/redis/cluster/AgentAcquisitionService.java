@@ -136,6 +136,10 @@ public class AgentAcquisitionService {
   private final ConcurrentLinkedQueue<AgentCompletion> completionQueue =
       new ConcurrentLinkedQueue<>();
 
+  // Time-based repopulation cadence control (epoch millis of last repopulation)
+  private final java.util.concurrent.atomic.AtomicLong lastRepopulateEpochMs =
+      new java.util.concurrent.atomic.AtomicLong(0L);
+
   /**
    * Local, per-pod failure streaks used for exponential backoff without extra Redis keys.
    *
@@ -264,8 +268,20 @@ public class AgentAcquisitionService {
       processQueuedCompletions(jedis);
 
       // PHASE 2: Agent Repopulation (Redis Recovery, periodic)
-      if (runCount % redisRefreshPeriod == 0) {
+      long nowMsForRepop = System.currentTimeMillis();
+      long refreshPeriodMs = Math.max(1L, schedulerProperties.getRefreshPeriodSeconds()) * 1000L;
+      long last = lastRepopulateEpochMs.get();
+      boolean dueByTime = (last != 0L) && ((nowMsForRepop - last) >= refreshPeriodMs);
+      boolean dueByCycle = (redisRefreshPeriod > 0) && (runCount % redisRefreshPeriod == 0);
+      if (dueByCycle) {
+        lastRepopulateEpochMs.set(nowMsForRepop);
         repopulateRedisAgents(jedis);
+      } else if (dueByTime) {
+        lastRepopulateEpochMs.set(nowMsForRepop);
+        repopulateRedisAgents(jedis);
+      } else if (last == 0L) {
+        // Initialize the window without performing repopulation on first call
+        lastRepopulateEpochMs.compareAndSet(0L, nowMsForRepop);
       }
 
       // PHASE 3: Determine current readiness state for diagnostics
@@ -564,7 +580,11 @@ public class AgentAcquisitionService {
   public void repopulateIfDue(long runCount) {
     long start = System.currentTimeMillis();
     try (Jedis jedis = jedisPool.getResource()) {
-      if (runCount % redisRefreshPeriod == 0) {
+      long nowMsForRepop = start;
+      long refreshPeriodMs = Math.max(1L, schedulerProperties.getRefreshPeriodSeconds()) * 1000L;
+      long last = lastRepopulateEpochMs.get();
+      if (nowMsForRepop - last >= refreshPeriodMs
+          && lastRepopulateEpochMs.compareAndSet(last, nowMsForRepop)) {
         repopulateRedisAgents(jedis);
         if (metrics != null) {
           metrics.recordRepopulateTime(System.currentTimeMillis() - start);
@@ -576,6 +596,42 @@ public class AgentAcquisitionService {
         metrics.incrementRepopulateError(e.getClass().getSimpleName());
         metrics.recordRepopulateTime(System.currentTimeMillis() - start);
       }
+    }
+  }
+
+  /**
+   * Perform time-based repopulation when due and return true if it was executed. This is intended
+   * for schedulers to decide whether to skip acquisition on the same tick.
+   */
+  public boolean repopulateIfDueNow() {
+    long now = System.currentTimeMillis();
+    long refreshPeriodMs = Math.max(1L, schedulerProperties.getRefreshPeriodSeconds()) * 1000L;
+    long last = lastRepopulateEpochMs.get();
+    if (last == 0L) {
+      // Do not initialize here; allow caller (scheduler) to fall back to legacy cycle-based repop
+      // so first run can still repopulate when required by tests/config.
+      return false;
+    }
+    if (now - last < refreshPeriodMs) {
+      return false;
+    }
+    if (!lastRepopulateEpochMs.compareAndSet(last, now)) {
+      return false;
+    }
+
+    long start = now;
+    try (Jedis jedis = jedisPool.getResource()) {
+      repopulateRedisAgents(jedis);
+      if (metrics != null) {
+        metrics.recordRepopulateTime(System.currentTimeMillis() - start);
+      }
+      return true;
+    } catch (Exception e) {
+      log.warn("Repopulation attempt failed: {}", e.getMessage());
+      if (metrics != null) {
+        metrics.incrementRepopulateError(e.getClass().getSimpleName());
+      }
+      return false;
     }
   }
 
@@ -938,19 +994,22 @@ public class AgentAcquisitionService {
         initialScore,
         agents.size());
 
-    // Persist the agent into Redis immediately with its first-run score so that it is visible
-    // cluster-wide even before the first repopulation cycle. This write is idempotent because the
-    // ADD_AGENT Lua script uses NX semantics when the agent already exists.
-    try {
-      // Schedule for immediate execution on initial registration to preserve legacy behavior and
-      // ensure new agents are picked up in the very first acquisition cycle. The regular interval
-      // will be applied after the first successful execution when the agent is re-queued.
-      scheduleAgentInRedis(agent, 0L);
-    } catch (Exception e) {
-      log.warn(
-          "Failed to write initial Redis entry for agent {} – will rely on repopulation: {}",
-          agent.getAgentType(),
-          e.getMessage());
+    // Persist the agent into Redis immediately only if scripts are initialized. When scripts are
+    // not yet initialized (e.g., during early scheduler bootstrap), defer to repopulation so that
+    // initial-registration jitter (when enabled) can be applied and to preserve historical tests.
+    if (scriptManager.isInitialized()) {
+      try {
+        scheduleAgentInRedis(agent, 0L);
+      } catch (Exception e) {
+        log.warn(
+            "Failed to write initial Redis entry for agent {} – will rely on repopulation: {}",
+            agent.getAgentType(),
+            e.getMessage());
+      }
+    } else {
+      log.debug(
+          "Deferring initial Redis write for agent {} until repopulation (scripts not initialized)",
+          agent.getAgentType());
     }
   }
 

@@ -383,8 +383,14 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // PHASE 0.75: Redis repopulation when due; if repopulated this cycle, skip acquisition to
       // stabilize Redis state and make initial registration/jitter behavior observable
       long beforeRepop = acquisitionService.getRegisteredAgentCount();
-      acquisitionService.repopulateIfDue(currentRun);
-      boolean repopulatedThisCycle = (currentRun % config.getRedisRefreshPeriod() == 0);
+      boolean repopulatedThisCycle = acquisitionService.repopulateIfDueNow();
+      if (!repopulatedThisCycle) {
+        int legacyRefreshSec = config.getRedisRefreshPeriod();
+        if (legacyRefreshSec > 0 && (currentRun % legacyRefreshSec == 0)) {
+          acquisitionService.repopulateIfDue(currentRun);
+          repopulatedThisCycle = true;
+        }
+      }
 
       // PHASE 1: Cleanup operations
       zombieService.cleanupZombieAgentsIfNeeded(
