@@ -695,21 +695,31 @@ public class OrphanCleanupService {
    */
   private String score(Jedis jedis, long delayMs) {
     try {
-      // Use Redis TIME for distributed coordination
+      // Prefer a unified time source: scheduler's view of "now" (Redis time + measured offset).
+      // This keeps all components (acquisition, cleanup) consistent even across Redis failovers.
+      long nowMsWithOffset = 0L;
+      if (acquisitionService != null) {
+        nowMsWithOffset = acquisitionService.nowMsWithOffset();
+      }
+
+      // Fast path: if we have a non-zero unified time, schedule using it.
+      // Scores are stored in seconds, so convert ms→s after adding any delay.
+      if (nowMsWithOffset > 0L) {
+        return String.valueOf((nowMsWithOffset + delayMs) / 1000L);
+      }
+
+      // Fallback: query Redis TIME directly (returns [seconds, microseconds]).
+      // Convert to ms, add delay, then down-convert to seconds for the ZSET score.
       List<String> time = jedis.time();
-      long redisTimeSeconds = Long.parseLong(time.get(0));
-      long redisTimeMicros = Long.parseLong(time.get(1));
-
-      // Convert to milliseconds and add delay
-      long targetTimeMs = (redisTimeSeconds * 1000) + (redisTimeMicros / 1000) + delayMs;
-
-      // Convert back to seconds for Redis score
-      return String.valueOf(targetTimeMs / 1000);
-    } catch (Exception e) {
-      log.warn("Failed to get Redis time, using system time: {}", e.getMessage());
-      // Fallback to system time
-      long targetTimeMs = System.currentTimeMillis() + delayMs;
-      return String.valueOf(targetTimeMs / 1000);
+      long sec = Long.parseLong(time.get(0));
+      long micros = Long.parseLong(time.get(1));
+      long targetMs = (sec * 1000) + (micros / 1000) + delayMs;
+      return String.valueOf(targetMs / 1000L);
+    } catch (Exception ignore) {
+      // Last-resort fallback: use local system clock. This is less ideal for coordination,
+      // but preserves forward progress if Redis TIME or offset lookups are unavailable.
+      long targetMs = System.currentTimeMillis() + delayMs;
+      return String.valueOf(targetMs / 1000L);
     }
   }
 

@@ -1164,6 +1164,16 @@ public class AgentAcquisitionService {
     return serverClientOffset.get();
   }
 
+  /**
+   * Returns current wall-clock time adjusted by the Redis server-client offset.
+   *
+   * <p>Used by cleanup services to avoid additional Redis TIME calls and to keep time sourcing
+   * consistent across acquisition and cleanup paths.
+   */
+  public long nowMsWithOffset() {
+    return System.currentTimeMillis() + serverClientOffset.get();
+  }
+
   public boolean isDegraded() {
     return lastDegraded.get();
   }
@@ -1771,6 +1781,8 @@ public class AgentAcquisitionService {
       // Apply jitter if configured and offset > 0
       if (offsetMs > 0L) {
         offsetMs = applyJitter(offsetMs, schedulerProperties.getJitter().getFailureBackoffRatio());
+        // Enforce whole-second scheduling for failure backoff to avoid undershooting by truncation
+        offsetMs = ((offsetMs + 999L) / 1000L) * 1000L; // ceil to nearest second
       }
     } catch (Exception e) {
       log.warn(
