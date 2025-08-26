@@ -98,6 +98,7 @@ public class AgentAcquisitionService {
   // Backlog/health snapshots and rate-limiting
   private final AtomicLong lastBacklogWarnEpochMs = new AtomicLong(0);
   private final AtomicLong lastStallWarnEpochMs = new AtomicLong(0);
+  private final AtomicLong lastDiagEpochMs = new AtomicLong(0);
   private final AtomicLong lastOldestOverdueSeconds = new AtomicLong(0);
   private final AtomicLong lastReadyCount = new AtomicLong(0);
   private final AtomicLong lastCapacityPerCycle = new AtomicLong(0);
@@ -298,76 +299,86 @@ public class AgentAcquisitionService {
         lastRepopulateEpochMs.compareAndSet(0L, nowMsForRepop);
       }
 
-      // PHASE 3: Determine current readiness state for diagnostics
+      // PHASE 3: Determine current readiness state for diagnostics (gated by cadence/need)
       String currentScore = score(jedis, 0L);
-      long readyCountForDiagnostics = 0L;
-      try {
-        readyCountForDiagnostics = jedis.zcount(WAITING_SET, "-inf", currentScore);
-      } catch (Exception ignore) {
-        // Best effort; keep 0 if unable to compute
-      }
+      // Gate diagnostics: only compute when debug is enabled, when warn cadence is due,
+      // or when a periodic diagnostic cadence elapses. Period derives from scheduler interval.
+      long schedulerIntervalMs = schedulerProperties.getIntervalMs();
+      final long DIAG_PERIOD_MS = Math.max(3L * Math.max(1L, schedulerIntervalMs), 10_000L);
+      boolean emitDiag =
+          log.isDebugEnabled()
+              || isPeriodElapsed(lastBacklogWarnEpochMs, 600_000L)
+              || isPeriodElapsed(lastStallWarnEpochMs, 300_000L)
+              || isPeriodElapsed(lastDiagEpochMs, DIAG_PERIOD_MS);
 
-      if (readyCountForDiagnostics == 0L) {
-        // Detect acquisition stall: waiting set has backlog but none are ready (e.g.,
-        // future-scored)
+      long readyCountForDiagnostics = -1L;
+      if (emitDiag) {
         try {
-          long waitingBacklog = jedis.zcard(WAITING_SET);
+          readyCountForDiagnostics = jedis.zcount(WAITING_SET, "-inf", currentScore);
+        } catch (Exception ignore) {
+          readyCountForDiagnostics = -1L; // unknown on failure
+        }
 
-          if (waitingBacklog > 0) {
-            // Compute current time from Redis score if possible
-            long nowSec;
-            try {
-              nowSec = Long.parseLong(currentScore);
-            } catch (NumberFormatException nfe) {
-              nowSec = System.currentTimeMillis() / 1000L;
-            }
+        if (readyCountForDiagnostics == 0L) {
+          // Detect acquisition stall: waiting set has backlog but none are ready (e.g.,
+          // future-scored)
+          try {
+            long waitingBacklog = jedis.zcard(WAITING_SET);
 
-            // Find the earliest local-enabled waiting entry
-            final int window =
-                Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
-            Long earliestLocalWaitingScore = null;
-            try {
-              Set<Tuple> earliest = jedis.zrangeWithScores(WAITING_SET, 0, Math.max(0, window - 1));
-              for (Tuple t : earliest) {
-                String agentType = t.getElement();
-                AgentWorker local = agents.get(agentType);
-                if (local != null && isAgentEnabled(local.getAgent())) {
-                  earliestLocalWaitingScore = (long) t.getScore();
-                  break;
+            if (waitingBacklog > 0) {
+              long nowSec;
+              try {
+                nowSec = Long.parseLong(currentScore);
+              } catch (NumberFormatException nfe) {
+                nowSec = System.currentTimeMillis() / 1000L;
+              }
+
+              final int window =
+                  Math.max(
+                      8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
+              Long earliestLocalWaitingScore = null;
+              try {
+                Set<Tuple> earliest =
+                    jedis.zrangeWithScores(WAITING_SET, 0, Math.max(0, window - 1));
+                for (Tuple t : earliest) {
+                  String agentType = t.getElement();
+                  AgentWorker local = agents.get(agentType);
+                  if (local != null && isAgentEnabled(local.getAgent())) {
+                    earliestLocalWaitingScore = (long) t.getScore();
+                    break;
+                  }
+                }
+              } catch (Exception ignore) {
+                // Best-effort; keep null on failure
+              }
+
+              long minIntervalSec = cachedMinEnabledIntervalSec.get();
+              if (earliestLocalWaitingScore != null
+                  && minIntervalSec > 0L
+                  && (earliestLocalWaitingScore - nowSec) > minIntervalSec
+                  && shouldWarnNow(lastStallWarnEpochMs, 300_000)) {
+                long nextReadyInSec = Math.max(0L, earliestLocalWaitingScore - nowSec);
+                log.warn(
+                    "Acquisition stall detected: ready=0, waiting_backlog={}, next_local_ready_in={}s > min_interval={}s, pool_active={}, pool_waiters={}",
+                    waitingBacklog,
+                    nextReadyInSec,
+                    minIntervalSec,
+                    jedisPool.getNumActive(),
+                    jedisPool.getNumWaiters());
+                if (metrics != null) {
+                  metrics.incrementStallDetected();
                 }
               }
-            } catch (Exception ignore) {
-              // Best-effort; keep null on failure
             }
-
-            // Use cached minimal enabled-agent interval in seconds
-            long minIntervalSec = cachedMinEnabledIntervalSec.get();
-
-            // Warn only if the next local-ready time is significantly in the future compared to
-            // the minimal rescheduling threshold (minIntervalSec). This indicates a likely stall
-            // due to future-scored entries.
-            if (earliestLocalWaitingScore != null
-                && minIntervalSec > 0L
-                && (earliestLocalWaitingScore - nowSec) > minIntervalSec
-                && shouldWarnNow(lastStallWarnEpochMs, 300_000)) {
-              long nextReadyInSec = Math.max(0L, earliestLocalWaitingScore - nowSec);
-              log.warn(
-                  "Acquisition stall detected: ready=0, waiting_backlog={}, next_local_ready_in={}s > min_interval={}s, pool_active={}, pool_waiters={}",
-                  waitingBacklog,
-                  nextReadyInSec,
-                  minIntervalSec,
-                  jedisPool.getNumActive(),
-                  jedisPool.getNumWaiters());
-              if (metrics != null) {
-                metrics.incrementStallDetected();
-              }
-            }
+          } catch (Exception ignore) {
+            // Diagnostics only
           }
-        } catch (Exception ignore) {
-          // Diagnostics only
+          if (log.isDebugEnabled()) {
+            log.debug("No agents ready for execution");
+          }
+          // Early return consistent with original behavior when we know none are ready
+          return 0;
         }
-        log.debug("No agents ready for execution");
-        return 0;
       }
 
       // Compute queue lag and health before acquisition; reuse Redis results when possible
@@ -378,26 +389,29 @@ public class AgentAcquisitionService {
         nowSec = System.currentTimeMillis() / 1000L;
       }
 
-      long readyCount = readyCountForDiagnostics;
+      long readyCount = emitDiag ? Math.max(0L, readyCountForDiagnostics) : -1L;
       long oldestOverdueSec = 0L;
-      try {
-        // To avoid false positives on DEGRADED, consider only agents known and enabled locally.
-        // Fetch a small window of the oldest ready entries and pick the first matching local agent.
-        final int window =
-            Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
-        Set<Tuple> oldestWindow =
-            jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", currentScore, 0, window);
-        for (Tuple t : oldestWindow) {
-          String agentType = t.getElement();
-          AgentWorker local = agents.get(agentType);
-          if (local != null && isAgentEnabled(local.getAgent())) {
-            long oldestScore = (long) t.getScore();
-            oldestOverdueSec = Math.max(0L, nowSec - oldestScore);
-            break;
+      if (emitDiag) {
+        try {
+          // To avoid false positives on DEGRADED, consider only agents known and enabled locally.
+          // Fetch a small window of the oldest ready entries and pick the first matching local
+          // agent.
+          final int window =
+              Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
+          Set<Tuple> oldestWindow =
+              jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", currentScore, 0, window);
+          for (Tuple t : oldestWindow) {
+            String agentType = t.getElement();
+            AgentWorker local = agents.get(agentType);
+            if (local != null && isAgentEnabled(local.getAgent())) {
+              long oldestScore = (long) t.getScore();
+              oldestOverdueSec = Math.max(0L, nowSec - oldestScore);
+              break;
+            }
           }
+        } catch (Exception ignore) {
+          // Best-effort; keep defaults on failure
         }
-      } catch (Exception ignore) {
-        // Best-effort; keep defaults on failure
       }
 
       // PHASE 4: Agent acquisition setup
@@ -420,10 +434,11 @@ public class AgentAcquisitionService {
         return 0;
       }
 
+      long readyLimit = (readyCount >= 0) ? readyCount : Long.MAX_VALUE;
       int effectiveMaxToAcquire =
           unbounded
-              ? (int) Math.min(Integer.MAX_VALUE, readyCount)
-              : (int) Math.min(availableSlotsForNewAgents, Math.max(0L, readyCount));
+              ? (int) Math.min(Integer.MAX_VALUE, readyLimit)
+              : (int) Math.min(availableSlotsForNewAgents, Math.max(0L, readyLimit));
 
       // Evaluate health/degradation and rate-limited WARNing.
       // Avoid false positives by excluding known-orphan/zombie cases: the decision is based purely
@@ -445,17 +460,20 @@ public class AgentAcquisitionService {
             agentProperties.getMaxConcurrentAgents());
       }
 
-      // Persist snapshots for stats/periodic health log
-      lastOldestOverdueSeconds.set(oldestOverdueSec);
-      lastReadyCount.set(readyCount);
-      lastCapacityPerCycle.set(capacityPerCycle);
-      lastDegraded.set(degraded);
-      lastDegradedReason.set(
-          degraded
-              ? String.format(
-                  "oldest_overdue=%ss > min_interval=%ss; ready=%d capacityPerCycle=%d",
-                  oldestOverdueSec, minIntervalSec, readyCount, capacityPerCycle)
-              : "");
+      // Persist snapshots for stats/periodic health log (only when diagnostics ran)
+      if (emitDiag) {
+        lastOldestOverdueSeconds.set(oldestOverdueSec);
+        lastReadyCount.set(Math.max(0L, readyCount));
+        lastCapacityPerCycle.set(capacityPerCycle);
+        lastDegraded.set(degraded);
+        lastDegradedReason.set(
+            degraded
+                ? String.format(
+                    "oldest_overdue=%ss > min_interval=%ss; ready=%d capacityPerCycle=%d",
+                    oldestOverdueSec, minIntervalSec, Math.max(0L, readyCount), capacityPerCycle)
+                : "");
+        lastDiagEpochMs.set(System.currentTimeMillis());
+      }
       int queueDepthDebug = -1;
       if (agentWorkPool instanceof java.util.concurrent.ThreadPoolExecutor) {
         queueDepthDebug =
@@ -635,6 +653,12 @@ public class AgentAcquisitionService {
       return true;
     }
     return false;
+  }
+
+  private static boolean isPeriodElapsed(AtomicLong lastEpochMs, long periodMs) {
+    long now = System.currentTimeMillis();
+    long last = lastEpochMs.get();
+    return now - last >= periodMs;
   }
 
   /**
