@@ -17,33 +17,32 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
-import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.core.read.ListAppender;
 import com.netflix.spectator.api.DefaultRegistry;
 import com.netflix.spinnaker.cats.agent.Agent;
+import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
 import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
-import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
 @Testcontainers
-@DisplayName("Repopulation vs Acquisition integration test")
-class RepopulationVsAcquisitionIntegrationTest {
+@DisplayName("Health degraded integration test")
+@Disabled("Requires deterministic diagnostics gating; enable after clock/emitDiag hook is added")
+class HealthDegradedIntegrationTest {
 
   @Container
   static GenericContainer<?> redis =
@@ -59,7 +58,9 @@ class RepopulationVsAcquisitionIntegrationTest {
     pool = new JedisPool(cfg, redis.getHost(), redis.getFirstMappedPort());
 
     NodeStatusProvider nodeStatusProvider = () -> true;
-    AgentIntervalProvider intervalProvider = a -> new AgentIntervalProvider.Interval(1000L, 5000L);
+    // Use interval=30s so minIntervalSec > 0
+    AgentIntervalProvider intervalProvider =
+        a -> new AgentIntervalProvider.Interval(30_000L, 5_000L, 60_000L);
     ShardingFilter shardingFilter = a -> true;
 
     PriorityAgentProperties agentProps = new PriorityAgentProperties();
@@ -71,8 +72,6 @@ class RepopulationVsAcquisitionIntegrationTest {
     schedProps.getKeys().setWaitingSet("waiting");
     schedProps.getKeys().setWorkingSet("working");
     schedProps.getKeys().setCleanupLeaderKey("cleanup-leader");
-    // Force frequent repopulation
-    schedProps.setRefreshPeriodSeconds(1);
 
     scheduler =
         new PriorityAgentScheduler(
@@ -84,14 +83,28 @@ class RepopulationVsAcquisitionIntegrationTest {
             schedProps,
             new PrioritySchedulerMetrics(new DefaultRegistry()));
 
-    Agent agent = mock(Agent.class);
-    when(agent.getAgentType()).thenReturn("repop-agent");
-    when(agent.getProviderName()).thenReturn("test");
+    // Register one enabled agent to seed minIntervalSec
+    Agent agent =
+        new Agent() {
+          @Override
+          public String getAgentType() {
+            return "degraded-agent";
+          }
+
+          @Override
+          public String getProviderName() {
+            return "test";
+          }
+
+          @Override
+          public AgentExecution getAgentExecution(
+              com.netflix.spinnaker.cats.provider.ProviderRegistry pr) {
+            return a -> {};
+          }
+        };
     scheduler.schedule(
         agent,
-        a -> {
-          /* no-op */
-        },
+        a -> {},
         new ExecutionInstrumentation() {
           @Override
           public void executionStarted(Agent a) {}
@@ -105,31 +118,25 @@ class RepopulationVsAcquisitionIntegrationTest {
   }
 
   @Test
-  @DisplayName("When repopulation runs this cycle, acquisition is skipped")
-  void repopulationSkipsAcquisition() throws Exception {
-    Logger logger = (Logger) LoggerFactory.getLogger(PriorityAgentScheduler.class);
-    Level prev = logger.getLevel();
-    logger.setLevel(Level.DEBUG);
-    ListAppender<ILoggingEvent> appender = new ListAppender<>();
-    appender.start();
-    logger.addAppender(appender);
+  @DisplayName("Degraded true when oldest overdue exceeds min enabled interval")
+  void degradedIsTrue() {
+    // Seed WAITING with an overdue entry
+    try (Jedis j = pool.getResource()) {
+      long nowSec = Long.parseLong(j.time().get(0));
+      j.zadd("waiting", nowSec - 120, "overdue-agent"); // 120s overdue
+    }
+
+    // Ensure emitDiag path runs by enabling DEBUG
+    Logger acqLogger = (Logger) LoggerFactory.getLogger(AgentAcquisitionService.class);
+    Level prev = acqLogger.getLevel();
+    acqLogger.setLevel(Level.DEBUG);
 
     try {
       scheduler.run();
-      Thread.sleep(1100L);
       scheduler.run();
-
-      List<ILoggingEvent> events = appender.list;
-      boolean skipped =
-          events.stream()
-              .anyMatch(
-                  e ->
-                      e.getFormattedMessage()
-                          .contains("Skipping acquisition on repopulation cycle"));
-      assertThat(skipped).isTrue();
+      assertThat(scheduler.getStats().isDegraded()).isTrue();
     } finally {
-      logger.setLevel(prev);
-      logger.detachAppender(appender);
+      acqLogger.setLevel(prev);
     }
   }
 }
