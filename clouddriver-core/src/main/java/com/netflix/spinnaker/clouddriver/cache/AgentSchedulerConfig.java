@@ -46,6 +46,7 @@ import redis.clients.jedis.JedisPool;
 public class AgentSchedulerConfig {
 
   private static final Logger log = LoggerFactory.getLogger(AgentSchedulerConfig.class);
+  private static final int DEFAULT_REDIS_PORT = 6379;
 
   @Bean
   public PrioritySchedulerMetrics prioritySchedulerMetrics(Registry registry) {
@@ -70,9 +71,15 @@ public class AgentSchedulerConfig {
       DynamicConfigService dynamicConfigService,
       ShardingFilter shardingFilter) {
     log.info("Creating ClusteredAgentScheduler (default)");
-    URI redisUri = URI.create(redisConfigurationProperties.getConnection());
+    URI redisUri;
+    try {
+      redisUri = URI.create(redisConfigurationProperties.getConnection());
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException(
+          "Invalid Redis connection URI: " + redisConfigurationProperties.getConnection(), e);
+    }
     String redisHost = redisUri.getHost();
-    int redisPort = redisUri.getPort() == -1 ? 6379 : redisUri.getPort();
+    int redisPort = redisUri.getPort() == -1 ? DEFAULT_REDIS_PORT : redisUri.getPort();
 
     return new ClusteredAgentScheduler(
         redisClientDelegate,
@@ -144,52 +151,52 @@ public class AgentSchedulerConfig {
     if (parallelism != 0) {
       log.warn(
           "redis.scheduler.parallelism ({}) is completely ignored by PriorityAgentScheduler. "
-              + "Use redis.agent.maxConcurrentAgents instead (current: {})",
+              + "Use redis.agent.max-concurrent-agents instead (current: {})",
           parallelism,
           agentProperties.getMaxConcurrentAgents());
     }
     if (!redisConfigurationProperties.getAgent().getDisabledAgents().isEmpty()) {
       log.warn(
           "redis.agent.disabledAgents ({} agents) is ignored by PriorityAgentScheduler. "
-              + "Use redis.agent.disabledPattern instead (current: '{}')",
+              + "Use redis.agent.disabled-pattern instead (current: '{}')",
           redisConfigurationProperties.getAgent().getDisabledAgents().size(),
           agentProperties.getDisabledPattern());
     }
 
     // Log scheduler configuration for operational visibility
     log.info(
-        "PriorityAgentScheduler configuration: maxConcurrentAgents={}, schedulerIntervalMs={}, refreshPeriodSeconds={}, timeCacheDurationMs={}",
+        "PriorityAgentScheduler configuration: max-concurrent-agents={}, interval-ms={}, refresh-period-seconds={}, time-cache-duration-ms={}",
         agentProperties.getMaxConcurrentAgents(),
         schedulerProperties.getIntervalMs(),
         schedulerProperties.getRefreshPeriodSeconds(),
         schedulerProperties.getTimeCacheDurationMs());
 
     log.info(
-        "PriorityAgentScheduler thread pool: coreSize={}, maxSize={}, keepAliveSeconds={}",
+        "PriorityAgentScheduler thread pool: core-size={}, max-size={}, keep-alive-seconds={}",
         schedulerProperties.getThreadPoolCoreSize(),
         schedulerProperties.getThreadPoolMaxSize(),
         schedulerProperties.getThreadPoolKeepAliveSeconds());
 
     log.info(
-        "PriorityAgentScheduler agent filtering: enabledPattern='{}', disabledPattern='{}'",
+        "PriorityAgentScheduler agent filtering: enabled-pattern='{}', disabled-pattern='{}'",
         agentProperties.getEnabledPattern(),
         agentProperties.getDisabledPattern());
 
     log.info(
-        "PriorityAgentScheduler zombie cleanup: enabled={}, thresholdMs={}, intervalMs={}",
+        "PriorityAgentScheduler zombie cleanup: enabled={}, threshold-ms={}, interval-ms={}",
         schedulerProperties.isZombieCleanupEnabled(),
         schedulerProperties.getZombieThresholdMs(),
         schedulerProperties.getZombieIntervalMs());
 
     if (schedulerProperties.hasExceptionalAgents()) {
       log.info(
-          "PriorityAgentScheduler exceptional agents: pattern='{}', thresholdMs={}",
+          "PriorityAgentScheduler exceptional agents: pattern='{}', threshold-ms={}",
           schedulerProperties.getExceptionalAgentsPattern(),
           schedulerProperties.getExceptionalAgentsThresholdMs());
     }
 
     log.info(
-        "PriorityAgentScheduler orphan cleanup: enabled={}, thresholdMs={}, intervalMs={}, leadershipTtlMs={}, forceAllPods={}",
+        "PriorityAgentScheduler orphan cleanup: enabled={}, threshold-ms={}, interval-ms={}, leadership-ttl-ms={}, force-all-pods={}",
         schedulerProperties.isOrphanCleanupEnabled(),
         schedulerProperties.getOrphanThresholdMs(),
         schedulerProperties.getOrphanIntervalMs(),
@@ -197,12 +204,13 @@ public class AgentSchedulerConfig {
         schedulerProperties.isOrphanForceAllPods());
 
     log.info(
-        "PriorityAgentScheduler batch operations: enabled={}, batchSize={}",
+        "PriorityAgentScheduler batch operations: enabled={}, batch-size={}, chunk-attempt-multiplier={}",
         schedulerProperties.getBatchOperations().isEnabled(),
-        schedulerProperties.getBatchOperations().getBatchSize());
+        schedulerProperties.getBatchOperations().getBatchSize(),
+        schedulerProperties.getBatchOperations().getChunkAttemptMultiplier());
 
     log.info(
-        "PriorityAgentScheduler Redis keys: prefix='{}', hashTag='{}', waitingSet='{}', workingSet='{}', cleanupLeaderKey='{}'",
+        "PriorityAgentScheduler Redis keys: prefix='{}', hash-tag='{}', waiting-set='{}', working-set='{}', cleanup-leader-key='{}'",
         schedulerProperties.getKeys().getPrefix(),
         schedulerProperties.getKeys().getHashTag(),
         schedulerProperties.getKeys().getWaitingSet(),

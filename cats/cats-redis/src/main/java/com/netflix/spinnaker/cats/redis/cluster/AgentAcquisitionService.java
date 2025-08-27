@@ -460,19 +460,21 @@ public class AgentAcquisitionService {
             agentProperties.getMaxConcurrentAgents());
       }
 
-      // Persist snapshots for stats/periodic health log (only when diagnostics ran)
+      // Store initial degradation state for later update after slot filling check
+      boolean initialDegraded = degraded;
+      String initialDegradedReason =
+          degraded
+              ? String.format(
+                  "oldest_overdue=%ss > min_interval=%ss; ready=%d capacityPerCycle=%d",
+                  oldestOverdueSec, minIntervalSec, Math.max(0L, readyCount), capacityPerCycle)
+              : "";
+
+      // Persist initial snapshots (will be updated after slot filling check if needed)
       if (emitDiag) {
         lastOldestOverdueSeconds.set(oldestOverdueSec);
         lastReadyCount.set(Math.max(0L, readyCount));
         lastCapacityPerCycle.set(capacityPerCycle);
-        lastDegraded.set(degraded);
-        lastDegradedReason.set(
-            degraded
-                ? String.format(
-                    "oldest_overdue=%ss > min_interval=%ss; ready=%d capacityPerCycle=%d",
-                    oldestOverdueSec, minIntervalSec, Math.max(0L, readyCount), capacityPerCycle)
-                : "");
-        lastDiagEpochMs.set(System.currentTimeMillis());
+        // Degradation status will be finalized after slot filling check
       }
       int queueDepthDebug = -1;
       if (agentWorkPool instanceof java.util.concurrent.ThreadPoolExecutor) {
@@ -489,7 +491,49 @@ public class AgentAcquisitionService {
 
       // PHASE 5: Acquire up to available slots in chunks of batch-size
       int remainingToAcquire = availableSlotsForNewAgents;
-      while (remainingToAcquire > 0) {
+      int chunkOffset = 0; // Track offset for pagination through ready agents
+
+      // Calculate max chunk attempts based on actual need and filtering expectations
+      int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
+      if (configuredBatchSize <= 0) {
+        configuredBatchSize =
+            availableSlotsForNewAgents; // Use all slots if batch size not configured
+      }
+
+      // Base calculation: how many chunks we need to fill available slots
+      int baseAttempts =
+          (availableSlotsForNewAgents + configuredBatchSize - 1)
+              / configuredBatchSize; // ceiling division
+
+      // Apply multiplier for filtering scenarios
+      double multiplier = schedulerProperties.getBatchOperations().getChunkAttemptMultiplier();
+      int maxChunkAttempts;
+
+      if (multiplier <= 0) {
+        // No multiplier configured - just use base attempts (no extra attempts for filtering)
+        maxChunkAttempts = Math.max(1, baseAttempts);
+        log.debug("Using base chunk attempts (no multiplier): {}", maxChunkAttempts);
+      } else {
+        // Apply multiplier to handle filtering
+        maxChunkAttempts = Math.max(1, (int) Math.ceil(baseAttempts * multiplier));
+
+        // Cap at a reasonable limit to prevent runaway in edge cases
+        maxChunkAttempts = Math.min(maxChunkAttempts, 100);
+
+        log.debug(
+            "Calculated chunk attempts: {} (slots: {} / batch: {} = {} base × {} multiplier)",
+            maxChunkAttempts,
+            availableSlotsForNewAgents,
+            configuredBatchSize,
+            baseAttempts,
+            multiplier);
+      }
+
+      int chunkAttempts = 0;
+
+      while (remainingToAcquire > 0 && chunkAttempts < maxChunkAttempts) {
+        chunkAttempts++;
+
         // Use configured batch size when positive; otherwise treat as unlimited for this chunk
         int configuredBatch = schedulerProperties.getBatchOperations().getBatchSize();
         int perChunkLimit = configuredBatch > 0 ? configuredBatch : remainingToAcquire;
@@ -501,8 +545,9 @@ public class AgentAcquisitionService {
         // Refresh server time for fairness across chunks
         currentScore = score(jedis, 0L);
 
+        // Use offset to skip already-tried agents when continuing after filtered chunks
         Set<String> readyChunk =
-            jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, 0, chunkSize);
+            jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, chunkOffset, chunkSize);
 
         if (readyChunk == null || readyChunk.isEmpty()) {
           break; // Nothing else ready right now
@@ -528,31 +573,103 @@ public class AgentAcquisitionService {
         }
 
         if (acquiredThisChunk <= 0) {
-          // Avoid spinning if we couldn't acquire from this chunk
-          break;
+          // No agents acquired from this chunk - could be due to:
+          // 1. All agents in chunk were acquired by other pods (normal contention)
+          // 2. All agents were filtered out (sharding/disabled)
+          // 3. Semaphore exhausted
+          // Continue to next chunk to avoid starvation of agents deeper in queue
+          log.debug(
+              "No agents acquired from chunk (size: {}) at offset {}, checking for more ready agents",
+              readyChunk.size(),
+              chunkOffset);
+
+          // Only break if we had nothing to attempt (empty chunk means no more ready)
+          if (readyChunk.isEmpty()) {
+            break;
+          }
+          // Move offset forward to skip agents we've already tried
+          chunkOffset += readyChunk.size();
+          // Continue to next chunk to prevent starvation
+          continue;
         }
 
         agentsAcquiredThisCycle += acquiredThisChunk;
         remainingToAcquire -= acquiredThisChunk;
+        // Reset offset to 0 after successful acquisition since acquired agents are removed from
+        // waiting set
+        // Only move offset forward if no agents were acquired (filtering scenario)
+        chunkOffset = 0;
+      }
+
+      // Check for slot filling performance issues
+      boolean slotFillingIssue = false;
+      String slotFillingReason = null;
+
+      if (chunkAttempts >= maxChunkAttempts && remainingToAcquire > 0) {
+        // Check if we have significant unfilled slots with evidence of filtering
+        double unfilledRatio = (double) remainingToAcquire / availableSlotsForNewAgents;
+        int scannedButNotAcquired = chunkOffset - agentsAcquiredThisCycle;
+
+        if (unfilledRatio > 0.2 && scannedButNotAcquired > 0) {
+          // Significant performance degradation detected
+          slotFillingIssue = true;
+          double actualFilterRate = (double) scannedButNotAcquired / chunkOffset;
+          slotFillingReason =
+              String.format(
+                  "slot_filling_degraded: %d%% unfilled after scanning %d agents (filter_rate=%.1f%%, multiplier=%s)",
+                  (int) (unfilledRatio * 100),
+                  chunkOffset,
+                  actualFilterRate * 100,
+                  multiplier > 0 ? String.valueOf(multiplier) : "0");
+        } else if (log.isDebugEnabled()) {
+          // Still log at debug for troubleshooting
+          log.debug(
+              "Reached max chunk attempts ({}), {} slots unfilled, scanned {}, acquired {}",
+              maxChunkAttempts,
+              remainingToAcquire,
+              chunkOffset,
+              agentsAcquiredThisCycle);
+        }
+      }
+
+      // Update final degradation status combining both issues
+      if (emitDiag) {
+        boolean finalDegraded = initialDegraded || slotFillingIssue;
+        String finalDegradedReason;
+
+        if (initialDegraded && slotFillingIssue) {
+          // Both issues present
+          finalDegradedReason = initialDegradedReason + "; " + slotFillingReason;
+        } else if (initialDegraded) {
+          // Only backlog issue
+          finalDegradedReason = initialDegradedReason;
+        } else if (slotFillingIssue) {
+          // Only slot filling issue
+          finalDegradedReason = slotFillingReason;
+        } else {
+          // No issues
+          finalDegradedReason = "";
+        }
+
+        lastDegraded.set(finalDegraded);
+        lastDegradedReason.set(finalDegradedReason);
+        lastDiagEpochMs.set(System.currentTimeMillis());
       }
 
       // PHASE 6: Submit all acquired agents for execution
-      try {
-        for (AgentWorker worker : workersToSubmit) {
-          // CRITICAL: Set semaphore before execution so it can be released when done
-          worker.setRunningAgents(runningAgents);
-          java.util.concurrent.Future<?> future = agentWorkPool.submit(worker);
+      // Submit each agent individually to handle rejections properly
+      for (AgentWorker worker : workersToSubmit) {
+        // CRITICAL: Set semaphore before execution so it can be released when done
+        worker.setRunningAgents(runningAgents);
+
+        // Submit with proper rejection handling
+        java.util.concurrent.Future<?> future =
+            submitAgentWithRejectionHandling(worker, agentWorkPool, runningAgents);
+
+        if (future != null) {
           activeAgentsFutures.put(worker.getAgent().getAgentType(), future);
           log.debug("Submitted agent {} for execution", worker.getAgent().getAgentType());
         }
-      } catch (Exception e) {
-        log.error(
-            "Error submitting agents for execution, but returning acquisition count anyway", e);
-        if (metrics != null) {
-          metrics.incrementSubmissionFailure(e.getClass().getSimpleName());
-        }
-        // Don't return 0 here - agents were successfully acquired from Redis
-        // The submission error is a separate issue and shouldn't affect the acquisition count
       }
 
       log.debug(
@@ -2623,6 +2740,128 @@ public class AgentAcquisitionService {
 
     public String getReleaseScore() {
       return releaseScore;
+    }
+  }
+
+  /**
+   * Submit an agent to the thread pool with proper rejection handling and permit management.
+   *
+   * @param worker The agent worker to submit
+   * @param agentWorkPool The thread pool to submit to
+   * @param runningAgents The semaphore for concurrency control (may be null)
+   * @return The Future for the submitted task, or null if submission failed
+   */
+  private java.util.concurrent.Future<?> submitAgentWithRejectionHandling(
+      AgentWorker worker, ExecutorService agentWorkPool, Semaphore runningAgents) {
+
+    String agentType = worker.getAgent().getAgentType();
+
+    try {
+      // Submit worker directly to thread pool
+      java.util.concurrent.Future<?> future = agentWorkPool.submit(worker);
+
+      log.debug("Successfully submitted agent {} to thread pool", agentType);
+      return future;
+
+    } catch (java.util.concurrent.RejectedExecutionException rex) {
+      // Handle rejection - release permit and track metric
+      log.warn(
+          "Agent {} submission rejected by thread pool (queue full or pool shutdown)", agentType);
+
+      // CRITICAL: Release the semaphore permit since the agent won't be executed
+      if (runningAgents != null) {
+        runningAgents.release();
+        log.debug("Released semaphore permit for rejected agent {}", agentType);
+      }
+
+      // Track rejection metric
+      if (metrics != null) {
+        metrics.incrementSubmissionFailure("rejected");
+      }
+
+      // Requeue the agent preserving its original readiness priority
+      requeueRejectedAgent(worker);
+
+      return null;
+
+    } catch (Exception e) {
+      // Handle other submission errors
+      log.error("Failed to submit agent {} due to unexpected error", agentType, e);
+
+      // CRITICAL: Release the semaphore permit for any submission failure
+      if (runningAgents != null) {
+        runningAgents.release();
+        log.debug("Released semaphore permit for failed submission of agent {}", agentType);
+      }
+
+      // Track generic submission failure
+      if (metrics != null) {
+        metrics.incrementSubmissionFailure(e.getClass().getSimpleName());
+      }
+
+      return null;
+    }
+  }
+
+  /**
+   * Requeue an agent that was rejected due to thread pool saturation. This preserves the agent's
+   * original priority in the queue to maintain fairness.
+   *
+   * @param worker The agent worker that was rejected
+   */
+  private void requeueRejectedAgent(AgentWorker worker) {
+    String agentType = worker.getAgent().getAgentType();
+
+    try (Jedis jedis = jedisPool.getResource()) {
+      // Calculate the score to preserve queue position
+      String requeueScore;
+
+      if (worker.acquireScore != null) {
+        // We have the acquire score (deadline = acquisition_time + timeout)
+        // Calculate when the agent was originally ready to maintain its position
+        try {
+          long acquireScoreSeconds = Long.parseLong(worker.acquireScore);
+          long timeoutSeconds =
+              intervalProvider.getInterval(worker.getAgent()).getTimeout() / 1000L;
+          long originalReadySeconds = acquireScoreSeconds - timeoutSeconds;
+
+          // Add a small delay (1 second) to avoid immediate re-acquisition in the same cycle
+          // This prevents spinning if the pool stays saturated
+          requeueScore = String.valueOf(originalReadySeconds + 1);
+
+          log.debug(
+              "Requeueing rejected agent {} with score {} (original ready time + 1s backoff)",
+              agentType,
+              requeueScore);
+        } catch (Exception e) {
+          // Fallback to small delay from now if calculation fails
+          log.warn(
+              "Failed to calculate original ready time for agent {}, using fallback delay",
+              agentType,
+              e);
+          requeueScore = score(jedis, 1000L); // 1 second delay
+        }
+      } else {
+        // No acquire score available, use small delay to avoid immediate re-acquisition
+        requeueScore = score(jedis, 1000L); // 1 second delay
+        log.debug(
+            "Requeueing rejected agent {} with score {} (1s delay, no acquire score)",
+            agentType,
+            requeueScore);
+      }
+
+      // Add back to waiting set
+      jedis.zadd(WAITING_SET, Double.parseDouble(requeueScore), agentType);
+      log.info(
+          "Requeued rejected agent {} with score {} - preserving queue fairness",
+          agentType,
+          requeueScore);
+
+    } catch (Exception e) {
+      log.error(
+          "Failed to requeue rejected agent {} - will be picked up in next repopulation",
+          agentType,
+          e);
     }
   }
 

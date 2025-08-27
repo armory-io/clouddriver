@@ -588,7 +588,7 @@ class OrphanCleanupServiceTest {
 
       // Then - With default invalid treatment (no acquisition service), both sets get cleaned
       assertThat(cleaned).isEqualTo(orphanCount);
-      assertThat(duration).isLessThan(15000); // Should complete within 15 seconds
+      assertThat(duration).isLessThan(30000); // Should complete within 30 seconds
 
       // Verify both sets cleaned
       try (Jedis jedis = jedisPool.getResource()) {

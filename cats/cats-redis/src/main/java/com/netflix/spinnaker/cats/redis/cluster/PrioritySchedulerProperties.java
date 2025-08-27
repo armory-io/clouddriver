@@ -162,6 +162,20 @@ public class PrioritySchedulerProperties {
 
     /** Maximum number of items to process in a single batch. Default: 50. */
     private int batchSize = 50;
+
+    /**
+     * Multiplier for chunk attempts during acquisition to handle filtering. The base number of
+     * attempts is calculated as: ceiling(availableSlots / batchSize). This multiplier accounts for
+     * agents that get filtered out (e.g., due to sharding).
+     *
+     * <p>Examples: - 0 or negative = No multiplier, use base attempts only (default - no extra
+     * filtering tolerance) - 1.0 = Same as base attempts (minimum attempts) - 2.0 = Double the
+     * attempts to handle up to 50% filtering - 3.0 = Triple the attempts to handle up to 67%
+     * filtering
+     *
+     * <p>Default: 0.0 (no multiplier - adjust if you see warnings about unfilled slots)
+     */
+    private double chunkAttemptMultiplier = 0.0;
   }
 
   public int getThreadPoolCoreSize() {

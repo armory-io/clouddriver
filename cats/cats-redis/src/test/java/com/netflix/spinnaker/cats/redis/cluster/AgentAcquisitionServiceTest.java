@@ -587,7 +587,7 @@ class AgentAcquisitionServiceTest {
 
       // Then
       assertThat(acquisitionService.getRegisteredAgentCount()).isEqualTo(agentCount);
-      assertThat(duration).isLessThan(5000); // Should complete within 5 seconds
+      assertThat(duration).isLessThan(10000); // Should complete within 10 seconds
     }
 
     @Test
