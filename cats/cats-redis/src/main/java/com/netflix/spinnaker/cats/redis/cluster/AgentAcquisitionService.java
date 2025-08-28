@@ -2270,7 +2270,57 @@ public class AgentAcquisitionService {
 
       // MOVE_AGENTS script returns the score on success, nil on failure
       if (result != null) {
-        return result.toString(); // Return the acquire score from script
+        // Handle different return types from Redis/Jedis
+        String scoreStr;
+        if (result instanceof String) {
+          scoreStr = (String) result;
+        } else if (result instanceof Long) {
+          scoreStr = String.valueOf(result);
+        } else if (result instanceof byte[]) {
+          scoreStr = new String((byte[]) result, java.nio.charset.StandardCharsets.UTF_8);
+        } else {
+          log.warn(
+              "Unexpected return type from MOVE_AGENTS for agent {}: {}",
+              agentType,
+              result.getClass().getName());
+          if (metrics != null) {
+            metrics.incrementAcquireValidationFailure("unexpected_type");
+          }
+          return null;
+        }
+
+        // Validate that the score is numeric (should be Unix timestamp in seconds)
+        // This guards against Redis type coercion surprises or external mutations
+        if (scoreStr == null || scoreStr.isEmpty()) {
+          log.warn("Empty acquire score from MOVE_AGENTS for agent {}", agentType);
+          if (metrics != null) {
+            metrics.incrementAcquireValidationFailure("empty_score");
+          }
+          return null;
+        }
+
+        boolean numeric = true;
+        for (int i = 0; i < scoreStr.length(); i++) {
+          char ch = scoreStr.charAt(i);
+          if (ch < '0' || ch > '9') {
+            numeric = false;
+            break;
+          }
+        }
+
+        if (!numeric) {
+          log.warn(
+              "Non-numeric acquire score from MOVE_AGENTS for agent {}: '{}' (type={})",
+              agentType,
+              scoreStr,
+              result.getClass().getSimpleName());
+          if (metrics != null) {
+            metrics.incrementAcquireValidationFailure("non_numeric_score");
+          }
+          return null;
+        }
+
+        return scoreStr; // Return the validated acquire score
       }
       return null; // Agent was acquired by another instance
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
