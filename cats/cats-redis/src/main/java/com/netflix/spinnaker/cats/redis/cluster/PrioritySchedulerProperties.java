@@ -361,8 +361,7 @@ public class PrioritySchedulerProperties {
   /**
    * Redis key naming configuration.
    *
-   * <p>Defaults use lowercase, function-oriented names and preserve the historical leadership key
-   * name for compatibility.
+   * <p>Defaults use lowercase, function-oriented names.
    */
   @Getter
   @Setter

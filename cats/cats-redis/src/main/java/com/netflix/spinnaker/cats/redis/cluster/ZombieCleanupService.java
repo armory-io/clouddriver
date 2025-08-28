@@ -209,6 +209,15 @@ public class ZombieCleanupService {
         }
       } catch (NumberFormatException e) {
         log.warn("Invalid acquire score for agent {}: {}", agentType, acquireScore);
+
+        // CRITICAL: Force cleanup of agents with invalid scores to prevent zombie limbo
+        // This can happen when dynamic account updates corrupt the acquire score during batch
+        // acquisition
+        zombieAgentTypes.add(agentType);
+        log.error(
+            "Force cleaning zombie agent {} with corrupted acquire score '{}' - likely caused by dynamic account update race condition",
+            agentType,
+            acquireScore);
       }
     }
 

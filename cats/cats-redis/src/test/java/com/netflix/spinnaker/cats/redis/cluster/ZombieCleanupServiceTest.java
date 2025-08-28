@@ -768,14 +768,15 @@ class ZombieCleanupServiceTest {
       // When - Run zombie cleanup
       int cleaned = zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
 
-      // Then - Only normal zombie cleaned, invalid score agent ignored
-      assertThat(cleaned).isEqualTo(1);
+      // Then - Both zombies should be cleaned (invalid scores are now force-cleaned to prevent
+      // zombie limbo)
+      assertThat(cleaned).isEqualTo(2);
 
-      // Invalid score agent should still be in map (not cleaned)
-      assertThat(activeAgents).containsKey("invalid-score-agent");
-      assertThat(activeAgentsFutures).containsKey("invalid-score-agent");
+      // Invalid score agent should be cleaned
+      assertThat(activeAgents).doesNotContainKey("invalid-score-agent");
+      assertThat(activeAgentsFutures).doesNotContainKey("invalid-score-agent");
 
-      // Normal zombie should be cleaned
+      // Normal zombie should also be cleaned
       assertThat(activeAgents).doesNotContainKey("normal-zombie");
       assertThat(activeAgentsFutures).doesNotContainKey("normal-zombie");
     }

@@ -509,9 +509,8 @@ public class OrphanCleanupService {
         // If ownership cannot be determined or belongs to other shard, preserve.
         boolean belongsToThisShard;
         if (acquisitionService == null) {
-          // Test environments (and legacy callers) may not wire acquisitionService. In that case,
-          // treat entries as belonging to this shard so cleanup behavior matches previous default
-          // (both sets cleaned when agents are considered invalid).
+          // Test environments may not wire acquisitionService. In that case,
+          // treat entries as belonging to this shard for consistent cleanup behavior.
           belongsToThisShard = true;
         } else {
           try {

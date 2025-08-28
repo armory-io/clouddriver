@@ -822,8 +822,8 @@ public class AgentAcquisitionService {
     long refreshPeriodMs = Math.max(1L, schedulerProperties.getRefreshPeriodSeconds()) * 1000L;
     long last = lastRepopulateEpochMs.get();
     if (last == 0L) {
-      // Do not initialize here; allow caller (scheduler) to fall back to legacy cycle-based repop
-      // so first run can still repopulate when required by tests/config.
+      // Do not initialize here; allow caller (scheduler) to trigger repopulation
+      // on first run when required by tests/config.
       return false;
     }
     if (now - last < refreshPeriodMs) {
@@ -900,6 +900,10 @@ public class AgentAcquisitionService {
     List<String> candidateAgents = new ArrayList<>();
     List<AgentWorker> candidateWorkers = new ArrayList<>();
 
+    // CRITICAL: Take a snapshot of agents map to prevent dynamic updates during batch processing
+    // This prevents race conditions when the dynamic account plugin adds/removes agents
+    Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
+
     // PHASE 1: Prepare candidates and acquire semaphore permits
     // Note: We respect BOTH the concurrency limit (maxToAcquire) AND batch size limit
     for (String agentType : readyAgents) {
@@ -914,9 +918,11 @@ public class AgentAcquisitionService {
         break;
       }
 
-      AgentWorker worker = agents.get(agentType);
+      AgentWorker worker = agentsSnapshot.get(agentType);
       if (worker == null) {
-        log.warn("Agent {} not found in local registry, skipping", agentType);
+        log.warn(
+            "Agent {} not found in local registry, skipping (may have been dynamically removed)",
+            agentType);
         if (runningAgents != null) {
           runningAgents.release();
         }
@@ -994,15 +1000,52 @@ public class AgentAcquisitionService {
             // Array structure: [agent1, score1, agent2, score2, ...]
             // For agent at index i: score is at position (i * 2 + 1)
 
-            String acquireScore = agentScorePairs.get(i * 2 + 1);
+            // CRITICAL: Validate index and score format to prevent corruption
+            // from dynamic account updates during batch acquisition
+            String acquireScore = null;
+            int scoreIndex = i * 2 + 1;
 
-            worker.acquireScore = acquireScore;
-            workersToSubmit.add(worker);
-            activeAgents.put(agentType, acquireScore);
-            activeAgentMapSize.incrementAndGet();
-            agentsAcquired.incrementAndGet();
+            if (scoreIndex < agentScorePairs.size()) {
+              String scoreCandidate = agentScorePairs.get(scoreIndex);
+              // Validate that the score is a numeric string (timestamp in seconds)
+              if (scoreCandidate != null && scoreCandidate.matches("^\\d+$")) {
+                acquireScore = scoreCandidate;
+              } else {
+                log.error(
+                    "Invalid acquire score detected for agent {} at index {}: '{}' - likely corruption from dynamic account update",
+                    agentType,
+                    scoreIndex,
+                    scoreCandidate);
+              }
+            } else {
+              log.error(
+                  "Score index {} out of bounds for agent {} (agentScorePairs.size={}). Dynamic account modification likely occurred during batch acquisition.",
+                  scoreIndex,
+                  agentType,
+                  agentScorePairs.size());
+            }
 
-            log.debug("Batch acquired agent {} with score {}", agentType, acquireScore);
+            // Only proceed if we have a valid score
+            if (acquireScore != null) {
+              worker.acquireScore = acquireScore;
+              workersToSubmit.add(worker);
+              activeAgents.put(agentType, acquireScore);
+              activeAgentMapSize.incrementAndGet();
+              agentsAcquired.incrementAndGet();
+
+              log.debug("Batch acquired agent {} with score {}", agentType, acquireScore);
+            } else {
+              // Could not get valid score - release permit and skip this agent
+              if (runningAgents != null) {
+                runningAgents.release();
+              }
+              log.warn(
+                  "Skipping agent {} due to invalid/missing acquire score - will retry on next cycle",
+                  agentType);
+              if (metrics != null) {
+                metrics.incrementAcquireValidationFailure("batch_score_corruption");
+              }
+            }
           } else {
             // FAILURE: Agent lost to another pod in race condition
             // Release the semaphore permit we pre-acquired
@@ -1086,6 +1129,10 @@ public class AgentAcquisitionService {
       }
 
       // Semaphore permit acquired
+      // Note: Individual acquisition is less prone to race conditions since it processes one agent
+      // at a time
+      // The dynamic account plugin race primarily affects batch acquisition where indices can be
+      // corrupted
       AgentWorker worker = agents.get(agentType);
       if (worker == null) {
         log.warn(
@@ -1592,7 +1639,9 @@ public class AgentAcquisitionService {
    * @param jedis Jedis connection to Redis
    */
   private void repopulateRedisAgents(Jedis jedis) {
-    int totalAgents = agents.size();
+    // Take a snapshot to prevent concurrent modification during repopulation
+    Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
+    int totalAgents = agentsSnapshot.size();
     log.debug("Repopulation check for {} known agents", totalAgents);
 
     if (totalAgents == 0) {
@@ -1602,8 +1651,8 @@ public class AgentAcquisitionService {
 
     try {
       // Get current Redis state from both sets
-      Set<String> redisAgents = getCurrentRedisAgents(jedis);
-      Set<String> localAgents = agents.keySet();
+      Set<String> localAgents = agentsSnapshot.keySet();
+      Set<String> redisAgents = getCurrentRedisAgents(jedis, localAgents);
 
       // Calculate what needs to be added (missing agents from this instance)
       Set<String> toAdd =
@@ -1625,7 +1674,7 @@ public class AgentAcquisitionService {
       // Update cached minimum interval after changes in the registered set
       try {
         long minSec =
-            agents.values().stream()
+            agentsSnapshot.values().stream()
                 .map(AgentWorker::getAgent)
                 .filter(this::isAgentEnabled)
                 .mapToLong(a -> intervalProvider.getInterval(a).getInterval() / 1000L)
@@ -1648,11 +1697,12 @@ public class AgentAcquisitionService {
    * method retrieves all agents from both Redis sorted sets in a single operation.
    *
    * @param jedis Redis connection to use
+   * @param localAgentNames Set of local agent names to check in Redis
    * @return Set containing all agent names from both Redis sets
    */
-  private Set<String> getCurrentRedisAgents(Jedis jedis) {
+  private Set<String> getCurrentRedisAgents(Jedis jedis, Set<String> localAgentNames) {
     // Avoid full-set scans: check presence for locally registered agents only
-    List<String> agentNames = new ArrayList<>(agents.keySet());
+    List<String> agentNames = new ArrayList<>(localAgentNames);
     if (agentNames.isEmpty()) {
       return java.util.Collections.emptySet();
     }
@@ -1883,7 +1933,8 @@ public class AgentAcquisitionService {
 
     } catch (Exception e) {
       log.error(
-          "Batch repopulation failed completely, falling back to legacy mode: {}", e.getMessage());
+          "Batch repopulation failed completely, falling back to individual operations: {}",
+          e.getMessage());
 
       // Complete fallback to pipeline with individual ADD_AGENT scripts
       Pipeline pipeline = jedis.pipelined();
@@ -1891,7 +1942,7 @@ public class AgentAcquisitionService {
         String agentType = worker.getAgent().getAgentType();
         String nextScore = agentScore(worker.getAgent());
 
-        // Use individual ADD_AGENT script for pipeline compatibility
+        // Use individual ADD_AGENT script for reliability
         pipeline.evalsha(
             scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
             Arrays.asList(WORKING_SET, WAITING_SET),
@@ -2841,10 +2892,13 @@ public class AgentAcquisitionService {
   private void performStartupConsistencyCheck() {
     log.info("Performing startup consistency check for agent reliability");
 
+    // Take snapshot to prevent concurrent modifications during startup check
+    Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
+
     try (Jedis jedis = jedisPool.getResource()) {
       // Get current Redis state from both sets
-      Set<String> redisAgents = getCurrentRedisAgents(jedis);
-      Set<String> localAgents = agents.keySet();
+      Set<String> localAgents = agentsSnapshot.keySet();
+      Set<String> redisAgents = getCurrentRedisAgents(jedis, localAgents);
 
       // Calculate what needs to be added (missing agents)
       Set<String> toAdd =
