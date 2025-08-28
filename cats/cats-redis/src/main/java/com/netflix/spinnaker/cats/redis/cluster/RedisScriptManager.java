@@ -51,16 +51,13 @@ public class RedisScriptManager {
 
   // === BASIC OPERATIONS ===
   public static final String ADD_AGENT = "addAgent"; // Single agent addition
-  public static final String REMOVE_AGENT = "removeAgent"; // Single agent removal
-
-  // Batch operations (with detailed return values for tracking)
   public static final String ADD_AGENTS = "addAgents"; // Batch agent addition
+  public static final String REMOVE_AGENT = "removeAgent"; // Single agent removal
   public static final String REMOVE_AGENTS =
       "removeAgents"; // Batch agent unconditional removal from both sets
 
   // === STATE TRANSITIONS ===
   public static final String MOVE_AGENT = "moveAgent"; // Single agent waiting→working movement
-
   public static final String MOVE_AGENTS =
       "moveAgents"; // Unconditional waiting→working for agent acquisition
   public static final String MOVE_AGENTS_CONDITIONAL =

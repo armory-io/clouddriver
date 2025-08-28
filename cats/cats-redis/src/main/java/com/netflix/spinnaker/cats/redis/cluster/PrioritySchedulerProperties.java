@@ -54,6 +54,8 @@ public class PrioritySchedulerProperties {
     private long halfOpenDurationMs = 5000;
   }
 
+  // === CORE SCHEDULING PROPERTIES ===
+
   /**
    * How often the scheduler runs to check for ready agents (milliseconds). Controls the frequency
    * of the main scheduling loop. Config key: {@code redis.scheduler.interval-ms}
@@ -66,11 +68,27 @@ public class PrioritySchedulerProperties {
    */
   private int refreshPeriodSeconds = 30;
 
+  /**
+   * How long to cache Redis server time to reduce TIME command calls (milliseconds). Higher values
+   * reduce Redis calls but may drift from server time. Config key: {@code
+   * redis.scheduler.time-cache-duration-ms}
+   */
+  private long timeCacheDurationMs = 10000L; // 10 seconds
+
+  // === RESOURCE MANAGEMENT ===
+
+  /** Thread pool configuration for agent execution. */
+  private RedisThreadPoolProperties pool = new RedisThreadPoolProperties();
+
+  // === CLEANUP SERVICES ===
+
   /** Zombie cleanup configuration for stuck agents. */
   private ZombieCleanupProperties zombieCleanup = new ZombieCleanupProperties();
 
   /** Orphan cleanup configuration for agents from crashed instances. */
   private OrphanCleanupProperties orphanCleanup = new OrphanCleanupProperties();
+
+  // === PERFORMANCE & RESILIENCE ===
 
   /**
    * Enable batch operations for Redis operations. When enabled, the scheduler will group agent
@@ -84,16 +102,6 @@ public class PrioritySchedulerProperties {
 
   /** Circuit breaker configuration for protecting against cascading failures. */
   private CircuitBreaker circuitBreaker = new CircuitBreaker();
-
-  /**
-   * How long to cache Redis server time to reduce TIME command calls (milliseconds). Higher values
-   * reduce Redis calls but may drift from server time. Config key: {@code
-   * redis.scheduler.time-cache-duration-ms}
-   */
-  private long timeCacheDurationMs = 10000L; // 10 seconds
-
-  /** Thread pool configuration for agent execution. */
-  private RedisThreadPoolProperties pool = new RedisThreadPoolProperties();
 
   /**
    * Failure-aware backoff configuration for agent failures.
