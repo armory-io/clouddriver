@@ -49,18 +49,10 @@ import redis.clients.jedis.Response;
 import redis.clients.jedis.Tuple;
 
 /**
- * Service responsible for acquiring agents from Redis and executing them.
+ * Service that acquires agents from Redis and executes them using atomic operations.
  *
- * <p>This service handles the core scheduling logic of moving agents from the waiting set to the
- * working set and executing them. It includes:
- *
- * <ul>
- *   <li>Finding agents ready for execution based on priority (Redis scores)
- *   <li>Atomically acquiring agents using Lua scripts to prevent double execution
- *   <li>Submitting acquired agents to the thread pool for execution
- *   <li>Managing concurrency limits via semaphores
- *   <li>Periodic Redis repopulation for recovery
- * </ul>
+ * <p>Manages agent lifecycle: acquisition from waiting set, execution in working set, completion
+ * handling, and periodic repopulation for recovery.
  */
 @Component
 @Slf4j
@@ -884,8 +876,7 @@ public class AgentAcquisitionService {
       Semaphore runningAgents,
       Set<AgentWorker> workersToSubmit) {
 
-    // Apply batch size limit to prevent overwhelming Redis and memory. If configured batch size is
-    // non-positive, treat it as unlimited for this chunk.
+    // Calculate batch size to prevent memory/Redis overload
     int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
     int effectiveBatchSize =
         configuredBatchSize > 0 ? Math.min(maxToAcquire, configuredBatchSize) : maxToAcquire;
@@ -900,11 +891,11 @@ public class AgentAcquisitionService {
     List<String> candidateAgents = new ArrayList<>();
     List<AgentWorker> candidateWorkers = new ArrayList<>();
 
-    // CRITICAL: Take a snapshot of agents map to prevent dynamic updates during batch processing
-    // This prevents race conditions when the dynamic account plugin adds/removes agents
+    // Snapshot agents to prevent concurrent modification during batch processing
+    // Critical for avoiding race conditions with dynamic account updates
     Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
 
-    // PHASE 1: Prepare candidates and acquire semaphore permits
+    // PHASE 1: Build candidate list and acquire semaphore permits
     // Note: We respect BOTH the concurrency limit (maxToAcquire) AND batch size limit
     for (String agentType : readyAgents) {
       if (candidateCount >= effectiveBatchSize) {

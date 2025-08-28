@@ -28,22 +28,11 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 
 /**
- * Service responsible for detecting and cleaning up zombie agents.
+ * Service that detects and cleans up zombie agents (stuck or timed-out agents).
  *
- * <p>Zombie agents are agents that have been running for longer than the configured threshold,
- * indicating they may be stuck or the process that was executing them has died. This service
- * identifies such agents and cleans them up to prevent resource leaks and allow them to be
- * rescheduled.
- *
- * <p>The cleanup process:
- *
- * <ul>
- *   <li>Scans the local activeAgents map for agents exceeding their completion deadline
- *   <li>Uses batch removal scripts for efficient cleanup if enabled (otherwise falls back to
- *       individual cleanup)
- *   <li>Cancels any local Future references to zombie executions
- *   <li>Updates both Redis working and waiting sets to reflect cleanup
- * </ul>
+ * <p>Zombies are agents that exceed their completion deadline plus a configurable buffer. The
+ * service scans locally active agents, cancels stuck executions, and removes them from Redis to
+ * allow rescheduling.
  */
 @Component
 @Slf4j
@@ -184,16 +173,16 @@ public class ZombieCleanupService {
       String acquireScore = entry.getValue();
 
       try {
-        // acquireScore is completion deadline (current_time + agent_timeout)
-        // Convert acquire score from seconds to milliseconds for comparison
+        // Score represents completion deadline in epoch seconds
+        // Formula: acquire_time + agent_timeout = completion deadline
         long completionDeadlineMs = Long.parseLong(acquireScore) * 1000;
         validAgentsScanned++;
 
-        // Get the appropriate zombie threshold for this specific agent
+        // Different agents may have different thresholds (e.g., BigQuery agents need longer)
         long zombieThreshold = getZombieThresholdForAgent(agentType);
 
-        // The agent is considered a zombie if current time exceeds completion deadline + zombie
-        // threshold buffer
+        // Zombie detection: current_time > (completion_deadline + buffer_threshold)
+        // Buffer prevents false positives from temporary delays
         if (currentTime > completionDeadlineMs + zombieThreshold) {
           zombieAgentTypes.add(agentType);
           long overdueMs = currentTime - completionDeadlineMs;
@@ -210,9 +199,8 @@ public class ZombieCleanupService {
       } catch (NumberFormatException e) {
         log.warn("Invalid acquire score for agent {}: {}", agentType, acquireScore);
 
-        // CRITICAL: Force cleanup of agents with invalid scores to prevent zombie limbo
-        // This can happen when dynamic account updates corrupt the acquire score during batch
-        // acquisition
+        // Force cleanup invalid scores to prevent permanent stuck state
+        // Can occur during concurrent dynamic account updates
         zombieAgentTypes.add(agentType);
         log.error(
             "Force cleaning zombie agent {} with corrupted acquire score '{}' - likely caused by dynamic account update race condition",

@@ -24,10 +24,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 /**
- * Priority scheduler execution configuration properties for Redis priority scheduler.
+ * Configuration properties for the Redis priority scheduler.
  *
- * <p>This class caches scheduler-related configuration values to avoid dynamic config calls.
- * Configuration changes are applied through Spring Boot's configuration refresh mechanism.
+ * <p>Externalized configuration via Spring Boot @ConfigurationProperties.
  */
 @Component
 @ConfigurationProperties(prefix = "redis.scheduler")

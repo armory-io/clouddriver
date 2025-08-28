@@ -23,24 +23,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Circuit breaker for protecting the Redis Priority Scheduler from cascading failures.
+ * Circuit breaker protecting the scheduler from cascading failures.
  *
- * <p>The circuit breaker has three states:
+ * <p>States: CLOSED (normal) → OPEN (blocking) → HALF_OPEN (testing) → CLOSED
  *
- * <ul>
- *   <li>CLOSED: Normal operation, all requests allowed
- *   <li>OPEN: Circuit is tripped, requests are blocked for a cooldown period
- *   <li>HALF_OPEN: Test period to see if the issue has resolved
- * </ul>
- *
- * <p>Transitions:
- *
- * <ul>
- *   <li>CLOSED → OPEN: After threshold failures within time window
- *   <li>OPEN → HALF_OPEN: After cooldown period expires
- *   <li>HALF_OPEN → CLOSED: On successful probe
- *   <li>HALF_OPEN → OPEN: On probe failure
- * </ul>
+ * <p>Trips open after threshold failures, cools down, then tests recovery.
  */
 public class PrioritySchedulerCircuitBreaker {
   private static final Logger log = LoggerFactory.getLogger(PrioritySchedulerCircuitBreaker.class);

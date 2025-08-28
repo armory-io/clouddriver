@@ -27,71 +27,21 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 
 /**
- * Manages Redis Lua scripts for the PriorityAgentScheduler.
+ * Manages Redis Lua scripts for atomic scheduler operations.
  *
- * <p>This service handles loading, caching, and executing all Lua scripts used for atomic Redis
- * operations. All scripts are loaded once during initialization and cached by SHA hash for
- * efficient execution via EVALSHA.
+ * <p>Loads and caches Lua scripts for efficient execution via EVALSHA. Scripts provide atomic
+ * operations for agent state transitions between waiting and working sets.
  *
- * <p><strong>Script Categories:</strong>
+ * <p>Key operations:
  *
  * <ul>
- *   <li><strong>Individual Operations:</strong> Scripts with simple return values
- *   <li><strong>Batch Operations:</strong> Detailed tracking with complex return values
- *   <li><strong>State Transitions:</strong> Agent movement between the waiting and working sets
- *   <li><strong>Advanced Operations:</strong> Conditional operations and ownership validation
- *   <li><strong>System Operations:</strong> Leadership management and scoring
+ *   <li>Agent movement between sets (waiting ↔ working)
+ *   <li>Batch operations for performance
+ *   <li>Conditional operations with ownership validation
+ *   <li>Leadership management for distributed coordination
  * </ul>
  *
- * <p><strong>Script Glossary (quick reference)</strong>
- *
- * <p>Sets and score semantics: - waiting: waiting/ready agents; working: working/leased agents. -
- * Scores are seconds-based timestamps used for scheduling and ownership (lock) semantics.
- *
- * <p>ADD_AGENT (addAgent) - KEYS: working, waiting | ARGV: agentName, score | Returns: 1 if added,
- * 0 if present - Purpose: Idempotent single-agent enqueue; preserves single membership invariant.
- *
- * <p>REMOVE_AGENT (removeAgent) - KEYS: working, waiting | ARGV: agentName | Returns: 1 - Purpose:
- * Unconditional removal from both sets; used by completion/zombie cleanup.
- *
- * <p>MOVE_AGENT (moveAgent) - KEYS: working, waiting | ARGV: agentName, newScore | Returns: 1 if
- * moved, 0 otherwise - Purpose: Atomic single-agent acquisition waiting → working (non-batch path).
- *
- * <p>ADD_AGENTS (addAgents) - KEYS: working, waiting | ARGV: [agent1, score1, agent2, score2, ...]
- * - Returns: [count, [addedAgents...]] - Purpose: Batched enqueue; idempotent per agent.
- *
- * <p>REMOVE_AGENTS (removeAgents) - KEYS: working, waiting | ARGV: agentName | Returns: 1 -
- * Purpose: Unconditional removal (compatibility single-arg variant).
- *
- * <p>MOVE_AGENTS (moveAgents) - KEYS: working, waiting | ARGV: agentName, newScore | Returns:
- * newScore or nil - Purpose: Atomic single-agent acquisition waiting → working (used in acquisition
- * flows).
- *
- * <p>MOVE_AGENTS_CONDITIONAL (moveAgentsConditional) - KEYS: working, waiting | ARGV: agentName,
- * expectedScore, newScore | Returns: 'swapped' or nil - Purpose: Ownership-verified working →
- * waiting requeue (e.g., graceful shutdown).
- *
- * <p>VALIDATE_OWNERSHIP (validateOwnership) - KEYS: working | ARGV: agentName, expectedScore |
- * Returns: score or nil - Purpose: Check if this node still owns the working lock (score match).
- *
- * <p>REMOVE_AGENTS_CONDITIONAL (removeAgentsConditional) - KEYS: one of working or waiting | ARGV:
- * [agent1, expectedScore1, ...] - Returns: [count, [removedAgents...]] - Purpose: Safe,
- * score-validated cleanup for orphans/zombies; avoids racey deletes.
- *
- * <p>ACQUIRE_AGENTS (acquireAgents) - KEYS: working, waiting | ARGV: [agent1, newScore1, ...] -
- * Returns: [count, [acquiredAgents...]] - Purpose: Batched acquisition waiting → working with
- * atomic per-entry checks; used with ready-scan limit for O(N) cycles.
- *
- * <p>SCORE_AGENTS (scoreAgents) - KEYS: working, waiting | ARGV: [agent1, agent2, ...] - Returns:
- * [agent, workScore|'null', waitScore|'null', ...] - Purpose: Diagnostics/observability of an
- * agent's presence and scores.
- *
- * <p>RELEASE_LEADERSHIP (releaseLeadership) - KEYS: leadershipKey | ARGV: ownerId | Returns: 1 if
- * deleted, 0 otherwise - Purpose: Atomic leadership release, guarded by ownership value.
- *
- * <p>Self-heal on NOSCRIPT: - evalshaWithSelfHeal transparently reloads scripts on NOSCRIPT,
- * retries EVALSHA, and falls back to EVAL using the same single-source body, avoiding operator
- * intervention.
+ * <p>Self-heals on NOSCRIPT errors by transparently reloading scripts.
  */
 @Component
 @Slf4j
@@ -205,18 +155,14 @@ public class RedisScriptManager {
   /**
    * Execute a script via EVALSHA with automatic self-heal on NOSCRIPT.
    *
-   * <p>Lifecycle alignment: - Scripts are the single source of truth for atomic queue mutations
-   * (waiting/working): add, move, acquire, remove, validate ownership, and release leadership.
-   * These implement the invariants documented in priority-scheduler-agent-lifecycle.md (e.g.,
-   * single membership across sets, atomic transitions, and score-as-ownership semantics). - If
-   * Redis has flushed scripts (failover, SCRIPT FLUSH, upgrades), EVALSHA will throw NOSCRIPT. We
-   * transparently reload all scripts, retry EVALSHA, and finally EVAL the raw body as a last resort
-   * so the scheduler can continue without operator intervention.
+   * <p>Scripts provide atomic operations for agent state transitions. If Redis has evicted scripts
+   * (failover, SCRIPT FLUSH), transparently reloads and retries to avoid disruption.
    */
   public Object evalshaWithSelfHeal(
       Jedis jedis, String scriptName, java.util.List<String> keys, java.util.List<String> args) {
     long start = System.nanoTime();
     try {
+      // Fast path: execute cached script SHA
       Object result = jedis.evalsha(getScriptSha(scriptName), keys, args);
       metrics.recordScriptEval(
           scriptName, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
@@ -225,17 +171,17 @@ public class RedisScriptManager {
       String msg = e.getMessage();
       if (msg != null && msg.contains("NOSCRIPT")) {
         try {
-          // Reload all scripts once
+          // Script evicted from Redis - reload all scripts
           metrics.incrementScriptsReload();
           loadAllScripts(jedis);
-          // Retry EVALSHA
+          // Retry with reloaded SHA
           long retryStart = System.nanoTime();
           Object result = jedis.evalsha(getScriptSha(scriptName), keys, args);
           metrics.recordScriptEval(
               scriptName, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - retryStart));
           return result;
         } catch (Exception retry) {
-          // Final fallback: EVAL with body if available
+          // Fallback: execute script body directly via EVAL
           String body = getScriptBody(scriptName);
           if (body != null) {
             long evalStart = System.nanoTime();

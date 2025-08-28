@@ -27,20 +27,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 /**
- * Centralized configuration management for the PriorityAgentScheduler.
+ * Configuration management for the PriorityAgentScheduler.
  *
- * <p>This service handles:
- *
- * <ul>
- *   <li>Thread pool configuration and creation
- *   <li>Semaphore setup for concurrency control
- *   <li>Pattern compilation for agent filtering
- *   <li>Configuration validation and defaults
- *   <li>Runtime configuration access
- * </ul>
- *
- * <p>All configuration is cached via Spring Boot @ConfigurationProperties, which allows consistent
- * access to configuration values during runtime.
+ * <p>Manages thread pools, semaphores, agent patterns, and runtime configuration. Configuration is
+ * cached via Spring Boot @ConfigurationProperties.
  */
 @Component
 @Slf4j
@@ -344,11 +334,6 @@ public class PrioritySchedulerConfiguration {
             new ThreadFactoryBuilder().setNameFormat("PriorityAgentWorker-%d").build(),
             new ThreadPoolExecutor.CallerRunsPolicy()); // Backpressure to scheduler thread
   }
-
-  // Queue policy:
-  // - linked: unbounded LinkedBlockingQueue for legacy parity
-  // - array: bounded ArrayBlockingQueue with configurable capacity (defaults to max threads)
-  // - sync: SynchronousQueue for direct handoff and strongest backpressure
 
   /** Creates the scheduler executor service. */
   private void createSchedulerExecutorService() {

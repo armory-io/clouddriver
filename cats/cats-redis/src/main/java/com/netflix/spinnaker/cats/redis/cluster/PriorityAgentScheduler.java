@@ -38,176 +38,19 @@ import org.springframework.stereotype.Component;
 import redis.clients.jedis.JedisPool;
 
 /**
- * Priority-based Redis agent scheduler using sorted sets for coordinated execution across multiple
- * clouddriver instances.
+ * Priority-based Redis agent scheduler using sorted sets for distributed coordination.
  *
- * <p>This scheduler provides distributed agent coordination with deadline-aware scheduling, zombie
- * detection, orphan cleanup, and atomic operations via Lua scripts.
- *
- * <p>Core Architecture:
+ * <p>Uses two Redis sorted sets for scheduling agents across multiple instances:
  *
  * <ul>
  *   <li><strong>waiting set:</strong> Agents ready for execution, scored by next run time
  *   <li><strong>working set:</strong> Agents currently executing, scored by completion deadline
- *       (current_time + agent_timeout)
- *   <li><strong>Atomic Operations:</strong> Lua scripts ensure race-free state transitions
- *   <li><strong>Priority Scheduling:</strong> Lower scores = higher priority execution
- *   <li><strong>Agent-Specific Timeouts:</strong> Each agent type gets appropriate timeout handling
  * </ul>
  *
- * <h2>Priority 0 invariants and health</h2>
+ * <p>Key features: atomic state transitions via Lua scripts, priority scheduling (lower scores =
+ * higher priority), deadline-aware timeouts, zombie detection, orphan cleanup.
  *
- * <ul>
- *   <li>Re-scheduling: On success, re-schedule for the next cadence (prefer original acquire-based
- *       cadence; else now + interval). On failure: immediate retry unless failure-aware backoff is
- *       enabled (then class-based delays are applied).
- *   <li>Waiting set preservation: Do not purge valid waiting entries by age; preserve FIFO under
- *       backlog.
- *   <li>Working orphans: Skip locally active entries; move valid stale entries back to waiting
- *       using conditional move; remove invalid ones.
- *   <li>Health logging: Every 10 minutes, emit HEALTHY/DEGRADED and queue lag (seconds). Queue lag
- *       is computed from the scores of agents in the waiting set. DEGRADED when
- *       oldest_overdue_seconds > minimum enabled-agent interval on this pod. WARNs are rate-limited
- *       to avoid flooding.
- * </ul>
- *
- * <h2>Configuration Properties</h2>
- *
- * <p><strong>Agent Configuration (redis.agent.*):</strong>
- *
- * <pre>
- * redis:
- *   agent:
- *     enabledPattern: ".*"              # Default: all agents enabled
- *     disabledPattern: ""               # Default: no pattern-based disabling
- *     maxConcurrentAgents: 100          # Default: max 100 simultaneous agents
- * </pre>
- *
- * <ul>
- *   <li><strong>enabledPattern:</strong> Regex for agent inclusion. Controls which agents are
- *       enabled for this scheduler instance.
- *   <li><strong>disabledPattern:</strong> Regex for agent exclusion (takes precedence over
- *       enabledPattern). Empty string disables pattern matching.
- *   <li><strong>maxConcurrentAgents:</strong> Instance-wide semaphore limit for concurrent agent
- *       executions. Controls resource utilization across the system.
- * </ul>
- *
- * <p><strong>Scheduler Configuration (redis.scheduler.*):</strong>
- *
- * <pre>
- * redis:
- *   scheduler:
- *     intervalMs: 1000                  # Default: 1 second pickup cycles
- *     refreshPeriodSeconds: 30          # Default: 30 second agent refresh
- *     batchOperationsEnabled: false     # Default: disabled for safety
- *     timeCacheDurationMs: 10000        # Default: 10 second time cache
- * </pre>
- *
- * <ul>
- *   <li><strong>intervalMs:</strong> Main scheduling loop frequency. Controls how often the
- *       scheduler checks for and acquires ready agents.
- *   <li><strong>refreshPeriodSeconds:</strong> How often agents are synchronized from Spring
- *       context to Redis. Controls the frequency of agent registration updates.
- *   <li><strong>batchOperationsEnabled:</strong> Groups multiple Redis operations into batches.
- *       Controls whether operations like agent acquisition use batch mode.
- *   <li><strong>timeCacheDurationMs:</strong> Duration to cache Redis TIME command results.
- *       Controls how frequently the scheduler refreshes its time synchronization.
- * </ul>
- *
- * <p><strong>Zombie Cleanup Configuration (redis.scheduler.zombieCleanup.*):</strong>
- *
- * <pre>
- * redis:
- *   scheduler:
- *     zombieCleanup:
- *       enabled: true                  # Default: zombie detection enabled
- *       thresholdMs: 30000             # Default: 30 seconds (30 * 1000)
- *       intervalMs: 300000             # Default: 5 minutes (5 * 60 * 1000)
- *       batchSize: 50                  # Default: process 50 zombies per batch
- *       exceptionalAgents:
- *         pattern: ".*BigQuery.*"      # Example: Regex pattern for agent names
- *         thresholdMs: 3600000         # Different threshold for matching agents (60 * 60 * 1000)
- * </pre>
- *
- * <ul>
- *   <li><strong>enabled:</strong> Master switch for zombie detection. Disable only for debugging.
- *   <li><strong>thresholdMs:</strong> Additional time buffer beyond agent completion deadline
- *       before considering an agent zombie. Defines how long to wait after an agent exceeds its
- *       timeout before marking it as a zombie.
- *   <li><strong>intervalMs:</strong> Zombie scan frequency. Controls how often the system checks
- *       for and cleans up zombie agents.
- *   <li><strong>batchSize:</strong> Number of zombies processed per cleanup cycle. Controls how
- *       many zombie agents can be cleaned up in a single operation.
- *   <li><strong>exceptionalAgents:</strong> Configuration for exceptional agents that require
- *       different zombie thresholds.
- *   <li><strong>pattern:</strong> Regex pattern for agent names.
- *   <li><strong>thresholdMs:</strong> Different time buffer beyond agent completion deadline before
- *       considering an agent zombie.
- * </ul>
- *
- * <p><strong>Orphan Cleanup Configuration (redis.scheduler.orphanCleanup.*):</strong>
- *
- * <pre>
- * redis:
- *   scheduler:
- *     orphanCleanup:
- *       enabled: true                  # Default: orphan cleanup enabled
- *       thresholdMs: 600000            # Default: 10 minutes (10 * 60 * 1000)
- *       intervalMs: 300000             # Default: 5 minutes (5 * 60 * 1000)
- *       batchSize: 50                  # Default: process 50 orphans per batch
- *       leadershipTtlMs: 120000        # Default: 2 minutes (2 * 60 * 1000)
- *       forceAllPods: false            # Default: leader-only cleanup
- * </pre>
- *
- * <ul>
- *   <li><strong>enabled:</strong> Controls cleanup of agents from crashed instances. Manages the
- *       removal of agents left behind by pods that no longer exist.
- *   <li><strong>thresholdMs:</strong> Time buffer for orphan detection. Defines how long to wait
- *       before considering an agent as orphaned. Different logic applies for agents in the working
- *       vs waiting sets: - working orphans: agents past completion deadline + buffer. - waiting
- *       orphans: agents with execution times older than current time - buffer.
- *   <li><strong>intervalMs:</strong> Orphan cleanup frequency. Controls how often the system checks
- *       for and removes orphaned agents.
- *   <li><strong>batchSize:</strong> Number of orphans processed per cleanup cycle. Controls how
- *       many orphaned agents can be cleaned up in a single operation.
- *   <li><strong>leadershipTtlMs:</strong> Duration of cleanup leadership lock. Prevents multiple
- *       instances from cleaning simultaneously.
- *   <li><strong>forceAllPods:</strong> If true, all instances perform cleanup without leadership
- *       coordination.
- * </ul>
- *
- * <p><strong>Thread Pool Configuration (redis.scheduler.pool.*):</strong>
- *
- * <pre>
- * redis:
- *   scheduler:
- *     pool:
- *       coreSize: 10                   # Default: 10 core threads
- *       maxSize: 50                    # Default: 50 max threads
- *       keepAliveSeconds: 60           # Default: 60 second keep-alive
- *       queueType: linked              # linked | array | sync
- *       queueCapacity: 0               # for array; 0 ⇒ fallback to maxSize
- * </pre>
- *
- * <ul>
- *   <li><strong>coreSize:</strong> Base number of threads for agent execution. Controls the number
- *       of always-available threads in the pool.
- *   <li><strong>maxSize:</strong> Maximum number of threads the pool can grow to. Controls the
- *       upper limit of concurrent agent executions.
- *   <li><strong>keepAliveSeconds:</strong> Idle thread timeout. Controls how long non-core threads
- *       remain in the pool when idle.
- *   <li><strong>queueType:</strong> Queue/backpressure strategy for the worker pool.
- *       <ul>
- *         <li>linked: Unbounded LinkedBlockingQueue (legacy parity). Fast submissions, risk of
- *             deeper queues under heavy load.
- *         <li>array: Bounded ArrayBlockingQueue. Set capacity via <code>queueCapacity</code> to cap
- *             queued work and reduce OOM risk.
- *         <li>sync: SynchronousQueue (no queue). Strong backpressure; with CallerRunsPolicy the
- *             scheduler thread may execute work when saturated.
- *       </ul>
- *   <li><strong>queueCapacity:</strong> Capacity for array queue type. If ≤ 0, defaults to <code>
- *       maxSize</code>.
- * </ul>
+ * <p>See external documentation for detailed configuration reference.
  */
 @Component
 @Slf4j
@@ -240,18 +83,15 @@ public class PriorityAgentScheduler extends CatsModuleAware
   private final AtomicLong lastReconcileEpochMs = new AtomicLong(0);
 
   /**
-   * Creates a PriorityAgentScheduler and wires core services.
+   * Creates a PriorityAgentScheduler with required dependencies.
    *
-   * <p>Initializes script management, runtime configuration (thread pool, semaphore, regex
-   * patterns), and the acquisition/zombie/orphan services. Also cross-links the orphan cleaner with
-   * acquisition for shard-aware cleanup.
-   *
-   * @param jedisPool Redis connection pool used by all scheduler services
-   * @param nodeStatusProvider Provides node enablement for gating scheduling
-   * @param intervalProvider Supplies per-agent intervals/timeouts
-   * @param shardingFilter Predicate to decide local shard ownership of agents
-   * @param agentProperties Agent-level configuration properties
-   * @param schedulerProperties Scheduler-level configuration properties
+   * @param jedisPool Redis connection pool
+   * @param nodeStatusProvider Node enablement state provider
+   * @param intervalProvider Agent interval/timeout provider
+   * @param shardingFilter Shard ownership filter
+   * @param agentProperties Agent configuration
+   * @param schedulerProperties Scheduler configuration
+   * @param metrics Metrics registry
    */
   public PriorityAgentScheduler(
       JedisPool jedisPool,
@@ -262,9 +102,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
       PrioritySchedulerProperties schedulerProperties,
       PrioritySchedulerMetrics metrics) {
 
-    // Initialize services
+    // Initialize services with defensive null checking
     this.metrics =
-        (metrics != null) ? metrics : new PrioritySchedulerMetrics(new DefaultRegistry());
+        SchedulerUtils.getOrDefault(metrics, new PrioritySchedulerMetrics(new DefaultRegistry()));
     this.scriptManager = new RedisScriptManager(jedisPool, this.metrics);
     this.config = new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
     this.acquisitionService =
@@ -343,25 +183,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
   }
 
   /**
-   * Main scheduler execution loop - called periodically by ScheduledExecutorService.
-   *
-   * <p>This method orchestrates the core scheduling logic:
-   *
-   * <ol>
-   *   <li>Checks if this node is enabled for scheduling
-   *   <li>Performs cleanup operations (zombies and orphans)
-   *   <li>Acquires ready agents and submits them for execution
-   * </ol>
-   *
-   * <p>Key Scheduling Decisions:
-   *
-   * <ul>
-   *   <li>Agents are acquired from waiting set based on their next execution time
-   *   <li>When acquired, agents are moved to working set with a completion deadline (current_time +
-   *       agent_timeout)
-   *   <li>Agent timeouts are agent-specific
-   *   <li>Completion deadlines are used for zombie detection and orphan cleanup
-   * </ul>
+   * Main scheduler execution loop - called periodically by ScheduledExecutorService. Orchestrates
+   * agent scheduling, cleanup operations, and health monitoring.
    */
   @Override
   public void run() {
@@ -374,14 +197,15 @@ public class PriorityAgentScheduler extends CatsModuleAware
       long currentRun = runCount.incrementAndGet();
       log.debug("Starting scheduler run cycle {}", currentRun);
 
-      // PHASE 0: Dynamic configuration refresh (periodic)
+      // Refresh configuration periodically to pick up dynamic changes
       refreshConfigurationIfNeeded(currentRun);
 
-      // PHASE 0.5: Reconcile known agents with current sharding/enablement (periodic)
+      // Reconcile agent registrations with current sharding/enablement state
+      // This ensures agents are properly distributed when shards change
       reconcileKnownAgentsIfNeeded(currentRun);
 
-      // PHASE 0.75: Redis repopulation when due; if repopulated this cycle, skip acquisition to
-      // stabilize Redis state and make initial registration/jitter behavior observable
+      // Check if Redis repopulation is due. If we repopulate, skip acquisition
+      // this cycle to avoid race conditions during initial agent registration
       long beforeRepop = acquisitionService.getRegisteredAgentCount();
       boolean repopulatedThisCycle = acquisitionService.repopulateIfDueNow();
       if (!repopulatedThisCycle) {
@@ -392,13 +216,15 @@ public class PriorityAgentScheduler extends CatsModuleAware
         }
       }
 
-      // PHASE 1: Cleanup operations
+      // Clean up zombie agents (locally stuck agents exceeding their timeout)
       zombieService.cleanupZombieAgentsIfNeeded(
           acquisitionService.getActiveAgentsMap(), acquisitionService.getActiveAgentsFutures());
 
+      // Clean up orphaned agents (agents from crashed instances)
       orphanService.cleanupOrphanedAgentsIfNeeded();
 
-      // PHASE 2: Agent acquisition and execution
+      // Acquire ready agents and submit them for execution
+      // Skip if we just repopulated to let Redis stabilize
       int agentsAcquired = 0;
       if (!repopulatedThisCycle) {
         agentsAcquired =
@@ -414,7 +240,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
             "Scheduler run cycle {} completed: {} agents acquired", currentRun, agentsAcquired);
       }
 
-      // Log periodic operational health summary based on time (not cycle count)
+      // Log health summary every 10 minutes (time-based, not cycle-based)
       maybeLogHealthSummary();
 
       metrics.recordRunCycle(true, System.currentTimeMillis() - start);
@@ -423,7 +249,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       log.error("Critical error in scheduler run cycle {}", runCount.get(), t);
       metrics.incrementRunFailure(t.getClass().getSimpleName());
       metrics.recordRunCycle(false, 0);
-      // Don't rethrow - let scheduler continue and try again next cycle
+      // Continue scheduler operation despite errors - resilient to failures
     }
   }
 
@@ -645,8 +471,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
             }
 
             // Release semaphore permit for interrupted agent
+            SchedulerUtils.safeRelease(config.getRunningAgents(), 1);
             if (config.getRunningAgents() != null) {
-              config.getRunningAgents().release();
               log.debug("Released semaphore permit for interrupted agent {}", agentType);
             }
           }

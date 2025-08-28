@@ -25,9 +25,9 @@ import org.springframework.stereotype.Component;
 import redis.clients.jedis.JedisPool;
 
 /**
- * Centralized metrics helper for the Priority Redis scheduler.
+ * Metrics collection for the Priority Redis scheduler.
  *
- * <p>Emits low-cardinality Spectator metrics.
+ * <p>Provides Spectator metrics for monitoring scheduler health and performance.
  */
 @Component
 public final class PrioritySchedulerMetrics {

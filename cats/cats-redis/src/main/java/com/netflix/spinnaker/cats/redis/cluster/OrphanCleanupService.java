@@ -31,40 +31,18 @@ import redis.clients.jedis.Tuple;
 import redis.clients.jedis.params.SetParams;
 
 /**
- * Service responsible for detecting and cleaning up orphaned agents.
+ * Service that detects and cleans up orphaned agents from crashed instances.
  *
- * <p>Definitions:
+ * <p>Orphans are agents left in Redis after their owning pod crashes. Unlike zombies (locally stuck
+ * agents), orphans have no running instance. The service uses leader election to coordinate cleanup
+ * across pods, preventing duplicate work.
  *
- * <ul>
- *   <li><strong>waiting</strong> – Agents ready to run, scored by next execution time (epoch
- *       seconds)
- *   <li><strong>working</strong> – Agents running, scored by completion deadline (acquire_time +
- *       timeout)
- * </ul>
- *
- * <p>Correctness rules (Priority 0):
+ * <p>Key rules:
  *
  * <ul>
- *   <li>Do not purge valid waiting entries solely by age. Only remove waiting members that are
- *       positively identified as invalid (e.g., not registered/enabled locally). This preserves
- *       FIFO ordering under backlog and prevents queue cycling.
- *   <li>When cleaning working orphans, skip entries that are locally active on this pod. Local
- *       overruns are handled by the Zombie cleaner; orphan cleanup should not interfere with
- *       currently executing work.
- *   <li>For valid working orphans (owned by other pods and past deadline + buffer), move back to
- *       waiting using a conditional, score-checked move; for invalid ones, remove.
- * </ul>
- *
- * <p>Configuration:
- *
- * <ul>
- *   <li>{@code redis.scheduler.orphanThresholdMs} – Age threshold for orphaned agents
- *   <li>{@code redis.scheduler.orphanCleanupIntervalMs} – How often cleanup runs
- *   <li>{@code redis.scheduler.orphanCleanupEnabled} – Enable/disable cleanup per pod
- *   <li>{@code redis.scheduler.forceOrphanCleanupAllPods} – Force all pods to clean or use leader
- *       election
- *   <li>{@code redis.scheduler.orphanCleanupBatchSize} – Batch size for efficient cleanup (applies
- *       when safe)
+ *   <li>Preserve valid waiting agents - only remove positively invalid ones
+ *   <li>Skip locally active agents - zombie cleaner handles those
+ *   <li>Move valid working orphans back to waiting, remove invalid ones
  * </ul>
  */
 @Component
@@ -233,14 +211,17 @@ public class OrphanCleanupService {
     long thresholdForLogging;
 
     if (WAITING_SET.equals(setName)) {
-      // For waiting: consider orphaned if score < current_time - threshold
+      // Waiting set: score = next execution time
+      // Orphan detection: score < (current_time - threshold)
+      // These are agents scheduled far in the past that never executed
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
       cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
       thresholdForLogging = orphanThreshold;
     } else {
-      // For working: agents have score = current_time + agent_timeout (completion deadline)
-      // Consider orphaned if: current_time > score + orphan_threshold
-      // Rearranging: score < current_time - orphan_threshold
+      // Working set: score = completion deadline (acquire_time + timeout)
+      // Orphan detection: current_time > (score + threshold)
+      // Rearranged: score < (current_time - threshold)
+      // These are agents that should have completed but their pod crashed
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
       cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
       thresholdForLogging = orphanThreshold;
