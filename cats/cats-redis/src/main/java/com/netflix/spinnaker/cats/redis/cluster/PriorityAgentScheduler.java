@@ -16,6 +16,8 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import static com.netflix.spinnaker.cats.redis.cluster.SchedulerUtils.*;
+
 import com.netflix.spectator.api.DefaultRegistry;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
@@ -193,7 +195,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     }
 
     try {
-      long start = System.currentTimeMillis();
+      long start = currentTimeMillis();
       long currentRun = runCount.incrementAndGet();
       log.debug("Starting scheduler run cycle {}", currentRun);
 
@@ -243,7 +245,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // Log health summary every 10 minutes (time-based, not cycle-based)
       maybeLogHealthSummary();
 
-      metrics.recordRunCycle(true, System.currentTimeMillis() - start);
+      metrics.recordRunCycle(true, currentTimeMillis() - start);
 
     } catch (Throwable t) {
       log.error("Critical error in scheduler run cycle {}", runCount.get(), t);
@@ -261,9 +263,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
    * semaphore permits when enabled.
    */
   private void maybeLogHealthSummary() {
-    long now = System.currentTimeMillis();
+    long now = currentTimeMillis();
     long last = lastHealthLogEpochMs.get();
-    if (now - last < 10 * 60 * 1000L) {
+    if (!isPeriodElapsed(last, 10 * 60 * 1000L)) {
       return;
     }
     if (!lastHealthLogEpochMs.compareAndSet(last, now)) {
@@ -554,9 +556,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
       long intervalMs = config.getSchedulerIntervalMs();
       long refreshPeriodSeconds = config.getRedisRefreshPeriod();
       long refreshPeriodMs = Math.max(1, refreshPeriodSeconds) * 1000L;
-      long now = System.currentTimeMillis();
+      long now = currentTimeMillis();
       long last = lastReconcileEpochMs.get();
-      if (now - last < refreshPeriodMs) {
+      if (!isPeriodElapsed(last, refreshPeriodMs)) {
         return;
       }
       lastReconcileEpochMs.set(now);

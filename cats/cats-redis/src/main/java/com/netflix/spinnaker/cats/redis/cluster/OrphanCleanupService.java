@@ -16,6 +16,8 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import static com.netflix.spinnaker.cats.redis.cluster.SchedulerUtils.*;
+
 import com.netflix.spinnaker.cats.agent.Agent;
 import java.net.InetAddress;
 import java.util.ArrayList;
@@ -96,18 +98,16 @@ public class OrphanCleanupService {
 
   /** Cleanup orphaned agents if needed, with configurable intervals and leadership coordination. */
   public void cleanupOrphanedAgentsIfNeeded() {
-    long start = System.currentTimeMillis();
+    long start = currentTimeMillis();
     if (!schedulerProperties.getOrphanCleanup().isEnabled()) {
       return;
     }
 
     // Check if enough time has passed since last cleanup
-    long currentTime = System.currentTimeMillis();
     long intervalMs = schedulerProperties.getOrphanCleanup().getIntervalMs();
-    if (currentTime - lastOrphanCleanup < intervalMs) {
-      log.debug(
-          "Skipping orphan cleanup - interval not elapsed ({}ms remaining)",
-          intervalMs - (currentTime - lastOrphanCleanup));
+    if (!isPeriodElapsed(lastOrphanCleanup, intervalMs)) {
+      long remaining = intervalMs - (currentTimeMillis() - lastOrphanCleanup);
+      log.debug("Skipping orphan cleanup - interval not elapsed ({}ms remaining)", remaining);
       return;
     }
 
@@ -132,11 +132,11 @@ public class OrphanCleanupService {
             waitingCleaned);
       }
       if (metrics != null) {
-        metrics.recordCleanupTime("orphan", System.currentTimeMillis() - start);
+        metrics.recordCleanupTime("orphan", currentTimeMillis() - start);
         metrics.incrementCleanupCleaned("orphan", totalCleaned);
       }
       // Update the last cleanup timestamp
-      lastOrphanCleanup = System.currentTimeMillis();
+      lastOrphanCleanup = currentTimeMillis();
     } catch (Exception e) {
       log.error("Failed to cleanup orphaned agents", e);
     } finally {
@@ -172,7 +172,7 @@ public class OrphanCleanupService {
             waitingCleaned);
       }
       // Update the last cleanup timestamp
-      lastOrphanCleanup = System.currentTimeMillis();
+      lastOrphanCleanup = currentTimeMillis();
       return totalCleaned;
     } catch (Exception e) {
       log.error("Failed to force cleanup orphaned agents", e);
@@ -215,7 +215,7 @@ public class OrphanCleanupService {
       // Orphan detection: score < (current_time - threshold)
       // These are agents scheduled far in the past that never executed
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
-      cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
+      cutoffScore = (currentTimeMillis() - orphanThreshold) / 1000;
       thresholdForLogging = orphanThreshold;
     } else {
       // Working set: score = completion deadline (acquire_time + timeout)
@@ -223,7 +223,7 @@ public class OrphanCleanupService {
       // Rearranged: score < (current_time - threshold)
       // These are agents that should have completed but their pod crashed
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
-      cutoffScore = (System.currentTimeMillis() - orphanThreshold) / 1000;
+      cutoffScore = (currentTimeMillis() - orphanThreshold) / 1000;
       thresholdForLogging = orphanThreshold;
     }
 
@@ -698,7 +698,7 @@ public class OrphanCleanupService {
     } catch (Exception ignore) {
       // Last-resort fallback: use local system clock. This is less ideal for coordination,
       // but preserves forward progress if Redis TIME or offset lookups are unavailable.
-      long targetMs = System.currentTimeMillis() + delayMs;
+      long targetMs = currentTimeMillis() + delayMs;
       return String.valueOf(targetMs / 1000L);
     }
   }

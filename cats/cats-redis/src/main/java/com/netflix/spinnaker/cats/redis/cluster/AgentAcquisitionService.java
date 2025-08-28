@@ -17,6 +17,7 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static com.netflix.spinnaker.cats.agent.ExecutionInstrumentation.elapsedTimeMs;
+import static com.netflix.spinnaker.cats.redis.cluster.SchedulerUtils.*;
 
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
@@ -171,7 +172,7 @@ public class AgentAcquisitionService {
       this.agent = agent;
       this.acquireScore = acquireScore;
       this.success = success;
-      this.timestamp = System.currentTimeMillis();
+      this.timestamp = currentTimeMillis();
       this.failureClass = null;
       this.throwableClassName = null;
     }
@@ -185,7 +186,7 @@ public class AgentAcquisitionService {
       this.agent = agent;
       this.acquireScore = acquireScore;
       this.success = success;
-      this.timestamp = System.currentTimeMillis();
+      this.timestamp = currentTimeMillis();
       this.failureClass = failureClass;
       this.throwableClassName = throwableClassName;
     }
@@ -810,7 +811,7 @@ public class AgentAcquisitionService {
    * for schedulers to decide whether to skip acquisition on the same tick.
    */
   public boolean repopulateIfDueNow() {
-    long now = System.currentTimeMillis();
+    long now = SchedulerUtils.currentTimeMillis();
     long refreshPeriodMs = Math.max(1L, schedulerProperties.getRefreshPeriodSeconds()) * 1000L;
     long last = lastRepopulateEpochMs.get();
     if (last == 0L) {
@@ -818,7 +819,7 @@ public class AgentAcquisitionService {
       // on first run when required by tests/config.
       return false;
     }
-    if (now - last < refreshPeriodMs) {
+    if (!SchedulerUtils.isPeriodElapsed(last, refreshPeriodMs)) {
       return false;
     }
     if (!lastRepopulateEpochMs.compareAndSet(last, now)) {

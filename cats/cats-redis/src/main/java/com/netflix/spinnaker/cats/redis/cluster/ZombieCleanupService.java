@@ -16,6 +16,8 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import static com.netflix.spinnaker.cats.redis.cluster.SchedulerUtils.*;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -130,10 +132,10 @@ public class ZombieCleanupService {
    */
   public void cleanupZombieAgentsIfNeeded(
       Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
-    long now = System.currentTimeMillis();
+    long now = currentTimeMillis();
     long zombieCleanupInterval = schedulerProperties.getZombieCleanup().getIntervalMs();
 
-    if (now - lastZombieCleanup >= zombieCleanupInterval) {
+    if (isPeriodElapsed(lastZombieCleanup, zombieCleanupInterval)) {
       int cleaned = cleanupZombieAgents(activeAgents, activeAgentsFutures);
       lastZombieCleanup = now;
 
@@ -162,8 +164,8 @@ public class ZombieCleanupService {
    */
   public int cleanupZombieAgents(
       Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
-    long start = System.currentTimeMillis();
-    long currentTime = System.currentTimeMillis();
+    long start = currentTimeMillis();
+    long currentTime = currentTimeMillis();
     List<String> zombieAgentTypes = new ArrayList<>();
 
     int validAgentsScanned = 0;
@@ -275,7 +277,7 @@ public class ZombieCleanupService {
 
       zombiesCleanedUp.addAndGet(totalCleaned);
       if (metrics != null) {
-        metrics.recordCleanupTime("zombie", System.currentTimeMillis() - start);
+        metrics.recordCleanupTime("zombie", currentTimeMillis() - start);
         metrics.incrementCleanupCleaned("zombie", totalCleaned);
       }
       if (log.isDebugEnabled()) {
@@ -286,7 +288,7 @@ public class ZombieCleanupService {
     } catch (Exception e) {
       log.error("Error during zombie agent cleanup", e);
       if (metrics != null) {
-        metrics.recordCleanupTime("zombie", System.currentTimeMillis() - start);
+        metrics.recordCleanupTime("zombie", currentTimeMillis() - start);
       }
       return 0;
     }
