@@ -35,6 +35,26 @@ import org.springframework.stereotype.Component;
 @Setter
 public class PrioritySchedulerProperties {
 
+  /** Circuit breaker configuration for protecting against cascading failures. */
+  @Getter
+  @Setter
+  public static class CircuitBreaker {
+    /** Enable circuit breaker protection. Default: true. */
+    private boolean enabled = true;
+
+    /** Number of failures required to trip the circuit. Default: 5. */
+    private int failureThreshold = 5;
+
+    /** Time window for counting failures (ms). Default: 10000. */
+    private long failureWindowMs = 10000;
+
+    /** Cooldown period after circuit trips (ms). Default: 30000. */
+    private long cooldownMs = 30000;
+
+    /** Half-open testing period duration (ms). Default: 5000. */
+    private long halfOpenDurationMs = 5000;
+  }
+
   /**
    * How often the scheduler runs to check for ready agents (milliseconds). Controls the frequency
    * of the main scheduling loop. Config key: {@code redis.scheduler.interval-ms}
@@ -62,6 +82,9 @@ public class PrioritySchedulerProperties {
    * respect this configuration. See {@link BatchOperations}.
    */
   private BatchOperations batchOperations = new BatchOperations();
+
+  /** Circuit breaker configuration for protecting against cascading failures. */
+  private CircuitBreaker circuitBreaker = new CircuitBreaker();
 
   /**
    * How long to cache Redis server time to reduce TIME command calls (milliseconds). Higher values

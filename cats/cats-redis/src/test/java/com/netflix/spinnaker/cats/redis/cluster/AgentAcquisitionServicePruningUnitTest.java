@@ -64,6 +64,8 @@ class AgentAcquisitionServicePruningUnitTest {
       schedProps.getKeys().setWaitingSet("waiting");
       schedProps.getKeys().setWorkingSet("working");
       schedProps.getKeys().setCleanupLeaderKey("cleanup-leader");
+      // Disable circuit breaker for this test
+      schedProps.getCircuitBreaker().setEnabled(false);
 
       AgentAcquisitionService acq =
           new AgentAcquisitionService(
@@ -97,11 +99,12 @@ class AgentAcquisitionServicePruningUnitTest {
       acq.registerAgent(a1, ag -> {}, instr);
       acq.registerAgent(a2, ag -> {}, instr);
 
-      // Pre-populate waiting set so both are ready
+      // Pre-populate waiting set so both are ready (use past timestamp to ensure they're ready)
       try (var j = pool.getResource()) {
         long now = Long.parseLong(j.time().get(0));
-        j.zadd("waiting", now, "prune-1");
-        j.zadd("waiting", now, "prune-2");
+        // Use a timestamp 10 seconds in the past to ensure agents are ready
+        j.zadd("waiting", now - 10, "prune-1");
+        j.zadd("waiting", now - 10, "prune-2");
       }
 
       // Executor that completes futures immediately

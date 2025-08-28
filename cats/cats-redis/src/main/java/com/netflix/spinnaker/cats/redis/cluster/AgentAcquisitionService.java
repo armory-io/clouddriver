@@ -136,6 +136,10 @@ public class AgentAcquisitionService {
   private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
   private final AtomicBoolean gracefulShutdown = new AtomicBoolean(false);
 
+  // Circuit breakers for protecting against cascading failures
+  private final PrioritySchedulerCircuitBreaker acquisitionCircuitBreaker;
+  private final PrioritySchedulerCircuitBreaker redisCircuitBreaker;
+
   // Queue agent completions for batch processing
   private final ConcurrentLinkedQueue<AgentCompletion> completionQueue =
       new ConcurrentLinkedQueue<>();
@@ -211,6 +215,47 @@ public class AgentAcquisitionService {
     this.schedulerProperties = schedulerProperties;
     this.metrics = metrics;
 
+    // Initialize circuit breakers with configuration settings
+    PrioritySchedulerProperties.CircuitBreaker cbConfig = schedulerProperties.getCircuitBreaker();
+    if (cbConfig != null && cbConfig.isEnabled()) {
+      this.acquisitionCircuitBreaker =
+          new PrioritySchedulerCircuitBreaker(
+              "acquisition",
+              cbConfig.getFailureThreshold(),
+              cbConfig.getFailureWindowMs(),
+              cbConfig.getCooldownMs(),
+              cbConfig.getHalfOpenDurationMs(),
+              metrics);
+
+      // Redis circuit breaker is more sensitive (lower threshold, shorter window)
+      this.redisCircuitBreaker =
+          new PrioritySchedulerCircuitBreaker(
+              "redis",
+              Math.max(3, cbConfig.getFailureThreshold() - 2), // Slightly lower threshold
+              Math.min(5000, cbConfig.getFailureWindowMs()), // Shorter window
+              (long) (cbConfig.getCooldownMs() * 0.7), // Shorter cooldown
+              (long) (cbConfig.getHalfOpenDurationMs() * 0.6), // Shorter half-open
+              metrics);
+    } else {
+      // Create disabled circuit breakers that always allow requests
+      this.acquisitionCircuitBreaker =
+          new PrioritySchedulerCircuitBreaker(
+              "acquisition",
+              Integer.MAX_VALUE, // Never trip
+              Long.MAX_VALUE,
+              0,
+              0,
+              metrics);
+      this.redisCircuitBreaker =
+          new PrioritySchedulerCircuitBreaker(
+              "redis",
+              Integer.MAX_VALUE, // Never trip
+              Long.MAX_VALUE,
+              0,
+              0,
+              metrics);
+    }
+
     // Resolve configured key names at construction time
     PrioritySchedulerProperties.Keys keysCfg = schedulerProperties.getKeys();
     String hash = keysCfg.getHashTag();
@@ -252,6 +297,17 @@ public class AgentAcquisitionService {
     if (metrics != null) {
       metrics.incrementAcquireAttempts();
     }
+
+    // Check circuit breaker before attempting acquisition
+    if (!acquisitionCircuitBreaker.allowRequest()) {
+      log.warn(
+          "Acquisition circuit breaker is OPEN - skipping agent acquisition cycle {}", runCount);
+      if (metrics != null) {
+        metrics.recordCircuitBreakerBlocked("acquisition");
+      }
+      return 0;
+    }
+
     long acquireStartMs = System.currentTimeMillis();
 
     try (Jedis jedis = jedisPool.getResource()) {
@@ -680,16 +736,30 @@ public class AgentAcquisitionService {
         metrics.incrementAcquired(agentsAcquiredThisCycle);
         metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
       }
+
+      // Record successful acquisition to circuit breaker
+      acquisitionCircuitBreaker.recordSuccess();
+      redisCircuitBreaker.recordSuccess();
+
       return agentsAcquiredThisCycle;
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
       log.warn("Redis connection error during agent acquisition: {}", e.getMessage());
+
+      // Record Redis failure to circuit breakers
+      redisCircuitBreaker.recordFailure(e);
+      acquisitionCircuitBreaker.recordFailure(e);
+
       if (metrics != null) {
         metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
       }
       return 0;
     } catch (Exception e) {
       log.error("Error during agent acquisition cycle", e);
+
+      // Record general failure to acquisition circuit breaker
+      acquisitionCircuitBreaker.recordFailure(e);
+
       if (metrics != null) {
         metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
       }
@@ -705,6 +775,15 @@ public class AgentAcquisitionService {
    * @param runCount current scheduler cycle number
    */
   public void repopulateIfDue(long runCount) {
+    // Check Redis circuit breaker before attempting repopulation
+    if (!redisCircuitBreaker.allowRequest()) {
+      log.debug("Redis circuit breaker is OPEN - skipping repopulation for cycle {}", runCount);
+      if (metrics != null) {
+        metrics.recordCircuitBreakerBlocked("redis");
+      }
+      return;
+    }
+
     long start = System.currentTimeMillis();
     try (Jedis jedis = jedisPool.getResource()) {
       long nowMsForRepop = start;
@@ -716,6 +795,14 @@ public class AgentAcquisitionService {
         if (metrics != null) {
           metrics.recordRepopulateTime(System.currentTimeMillis() - start);
         }
+        redisCircuitBreaker.recordSuccess();
+      }
+    } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+      log.warn("Redis connection error during repopulation: {}", e.getMessage());
+      redisCircuitBreaker.recordFailure(e);
+      if (metrics != null) {
+        metrics.incrementRepopulateError("redis_connection");
+        metrics.recordRepopulateTime(System.currentTimeMillis() - start);
       }
     } catch (Exception e) {
       log.warn("Repopulation attempt failed: {}", e.getMessage());
@@ -1341,6 +1428,25 @@ public class AgentAcquisitionService {
 
   public String getDegradedReason() {
     return lastDegradedReason.get();
+  }
+
+  /**
+   * Get circuit breaker status for monitoring.
+   *
+   * @return Map containing status of each circuit breaker
+   */
+  public Map<String, String> getCircuitBreakerStatus() {
+    Map<String, String> status = new HashMap<>();
+    status.put("acquisition", acquisitionCircuitBreaker.getStatus());
+    status.put("redis", redisCircuitBreaker.getStatus());
+    return status;
+  }
+
+  /** Reset circuit breakers (for recovery/testing). */
+  public void resetCircuitBreakers() {
+    acquisitionCircuitBreaker.reset();
+    redisCircuitBreaker.reset();
+    log.info("Circuit breakers manually reset");
   }
 
   /**

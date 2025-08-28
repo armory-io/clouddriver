@@ -91,6 +91,8 @@ class AgentAcquisitionServiceRejectionTest {
     agentProperties.setMaxConcurrentAgents(5); // Limited for testing
 
     schedulerProperties = new PrioritySchedulerProperties();
+    // Disable circuit breaker for testing
+    schedulerProperties.getCircuitBreaker().setEnabled(false);
     PrioritySchedulerProperties.BatchOperations batchOps =
         new PrioritySchedulerProperties.BatchOperations();
     batchOps.setEnabled(false);

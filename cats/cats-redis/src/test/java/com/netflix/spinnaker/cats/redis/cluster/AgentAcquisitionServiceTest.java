@@ -106,6 +106,8 @@ class AgentAcquisitionServiceTest {
     agentProperties.setDisabledPattern("");
 
     schedulerProperties = new PrioritySchedulerProperties();
+    // Disable circuit breaker for testing
+    schedulerProperties.getCircuitBreaker().setEnabled(false);
     schedulerProperties.setRefreshPeriodSeconds(10);
     schedulerProperties.getKeys().setWaitingSet("waiting");
     schedulerProperties.getKeys().setWorkingSet("working");

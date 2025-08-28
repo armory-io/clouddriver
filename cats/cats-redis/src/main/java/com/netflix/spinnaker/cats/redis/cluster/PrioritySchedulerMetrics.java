@@ -43,6 +43,9 @@ public final class PrioritySchedulerMetrics {
   private final Id submissionFailuresId;
   private final Id batchFallbacksId;
   private final Id stallDetectedId;
+  private final Id circuitBreakerTripId;
+  private final Id circuitBreakerRecoveryId;
+  private final Id circuitBreakerBlockedId;
 
   private final Id repopulateTimeId;
   private final Id repopulateAddedId;
@@ -75,6 +78,9 @@ public final class PrioritySchedulerMetrics {
     this.submissionFailuresId = registry.createId("cats.redisPriority.acquire.submissionFailures");
     this.batchFallbacksId = registry.createId("cats.redisPriority.batch.fallbacks");
     this.stallDetectedId = registry.createId("cats.redisPriority.acquire.stallDetected");
+    this.circuitBreakerTripId = registry.createId("cats.redisPriority.circuitBreaker.trip");
+    this.circuitBreakerRecoveryId = registry.createId("cats.redisPriority.circuitBreaker.recovery");
+    this.circuitBreakerBlockedId = registry.createId("cats.redisPriority.circuitBreaker.blocked");
 
     this.repopulateTimeId = registry.createId("cats.redisPriority.repopulate.time");
     this.repopulateAddedId = registry.createId("cats.redisPriority.repopulate.added");
@@ -125,6 +131,20 @@ public final class PrioritySchedulerMetrics {
 
   public void incrementStallDetected() {
     registry.counter(stallDetectedId).increment();
+  }
+
+  public void recordCircuitBreakerTrip(String name, String reason) {
+    registry
+        .counter(circuitBreakerTripId.withTag("name", safe(name)).withTag("reason", safe(reason)))
+        .increment();
+  }
+
+  public void recordCircuitBreakerRecovery(String name) {
+    registry.counter(circuitBreakerRecoveryId.withTag("name", safe(name))).increment();
+  }
+
+  public void recordCircuitBreakerBlocked(String name) {
+    registry.counter(circuitBreakerBlockedId.withTag("name", safe(name))).increment();
   }
 
   public void recordRepopulateTime(long elapsedMs) {

@@ -90,6 +90,8 @@ class AgentAcquisitionServiceFairnessTest {
     agentProperties.setMaxConcurrentAgents(100); // High limit for fairness testing
 
     schedulerProperties = new PrioritySchedulerProperties();
+    // Disable circuit breaker for testing
+    schedulerProperties.getCircuitBreaker().setEnabled(false);
     PrioritySchedulerProperties.BatchOperations batchOps =
         new PrioritySchedulerProperties.BatchOperations();
     batchOps.setEnabled(true);
