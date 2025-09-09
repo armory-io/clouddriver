@@ -311,14 +311,12 @@ public class PrioritySchedulerConfiguration {
   private void createConcurrencyControl() {
     int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
 
-    if (maxConcurrentAgents > 0) {
-      this.runningAgents = new Semaphore(maxConcurrentAgents);
-      log.info("Created concurrency semaphore with {} permits", maxConcurrentAgents);
-    } else {
-      this.runningAgents = null;
-      log.warn(
-          "Max concurrent agents is unbounded (redis.agent.max-concurrent-agents <= 0). "
-              + "This is not recommended for production; set an explicit bound to avoid overload.");
+    if (maxConcurrentAgents <= 0) {
+      throw new IllegalArgumentException(
+          "redis.agent.max-concurrent-agents must be > 0 when using cached thread pool");
     }
+
+    this.runningAgents = new Semaphore(maxConcurrentAgents);
+    log.info("Created concurrency semaphore with {} permits", maxConcurrentAgents);
   }
 }
