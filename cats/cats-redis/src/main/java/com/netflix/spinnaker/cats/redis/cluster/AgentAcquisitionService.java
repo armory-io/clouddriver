@@ -469,6 +469,9 @@ public class AgentAcquisitionService {
       workersToSubmit.clear(); // Clear any previous contents
       int agentsAcquiredThisCycle = 0;
 
+      // Prevent same-tick reacquisition attempts for the same agent
+      java.util.Set<String> attemptedThisCycle = new java.util.HashSet<>();
+
       // Calculate how many new agents this pod can try to acquire
       int availableSlotsForNewAgents =
           unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - currentlyRunning);
@@ -606,7 +609,13 @@ public class AgentAcquisitionService {
         if (schedulerProperties.getBatchOperations().isEnabled() && readyChunk.size() > 1) {
           try {
             acquiredThisChunk =
-                saturatePoolBatch(jedis, readyChunk, chunkSize, runningAgents, workersToSubmit);
+                saturatePoolBatch(
+                    jedis,
+                    readyChunk,
+                    chunkSize,
+                    runningAgents,
+                    workersToSubmit,
+                    attemptedThisCycle);
           } catch (Exception e) {
             log.warn(
                 "Batch acquisition failed for chunk, falling back to individual: {}",
@@ -614,11 +623,17 @@ public class AgentAcquisitionService {
             workersToSubmit.clear();
             acquiredThisChunk =
                 saturatePoolIndividual(
-                    jedis, readyChunk, chunkSize, runningAgents, workersToSubmit);
+                    jedis,
+                    readyChunk,
+                    chunkSize,
+                    runningAgents,
+                    workersToSubmit,
+                    attemptedThisCycle);
           }
         } else {
           acquiredThisChunk =
-              saturatePoolIndividual(jedis, readyChunk, chunkSize, runningAgents, workersToSubmit);
+              saturatePoolIndividual(
+                  jedis, readyChunk, chunkSize, runningAgents, workersToSubmit, attemptedThisCycle);
         }
 
         if (acquiredThisChunk <= 0) {
@@ -875,7 +890,8 @@ public class AgentAcquisitionService {
       Set<String> readyAgents,
       int maxToAcquire,
       Semaphore runningAgents,
-      Set<AgentWorker> workersToSubmit) {
+      Set<AgentWorker> workersToSubmit,
+      java.util.Set<String> attemptedThisCycle) {
 
     // Calculate batch size to prevent memory/Redis overload
     int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
@@ -899,6 +915,9 @@ public class AgentAcquisitionService {
     // PHASE 1: Build candidate list and acquire semaphore permits
     // Note: We respect BOTH the concurrency limit (maxToAcquire) AND batch size limit
     for (String agentType : readyAgents) {
+      if (attemptedThisCycle != null && attemptedThisCycle.contains(agentType)) {
+        continue;
+      }
       if (candidateCount >= effectiveBatchSize) {
         log.debug(
             "Reached batch size limit: {} agents prepared for acquisition", effectiveBatchSize);
@@ -935,6 +954,9 @@ public class AgentAcquisitionService {
       candidateAgents.add(agentType);
       candidateWorkers.add(worker);
       candidateCount++; // Track candidates prepared
+      if (attemptedThisCycle != null) {
+        attemptedThisCycle.add(agentType);
+      }
     }
 
     if (candidateAgents.isEmpty()) {
@@ -1076,7 +1098,12 @@ public class AgentAcquisitionService {
 
       // Fallback to individual acquisition
       return saturatePoolIndividual(
-          jedis, new HashSet<>(candidateAgents), maxToAcquire, runningAgents, workersToSubmit);
+          jedis,
+          new HashSet<>(candidateAgents),
+          maxToAcquire,
+          runningAgents,
+          workersToSubmit,
+          attemptedThisCycle);
     }
   }
 
@@ -1096,7 +1123,8 @@ public class AgentAcquisitionService {
       Set<String> readyAgents,
       int maxToAcquire,
       Semaphore runningAgents,
-      Set<AgentWorker> workersToSubmit) {
+      Set<AgentWorker> workersToSubmit,
+      java.util.Set<String> attemptedThisCycle) {
 
     log.debug(
         "Using individual agent acquisition for {} ready agents (max: {})",
@@ -1106,6 +1134,9 @@ public class AgentAcquisitionService {
     int agentsAcquiredThisCycle = 0;
 
     for (String agentType : readyAgents) {
+      if (attemptedThisCycle != null && attemptedThisCycle.contains(agentType)) {
+        continue;
+      }
       if (agentsAcquiredThisCycle >= maxToAcquire) {
         log.debug(
             "Reached available slot limit for new agents this cycle ({} acquired out of {} target slots).",
@@ -1161,12 +1192,18 @@ public class AgentAcquisitionService {
         agentsAcquired.incrementAndGet(); // Track acquisition statistics
 
         log.debug("Acquired agent {} with score {}", agentType, agentAcquireScore);
+        if (attemptedThisCycle != null) {
+          attemptedThisCycle.add(agentType);
+        }
       } else {
         // Failed to acquire (another instance got it first)
         if (runningAgents != null) {
           runningAgents.release();
         }
         log.debug("Agent {} was acquired by another instance, releasing permit", agentType);
+        if (attemptedThisCycle != null) {
+          attemptedThisCycle.add(agentType);
+        }
       }
     }
 
@@ -3027,27 +3064,26 @@ public class AgentAcquisitionService {
               intervalProvider.getInterval(worker.getAgent()).getTimeout() / 1000L;
           long originalReadySeconds = acquireScoreSeconds - timeoutSeconds;
 
-          // Add a small delay (1 second) to avoid immediate re-acquisition in the same cycle
-          // This prevents spinning if the pool stays saturated
-          requeueScore = String.valueOf(originalReadySeconds + 1);
+          // Preserve exact original ready time to maintain strict FIFO fairness
+          requeueScore = String.valueOf(originalReadySeconds);
 
           log.debug(
-              "Requeueing rejected agent {} with score {} (original ready time + 1s backoff)",
+              "Requeueing rejected agent {} with score {} (preserve original ready time)",
               agentType,
               requeueScore);
         } catch (Exception e) {
-          // Fallback to small delay from now if calculation fails
+          // Fallback to immediate readiness if calculation fails
           log.warn(
-              "Failed to calculate original ready time for agent {}, using fallback delay",
+              "Failed to calculate original ready time for agent {}, using immediate score",
               agentType,
               e);
-          requeueScore = score(jedis, 1000L); // 1 second delay
+          requeueScore = score(jedis, 0L);
         }
       } else {
-        // No acquire score available, use small delay to avoid immediate re-acquisition
-        requeueScore = score(jedis, 1000L); // 1 second delay
+        // No acquire score available, make it immediately eligible
+        requeueScore = score(jedis, 0L);
         log.debug(
-            "Requeueing rejected agent {} with score {} (1s delay, no acquire score)",
+            "Requeueing rejected agent {} with score {} (immediate, no acquire score)",
             agentType,
             requeueScore);
       }

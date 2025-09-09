@@ -22,7 +22,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -74,10 +73,6 @@ class PrioritySchedulerConfigurationTest {
     schedulerProperties.getOrphanCleanup().setThresholdMs(60000L);
     schedulerProperties.getOrphanCleanup().setIntervalMs(30000L);
 
-    schedulerProperties.getPool().setCoreSize(5);
-    schedulerProperties.getPool().setMaxSize(20);
-    schedulerProperties.getPool().setKeepAliveSeconds(60);
-
     configuration = new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
   }
 
@@ -86,22 +81,15 @@ class PrioritySchedulerConfigurationTest {
   class ThreadPoolConfigurationTests {
 
     @Test
-    @DisplayName("Should create agent work pool with correct configuration")
-    void shouldCreateAgentWorkPoolWithCorrectConfiguration() {
+    @DisplayName("Should create agent work pool with cached thread pool")
+    void shouldCreateAgentWorkPoolWithCachedThreadPool() {
       // When
       ExecutorService workPool = configuration.getAgentWorkPool();
 
       // Then
       assertThat(workPool).isNotNull();
-      assertThat(workPool).isInstanceOf(ThreadPoolExecutor.class);
-
       ThreadPoolExecutor threadPool = (ThreadPoolExecutor) workPool;
-      assertThat(threadPool.getCorePoolSize()).isEqualTo(5);
-      assertThat(threadPool.getMaximumPoolSize()).isEqualTo(20);
-      assertThat(threadPool.getKeepAliveTime(TimeUnit.SECONDS)).isEqualTo(60);
-
-      // Should use unbounded queue (LinkedBlockingQueue without capacity) by default
-      assertThat(threadPool.getQueue().remainingCapacity()).isEqualTo(Integer.MAX_VALUE);
+      assertThat(threadPool.getQueue()).isInstanceOf(java.util.concurrent.SynchronousQueue.class);
     }
 
     @Test
@@ -113,63 +101,6 @@ class PrioritySchedulerConfigurationTest {
       // Then
       assertThat(schedulerExecutor).isNotNull();
       assertThat(schedulerExecutor.isShutdown()).isFalse();
-    }
-
-    @Test
-    @DisplayName("Should use SynchronousQueue when queueType=sync")
-    void shouldUseSynchronousQueueWhenQueueTypeSync() {
-      // Given
-      schedulerProperties.getPool().setQueueType("sync");
-      PrioritySchedulerConfiguration cfg =
-          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
-
-      // When
-      ExecutorService workPool = cfg.getAgentWorkPool();
-
-      // Then
-      assertThat(workPool).isInstanceOf(ThreadPoolExecutor.class);
-      ThreadPoolExecutor threadPool = (ThreadPoolExecutor) workPool;
-      assertThat(threadPool.getQueue()).isInstanceOf(java.util.concurrent.SynchronousQueue.class);
-    }
-
-    @Test
-    @DisplayName("Should use ArrayBlockingQueue with configured capacity when queueType=array")
-    void shouldUseArrayBlockingQueueWithConfiguredCapacity() {
-      // Given
-      schedulerProperties.getPool().setQueueType("array");
-      schedulerProperties.getPool().setQueueCapacity(7);
-      PrioritySchedulerConfiguration cfg =
-          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
-
-      // When
-      ExecutorService workPool = cfg.getAgentWorkPool();
-
-      // Then
-      assertThat(workPool).isInstanceOf(ThreadPoolExecutor.class);
-      ThreadPoolExecutor threadPool = (ThreadPoolExecutor) workPool;
-      assertThat(threadPool.getQueue()).isInstanceOf(java.util.concurrent.ArrayBlockingQueue.class);
-      // Capacity when empty equals remainingCapacity
-      assertThat(threadPool.getQueue().remainingCapacity()).isEqualTo(7);
-    }
-
-    @Test
-    @DisplayName("ArrayBlockingQueue defaults capacity to maxSize when queueCapacity<=0")
-    void arrayQueueDefaultsCapacityToMaxSizeWhenZero() {
-      // Given
-      schedulerProperties.getPool().setQueueType("array");
-      schedulerProperties.getPool().setQueueCapacity(0); // fallback
-      schedulerProperties.getPool().setMaxSize(13);
-      PrioritySchedulerConfiguration cfg =
-          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
-
-      // When
-      ExecutorService workPool = cfg.getAgentWorkPool();
-
-      // Then
-      assertThat(workPool).isInstanceOf(ThreadPoolExecutor.class);
-      ThreadPoolExecutor threadPool = (ThreadPoolExecutor) workPool;
-      assertThat(threadPool.getQueue()).isInstanceOf(java.util.concurrent.ArrayBlockingQueue.class);
-      assertThat(threadPool.getQueue().remainingCapacity()).isEqualTo(13);
     }
   }
 

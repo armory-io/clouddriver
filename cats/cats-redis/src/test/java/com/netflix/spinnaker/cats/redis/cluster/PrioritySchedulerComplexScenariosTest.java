@@ -94,18 +94,6 @@ public class PrioritySchedulerComplexScenariosTest {
     keys.setCleanupLeaderKey("cleanup-leader");
     when(mockSchedulerProperties.getKeys()).thenReturn(keys);
 
-    // Mock nested thread pool properties
-    RedisThreadPoolProperties threadPoolProps = mock(RedisThreadPoolProperties.class);
-    when(threadPoolProps.getCoreSize()).thenReturn(10);
-    when(threadPoolProps.getMaxSize()).thenReturn(50);
-    when(threadPoolProps.getKeepAliveSeconds()).thenReturn(60L);
-    when(mockSchedulerProperties.getPool()).thenReturn(threadPoolProps);
-
-    // Mock convenience methods for thread pool (these delegate to the pool)
-    when(mockSchedulerProperties.getThreadPoolCoreSize()).thenReturn(10);
-    when(mockSchedulerProperties.getThreadPoolMaxSize()).thenReturn(50);
-    when(mockSchedulerProperties.getThreadPoolKeepAliveSeconds()).thenReturn(60L);
-
     // Mock zombie cleanup properties
     ZombieCleanupProperties zombieProps = mock(ZombieCleanupProperties.class);
     when(zombieProps.isEnabled()).thenReturn(true);

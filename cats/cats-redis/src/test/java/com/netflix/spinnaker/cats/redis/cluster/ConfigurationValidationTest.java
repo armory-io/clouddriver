@@ -143,44 +143,6 @@ public class ConfigurationValidationTest {
   }
 
   @Nested
-  @DisplayName("Thread Pool Configuration Tests")
-  class ThreadPoolConfigurationTests {
-
-    @Test
-    @DisplayName("Should have reasonable thread pool defaults")
-    void shouldHaveReasonableThreadPoolDefaults() {
-      assertThat(properties.getPool().getCoreSize()).isEqualTo(10);
-      assertThat(properties.getPool().getMaxSize()).isEqualTo(50);
-      assertThat(properties.getPool().getKeepAliveSeconds()).isEqualTo(60);
-    }
-
-    @Test
-    @DisplayName("Should allow valid thread pool configuration")
-    void shouldAllowValidThreadPoolConfiguration() {
-      properties.getPool().setCoreSize(100);
-      properties.getPool().setMaxSize(500);
-      properties.getPool().setKeepAliveSeconds(120);
-
-      assertThat(properties.getPool().getCoreSize()).isEqualTo(100);
-      assertThat(properties.getPool().getMaxSize()).isEqualTo(500);
-      assertThat(properties.getPool().getKeepAliveSeconds()).isEqualTo(120);
-    }
-
-    @Test
-    @DisplayName("Should handle edge case thread pool values")
-    void shouldHandleEdgeCaseThreadPoolValues() {
-      // Test minimum values
-      properties.getPool().setCoreSize(1);
-      properties.getPool().setMaxSize(1);
-      properties.getPool().setKeepAliveSeconds(0);
-
-      assertThat(properties.getPool().getCoreSize()).isEqualTo(1);
-      assertThat(properties.getPool().getMaxSize()).isEqualTo(1);
-      assertThat(properties.getPool().getKeepAliveSeconds()).isEqualTo(0);
-    }
-  }
-
-  @Nested
   @DisplayName("Timing Configuration Tests")
   class TimingConfigurationTests {
 
@@ -274,7 +236,6 @@ public class ConfigurationValidationTest {
     void shouldHaveProperNestedConfigurationStructure() {
       assertThat(properties.getZombieCleanup()).isNotNull();
       assertThat(properties.getOrphanCleanup()).isNotNull();
-      assertThat(properties.getPool()).isNotNull();
     }
 
     @Test
@@ -306,11 +267,6 @@ public class ConfigurationValidationTest {
                 // Batch operations
                 properties.getBatchOperations().isEnabled();
                 properties.getBatchOperations().getBatchSize();
-
-                // Thread pool
-                properties.getPool().getCoreSize();
-                properties.getPool().getMaxSize();
-                properties.getPool().getKeepAliveSeconds();
 
                 // Zombie cleanup
                 properties.isZombieCleanupEnabled();

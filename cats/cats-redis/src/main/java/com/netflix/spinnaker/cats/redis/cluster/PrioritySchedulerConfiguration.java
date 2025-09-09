@@ -20,7 +20,6 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import lombok.extern.slf4j.Slf4j;
@@ -289,50 +288,12 @@ public class PrioritySchedulerConfiguration {
     log.info("Scheduler configuration shutdown completed");
   }
 
-  /** Creates the agent work pool with the specified configuration. */
+  /** Creates the agent work pool. */
   private void createAgentWorkPool() {
-    // Create thread pool with explicit configuration (aligned with other schedulers)
-    // Redis WAITING_SET provides queuing, so ThreadPool uses unbounded queue like other schedulers
-    int corePoolSize = schedulerProperties.getThreadPoolCoreSize();
-    int maximumPoolSize = schedulerProperties.getThreadPoolMaxSize();
-    long keepAliveTime = schedulerProperties.getThreadPoolKeepAliveSeconds();
-
-    log.info(
-        "Creating agent work pool: core={}, max={}, keepAlive={}s",
-        corePoolSize,
-        maximumPoolSize,
-        keepAliveTime);
-
-    java.util.concurrent.BlockingQueue<Runnable> workQueue;
-    String queueType = String.valueOf(schedulerProperties.getPool().getQueueType()).toLowerCase();
-    switch (queueType) {
-      case "sync":
-        workQueue = new java.util.concurrent.SynchronousQueue<>();
-        break;
-      case "array":
-        int capacity = schedulerProperties.getPool().getQueueCapacity();
-        if (capacity <= 0) {
-          // Defensive default: cap to maximumPoolSize to avoid unbounded retention
-          capacity = maximumPoolSize;
-        }
-        workQueue = new java.util.concurrent.ArrayBlockingQueue<>(capacity);
-        break;
-      case "linked":
-      default:
-        // Parity with other schedulers: unbounded queue
-        workQueue = new java.util.concurrent.LinkedBlockingQueue<>();
-        break;
-    }
-
     this.agentWorkPool =
-        new ThreadPoolExecutor(
-            corePoolSize,
-            maximumPoolSize,
-            keepAliveTime,
-            TimeUnit.SECONDS,
-            workQueue,
-            new ThreadFactoryBuilder().setNameFormat("PriorityAgentWorker-%d").build(),
-            new ThreadPoolExecutor.CallerRunsPolicy()); // Backpressure to scheduler thread
+        java.util.concurrent.Executors.newCachedThreadPool(
+            new ThreadFactoryBuilder().setNameFormat("PriorityAgentWorker-%d").build());
+    log.info("Created agent work pool");
   }
 
   /** Creates the scheduler executor service. */

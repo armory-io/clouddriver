@@ -75,11 +75,6 @@ public class PrioritySchedulerProperties {
    */
   private long timeCacheDurationMs = 10000L; // 10 seconds
 
-  // === RESOURCE MANAGEMENT ===
-
-  /** Thread pool configuration for agent execution. */
-  private RedisThreadPoolProperties pool = new RedisThreadPoolProperties();
-
   // === CLEANUP SERVICES ===
 
   /** Zombie cleanup configuration for stuck agents. */
@@ -208,18 +203,6 @@ public class PrioritySchedulerProperties {
     private double chunkAttemptMultiplier = 0.0;
   }
 
-  public int getThreadPoolCoreSize() {
-    return pool.getCoreSize();
-  }
-
-  public int getThreadPoolMaxSize() {
-    return pool.getMaxSize();
-  }
-
-  public long getThreadPoolKeepAliveSeconds() {
-    return pool.getKeepAliveSeconds();
-  }
-
   public boolean isZombieCleanupEnabled() {
     return zombieCleanup.isEnabled();
   }
@@ -272,14 +255,6 @@ public class PrioritySchedulerProperties {
     validateNonNegative(
         batchOperations.getBatchSize(), "redis.scheduler.batch-operations.batch-size");
 
-    // Pool bounds sanity
-    if (pool.getCoreSize() <= 0) {
-      throw new IllegalArgumentException("redis.scheduler.pool.core-size must be > 0");
-    }
-    if (pool.getMaxSize() < pool.getCoreSize()) {
-      throw new IllegalArgumentException("redis.scheduler.pool.max-size must be >= core-size");
-    }
-
     // Keys validation: non-empty base names
     if (keys == null) {
       keys = new Keys();
@@ -317,29 +292,6 @@ public class PrioritySchedulerProperties {
     if (jitter.getTiebreakHashSeconds() < 0) {
       throw new IllegalArgumentException(
           "redis.scheduler.jitter.tiebreak-hash-seconds must be >= 0");
-    }
-
-    // Queue selection validation
-    String queueType = pool.getQueueType();
-    if (queueType == null) {
-      queueType = "linked"; // default
-      pool.setQueueType(queueType);
-    }
-    String normalized = queueType.toLowerCase();
-    if (!normalized.equals("linked") && !normalized.equals("array") && !normalized.equals("sync")) {
-      throw new IllegalArgumentException(
-          "redis.scheduler.pool.queue-type must be one of {linked,array,sync} (was '"
-              + queueType
-              + "')");
-    }
-    if (normalized.equals("array")) {
-      // Capacity can be zero to indicate fallback; but must not be negative
-      if (pool.getQueueCapacity() < 0) {
-        throw new IllegalArgumentException(
-            "redis.scheduler.pool.queue-capacity must be >= 0 (was "
-                + pool.getQueueCapacity()
-                + ")");
-      }
     }
   }
 

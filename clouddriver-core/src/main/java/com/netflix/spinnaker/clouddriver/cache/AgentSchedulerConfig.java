@@ -172,12 +172,6 @@ public class AgentSchedulerConfig {
         schedulerProperties.getTimeCacheDurationMs());
 
     log.info(
-        "PriorityAgentScheduler thread pool: core-size={}, max-size={}, keep-alive-seconds={}",
-        schedulerProperties.getThreadPoolCoreSize(),
-        schedulerProperties.getThreadPoolMaxSize(),
-        schedulerProperties.getThreadPoolKeepAliveSeconds());
-
-    log.info(
         "PriorityAgentScheduler agent filtering: enabled-pattern='{}', disabled-pattern='{}'",
         agentProperties.getEnabledPattern(),
         agentProperties.getDisabledPattern());

@@ -626,15 +626,12 @@ public class PrioritySchedulerIntegrationTest {
       props.setRefreshPeriodSeconds(30);
       props.getBatchOperations().setEnabled(true);
       props.getBatchOperations().setBatchSize(50);
-      props.getPool().setCoreSize(2);
-      props.getPool().setMaxSize(2);
-      props.getPool().setQueueType("sync");
       return props;
     }
 
     @Test
-    @DisplayName("SynchronousQueue backpressure prevents scheduler spin under saturation")
-    void synchronousQueueBackpressurePreventsSpin() throws Exception {
+    @DisplayName("Cached thread pool with AbortPolicy prevents scheduler spin under saturation")
+    void cachedThreadPoolPreventsSpin() throws Exception {
       PrioritySchedulerProperties slowProps = createSlowSynchronousQueueProps();
       PriorityAgentProperties agentProps = new PriorityAgentProperties();
       agentProps.setEnabledPattern(".*");
@@ -685,7 +682,7 @@ public class PrioritySchedulerIntegrationTest {
       sched.run();
       long durationMs = System.currentTimeMillis() - start;
 
-      // If the scheduler spun rapidly while submitting into a full SynchronousQueue, duration would
+      // If the scheduler spun rapidly while submitting into a saturated pool, duration would
       // be near-zero. Assert a small lower bound to indicate backpressure took effect without
       // making this test flaky on fast CI runners.
       assertThat(durationMs).isGreaterThanOrEqualTo(5L);
