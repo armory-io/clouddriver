@@ -1351,6 +1351,10 @@ public class AgentAcquisitionService {
     String agentType = agent.getAgentType();
     agents.remove(agentType);
 
+    // Remove any local failure backoff state for this agent (important for dynamically removed
+    // agents)
+    failureStreaks.remove(agentType);
+
     // Clean up active tracking
     if (activeAgents.remove(agentType) != null) {
       activeAgentMapSize.decrementAndGet();
