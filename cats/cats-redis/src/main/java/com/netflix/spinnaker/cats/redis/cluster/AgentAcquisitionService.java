@@ -38,6 +38,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -77,6 +78,10 @@ public class AgentAcquisitionService {
   private final Map<String, java.util.concurrent.Future<?>> activeAgentsFutures =
       new ConcurrentHashMap<>();
 
+  // Tracks zombies that were cancelled and had their permits pre-released but whose threads
+  // have not yet exited. This prevents the scheduler from oversubscribing when we release early.
+  private final AtomicInteger zombiesInFlight = new AtomicInteger(0);
+
   // Redis TIME synchronization for multi-instance coordination
   private static final AtomicLong lastTimeCheck = new AtomicLong(0);
   private static final AtomicLong serverClientOffset = new AtomicLong(0);
@@ -87,6 +92,15 @@ public class AgentAcquisitionService {
   private final AtomicLong agentsAcquired = new AtomicLong(0);
   private final AtomicLong agentsExecuted = new AtomicLong(0);
   private final AtomicLong agentsFailed = new AtomicLong(0);
+
+  // Exactly-once permit release handshake for zombie cancellation fairness
+  private final ConcurrentHashMap<String, RunState> runStates = new ConcurrentHashMap<>();
+  private volatile Semaphore runningAgentsRef; // Provided by scheduler when calling saturatePool
+
+  private static final class RunState {
+    final java.util.concurrent.atomic.AtomicBoolean permitHeld =
+        new java.util.concurrent.atomic.AtomicBoolean(true);
+  }
 
   // Backlog/health snapshots and rate-limiting
   private final AtomicLong lastBacklogWarnEpochMs = new AtomicLong(0);
@@ -286,6 +300,8 @@ public class AgentAcquisitionService {
    * @return Number of agents successfully acquired and submitted for execution
    */
   public int saturatePool(long runCount, Semaphore runningAgents, ExecutorService agentWorkPool) {
+    // Store reference for fairness bookkeeping (zombie in-flight compensation)
+    this.runningAgentsRef = runningAgents;
     log.debug("Starting agent acquisition cycle {}, known agents: {}", runCount, agents.size());
     if (metrics != null) {
       metrics.incrementAcquireAttempts();
@@ -473,8 +489,9 @@ public class AgentAcquisitionService {
       java.util.Set<String> attemptedThisCycle = new java.util.HashSet<>();
 
       // Calculate how many new agents this pod can try to acquire
+      int effectiveRunning = currentlyRunning + zombiesInFlight.get();
       int availableSlotsForNewAgents =
-          unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - currentlyRunning);
+          unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - effectiveRunning);
 
       if (!unbounded && availableSlotsForNewAgents <= 0) {
         if (log.isDebugEnabled()) {
@@ -535,7 +552,7 @@ public class AgentAcquisitionService {
       }
       log.debug(
           "Attempting to acquire agents ({} running, {} max capacity, {} ready in Redis, up to {} slots this cycle, queueDepth={})",
-          currentlyRunning,
+          effectiveRunning,
           maxConcurrentAgents,
           readyCount,
           availableSlotsForNewAgents,
@@ -725,6 +742,8 @@ public class AgentAcquisitionService {
       for (AgentWorker worker : workersToSubmit) {
         // CRITICAL: Set semaphore before execution so it can be released when done
         worker.setRunningAgents(runningAgents);
+        // Initialize run-state for exactly-once permit release
+        runStates.put(worker.getAgent().getAgentType(), new RunState());
 
         // Submit with proper rejection handling
         java.util.concurrent.Future<?> future =
@@ -3168,10 +3187,23 @@ public class AgentAcquisitionService {
         acquisitionService.conditionalReleaseAgent(
             agent, acquireScore, success, failureClass, capturedCause);
 
-        // CRITICAL: Release semaphore permit to allow new agent acquisitions
-        if (runningAgents != null) {
-          runningAgents.release();
-          log.debug("Released semaphore permit for agent {}", agentType);
+        // CRITICAL: Exactly-once permit release
+        RunState rs = acquisitionService.runStates.remove(agentType);
+        if (rs == null) {
+          // No run-state (e.g., tests calling AgentWorker directly) -> release as before
+          if (runningAgents != null) {
+            runningAgents.release();
+            log.debug("Released semaphore permit for agent {} (no run-state)", agentType);
+          }
+        } else if (rs.permitHeld.compareAndSet(true, false)) {
+          // Normal path: release once
+          if (runningAgents != null) {
+            runningAgents.release();
+            log.debug("Released semaphore permit for agent {}", agentType);
+          }
+        } else {
+          // Permit was pre-released by zombie cleanup; decrement in-flight compensation
+          acquisitionService.zombiesInFlight.decrementAndGet();
         }
 
         log.debug("Agent {} execution cleanup completed", agentType);

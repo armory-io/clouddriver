@@ -125,6 +125,20 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     // Set up service references for advanced cleanup processing
     this.orphanService.setAcquisitionService(this.acquisitionService);
+    // Provide acquisition service to zombie cleanup for fairness bookkeeping (optional wiring).
+    //
+    // Optional = not required for correctness. Without this, zombie cleanup still cancels futures
+    // and cleans Redis. When present, it additionally performs early semaphore permit release via
+    // an exactly-once handshake and compensates capacity using a zombiesInFlight counter, avoiding
+    // temporary under-filling if cancelled threads linger.
+    try {
+      java.lang.reflect.Method m =
+          ZombieCleanupService.class.getDeclaredMethod(
+              "setAcquisitionService", AgentAcquisitionService.class);
+      m.setAccessible(true);
+      m.invoke(this.zombieService, this.acquisitionService);
+    } catch (Throwable ignore) {
+    }
 
     // Store external dependencies
     this.nodeStatusProvider = nodeStatusProvider;

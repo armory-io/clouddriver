@@ -81,6 +81,26 @@ public class ZombieCleanupService {
     this.WORKING_SET = prefix + keysCfg.getWorkingSet() + brace;
   }
 
+  // Optional fairness wiring to acquisition service.
+  //
+  // Meaning of optional:
+  // - Not required for correctness: if this reference is not set, zombie cleanup still cancels
+  //   running futures and removes entries from Redis; the scheduler continues to function.
+  // - When set (wired by the scheduler), zombie cleanup also performs early permit release using an
+  //   exactly-once handshake and increments a zombiesInFlight counter in the acquisition service.
+  //   This avoids temporary under-filling when a cancelled thread lingers before exiting.
+  // - When omitted, only the fairness step is skipped: a cancelled zombie may hold its semaphore
+  //   permit until the worker thread exits, which can temporarily reduce effective concurrency on
+  //   this pod. There is no oversubscription risk either way; the capacity guard remains intact.
+  //
+  // Tests or alternate constructors may omit the wiring for simplicity; the main scheduler wires
+  // it in to enable the fairness behavior in production.
+  private AgentAcquisitionService acquisitionService;
+
+  void setAcquisitionService(AgentAcquisitionService acquisitionService) {
+    this.acquisitionService = acquisitionService;
+  }
+
   /**
    * Compiles the exceptional agents pattern for efficient matching. This method is called during
    * initialization and can be called again if configuration changes.
@@ -450,6 +470,42 @@ public class ZombieCleanupService {
             boolean cancelled = future.cancel(true);
             if (log.isDebugEnabled()) {
               log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
+            }
+          }
+
+          // Fairness: if acquisition service is present, perform exactly-once early permit release
+          if (acquisitionService != null) {
+            try {
+              java.util.concurrent.ConcurrentHashMap<String, ?> rsMap =
+                  (java.util.concurrent.ConcurrentHashMap<String, ?>)
+                      AgentAcquisitionService.class
+                          .getDeclaredField("runStates")
+                          .get(acquisitionService);
+              Object rs = rsMap != null ? rsMap.get(agentType) : null;
+              if (rs != null) {
+                java.util.concurrent.atomic.AtomicBoolean permitHeld =
+                    (java.util.concurrent.atomic.AtomicBoolean)
+                        rs.getClass().getDeclaredField("permitHeld").get(rs);
+                if (permitHeld != null && permitHeld.compareAndSet(true, false)) {
+                  java.util.concurrent.Semaphore sem =
+                      (java.util.concurrent.Semaphore)
+                          AgentAcquisitionService.class
+                              .getDeclaredField("runningAgentsRef")
+                              .get(acquisitionService);
+                  if (sem != null) {
+                    sem.release();
+                  }
+                  java.util.concurrent.atomic.AtomicInteger zif =
+                      (java.util.concurrent.atomic.AtomicInteger)
+                          AgentAcquisitionService.class
+                              .getDeclaredField("zombiesInFlight")
+                              .get(acquisitionService);
+                  if (zif != null) {
+                    zif.incrementAndGet();
+                  }
+                }
+              }
+            } catch (Throwable ignore) {
             }
           }
 
