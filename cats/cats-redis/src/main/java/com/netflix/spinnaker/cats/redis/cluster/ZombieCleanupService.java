@@ -22,7 +22,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.regex.Pattern;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -49,7 +49,7 @@ public class ZombieCleanupService {
   private final PrioritySchedulerMetrics metrics;
 
   // Tracking for zombie cleanup
-  private final AtomicLong zombiesCleanedUp = new AtomicLong(0);
+  private final LongAdder zombiesCleanedUp = new LongAdder();
   private volatile long lastZombieCleanup = 0;
 
   // Compiled regex pattern for exceptional agents
@@ -295,7 +295,7 @@ public class ZombieCleanupService {
         }
       }
 
-      zombiesCleanedUp.addAndGet(totalCleaned);
+      zombiesCleanedUp.add(totalCleaned);
       if (metrics != null) {
         metrics.recordCleanupTime("zombie", currentTimeMillis() - start);
         metrics.incrementCleanupCleaned("zombie", totalCleaned);
@@ -320,7 +320,7 @@ public class ZombieCleanupService {
    * @return total zombies cleaned up
    */
   public long getZombiesCleanedUp() {
-    return zombiesCleanedUp.get();
+    return zombiesCleanedUp.sum();
   }
 
   /**

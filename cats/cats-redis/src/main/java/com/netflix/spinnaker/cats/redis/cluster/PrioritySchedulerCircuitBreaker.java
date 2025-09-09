@@ -19,6 +19,7 @@ package com.netflix.spinnaker.cats.redis.cluster;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,8 +57,8 @@ public class PrioritySchedulerCircuitBreaker {
   private final AtomicInteger halfOpenAttempts = new AtomicInteger(0);
 
   // Statistics
-  private final AtomicLong totalAllowed = new AtomicLong(0);
-  private final AtomicLong totalBlocked = new AtomicLong(0);
+  private final LongAdder totalAllowed = new LongAdder();
+  private final LongAdder totalBlocked = new LongAdder();
   private final AtomicLong lastFailureMs = new AtomicLong(0);
 
   /** Create a circuit breaker with default settings suitable for Redis operations. */
@@ -105,7 +106,7 @@ public class PrioritySchedulerCircuitBreaker {
         if (now - windowStartMs.get() > timeWindowMs) {
           resetFailureWindow(now);
         }
-        totalAllowed.incrementAndGet();
+        totalAllowed.increment();
         return true;
 
       case OPEN:
@@ -114,11 +115,11 @@ public class PrioritySchedulerCircuitBreaker {
           if (transitionToHalfOpen(now)) {
             log.info(
                 "Circuit breaker '{}' transitioning from OPEN to HALF_OPEN after cooldown", name);
-            totalAllowed.incrementAndGet();
+            totalAllowed.increment();
             return true; // Allow one probe request
           }
         }
-        totalBlocked.incrementAndGet();
+        totalBlocked.increment();
         if (metrics != null) {
           metrics.recordCircuitBreakerBlocked(name);
         }
@@ -129,14 +130,14 @@ public class PrioritySchedulerCircuitBreaker {
         if (now - stateChangeTimeMs.get() < halfOpenDurationMs) {
           int attempts = halfOpenAttempts.incrementAndGet();
           if (attempts <= 3) { // Allow up to 3 probe attempts
-            totalAllowed.incrementAndGet();
+            totalAllowed.increment();
             return true;
           }
         } else {
           // Half-open period expired without enough successes, go back to open
           transitionToOpen(now, "Half-open period expired without recovery");
         }
-        totalBlocked.incrementAndGet();
+        totalBlocked.increment();
         if (metrics != null) {
           metrics.recordCircuitBreakerBlocked(name);
         }
@@ -257,8 +258,8 @@ public class PrioritySchedulerCircuitBreaker {
         state.get(),
         failureCount.get(),
         consecutiveFailures.get(),
-        totalAllowed.get(),
-        totalBlocked.get(),
+        totalAllowed.sum(),
+        totalBlocked.sum(),
         System.currentTimeMillis() - stateChangeTimeMs.get(),
         lastFailureMs.get());
   }

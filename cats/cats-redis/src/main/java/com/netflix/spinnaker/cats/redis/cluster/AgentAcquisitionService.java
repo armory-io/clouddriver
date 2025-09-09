@@ -40,6 +40,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
@@ -89,9 +90,9 @@ public class AgentAcquisitionService {
   // Advanced statistics tracking
   private final AtomicLong agentMapSize = new AtomicLong(0);
   private final AtomicLong activeAgentMapSize = new AtomicLong(0);
-  private final AtomicLong agentsAcquired = new AtomicLong(0);
-  private final AtomicLong agentsExecuted = new AtomicLong(0);
-  private final AtomicLong agentsFailed = new AtomicLong(0);
+  private final LongAdder agentsAcquired = new LongAdder();
+  private final LongAdder agentsExecuted = new LongAdder();
+  private final LongAdder agentsFailed = new LongAdder();
 
   // Exactly-once permit release handshake for zombie cancellation fairness
   private final ConcurrentHashMap<String, RunState> runStates = new ConcurrentHashMap<>();
@@ -1064,7 +1065,7 @@ public class AgentAcquisitionService {
               workersToSubmit.add(worker);
               activeAgents.put(agentType, acquireScore);
               activeAgentMapSize.incrementAndGet();
-              agentsAcquired.incrementAndGet();
+              agentsAcquired.increment();
 
               log.debug("Batch acquired agent {} with score {}", agentType, acquireScore);
             } else {
@@ -1208,7 +1209,7 @@ public class AgentAcquisitionService {
         // Track active agent
         activeAgents.put(agentType, agentAcquireScore);
         activeAgentMapSize.incrementAndGet();
-        agentsAcquired.incrementAndGet(); // Track acquisition statistics
+        agentsAcquired.increment(); // Track acquisition statistics
 
         log.debug("Acquired agent {} with score {}", agentType, agentAcquireScore);
         if (attemptedThisCycle != null) {
@@ -1639,17 +1640,17 @@ public class AgentAcquisitionService {
     return new AgentAcquisitionStats(
         agentMapSize.get(),
         activeAgentMapSize.get(),
-        agentsAcquired.get(),
-        agentsExecuted.get(),
-        agentsFailed.get(),
+        agentsAcquired.sum(),
+        agentsExecuted.sum(),
+        agentsFailed.sum(),
         activeAgentsFutures.size());
   }
 
   /** Reset execution statistics counters. Useful for periodic reporting. */
   public void resetExecutionStats() {
-    agentsAcquired.set(0);
-    agentsExecuted.set(0);
-    agentsFailed.set(0);
+    agentsAcquired.reset();
+    agentsExecuted.reset();
+    agentsFailed.reset();
   }
 
   private boolean isAgentEnabled(Agent agent) {
@@ -3163,7 +3164,7 @@ public class AgentAcquisitionService {
         agentExecution.executeAgent(agent);
         executionInstrumentation.executionCompleted(agent, elapsedTimeMs(startTimeMs));
         success = true;
-        acquisitionService.agentsExecuted.incrementAndGet(); // Track successful executions
+        acquisitionService.agentsExecuted.increment(); // Track successful executions
         log.debug("Agent {} execution completed successfully", agentType);
       } catch (Throwable cause) {
         long elapsedMs = System.currentTimeMillis() - startTimeMs;
@@ -3178,7 +3179,7 @@ public class AgentAcquisitionService {
               "Agent {} execution failed after {}ms", agentType, elapsedTimeMs(startTimeMs), cause);
         }
 
-        acquisitionService.agentsFailed.incrementAndGet(); // Track failed executions
+        acquisitionService.agentsFailed.increment(); // Track failed executions
         executionInstrumentation.executionFailed(agent, cause, elapsedTimeMs(startTimeMs));
         capturedCause = cause;
         failureClass = acquisitionService.classifyFailure(cause);

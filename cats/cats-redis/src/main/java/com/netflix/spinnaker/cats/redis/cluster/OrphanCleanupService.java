@@ -24,7 +24,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.Jedis;
@@ -60,7 +60,7 @@ public class OrphanCleanupService {
   private final RedisScriptManager scriptManager;
   private final PrioritySchedulerProperties schedulerProperties;
   private final PrioritySchedulerMetrics metrics;
-  private final AtomicLong orphansCleanedUp = new AtomicLong(0);
+  private final LongAdder orphansCleanedUp = new LongAdder();
 
   // Reference to access agent state for orphan identification
   private AgentAcquisitionService acquisitionService;
@@ -124,7 +124,7 @@ public class OrphanCleanupService {
       int totalCleaned = workingCleaned + waitingCleaned;
 
       if (totalCleaned > 0) {
-        orphansCleanedUp.addAndGet(totalCleaned);
+        orphansCleanedUp.add(totalCleaned);
         log.info(
             "Orphan cleanup completed: {} agents cleaned ({} from working, {} from waiting)",
             totalCleaned,
@@ -164,7 +164,7 @@ public class OrphanCleanupService {
       int totalCleaned = workingCleaned + waitingCleaned;
 
       if (totalCleaned > 0) {
-        orphansCleanedUp.addAndGet(totalCleaned);
+        orphansCleanedUp.add(totalCleaned);
         log.info(
             "Forced orphan cleanup completed: {} agents cleaned ({} from working, {} from waiting)",
             totalCleaned,
@@ -186,7 +186,7 @@ public class OrphanCleanupService {
    * @return total orphans cleaned up
    */
   public long getOrphansCleanedUp() {
-    return orphansCleanedUp.get();
+    return orphansCleanedUp.sum();
   }
 
   /**
