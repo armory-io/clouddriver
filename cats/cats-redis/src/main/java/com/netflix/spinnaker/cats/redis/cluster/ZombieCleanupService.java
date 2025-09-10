@@ -460,17 +460,25 @@ public class ZombieCleanupService {
         // Synchronize local Java state with Redis cleanup results
         // Only clean up local state for agents that were actually removed from Redis
         for (String agentType : cleanedAgents) {
-          // Remove from in-memory active agent tracking map
-          activeAgents.remove(agentType);
-
           // Cancel the Java Future to stop any running agent execution
           Future<?> future = activeAgentsFutures.remove(agentType);
           if (future != null && !future.isDone()) {
-            // Interrupt the thread executing this agent (force cleanup)
             boolean cancelled = future.cancel(true);
             if (log.isDebugEnabled()) {
               log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
             }
+          }
+
+          // Delegate active tracking removal to acquisition service so counters stay consistent
+          if (acquisitionService != null) {
+            try {
+              acquisitionService.removeActiveAgent(agentType);
+            } catch (Throwable t) {
+              // Fall back to direct map removal if service-based cleanup fails
+              activeAgents.remove(agentType);
+            }
+          } else {
+            activeAgents.remove(agentType);
           }
 
           // Fairness: if acquisition service is present, perform exactly-once early permit release
@@ -541,9 +549,9 @@ public class ZombieCleanupService {
       Map<String, Future<?>> activeAgentsFutures) {
 
     try {
-      // Get acquire score from active agents
-      String acquireScore = activeAgents.remove(agentType);
+      // Snapshot current future and then delegate active tracking removal to acquisition service
       Future<?> future = activeAgentsFutures.remove(agentType);
+      String acquireScore = activeAgents.get(agentType);
 
       if (acquireScore == null) {
         log.debug("Agent {} not found in active tracking, skipping cleanup", agentType);
@@ -567,6 +575,12 @@ public class ZombieCleanupService {
       boolean removed = result != null && ((Long) result).intValue() == 1;
       if (removed) {
         log.debug("Removed zombie agent {} from Redis working set", agentType);
+        // Ensure in-memory counters are updated consistently
+        if (acquisitionService != null) {
+          acquisitionService.removeActiveAgent(agentType);
+        } else {
+          activeAgents.remove(agentType);
+        }
       } else {
         log.debug("Zombie agent {} was not cleaned (may have been updated): {}", agentType, result);
       }

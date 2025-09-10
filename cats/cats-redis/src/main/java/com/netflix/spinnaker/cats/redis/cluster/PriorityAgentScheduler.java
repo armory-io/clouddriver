@@ -232,14 +232,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         }
       }
 
-      // Clean up zombie agents (locally stuck agents exceeding their timeout)
-      zombieService.cleanupZombieAgentsIfNeeded(
-          acquisitionService.getActiveAgentsMap(), acquisitionService.getActiveAgentsFutures());
-
-      // Clean up orphaned agents (agents from crashed instances)
-      orphanService.cleanupOrphanedAgentsIfNeeded();
-
-      // Acquire ready agents and submit them for execution
+      // Acquire ready agents and submit them for execution first to guarantee forward progress
       // Skip if we just repopulated to let Redis stabilize
       int agentsAcquired = 0;
       if (!repopulatedThisCycle) {
@@ -249,6 +242,33 @@ public class PriorityAgentScheduler extends CatsModuleAware
       } else {
         log.debug(
             "Skipping acquisition on repopulation cycle {} to prevent first-run races", currentRun);
+      }
+
+      // Clean up zombie agents (locally stuck agents exceeding their timeout) using snapshots
+      // to avoid mutating live maps from the scheduler thread
+      try {
+        java.util.Map<String, String> activeAgentsSnapshot =
+            new java.util.HashMap<>(acquisitionService.getActiveAgentsMap());
+        java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
+            new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
+        zombieService.cleanupZombieAgentsIfNeeded(activeAgentsSnapshot, futuresSnapshot);
+      } catch (Throwable t) {
+        log.debug("Zombie cleanup skipped due to error: {}", t.getMessage());
+        try {
+          metrics.incrementRunFailure(t.getClass().getSimpleName());
+        } catch (Throwable ignore) {
+        }
+      }
+
+      // Clean up orphaned agents (agents from crashed instances)
+      try {
+        orphanService.cleanupOrphanedAgentsIfNeeded();
+      } catch (Throwable t) {
+        log.debug("Orphan cleanup skipped due to error: {}", t.getMessage());
+        try {
+          metrics.incrementRunFailure(t.getClass().getSimpleName());
+        } catch (Throwable ignore) {
+        }
       }
 
       if (log.isDebugEnabled() && agentsAcquired > 0) {
