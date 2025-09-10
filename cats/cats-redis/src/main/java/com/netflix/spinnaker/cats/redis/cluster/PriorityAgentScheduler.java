@@ -154,28 +154,11 @@ public class PriorityAgentScheduler extends CatsModuleAware
     this.intervalProvider = intervalProvider;
     this.shardingFilter = shardingFilter;
 
-    // Dedicated single-thread executors so the scheduler loop never blocks
-    this.zombieCleanupExecutor =
-        java.util.concurrent.Executors.newSingleThreadExecutor(
-            r -> {
-              Thread t = new Thread(r, "PriorityAgentCleanup-Zombie-0");
-              t.setDaemon(true);
-              return t;
-            });
-    this.orphanCleanupExecutor =
-        java.util.concurrent.Executors.newSingleThreadExecutor(
-            r -> {
-              Thread t = new Thread(r, "PriorityAgentCleanup-Orphan-0");
-              t.setDaemon(true);
-              return t;
-            });
-    this.reconcileExecutor =
-        java.util.concurrent.Executors.newSingleThreadExecutor(
-            r -> {
-              Thread t = new Thread(r, "PriorityAgentReconcile-0");
-              t.setDaemon(true);
-              return t;
-            });
+    // Dedicated on-demand single-thread executors so the scheduler loop never blocks.
+    // Threads are created only when needed and time out when idle for cleaner metrics.
+    this.zombieCleanupExecutor = newOnDemandSingleThreadExecutor("PriorityAgentCleanup-Zombie-#");
+    this.orphanCleanupExecutor = newOnDemandSingleThreadExecutor("PriorityAgentCleanup-Orphan-#");
+    this.reconcileExecutor = newOnDemandSingleThreadExecutor("PriorityAgentReconcile-#");
 
     // Register shared gauges once
     try {
@@ -293,13 +276,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // Offload zombie cleanup (non-blocking) using snapshots of local state
       try {
         if (zombieCleanupRunning.compareAndSet(false, true)) {
-          java.util.Map<String, String> activeAgentsSnapshot =
-              new java.util.HashMap<>(acquisitionService.getActiveAgentsMap());
-          java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
-              new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
           zombieCleanupExecutor.submit(
               () -> {
                 try {
+                  java.util.Map<String, String> activeAgentsSnapshot =
+                      new java.util.HashMap<>(acquisitionService.getActiveAgentsMap());
+                  java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
+                      new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
                   zombieService.cleanupZombieAgentsIfNeeded(activeAgentsSnapshot, futuresSnapshot);
                 } catch (Throwable t) {
                   log.warn("Zombie cleanup failed", t);
@@ -750,6 +733,29 @@ public class PriorityAgentScheduler extends CatsModuleAware
             TimeUnit.MILLISECONDS);
 
     log.info("Scheduler started with interval {}ms", intervalMs);
+  }
+
+  /**
+   * Create an on-demand single-thread executor: no core threads, one max thread, 60s keep alive,
+   * and daemon threads with a friendly name. The thread is created only when a task is submitted
+   * and will be terminated after idle period, keeping thread metrics clean during idle windows.
+   */
+  private static java.util.concurrent.ExecutorService newOnDemandSingleThreadExecutor(
+      String threadNamePattern) {
+    java.util.concurrent.ThreadPoolExecutor exec =
+        new java.util.concurrent.ThreadPoolExecutor(
+            0,
+            1,
+            60L,
+            java.util.concurrent.TimeUnit.SECONDS,
+            new java.util.concurrent.SynchronousQueue<>(),
+            r -> {
+              Thread t = new Thread(r, threadNamePattern.replace("#", "0"));
+              t.setDaemon(true);
+              return t;
+            });
+    exec.allowCoreThreadTimeOut(true);
+    return exec;
   }
 
   /**
