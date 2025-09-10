@@ -248,7 +248,7 @@ public class OrphanCleanupService {
       return processOrphanBatch(jedis, setName, orphanList);
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
-      log.warn("Redis connection error while scanning {} for orphans: {}", setName, e.getMessage());
+      log.warn("Redis connection error while scanning {} for orphans", setName, e);
       return 0;
     } catch (Exception e) {
       log.error("Error cleaning orphaned agents from {} set", setName, e);
@@ -299,9 +299,7 @@ public class OrphanCleanupService {
               }
             }
           } catch (Exception e) {
-            log.warn(
-                "Batch removal of invalid waiting agents failed, using individual path: {}",
-                e.getMessage());
+            log.warn("Batch removal of invalid waiting agents failed, using individual path", e);
             totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans);
           }
         }
@@ -426,7 +424,7 @@ public class OrphanCleanupService {
       return acquired;
 
     } catch (Exception e) {
-      log.warn("Failed to acquire cleanup leadership: {}", e.getMessage());
+      log.warn("Failed to acquire cleanup leadership", e);
       return false;
     }
   }
@@ -457,7 +455,7 @@ public class OrphanCleanupService {
       }
 
     } catch (Exception e) {
-      log.warn("Failed to release cleanup leadership: {}", e.getMessage());
+      log.warn("Failed to release cleanup leadership", e);
     } finally {
       currentLeadershipId = null;
     }
@@ -608,16 +606,15 @@ public class OrphanCleanupService {
 
       } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
         log.warn(
-            "Redis connection error during orphan cleanup for {} (score {}): {}",
+            "Redis connection error during orphan cleanup for {} (score {})",
             orphan.getElement(),
             (long) orphan.getScore(),
-            e.getMessage());
+            e);
       } catch (Exception e) {
         log.error(
-            "Error during orphaned agent cleanup attempt for {} (original score: {}): {}",
+            "Error during orphaned agent cleanup attempt for {} (original score: {})",
             orphan.getElement(),
             (long) orphan.getScore(),
-            e.getMessage(),
             e);
       }
     }

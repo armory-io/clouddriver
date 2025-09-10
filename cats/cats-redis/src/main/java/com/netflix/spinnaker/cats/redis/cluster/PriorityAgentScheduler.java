@@ -137,7 +137,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
               "setAcquisitionService", AgentAcquisitionService.class);
       m.setAccessible(true);
       m.invoke(this.zombieService, this.acquisitionService);
-    } catch (Throwable ignore) {
+    } catch (Exception e) {
+      log.debug("Optional zombie cleanup fairness wiring failed; continuing without it", e);
     }
 
     // Store external dependencies
@@ -173,7 +174,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
             double ready = acquisitionService.getReadyCountSnapshot();
             return cap > 0 ? (ready / cap) : 0;
           });
-    } catch (Throwable ignore) {
+    } catch (Exception e) {
+      log.debug("Failed to register scheduler gauges", e);
     }
 
     log.info("PriorityAgentScheduler initialized successfully");
@@ -252,22 +254,24 @@ public class PriorityAgentScheduler extends CatsModuleAware
         java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
             new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
         zombieService.cleanupZombieAgentsIfNeeded(activeAgentsSnapshot, futuresSnapshot);
-      } catch (Throwable t) {
-        log.debug("Zombie cleanup skipped due to error: {}", t.getMessage());
+      } catch (Exception e) {
+        log.warn("Zombie cleanup skipped due to error", e);
         try {
-          metrics.incrementRunFailure(t.getClass().getSimpleName());
-        } catch (Throwable ignore) {
+          metrics.incrementRunFailure(e.getClass().getSimpleName());
+        } catch (Exception me) {
+          log.debug("Failed to record zombie cleanup failure metric", me);
         }
       }
 
       // Clean up orphaned agents (agents from crashed instances)
       try {
         orphanService.cleanupOrphanedAgentsIfNeeded();
-      } catch (Throwable t) {
-        log.debug("Orphan cleanup skipped due to error: {}", t.getMessage());
+      } catch (Exception e) {
+        log.warn("Orphan cleanup skipped due to error", e);
         try {
-          metrics.incrementRunFailure(t.getClass().getSimpleName());
-        } catch (Throwable ignore) {
+          metrics.incrementRunFailure(e.getClass().getSimpleName());
+        } catch (Exception me) {
+          log.debug("Failed to record orphan cleanup failure metric", me);
         }
       }
 
@@ -386,7 +390,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // Use acquisition service to try to acquire the agent
       return acquisitionService.tryLockAgent(agent);
     } catch (Exception e) {
-      log.warn("Failed to lock agent {}: {}", agent.getAgentType(), e.getMessage());
+      log.warn("Failed to lock agent {}", agent.getAgentType(), e);
       return null;
     }
   }
@@ -401,8 +405,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     try {
       return acquisitionService.tryReleaseAgent(lock);
     } catch (Exception e) {
-      log.warn(
-          "Failed to release agent lock {}: {}", lock.getAgent().getAgentType(), e.getMessage());
+      log.warn("Failed to release agent lock {}", lock.getAgent().getAgentType(), e);
       return false;
     }
   }
@@ -417,8 +420,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     try {
       return acquisitionService.isLockValid(lock);
     } catch (Exception e) {
-      log.warn(
-          "Failed to validate agent lock {}: {}", lock.getAgent().getAgentType(), e.getMessage());
+      log.warn("Failed to validate agent lock {}", lock.getAgent().getAgentType(), e);
       return false;
     }
   }
@@ -513,7 +515,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
             }
           }
         } catch (Exception e) {
-          log.debug("Failed to interrupt agent {}: {}", agentType, e.getMessage());
+          log.debug("Failed to interrupt agent {}", agentType, e);
         }
       }
 
@@ -541,10 +543,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
                 "Attempted re-queue of active agent {} for post-restart execution", agentType);
           }
         } catch (Exception e) {
-          log.warn(
-              "Failed to gracefully release active agent {} during shutdown: {}",
-              agentType,
-              e.getMessage());
+          log.warn("Failed to gracefully release active agent {} during shutdown", agentType, e);
         }
       }
 
@@ -610,8 +609,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
           acquisitionService.unregisterAgent(agent);
         }
       }
-    } catch (Throwable t) {
-      log.warn("Failed to reconcile known agents with current shard/config: {}", t.getMessage());
+    } catch (Exception e) {
+      log.warn("Failed to reconcile known agents with current shard/config", e);
     }
   }
 
@@ -649,7 +648,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // that don't require application restart
 
     } catch (Exception e) {
-      log.warn("Failed to refresh configuration: {}", e.getMessage());
+      log.warn("Failed to refresh configuration", e);
     }
   }
 

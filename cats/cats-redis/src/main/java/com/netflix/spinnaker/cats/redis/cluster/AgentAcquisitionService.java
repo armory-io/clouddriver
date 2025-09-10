@@ -527,7 +527,16 @@ public class AgentAcquisitionService {
             readyCount,
             capacityPerCycle,
             currentlyRunning,
-            agentProperties.getMaxConcurrentAgents());
+            maxConcurrentAgents);
+      } else if (degraded && log.isDebugEnabled()) {
+        log.debug(
+            "PriorityScheduler degraded (suppressed WARN): oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
+            oldestOverdueSec,
+            minIntervalSec,
+            readyCount,
+            capacityPerCycle,
+            currentlyRunning,
+            maxConcurrentAgents);
       }
 
       // Store initial degradation state for later update after slot filling check
@@ -635,9 +644,7 @@ public class AgentAcquisitionService {
                     workersToSubmit,
                     attemptedThisCycle);
           } catch (Exception e) {
-            log.warn(
-                "Batch acquisition failed for chunk, falling back to individual: {}",
-                e.getMessage());
+            log.warn("Batch acquisition failed for chunk, falling back to individual", e);
             workersToSubmit.clear();
             acquiredThisChunk =
                 saturatePoolIndividual(
@@ -756,9 +763,11 @@ public class AgentAcquisitionService {
         }
       }
 
-      log.debug(
-          "Completed agent acquisition cycle: {} agents acquired and submitted for execution",
-          agentsAcquiredThisCycle);
+      if (log.isDebugEnabled()) {
+        log.debug(
+            "Completed agent acquisition cycle: {} agents acquired and submitted for execution",
+            agentsAcquiredThisCycle);
+      }
 
       if (metrics != null) {
         metrics.incrementAcquired(agentsAcquiredThisCycle);
@@ -772,7 +781,7 @@ public class AgentAcquisitionService {
       return agentsAcquiredThisCycle;
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
-      log.warn("Redis connection error during agent acquisition: {}", e.getMessage());
+      log.warn("Redis connection error during agent acquisition", e);
 
       // Record Redis failure to circuit breakers
       redisCircuitBreaker.recordFailure(e);
@@ -826,14 +835,14 @@ public class AgentAcquisitionService {
         redisCircuitBreaker.recordSuccess();
       }
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
-      log.warn("Redis connection error during repopulation: {}", e.getMessage());
+      log.warn("Redis connection error during repopulation", e);
       redisCircuitBreaker.recordFailure(e);
       if (metrics != null) {
         metrics.incrementRepopulateError("redis_connection");
         metrics.recordRepopulateTime(System.currentTimeMillis() - start);
       }
     } catch (Exception e) {
-      log.warn("Repopulation attempt failed: {}", e.getMessage());
+      log.warn("Repopulation attempt failed", e);
       if (metrics != null) {
         metrics.incrementRepopulateError(e.getClass().getSimpleName());
         metrics.recordRepopulateTime(System.currentTimeMillis() - start);
@@ -869,7 +878,7 @@ public class AgentAcquisitionService {
       }
       return true;
     } catch (Exception e) {
-      log.warn("Repopulation attempt failed: {}", e.getMessage());
+      log.warn("Repopulation attempt failed", e);
       if (metrics != null) {
         metrics.incrementRepopulateError(e.getClass().getSimpleName());
       }
@@ -1107,8 +1116,7 @@ public class AgentAcquisitionService {
       return 0;
 
     } catch (Exception e) {
-      log.error(
-          "Batch agent acquisition failed, falling back to individual mode: {}", e.getMessage());
+      log.error("Batch agent acquisition failed, falling back to individual mode", e);
       // Release all semaphore permits on batch failure
       if (runningAgents != null) {
         for (int i = 0; i < candidateAgents.size(); i++) {
@@ -1244,7 +1252,7 @@ public class AgentAcquisitionService {
       Agent agent = worker != null ? worker.getAgent() : new AgentTypeOnlyStub(agentType);
       return shardingFilter.filter(agent);
     } catch (Exception e) {
-      log.debug("Unable to determine shard ownership for {}: {}", agentType, e.getMessage());
+      log.debug("Unable to determine shard ownership for {}", agentType, e);
       return false;
     }
   }
@@ -1333,7 +1341,7 @@ public class AgentAcquisitionService {
         log.warn(
             "Failed to write initial Redis entry for agent {} – will rely on repopulation: {}",
             agent.getAgentType(),
-            e.getMessage());
+            e);
       }
     } else {
       log.debug(
@@ -1614,10 +1622,11 @@ public class AgentAcquisitionService {
         log.info("Successfully re-queued agent {} for shutdown restart", agentType);
       } else {
         log.warn(
-            "Agent {} not re-queued (already completed or moved during shutdown) (expected={}, current={}, result={})",
+            "Agent {} not re-queued (already completed or moved during shutdown) (expected_working={}, current_working={}, current_waiting={}, result={})",
             agentType,
             expectedScore,
             currentWorkzScore,
+            currentWaitzScore,
             result);
       }
 
@@ -1695,7 +1704,9 @@ public class AgentAcquisitionService {
     // Take a snapshot to prevent concurrent modification during repopulation
     Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
     int totalAgents = agentsSnapshot.size();
-    log.debug("Repopulation check for {} known agents", totalAgents);
+    if (log.isDebugEnabled()) {
+      log.debug("Repopulation check for {} known agents", totalAgents);
+    }
 
     if (totalAgents == 0) {
       log.debug("No agents to repopulate");
@@ -1740,7 +1751,7 @@ public class AgentAcquisitionService {
       }
 
     } catch (Exception e) {
-      log.warn("Repopulation failed, falling back to full sync: {}", e.getMessage());
+      log.warn("Repopulation failed, falling back to full sync", e);
       repopulateRedisAgentsFallback(jedis);
     }
   }
@@ -1783,8 +1794,7 @@ public class AgentAcquisitionService {
       return allAgents;
     } catch (Exception e) {
       // Fallback: full-set scan if script fails
-      log.warn(
-          "Repopulation presence check failed, falling back to full-set scan: {}", e.getMessage());
+      log.warn("Repopulation presence check failed, falling back to full-set scan", e);
       Pipeline pipeline = jedis.pipelined();
       Response<Set<String>> waitingAgents = pipeline.zrange(WAITING_SET, 0, -1);
       Response<Set<String>> workingAgents = pipeline.zrange(WORKING_SET, 0, -1);
@@ -1838,7 +1848,7 @@ public class AgentAcquisitionService {
           metrics.incrementRepopulateAdded(added);
         }
       } catch (Exception e) {
-        log.warn("Batch add failed, using individual mode: {}", e.getMessage());
+        log.warn("Batch add failed, using individual mode", e);
         addMissingAgentsIndividual(jedis, agentsToAdd);
       }
     }
@@ -1868,7 +1878,7 @@ public class AgentAcquisitionService {
             added++;
           }
         } catch (Exception e) {
-          log.warn("Failed to add missing agent {}: {}", agentType, e.getMessage());
+          log.warn("Failed to add missing agent {}", agentType, e);
         }
       }
     }
@@ -1954,7 +1964,7 @@ public class AgentAcquisitionService {
             log.warn(
                 "Batch repopulation failed for {} agents, using individual mode: {}",
                 batchArgs.size() / 2,
-                e.getMessage());
+                e);
 
             // Fallback: Use pipeline with individual ADD_AGENT script
             Pipeline pipeline = jedis.pipelined();
@@ -1985,9 +1995,7 @@ public class AgentAcquisitionService {
       }
 
     } catch (Exception e) {
-      log.error(
-          "Batch repopulation failed completely, falling back to individual operations: {}",
-          e.getMessage());
+      log.error("Batch repopulation failed completely, falling back to individual operations", e);
 
       // Complete fallback to pipeline with individual ADD_AGENT scripts
       Pipeline pipeline = jedis.pipelined();
@@ -2299,7 +2307,7 @@ public class AgentAcquisitionService {
       return scheduled;
 
     } catch (Exception e) {
-      log.warn("Batch completion scheduling failed, using individual mode: {}", e.getMessage());
+      log.warn("Batch completion scheduling failed, using individual mode", e);
       return individualScheduleCompletions(jedis, completions, offset);
     }
   }
@@ -2339,9 +2347,7 @@ public class AgentAcquisitionService {
 
       } catch (Exception e) {
         log.warn(
-            "Failed to schedule completion for agent {}: {}",
-            completion.agent.getAgentType(),
-            e.getMessage());
+            "Failed to schedule completion for agent {}: {}", completion.agent.getAgentType(), e);
       }
     }
 
@@ -2428,8 +2434,7 @@ public class AgentAcquisitionService {
       }
       return null; // Agent was acquired by another instance
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
-      log.warn(
-          "Redis connection error while acquiring {}: {}", agent.getAgentType(), e.getMessage());
+      log.warn("Redis connection error while acquiring {}", agent.getAgentType(), e);
       return null;
     } catch (Exception e) {
       log.warn("Failed to acquire agent {}", agent.getAgentType(), e);
@@ -2489,8 +2494,7 @@ public class AgentAcquisitionService {
           result);
       return result;
     } catch (Exception e) {
-      log.debug(
-          "Could not get agent score from Redis for {}: {}", agent.getAgentType(), e.getMessage());
+      log.debug("Could not get agent score from Redis for {}", agent.getAgentType(), e);
       return "unknown";
     }
   }
@@ -2554,8 +2558,7 @@ public class AgentAcquisitionService {
       return agentScores;
 
     } catch (Exception e) {
-      log.warn(
-          "Batch agent scoring failed, falling back to individual scoring: {}", e.getMessage());
+      log.warn("Batch agent scoring failed, falling back to individual scoring", e);
       // Fallback to individual scoring
       Map<String, String> scores = new HashMap<>();
       for (AgentWorker worker : agents) {
@@ -2605,8 +2608,7 @@ public class AgentAcquisitionService {
         }
       }
     } catch (Exception e) {
-      log.error(
-          "Error calculating score for agent {}: {}", agent.getAgentType(), e.getMessage(), e);
+      log.error("Error calculating score for agent {}", agent.getAgentType(), e);
       // Fall through to default case
     }
 
@@ -2617,10 +2619,7 @@ public class AgentAcquisitionService {
       return result;
     } catch (Exception e) {
       log.error(
-          "Error generating immediate execution score for agent {}: {}",
-          agent.getAgentType(),
-          e.getMessage(),
-          e);
+          "Error generating immediate execution score for agent {}: {}", agent.getAgentType(), e);
       // Return immediate execution score as fallback - this matches agentScore() behavior
       // where Redis failures still allow the agent to be scheduled
       return String.valueOf(System.currentTimeMillis() / 1000);
@@ -2664,7 +2663,7 @@ public class AgentAcquisitionService {
         }
       } catch (Exception e) {
         // In case of Redis TIME command failure, we'll use client time
-        log.warn("Failed to get Redis server time, using client time: {}", e.getMessage());
+        log.warn("Failed to get Redis server time, using client time", e);
       }
     }
 
@@ -2729,8 +2728,7 @@ public class AgentAcquisitionService {
           failureClass);
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
-      log.warn(
-          "Redis connection error while queueing completion for {}: {}", agentType, e.getMessage());
+      log.warn("Redis connection error while queueing completion for {}", agentType, e);
     } catch (Exception e) {
       log.error(
           "Failed to queue agent completion for {}, falling back to immediate scheduling",

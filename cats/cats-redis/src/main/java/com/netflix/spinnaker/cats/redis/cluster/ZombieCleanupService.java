@@ -112,7 +112,7 @@ public class ZombieCleanupService {
         this.exceptionalAgentsPattern = Pattern.compile(pattern);
         log.info("Compiled exceptional agents pattern: {}", pattern);
       } catch (Exception e) {
-        log.error("Failed to compile exceptional agents pattern '{}': {}", pattern, e.getMessage());
+        log.error("Failed to compile exceptional agents pattern '{}'", pattern, e);
         this.exceptionalAgentsPattern = null;
       }
     } else {
@@ -219,7 +219,7 @@ public class ZombieCleanupService {
               isExceptional ? "exceptional" : "default");
         }
       } catch (NumberFormatException e) {
-        log.warn("Invalid acquire score for agent {}: {}", agentType, acquireScore);
+        log.warn("Invalid acquire score for agent {}: {}", agentType, acquireScore, e);
 
         // Force cleanup invalid scores to prevent permanent stuck state
         // Can occur during concurrent dynamic account updates
@@ -263,7 +263,7 @@ public class ZombieCleanupService {
               totalCleaned++;
             }
           } catch (Exception e) {
-            log.error("Failed to cleanup zombie agent {}: {}", agentType, e.getMessage());
+            log.error("Failed to cleanup zombie agent {}", agentType, e);
           }
         }
       } else {
@@ -394,14 +394,14 @@ public class ZombieCleanupService {
         }
       } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
         log.warn(
-            "Redis connection error during batch zombie cleanup for {} agents: {}",
+            "Redis connection error during batch zombie cleanup for {} agents",
             zombieAgentTypes.size(),
-            e.getMessage());
+            e);
       } catch (Exception e) {
         log.warn(
-            "Batch zombie cleanup failed for {} agents, falling back to individual cleanup: {}",
+            "Batch zombie cleanup failed for {} agents, falling back to individual cleanup",
             zombieAgentTypes.size(),
-            e.getMessage());
+            e);
       }
     }
 
@@ -416,9 +416,9 @@ public class ZombieCleanupService {
           totalCleaned++;
         }
       } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
-        log.warn("Redis connection error while cleaning zombie {}: {}", agentType, e.getMessage());
+        log.warn("Redis connection error while cleaning zombie {}", agentType, e);
       } catch (Exception e) {
-        log.warn("Failed to cleanup individual zombie {}: {}", agentType, e.getMessage());
+        log.warn("Failed to cleanup individual zombie {}", agentType, e);
       }
     }
     return totalCleaned;
@@ -473,7 +473,9 @@ public class ZombieCleanupService {
           if (acquisitionService != null) {
             try {
               acquisitionService.removeActiveAgent(agentType);
-            } catch (Throwable t) {
+            } catch (Exception e) {
+              log.debug(
+                  "Failed to remove active agent via service; falling back to map removal", e);
               // Fall back to direct map removal if service-based cleanup fails
               activeAgents.remove(agentType);
             }
@@ -513,7 +515,8 @@ public class ZombieCleanupService {
                   }
                 }
               }
-            } catch (Throwable ignore) {
+            } catch (Exception e) {
+              log.debug("Fairness handshake during zombie cleanup failed; continuing", e);
             }
           }
 
@@ -588,11 +591,10 @@ public class ZombieCleanupService {
       return removed;
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
-      log.warn(
-          "Redis connection error removing zombie {} from Redis: {}", agentType, e.getMessage());
+      log.warn("Redis connection error removing zombie {} from Redis", agentType, e);
       return false;
     } catch (Exception e) {
-      log.warn("Failed to remove zombie agent {} from Redis: {}", agentType, e.getMessage());
+      log.warn("Failed to remove zombie agent {} from Redis", agentType, e);
       return false;
     }
   }
