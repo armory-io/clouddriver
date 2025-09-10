@@ -378,14 +378,19 @@ public class AgentAcquisitionService {
               || isPeriodElapsed(lastDiagEpochMs, DIAG_PERIOD_MS);
 
       long readyCountForDiagnostics = -1L;
+      boolean earlyEmptyReady = false;
       if (emitDiag) {
         try {
-          readyCountForDiagnostics = jedis.zcount(WAITING_SET, "-inf", currentScore);
+          // Cheap readiness probe: ask for a single ready element; avoid full count scan
+          java.util.Set<String> oneReady =
+              jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, 0, 1);
+          earlyEmptyReady = (oneReady == null || oneReady.isEmpty());
+          readyCountForDiagnostics = earlyEmptyReady ? 0L : 1L;
         } catch (Exception ignore) {
           readyCountForDiagnostics = -1L; // unknown on failure
         }
 
-        if (readyCountForDiagnostics == 0L) {
+        if (earlyEmptyReady) {
           // Detect acquisition stall: waiting set has backlog but none are ready (e.g.,
           // future-scored)
           try {

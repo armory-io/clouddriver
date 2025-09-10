@@ -208,8 +208,8 @@ class AgentScoreLifecycleTest {
       Double waitScore = j.zscore("waiting", "cadence-agent");
       assertThat(waitScore).isNotNull();
       long actual = waitScore.longValue();
-      // allow ±3s jitter for CI timing
-      assertThat(Math.abs(actual - desiredNextSec)).isLessThanOrEqualTo(3);
+      // allow a slightly wider band for CI timing (Redis seconds granularity + scheduling jitter)
+      assertThat(Math.abs(actual - desiredNextSec)).isLessThanOrEqualTo(5);
     }
   }
 

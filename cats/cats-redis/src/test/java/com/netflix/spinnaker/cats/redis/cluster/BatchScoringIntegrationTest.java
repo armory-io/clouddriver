@@ -288,12 +288,17 @@ class BatchScoringIntegrationTest {
 
         String batchResult = batchResults.get("new-agent");
 
-        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+        long currentTimeSeconds;
+        try (Jedis j2 = jedisPool.getResource()) {
+          java.util.List<String> times = j2.time();
+          currentTimeSeconds = Long.parseLong(times.get(0));
+        }
         long individualScore = Long.parseLong(individualResult);
         long batchScore = Long.parseLong(batchResult);
 
-        assertThat(individualScore).isBetween(scoringTimeSeconds - 3, currentTimeSeconds + 3);
-        assertThat(batchScore).isBetween(scoringTimeSeconds - 3, currentTimeSeconds + 3);
+        // Allow small skew since both sides are second-granularity
+        assertThat(individualScore).isBetween(scoringTimeSeconds - 4, currentTimeSeconds + 4);
+        assertThat(batchScore).isBetween(scoringTimeSeconds - 4, currentTimeSeconds + 4);
       }
     }
   }

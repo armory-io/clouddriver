@@ -77,6 +77,14 @@ public class PriorityAgentScheduler extends CatsModuleAware
   private final AtomicBoolean running = new AtomicBoolean(false);
   private final AtomicLong lastHealthLogEpochMs = new AtomicLong(0);
 
+  // Non-blocking executors and guards
+  private final java.util.concurrent.ExecutorService zombieCleanupExecutor;
+  private final java.util.concurrent.ExecutorService orphanCleanupExecutor;
+  private final java.util.concurrent.ExecutorService reconcileExecutor;
+  private final AtomicBoolean zombieCleanupRunning = new AtomicBoolean(false);
+  private final AtomicBoolean orphanCleanupRunning = new AtomicBoolean(false);
+  private final AtomicBoolean reconcileRunning = new AtomicBoolean(false);
+
   // Track all agents provided via schedule(), regardless of current sharding gating
   private final java.util.concurrent.ConcurrentMap<String, KnownAgent> knownAgents =
       new java.util.concurrent.ConcurrentHashMap<>();
@@ -145,6 +153,29 @@ public class PriorityAgentScheduler extends CatsModuleAware
     this.nodeStatusProvider = nodeStatusProvider;
     this.intervalProvider = intervalProvider;
     this.shardingFilter = shardingFilter;
+
+    // Dedicated single-thread executors so the scheduler loop never blocks
+    this.zombieCleanupExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor(
+            r -> {
+              Thread t = new Thread(r, "PriorityAgentCleanup-Zombie-0");
+              t.setDaemon(true);
+              return t;
+            });
+    this.orphanCleanupExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor(
+            r -> {
+              Thread t = new Thread(r, "PriorityAgentCleanup-Orphan-0");
+              t.setDaemon(true);
+              return t;
+            });
+    this.reconcileExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor(
+            r -> {
+              Thread t = new Thread(r, "PriorityAgentReconcile-0");
+              t.setDaemon(true);
+              return t;
+            });
 
     // Register shared gauges once
     try {
@@ -215,24 +246,37 @@ public class PriorityAgentScheduler extends CatsModuleAware
       long currentRun = runCount.incrementAndGet();
       log.debug("Starting scheduler run cycle {}", currentRun);
 
-      // Refresh configuration periodically to pick up dynamic changes
-      refreshConfigurationIfNeeded(currentRun);
-
-      // Reconcile agent registrations with current sharding/enablement state
-      // This ensures agents are properly distributed when shards change
-      reconcileKnownAgentsIfNeeded(currentRun);
+      // Reconcile agent registrations with current sharding/enablement state (offloaded)
+      if (reconcileRunning.compareAndSet(false, true)) {
+        if (log.isDebugEnabled()) {
+          log.debug("Begin reconcileKnownAgents offload for run {}", currentRun);
+        }
+        reconcileExecutor.submit(
+            () -> {
+              try {
+                reconcileKnownAgentsIfNeeded(currentRun);
+              } catch (Throwable t) {
+                log.warn("Reconcile known agents failed", t);
+                try {
+                  metrics.incrementRunFailure(t.getClass().getSimpleName());
+                } catch (Exception me) {
+                  log.debug("Failed to record reconcile failure metric", me);
+                }
+              } finally {
+                reconcileRunning.set(false);
+                if (log.isDebugEnabled()) {
+                  log.debug("End reconcileKnownAgents offload for run {}", currentRun);
+                }
+              }
+            });
+      } else if (log.isDebugEnabled()) {
+        log.debug("Skipping reconcileKnownAgents: previous run still in progress");
+      }
 
       // Check if Redis repopulation is due. If we repopulate, skip acquisition
       // this cycle to avoid race conditions during initial agent registration
       long beforeRepop = acquisitionService.getRegisteredAgentCount();
       boolean repopulatedThisCycle = acquisitionService.repopulateIfDueNow();
-      if (!repopulatedThisCycle) {
-        int legacyRefreshSec = config.getRedisRefreshPeriod();
-        if (legacyRefreshSec > 0 && (currentRun % legacyRefreshSec == 0)) {
-          acquisitionService.repopulateIfDue(currentRun);
-          repopulatedThisCycle = true;
-        }
-      }
 
       // Acquire ready agents and submit them for execution first to guarantee forward progress
       // Skip if we just repopulated to let Redis stabilize
@@ -246,33 +290,58 @@ public class PriorityAgentScheduler extends CatsModuleAware
             "Skipping acquisition on repopulation cycle {} to prevent first-run races", currentRun);
       }
 
-      // Clean up zombie agents (locally stuck agents exceeding their timeout) using snapshots
-      // to avoid mutating live maps from the scheduler thread
+      // Offload zombie cleanup (non-blocking) using snapshots of local state
       try {
-        java.util.Map<String, String> activeAgentsSnapshot =
-            new java.util.HashMap<>(acquisitionService.getActiveAgentsMap());
-        java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
-            new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
-        zombieService.cleanupZombieAgentsIfNeeded(activeAgentsSnapshot, futuresSnapshot);
-      } catch (Exception e) {
-        log.warn("Zombie cleanup skipped due to error", e);
-        try {
-          metrics.incrementRunFailure(e.getClass().getSimpleName());
-        } catch (Exception me) {
-          log.debug("Failed to record zombie cleanup failure metric", me);
+        if (zombieCleanupRunning.compareAndSet(false, true)) {
+          java.util.Map<String, String> activeAgentsSnapshot =
+              new java.util.HashMap<>(acquisitionService.getActiveAgentsMap());
+          java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
+              new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
+          zombieCleanupExecutor.submit(
+              () -> {
+                try {
+                  zombieService.cleanupZombieAgentsIfNeeded(activeAgentsSnapshot, futuresSnapshot);
+                } catch (Throwable t) {
+                  log.warn("Zombie cleanup failed", t);
+                  try {
+                    metrics.incrementRunFailure(t.getClass().getSimpleName());
+                  } catch (Exception me) {
+                    log.debug("Failed to record zombie cleanup failure metric", me);
+                  }
+                } finally {
+                  zombieCleanupRunning.set(false);
+                }
+              });
+        } else if (log.isDebugEnabled()) {
+          log.debug("Skipping zombie cleanup: previous run still in progress");
         }
+      } catch (Throwable t) {
+        log.warn("Failed to schedule zombie cleanup", t);
       }
 
-      // Clean up orphaned agents (agents from crashed instances)
+      // Offload orphan cleanup (non-blocking)
       try {
-        orphanService.cleanupOrphanedAgentsIfNeeded();
-      } catch (Exception e) {
-        log.warn("Orphan cleanup skipped due to error", e);
-        try {
-          metrics.incrementRunFailure(e.getClass().getSimpleName());
-        } catch (Exception me) {
-          log.debug("Failed to record orphan cleanup failure metric", me);
+        if (orphanCleanupRunning.compareAndSet(false, true)) {
+          orphanCleanupExecutor.submit(
+              () -> {
+                try {
+                  orphanService.cleanupOrphanedAgentsIfNeeded();
+                } catch (Throwable t) {
+                  log.warn("Orphan cleanup failed", t);
+                  try {
+                    metrics.incrementRunFailure(t.getClass().getSimpleName());
+                  } catch (Exception me) {
+                    log.debug("Failed to record orphan cleanup failure metric", me);
+                  }
+                } finally {
+                  orphanCleanupRunning.set(false);
+                }
+              });
+        } else if (log.isDebugEnabled()) {
+          log.debug("Skipping orphan cleanup: previous run still in progress");
         }
+      } catch (Throwable t) {
+        log.warn("Failed to schedule orphan cleanup", t);
       }
 
       if (log.isDebugEnabled() && agentsAcquired > 0) {
@@ -451,14 +520,52 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Step 2: Stop the scheduler executor
       config.getSchedulerExecutorService().shutdown();
-      if (!config.getSchedulerExecutorService().awaitTermination(30, TimeUnit.SECONDS)) {
+      long schedAwait = config.getOrphanExecutorShutdownAwaitMs();
+      long schedForceAwait = config.getOrphanExecutorShutdownForceAwaitMs();
+      if (!config
+          .getSchedulerExecutorService()
+          .awaitTermination(schedAwait, TimeUnit.MILLISECONDS)) {
         log.warn("Scheduler executor did not terminate gracefully, forcing shutdown");
         config.getSchedulerExecutorService().shutdownNow();
-
         // Wait for forced termination
-        if (!config.getSchedulerExecutorService().awaitTermination(10, TimeUnit.SECONDS)) {
+        if (!config
+            .getSchedulerExecutorService()
+            .awaitTermination(schedForceAwait, TimeUnit.MILLISECONDS)) {
           log.error("Scheduler executor failed to terminate even after forced shutdown");
         }
+      }
+
+      // Stop zombie cleanup executor
+      zombieCleanupExecutor.shutdown();
+      long zombieAwait = config.getZombieExecutorShutdownAwaitMs();
+      long zombieForceAwait = config.getZombieExecutorShutdownForceAwaitMs();
+      if (!zombieCleanupExecutor.awaitTermination(zombieAwait, TimeUnit.MILLISECONDS)) {
+        log.warn("Zombie cleanup executor did not terminate gracefully, forcing shutdown");
+        zombieCleanupExecutor.shutdownNow();
+        if (!zombieCleanupExecutor.awaitTermination(zombieForceAwait, TimeUnit.MILLISECONDS)) {
+          log.error("Zombie cleanup executor failed to terminate after forced shutdown");
+        }
+      }
+
+      // Stop orphan cleanup executor
+      orphanCleanupExecutor.shutdown();
+      long orphanAwait = config.getOrphanExecutorShutdownAwaitMs();
+      long orphanForceAwait = config.getOrphanExecutorShutdownForceAwaitMs();
+      if (!orphanCleanupExecutor.awaitTermination(orphanAwait, TimeUnit.MILLISECONDS)) {
+        log.warn("Orphan cleanup executor did not terminate gracefully, forcing shutdown");
+        orphanCleanupExecutor.shutdownNow();
+        if (!orphanCleanupExecutor.awaitTermination(orphanForceAwait, TimeUnit.MILLISECONDS)) {
+          log.error("Orphan cleanup executor failed to terminate after forced shutdown");
+        }
+      }
+
+      // Stop reconcile executor (best-effort)
+      reconcileExecutor.shutdown();
+      long reconcileAwait = config.getReconcileExecutorShutdownAwaitMs();
+      long reconcileForceAwait = config.getReconcileExecutorShutdownForceAwaitMs();
+      if (!reconcileExecutor.awaitTermination(reconcileAwait, TimeUnit.MILLISECONDS)) {
+        reconcileExecutor.shutdownNow();
+        reconcileExecutor.awaitTermination(reconcileForceAwait, TimeUnit.MILLISECONDS);
       }
 
       // Step 3: Shutdown all services
@@ -558,27 +665,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
   }
 
   /**
-   * Periodically refreshes configuration based on elapsed cycles. Acts as a hook for dynamic config
-   * even when properties are cached via {@code @ConfigurationProperties}.
-   *
-   * @param currentRun current scheduler cycle number
-   */
-  private void refreshConfigurationIfNeeded(long currentRun) {
-    // Check if we should refresh configuration (every 30 seconds by default)
-    // With @ConfigurationProperties, most config is cached, but we maintain
-    // the refresh framework for dynamic config support
-    long schedulerIntervalMs = config.getSchedulerIntervalMs();
-
-    // Calculate refresh cycles (refresh every 30 seconds)
-    long refreshPeriodMs = 30000L; // 30 seconds
-    long cyclesPerRefresh = refreshPeriodMs / schedulerIntervalMs;
-
-    if (cyclesPerRefresh > 0 && currentRun % cyclesPerRefresh == 0) {
-      refreshConfiguration();
-    }
-  }
-
-  /**
    * Periodically reconciles known agents with current sharding/enablement, registering newly-owned
    * agents and unregistering no-longer-owned ones without a restart.
    *
@@ -631,25 +717,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
   void reconcileKnownAgentsNow() {
     lastReconcileEpochMs.set(0);
     reconcileKnownAgentsIfNeeded(runCount.get());
-  }
-
-  /**
-   * Refresh runtime configuration from properties. Note: With @ConfigurationProperties, most config
-   * is already cached, but this method can be used for dynamic config integration.
-   */
-  private void refreshConfiguration() {
-    try {
-      // Currently using @ConfigurationProperties which are already cached
-      // This method is a placeholder for dynamic configuration support
-
-      log.debug("Configuration refresh completed - using cached @ConfigurationProperties");
-
-      // Possible enhancement: Add support for runtime configuration updates
-      // that don't require application restart
-
-    } catch (Exception e) {
-      log.warn("Failed to refresh configuration", e);
-    }
   }
 
   /**

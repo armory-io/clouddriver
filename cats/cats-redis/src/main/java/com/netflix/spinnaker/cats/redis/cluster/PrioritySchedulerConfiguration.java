@@ -257,6 +257,32 @@ public class PrioritySchedulerConfiguration {
     return schedulerProperties.getBatchOperations().isEnabled();
   }
 
+  // === Cleanup executor shutdown timeouts (sourced from sub-blocks) ===
+
+  public long getZombieExecutorShutdownAwaitMs() {
+    return schedulerProperties.getZombieCleanup().getExecutorShutdownAwaitMs();
+  }
+
+  public long getZombieExecutorShutdownForceAwaitMs() {
+    return schedulerProperties.getZombieCleanup().getExecutorShutdownForceAwaitMs();
+  }
+
+  public long getOrphanExecutorShutdownAwaitMs() {
+    return schedulerProperties.getOrphanCleanup().getExecutorShutdownAwaitMs();
+  }
+
+  public long getOrphanExecutorShutdownForceAwaitMs() {
+    return schedulerProperties.getOrphanCleanup().getExecutorShutdownForceAwaitMs();
+  }
+
+  public long getReconcileExecutorShutdownAwaitMs() {
+    return schedulerProperties.getReconcile().getExecutorShutdownAwaitMs();
+  }
+
+  public long getReconcileExecutorShutdownForceAwaitMs() {
+    return schedulerProperties.getReconcile().getExecutorShutdownForceAwaitMs();
+  }
+
   /** Shutdown all managed resources. */
   public void shutdown() {
     log.info("Shutting down scheduler configuration resources");

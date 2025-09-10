@@ -585,8 +585,11 @@ public class OrphanCleanupService {
             }
           }
         } else if (WAITING_SET.equals(setName)) {
-          // waiting: Only remove invalid entries for this shard; preserve others regardless of age
-          if (!isStillValid && belongsToThisShard) {
+          // waiting: Only remove invalid entries; shard gating may be skipped when forceAllPods
+          boolean forceAllPods = schedulerProperties.getOrphanCleanup().isForceAllPods();
+          // Avoid potentially blocking shard check when forceAllPods is enabled
+          boolean removeCandidate = !isStillValid && (forceAllPods || belongsToThisShard);
+          if (removeCandidate) {
             Object result =
                 scriptManager.evalshaWithSelfHeal(
                     jedis,

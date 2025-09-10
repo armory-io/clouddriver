@@ -83,6 +83,9 @@ public class PrioritySchedulerProperties {
   /** Orphan cleanup configuration for agents from crashed instances. */
   private OrphanCleanupProperties orphanCleanup = new OrphanCleanupProperties();
 
+  /** Reconcile offload executor shutdown timeouts. */
+  private ReconcileProperties reconcile = new ReconcileProperties();
+
   // === PERFORMANCE & RESILIENCE ===
 
   /**
@@ -248,6 +251,34 @@ public class PrioritySchedulerProperties {
     return orphanCleanup.isForceAllPods();
   }
 
+  // Public proxies to avoid leaking package-private types to other modules
+  public long getZombieExecutorShutdownAwaitMs() {
+    return zombieCleanup.getExecutorShutdownAwaitMs();
+  }
+
+  public long getZombieExecutorShutdownForceAwaitMs() {
+    return zombieCleanup.getExecutorShutdownForceAwaitMs();
+  }
+
+  public long getOrphanExecutorShutdownAwaitMs() {
+    return orphanCleanup.getExecutorShutdownAwaitMs();
+  }
+
+  public long getOrphanExecutorShutdownForceAwaitMs() {
+    return orphanCleanup.getExecutorShutdownForceAwaitMs();
+  }
+
+  public ReconcileProperties getReconcile() {
+    if (reconcile == null) {
+      reconcile = new ReconcileProperties();
+    }
+    return reconcile;
+  }
+
+  public void setReconcile(ReconcileProperties reconcile) {
+    this.reconcile = reconcile != null ? reconcile : new ReconcileProperties();
+  }
+
   @PostConstruct
   void validate() {
     validatePositive(intervalMs, "redis.scheduler.interval-ms");
@@ -284,6 +315,31 @@ public class PrioritySchedulerProperties {
     if (jitter.getFailureBackoffRatio() < 0.0 || jitter.getFailureBackoffRatio() > 1.0) {
       throw new IllegalArgumentException(
           "redis.scheduler.jitter.failure-backoff-ratio must be in [0.0, 1.0]");
+    }
+    // Cleanup validation within sub-blocks
+    if (zombieCleanup == null) {
+      zombieCleanup = new ZombieCleanupProperties();
+    }
+    if (orphanCleanup == null) {
+      orphanCleanup = new OrphanCleanupProperties();
+    }
+    if (zombieCleanup.getExecutorShutdownAwaitMs() < 0
+        || zombieCleanup.getExecutorShutdownForceAwaitMs() < 0) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.zombie-cleanup.* shutdown timeouts must be >= 0");
+    }
+    if (orphanCleanup.getExecutorShutdownAwaitMs() < 0
+        || orphanCleanup.getExecutorShutdownForceAwaitMs() < 0) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.orphan-cleanup.* shutdown timeouts must be >= 0");
+    }
+    if (reconcile == null) {
+      reconcile = new ReconcileProperties();
+    }
+    if (reconcile.getExecutorShutdownAwaitMs() < 0
+        || reconcile.getExecutorShutdownForceAwaitMs() < 0) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.reconcile.* shutdown timeouts must be >= 0");
     }
   }
 
@@ -465,6 +521,11 @@ class ZombieCleanupProperties {
   /** Configuration for exceptional agents that require different zombie thresholds. */
   private ExceptionalAgentsProperties exceptionalAgents = new ExceptionalAgentsProperties();
 
+  /** Graceful wait for zombie-cleanup executor shutdown (milliseconds). Default: 10000. */
+  private long executorShutdownAwaitMs = 10000L;
+  /** Forced wait after zombie-cleanup shutdownNow (milliseconds). Default: 5000. */
+  private long executorShutdownForceAwaitMs = 5000L;
+
   public ExceptionalAgentsProperties getExceptionalAgents() {
     if (exceptionalAgents == null) {
       exceptionalAgents = new ExceptionalAgentsProperties();
@@ -527,47 +588,19 @@ class OrphanCleanupProperties {
    * safety.
    */
   private boolean forceAllPods = false;
+
+  /** Graceful wait for orphan-cleanup executor shutdown (milliseconds). Default: 10000. */
+  private long executorShutdownAwaitMs = 10000L;
+  /** Forced wait after orphan-cleanup shutdownNow (milliseconds). Default: 5000. */
+  private long executorShutdownForceAwaitMs = 5000L;
 }
 
-/** Thread pool configuration properties for Redis scheduler. */
+/** Reconcile executor shutdown tuning knobs. */
 @Getter
 @Setter
-class RedisThreadPoolProperties {
-
-  /**
-   * Thread pool core size for agent execution. Defaults to 10, which works for most deployments.
-   * Config key: {@code redis.scheduler.pool.core-size}
-   */
-  private int coreSize = 10;
-
-  /**
-   * Thread pool maximum size for agent execution. Defaults to 50, increase for high-throughput
-   * deployments. Config key: {@code redis.scheduler.pool.max-size}
-   */
-  private int maxSize = 50;
-
-  /**
-   * Thread keep-alive time in seconds. Config key: {@code redis.scheduler.pool.keep-alive-seconds}
-   */
-  private long keepAliveSeconds = 60L;
-
-  /**
-   * Queue type for the agent work pool. One of: linked | array | sync.
-   *
-   * <ul>
-   *   <li>linked → LinkedBlockingQueue (unbounded, parity with other schedulers)
-   *   <li>array → ArrayBlockingQueue (bounded by queueCapacity)
-   *   <li>sync → SynchronousQueue (direct handoff, strong backpressure)
-   * </ul>
-   *
-   * Config key: {@code redis.scheduler.pool.queue-type}
-   */
-  private String queueType = "linked";
-
-  /**
-   * Queue capacity for ArrayBlockingQueue when {@code queueType=array}. If <= 0, the implementation
-   * will default to using the pool's maxSize as the capacity. Ignored for other queue types. Config
-   * key: {@code redis.scheduler.pool.queue-capacity}
-   */
-  private int queueCapacity = 0;
+class ReconcileProperties {
+  /** Graceful wait for reconcile executor shutdown (milliseconds). Default: 5000. */
+  private long executorShutdownAwaitMs = 5000L;
+  /** Forced wait after reconcile shutdownNow (milliseconds). Default: 2000. */
+  private long executorShutdownForceAwaitMs = 2000L;
 }

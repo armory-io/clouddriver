@@ -181,6 +181,10 @@ public class AgentSchedulerConfig {
         schedulerProperties.isZombieCleanupEnabled(),
         schedulerProperties.getZombieThresholdMs(),
         schedulerProperties.getZombieIntervalMs());
+    log.info(
+        "PriorityAgentScheduler zombie cleanup shutdown: await-ms={}, force-await-ms={}",
+        schedulerProperties.getZombieExecutorShutdownAwaitMs(),
+        schedulerProperties.getZombieExecutorShutdownForceAwaitMs());
 
     if (schedulerProperties.hasExceptionalAgents()) {
       log.info(
@@ -196,6 +200,10 @@ public class AgentSchedulerConfig {
         schedulerProperties.getOrphanIntervalMs(),
         schedulerProperties.getOrphanLeadershipTtlMs(),
         schedulerProperties.isOrphanForceAllPods());
+    log.info(
+        "PriorityAgentScheduler orphan cleanup shutdown: await-ms={}, force-await-ms={}",
+        schedulerProperties.getOrphanExecutorShutdownAwaitMs(),
+        schedulerProperties.getOrphanExecutorShutdownForceAwaitMs());
 
     log.info(
         "PriorityAgentScheduler batch operations: enabled={}, batch-size={}, chunk-attempt-multiplier={}",
