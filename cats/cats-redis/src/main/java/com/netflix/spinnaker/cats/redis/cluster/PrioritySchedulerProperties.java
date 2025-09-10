@@ -285,14 +285,6 @@ public class PrioritySchedulerProperties {
       throw new IllegalArgumentException(
           "redis.scheduler.jitter.failure-backoff-ratio must be in [0.0, 1.0]");
     }
-    if (jitter.getTimeSyncStartJitterMs() < 0) {
-      throw new IllegalArgumentException(
-          "redis.scheduler.jitter.time-sync-start-jitter-ms must be >= 0");
-    }
-    if (jitter.getTiebreakHashSeconds() < 0) {
-      throw new IllegalArgumentException(
-          "redis.scheduler.jitter.tiebreak-hash-seconds must be >= 0");
-    }
   }
 
   private static void validatePositive(long v, String name) {
@@ -409,8 +401,16 @@ class FailureBackoffProperties {
 }
 
 /**
- * Unified jitter configuration properties. All schedule-affecting jitters use whole seconds to
- * match Redis ZSET score granularity.
+ * Unified jitter configuration properties.
+ *
+ * <p>Seconds-based knobs affect Redis ZSET scores directly (whole-second granularity):
+ *
+ * <ul>
+ *   <li>initialRegistrationSeconds
+ *   <li>shutdownSeconds
+ * </ul>
+ *
+ * The {@code failureBackoffRatio} is a dimensionless ratio applied to non-zero backoff delays.
  */
 @Getter
 @Setter
@@ -423,14 +423,6 @@ class JitterProperties {
 
   /** ±ratio applied to non-zero failure backoff delays. Range [0.0, 1.0]. Default: 0.1. */
   private double failureBackoffRatio = 0.1d;
-
-  /** Infra-only: start jitter for the TIME sync ticker (milliseconds). */
-  private long timeSyncStartJitterMs = 500L;
-
-  /**
-   * Optional deterministic whole-second tie-breaker phase by stable hash. Default: 0 (disabled).
-   */
-  private int tiebreakHashSeconds = 0;
 }
 
 /**
