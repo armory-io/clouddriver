@@ -268,6 +268,26 @@ public class PrioritySchedulerProperties {
     return orphanCleanup.getExecutorShutdownForceAwaitMs();
   }
 
+  public long getZombieRunBudgetMs() {
+    return zombieCleanup.getRunBudgetMs();
+  }
+
+  public long getOrphanRunBudgetMs() {
+    return orphanCleanup.getRunBudgetMs();
+  }
+
+  public long getReconcileRunBudgetMs() {
+    return getReconcile().getRunBudgetMs();
+  }
+
+  public long getReconcileExecutorShutdownAwaitMs() {
+    return getReconcile().getExecutorShutdownAwaitMs();
+  }
+
+  public long getReconcileExecutorShutdownForceAwaitMs() {
+    return getReconcile().getExecutorShutdownForceAwaitMs();
+  }
+
   public ReconcileProperties getReconcile() {
     if (reconcile == null) {
       reconcile = new ReconcileProperties();
@@ -525,6 +545,8 @@ class ZombieCleanupProperties {
   private long executorShutdownAwaitMs = 10000L;
   /** Forced wait after zombie-cleanup shutdownNow (milliseconds). Default: 5000. */
   private long executorShutdownForceAwaitMs = 5000L;
+  /** Optional max runtime budget per cleanup pass (milliseconds). 0 disables. */
+  private long runBudgetMs = 0L;
 
   public ExceptionalAgentsProperties getExceptionalAgents() {
     if (exceptionalAgents == null) {
@@ -593,6 +615,8 @@ class OrphanCleanupProperties {
   private long executorShutdownAwaitMs = 10000L;
   /** Forced wait after orphan-cleanup shutdownNow (milliseconds). Default: 5000. */
   private long executorShutdownForceAwaitMs = 5000L;
+  /** Optional max runtime budget per cleanup pass (milliseconds). 0 disables. */
+  private long runBudgetMs = 0L;
 }
 
 /** Reconcile executor shutdown tuning knobs. */
@@ -603,4 +627,6 @@ class ReconcileProperties {
   private long executorShutdownAwaitMs = 5000L;
   /** Forced wait after reconcile shutdownNow (milliseconds). Default: 2000. */
   private long executorShutdownForceAwaitMs = 2000L;
+  /** Optional max runtime budget per reconcile pass (milliseconds). 0 disables. */
+  private long runBudgetMs = 0L;
 }

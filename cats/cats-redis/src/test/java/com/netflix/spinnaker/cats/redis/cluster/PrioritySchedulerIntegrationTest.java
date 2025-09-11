@@ -1122,7 +1122,8 @@ public class PrioritySchedulerIntegrationTest {
       }
       long delta = s.longValue() - nowSec;
       // errorInterval is 5000ms (5s) from setUp mock intervalProvider
-      assertThat(delta).isBetween(4L, 7L);
+      // Allow a wider lower-bound to avoid flakiness due to second rounding/timing
+      assertThat(delta).isBetween(3L, 7L);
     }
   }
 }

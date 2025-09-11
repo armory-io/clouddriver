@@ -283,6 +283,18 @@ public class PrioritySchedulerConfiguration {
     return schedulerProperties.getReconcile().getExecutorShutdownForceAwaitMs();
   }
 
+  public long getZombieRunBudgetMs() {
+    return schedulerProperties.getZombieCleanup().getRunBudgetMs();
+  }
+
+  public long getOrphanRunBudgetMs() {
+    return schedulerProperties.getOrphanCleanup().getRunBudgetMs();
+  }
+
+  public long getReconcileRunBudgetMs() {
+    return schedulerProperties.getReconcile().getRunBudgetMs();
+  }
+
   /** Shutdown all managed resources. */
   public void shutdown() {
     log.info("Shutting down scheduler configuration resources");

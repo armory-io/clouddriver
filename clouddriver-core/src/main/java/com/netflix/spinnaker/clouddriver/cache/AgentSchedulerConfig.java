@@ -185,6 +185,9 @@ public class AgentSchedulerConfig {
         "PriorityAgentScheduler zombie cleanup shutdown: await-ms={}, force-await-ms={}",
         schedulerProperties.getZombieExecutorShutdownAwaitMs(),
         schedulerProperties.getZombieExecutorShutdownForceAwaitMs());
+    log.info(
+        "PriorityAgentScheduler zombie cleanup run budget: {}ms",
+        schedulerProperties.getZombieRunBudgetMs());
 
     if (schedulerProperties.hasExceptionalAgents()) {
       log.info(
@@ -204,12 +207,21 @@ public class AgentSchedulerConfig {
         "PriorityAgentScheduler orphan cleanup shutdown: await-ms={}, force-await-ms={}",
         schedulerProperties.getOrphanExecutorShutdownAwaitMs(),
         schedulerProperties.getOrphanExecutorShutdownForceAwaitMs());
+    log.info(
+        "PriorityAgentScheduler orphan cleanup run budget: {}ms",
+        schedulerProperties.getOrphanRunBudgetMs());
 
     log.info(
         "PriorityAgentScheduler batch operations: enabled={}, batch-size={}, chunk-attempt-multiplier={}",
         schedulerProperties.getBatchOperations().isEnabled(),
         schedulerProperties.getBatchOperations().getBatchSize(),
         schedulerProperties.getBatchOperations().getChunkAttemptMultiplier());
+
+    log.info(
+        "PriorityAgentScheduler reconcile shutdown: await-ms={}, force-await-ms={}, run-budget-ms={}",
+        schedulerProperties.getReconcileExecutorShutdownAwaitMs(),
+        schedulerProperties.getReconcileExecutorShutdownForceAwaitMs(),
+        schedulerProperties.getReconcileRunBudgetMs());
 
     log.info(
         "PriorityAgentScheduler Redis keys: prefix='{}', hash-tag='{}', waiting-set='{}', working-set='{}', cleanup-leader-key='{}'",

@@ -283,8 +283,21 @@ public class PriorityAgentScheduler extends CatsModuleAware
                       new java.util.HashMap<>(acquisitionService.getActiveAgentsMap());
                   java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
                       new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
+                  long startTs = currentTimeMillis();
+                  long budgetMs = config.getZombieRunBudgetMs();
                   zombieService.cleanupZombieAgentsIfNeeded(activeAgentsSnapshot, futuresSnapshot);
+                  if (budgetMs > 0 && currentTimeMillis() - startTs > budgetMs) {
+                    log.warn(
+                        "Zombie cleanup exceeded budget {}ms; subsequent work will be deferred",
+                        budgetMs);
+                    // Cooperative hard stop: interrupt to signal budget breach
+                    Thread.currentThread().interrupt();
+                  }
                 } catch (Throwable t) {
+                  if (t instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                    return;
+                  }
                   log.warn("Zombie cleanup failed", t);
                   try {
                     metrics.incrementRunFailure(t.getClass().getSimpleName());
@@ -308,8 +321,21 @@ public class PriorityAgentScheduler extends CatsModuleAware
           orphanCleanupExecutor.submit(
               () -> {
                 try {
+                  long startTs = currentTimeMillis();
+                  long budgetMs = config.getOrphanRunBudgetMs();
                   orphanService.cleanupOrphanedAgentsIfNeeded();
+                  if (budgetMs > 0 && currentTimeMillis() - startTs > budgetMs) {
+                    log.warn(
+                        "Orphan cleanup exceeded budget {}ms; subsequent work will be deferred",
+                        budgetMs);
+                    Thread.currentThread().interrupt();
+                    return;
+                  }
                 } catch (Throwable t) {
+                  if (t instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                    return;
+                  }
                   log.warn("Orphan cleanup failed", t);
                   try {
                     metrics.incrementRunFailure(t.getClass().getSimpleName());
