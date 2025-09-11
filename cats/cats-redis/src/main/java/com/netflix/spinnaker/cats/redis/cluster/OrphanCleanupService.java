@@ -119,8 +119,14 @@ public class OrphanCleanupService {
     }
 
     try (Jedis jedis = jedisPool.getResource()) {
-      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET);
-      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET);
+      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start);
+      // If we already exceeded the budget on working, do not attempt waiting
+      if (overBudget(start)) {
+        log.warn("Orphan cleanup budget exceeded after working set; skipping waiting set");
+        lastOrphanCleanup = currentTimeMillis();
+        return;
+      }
+      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, start);
       int totalCleaned = workingCleaned + waitingCleaned;
 
       if (totalCleaned > 0) {
@@ -159,8 +165,9 @@ public class OrphanCleanupService {
     }
 
     try (Jedis jedis = jedisPool.getResource()) {
-      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET);
-      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET);
+      long start = currentTimeMillis();
+      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start);
+      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, start);
       int totalCleaned = workingCleaned + waitingCleaned;
 
       if (totalCleaned > 0) {
@@ -206,7 +213,7 @@ public class OrphanCleanupService {
    * @param setName The name of the Redis set to clean up
    * @return The number of orphaned agents cleaned up
    */
-  private int cleanupOrphanedAgentsFromSet(Jedis jedis, String setName) {
+  private int cleanupOrphanedAgentsFromSet(Jedis jedis, String setName, long startTs) {
     long cutoffScore;
     long thresholdForLogging;
 
@@ -228,6 +235,10 @@ public class OrphanCleanupService {
     }
 
     try {
+      if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+        log.warn("Skipping {} orphan scan due to budget/interrupt", setName);
+        return 0;
+      }
       // Find all agents in set older than threshold
       Set<Tuple> potentialOrphans = jedis.zrangeByScoreWithScores(setName, 0, cutoffScore);
 
@@ -245,7 +256,7 @@ public class OrphanCleanupService {
 
       // Process orphans with batch operations and fallback
       List<Tuple> orphanList = new ArrayList<>(potentialOrphans);
-      return processOrphanBatch(jedis, setName, orphanList);
+      return processOrphanBatch(jedis, setName, orphanList, startTs);
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
       log.warn("Redis connection error while scanning {} for orphans", setName, e);
@@ -264,12 +275,27 @@ public class OrphanCleanupService {
    * @param orphans List of orphaned agents to process
    * @return The number of orphaned agents cleaned up
    */
-  private int processOrphanBatch(Jedis jedis, String setName, List<Tuple> orphans) {
+  private int processOrphanBatch(Jedis jedis, String setName, List<Tuple> orphans, long startTs) {
     if (orphans.isEmpty()) {
       return 0;
     }
 
     int batchSize = schedulerProperties.getBatchOperations().getBatchSize();
+    if (batchSize <= 0) {
+      // Align with system convention: when batch-size is 0 or negative, default to instance
+      // concurrency to keep passes bounded and predictable.
+      try {
+        int maxConcurrent =
+            Math.max(
+                1,
+                new PrioritySchedulerConfiguration(
+                        new PriorityAgentProperties(), schedulerProperties)
+                    .getMaxConcurrentAgents());
+        batchSize = maxConcurrent;
+      } catch (Exception ignore) {
+        batchSize = 50; // conservative fallback
+      }
+    }
     boolean batchOperationsEnabled = schedulerProperties.getBatchOperations().isEnabled();
     int totalCleaned = 0;
 
@@ -278,6 +304,10 @@ public class OrphanCleanupService {
       if (batchOperationsEnabled) {
         List<String> invalidArgs = new ArrayList<>();
         for (Tuple orphan : orphans) {
+          if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+            log.warn("Aborting waiting-batch build due to budget/interrupt");
+            break;
+          }
           String agentName = orphan.getElement();
           if (!isAgentStillValid(agentName)) {
             invalidArgs.add(agentName);
@@ -300,19 +330,23 @@ public class OrphanCleanupService {
             }
           } catch (Exception e) {
             log.warn("Batch removal of invalid waiting agents failed, using individual path", e);
-            totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans);
+            totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startTs);
           }
         }
       } else {
-        totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans);
+        totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startTs);
       }
     } else {
       // working: Prefer individual path to allow validity checks and conditional moves, and to skip
       // locally active work.
       for (int i = 0; i < orphans.size(); i += batchSize) {
+        if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+          log.warn("Aborting working-batch processing due to budget/interrupt");
+          break;
+        }
         int endIndex = Math.min(i + batchSize, orphans.size());
         List<Tuple> batch = orphans.subList(i, endIndex);
-        totalCleaned += cleanupIndividualOrphans(jedis, setName, batch);
+        totalCleaned += cleanupIndividualOrphans(jedis, setName, batch, startTs);
       }
     }
 
@@ -471,10 +505,15 @@ public class OrphanCleanupService {
    * @param orphans List of orphaned agents to clean up
    * @return Number of agents successfully cleaned up
    */
-  private int cleanupIndividualOrphans(Jedis jedis, String setName, List<Tuple> orphans) {
+  private int cleanupIndividualOrphans(
+      Jedis jedis, String setName, List<Tuple> orphans, long startTs) {
     int cleaned = 0;
 
     for (Tuple orphan : orphans) {
+      if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+        log.warn("Stopping individual orphan cleanup early due to budget/interrupt");
+        break;
+      }
       try {
         String agentName = orphan.getElement();
         double score = orphan.getScore();
@@ -627,6 +666,14 @@ public class OrphanCleanupService {
     }
 
     return cleaned;
+  }
+
+  // Cooperative time-budget guard. Prevents long orphan passes from monopolizing cleanup threads
+  // when many entries are present. Network calls inside a single Redis operation still rely on
+  // Jedis socket timeouts; this guard stops between operations.
+  private boolean overBudget(long startTs) {
+    long budgetMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
+    return budgetMs > 0 && (currentTimeMillis() - startTs) > budgetMs;
   }
 
   /**

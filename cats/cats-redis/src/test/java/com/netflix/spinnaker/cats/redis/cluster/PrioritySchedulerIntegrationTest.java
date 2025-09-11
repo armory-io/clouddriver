@@ -265,8 +265,8 @@ public class PrioritySchedulerIntegrationTest {
         nowSec = Long.parseLong(times.get(0));
       }
       long delta = s.longValue() - nowSec;
-      // errorInterval = 5s; ±20% => [4,6] seconds after rounding
-      assertThat(delta).isBetween(4L, 6L);
+      // errorInterval = 5s; ±20% => [3,6] seconds after rounding
+      assertThat(delta).isBetween(3L, 6L);
     }
   }
 

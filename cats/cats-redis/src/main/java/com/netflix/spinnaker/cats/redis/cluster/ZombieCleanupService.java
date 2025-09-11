@@ -191,6 +191,11 @@ public class ZombieCleanupService {
     int validAgentsScanned = 0;
 
     for (Map.Entry<String, String> entry : activeAgents.entrySet()) {
+      if (overBudget(start) || Thread.currentThread().isInterrupted()) {
+        log.warn("Stopping zombie scan early due to budget/interrupt");
+        break;
+      }
+      currentTime = currentTimeMillis();
       String agentType = entry.getKey();
       String acquireScore = entry.getValue();
 
@@ -258,6 +263,10 @@ public class ZombieCleanupService {
         }
 
         for (String agentType : zombieAgentTypes) {
+          if (overBudget(start) || Thread.currentThread().isInterrupted()) {
+            log.warn("Stopping zombie individual cleanup due to budget/interrupt");
+            break;
+          }
           try {
             if (cleanupIndividualZombieAgent(jedis, agentType, activeAgents, activeAgentsFutures)) {
               totalCleaned++;
@@ -269,9 +278,20 @@ public class ZombieCleanupService {
       } else {
         // Use batch cleanup with fallback to individual operations
         List<String> zombieBatch = new ArrayList<>();
-        int batchSize =
-            Math.min(
-                schedulerProperties.getBatchOperations().getBatchSize(), zombieAgentTypes.size());
+        int configured = schedulerProperties.getBatchOperations().getBatchSize();
+        if (configured <= 0) {
+          // Align with convention: default to max-concurrent-agents when batch-size <= 0
+          try {
+            int maxConcurrent =
+                new PrioritySchedulerConfiguration(
+                        new PriorityAgentProperties(), schedulerProperties)
+                    .getMaxConcurrentAgents();
+            configured = Math.max(1, maxConcurrent);
+          } catch (Exception ignore) {
+            configured = 50; // conservative fallback to default
+          }
+        }
+        int batchSize = Math.min(configured, zombieAgentTypes.size());
         if (log.isDebugEnabled()) {
           log.debug(
               "Processing {} zombie agents in batches of {} with fallback",
@@ -280,18 +300,29 @@ public class ZombieCleanupService {
         }
 
         for (String agentType : zombieAgentTypes) {
+          if (overBudget(start) || Thread.currentThread().isInterrupted()) {
+            log.warn("Stopping zombie batch preparation due to budget/interrupt");
+            break;
+          }
           zombieBatch.add(agentType);
 
           if (zombieBatch.size() >= batchSize) {
+            if (overBudget(start) || Thread.currentThread().isInterrupted()) {
+              log.warn("Skipping zombie batch execution due to budget/interrupt");
+              break;
+            }
             totalCleaned +=
-                cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures);
+                cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures, start);
             zombieBatch.clear();
           }
         }
 
         // Process remaining zombies
         if (!zombieBatch.isEmpty()) {
-          totalCleaned += cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures);
+          if (!overBudget(start) && !Thread.currentThread().isInterrupted()) {
+            totalCleaned +=
+                cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures, start);
+          }
         }
       }
 
@@ -355,7 +386,8 @@ public class ZombieCleanupService {
       Jedis jedis,
       List<String> zombieAgentTypes,
       Map<String, String> activeAgents,
-      Map<String, Future<?>> activeAgentsFutures) {
+      Map<String, Future<?>> activeAgentsFutures,
+      long startTs) {
 
     if (zombieAgentTypes.isEmpty()) {
       return 0;
@@ -368,6 +400,10 @@ public class ZombieCleanupService {
         List<String> batchArgs = new ArrayList<>(zombieAgentTypes.size() * 2);
 
         for (String agentType : zombieAgentTypes) {
+          if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+            log.warn("Stopping zombie batch build due to budget/interrupt");
+            break;
+          }
           String acquireScore = activeAgents.get(agentType);
           if (acquireScore != null) {
             batchArgs.add(agentType);
@@ -411,6 +447,10 @@ public class ZombieCleanupService {
     }
     int totalCleaned = 0;
     for (String agentType : zombieAgentTypes) {
+      if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+        log.warn("Stopping zombie individual fallback due to budget/interrupt");
+        break;
+      }
       try {
         if (cleanupIndividualZombieAgent(jedis, agentType, activeAgents, activeAgentsFutures)) {
           totalCleaned++;
@@ -597,5 +637,10 @@ public class ZombieCleanupService {
       log.warn("Failed to remove zombie agent {} from Redis", agentType, e);
       return false;
     }
+  }
+
+  private boolean overBudget(long startTs) {
+    long budgetMs = schedulerProperties.getZombieCleanup().getRunBudgetMs();
+    return budgetMs > 0 && (currentTimeMillis() - startTs) > budgetMs;
   }
 }

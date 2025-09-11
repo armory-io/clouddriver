@@ -276,11 +276,11 @@ public class PrioritySchedulerConfiguration {
   }
 
   public long getReconcileExecutorShutdownAwaitMs() {
-    return schedulerProperties.getReconcile().getExecutorShutdownAwaitMs();
+    return safeReconcile().getExecutorShutdownAwaitMs();
   }
 
   public long getReconcileExecutorShutdownForceAwaitMs() {
-    return schedulerProperties.getReconcile().getExecutorShutdownForceAwaitMs();
+    return safeReconcile().getExecutorShutdownForceAwaitMs();
   }
 
   public long getZombieRunBudgetMs() {
@@ -292,7 +292,12 @@ public class PrioritySchedulerConfiguration {
   }
 
   public long getReconcileRunBudgetMs() {
-    return schedulerProperties.getReconcile().getRunBudgetMs();
+    return safeReconcile().getRunBudgetMs();
+  }
+
+  private ReconcileProperties safeReconcile() {
+    ReconcileProperties r = schedulerProperties.getReconcile();
+    return r != null ? r : new ReconcileProperties();
   }
 
   /** Shutdown all managed resources. */

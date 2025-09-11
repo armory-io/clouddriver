@@ -91,6 +91,10 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
   // Reconciliation cadence control
   private final AtomicLong lastReconcileEpochMs = new AtomicLong(0);
+  // Local submission gate for orphan cleanup to avoid per-second submits when not due/leader
+  private final AtomicLong lastOrphanSubmitEpochMs = new AtomicLong(0);
+  // Local submission gate for zombie cleanup to avoid per-second submits
+  private final AtomicLong lastZombieSubmitEpochMs = new AtomicLong(0);
 
   /**
    * Creates a PriorityAgentScheduler with required dependencies.
@@ -156,9 +160,33 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     // Dedicated on-demand single-thread executors so the scheduler loop never blocks.
     // Threads are created only when needed and time out when idle for cleaner metrics.
-    this.zombieCleanupExecutor = newOnDemandSingleThreadExecutor("PriorityAgentCleanup-Zombie-#");
-    this.orphanCleanupExecutor = newOnDemandSingleThreadExecutor("PriorityAgentCleanup-Orphan-#");
-    this.reconcileExecutor = newOnDemandSingleThreadExecutor("PriorityAgentReconcile-#");
+    // For zombie cleanup, prefer to keep the worker thread parked when budget=0 by using the
+    // zombie-cleanup interval as keep-alive. With a positive budget, keep-alive equals the budget
+    // so the worker retires shortly after work finishes.
+    this.zombieCleanupExecutor =
+        newOnDemandSingleThreadExecutor(
+            "PriorityAgentCleanup-Zombie-#",
+            config.getZombieRunBudgetMs() > 0
+                ? config.getZombieRunBudgetMs()
+                : config.getZombieIntervalMs());
+    // For orphan cleanup, when runBudgetMs=0 we intentionally keep the worker thread around in
+    // TIMED_WAITING between passes by using the cleanup interval as the keep-alive. This avoids
+    // thread churn and makes APM attribution clearer. When a positive budget is configured, use it
+    // as the keep-alive so the worker retires shortly after work finishes.
+    this.orphanCleanupExecutor =
+        newOnDemandSingleThreadExecutor(
+            "PriorityAgentCleanup-Orphan-#",
+            config.getOrphanRunBudgetMs() > 0
+                ? config.getOrphanRunBudgetMs()
+                : config.getOrphanIntervalMs());
+    // For reconcile, fall back to the Redis refresh cadence when no budget is set, to keep the
+    // worker thread parked between reconciliation passes.
+    this.reconcileExecutor =
+        newOnDemandSingleThreadExecutor(
+            "PriorityAgentReconcile-#",
+            config.getReconcileRunBudgetMs() > 0
+                ? config.getReconcileRunBudgetMs()
+                : Math.max(1_000L, (long) config.getRedisRefreshPeriod() * 1_000L));
 
     // Register shared gauges once
     try {
@@ -230,7 +258,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
       log.debug("Starting scheduler run cycle {}", currentRun);
 
       // Reconcile agent registrations with current sharding/enablement state (offloaded)
-      if (reconcileRunning.compareAndSet(false, true)) {
+      long refreshPeriodMs = Math.max(1, config.getRedisRefreshPeriod()) * 1000L;
+      boolean reconcileDue = isPeriodElapsed(lastReconcileEpochMs.get(), refreshPeriodMs);
+      if (reconcileDue && reconcileRunning.compareAndSet(false, true)) {
         if (log.isDebugEnabled()) {
           log.debug("Begin reconcileKnownAgents offload for run {}", currentRun);
         }
@@ -253,7 +283,11 @@ public class PriorityAgentScheduler extends CatsModuleAware
               }
             });
       } else if (log.isDebugEnabled()) {
-        log.debug("Skipping reconcileKnownAgents: previous run still in progress");
+        if (!reconcileDue) {
+          log.debug("Skipping reconcile submission: refresh period not elapsed");
+        } else {
+          log.debug("Skipping reconcileKnownAgents: previous run still in progress");
+        }
       }
 
       // Check if Redis repopulation is due. If we repopulate, skip acquisition
@@ -273,9 +307,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
             "Skipping acquisition on repopulation cycle {} to prevent first-run races", currentRun);
       }
 
-      // Offload zombie cleanup (non-blocking) using snapshots of local state
+      // Offload zombie cleanup (non-blocking) — pre-gated by cadence to avoid per-second submits
       try {
-        if (zombieCleanupRunning.compareAndSet(false, true)) {
+        long zombieIntervalMs = config.getZombieIntervalMs();
+        long lastZombieSubmit = lastZombieSubmitEpochMs.get();
+        boolean zombieDueToSubmit = isPeriodElapsed(lastZombieSubmit, zombieIntervalMs);
+        if (zombieDueToSubmit && zombieCleanupRunning.compareAndSet(false, true)) {
+          lastZombieSubmitEpochMs.set(currentTimeMillis());
           zombieCleanupExecutor.submit(
               () -> {
                 try {
@@ -309,15 +347,23 @@ public class PriorityAgentScheduler extends CatsModuleAware
                 }
               });
         } else if (log.isDebugEnabled()) {
-          log.debug("Skipping zombie cleanup: previous run still in progress");
+          if (!zombieDueToSubmit) {
+            log.debug("Skipping zombie cleanup submission: interval not elapsed");
+          } else {
+            log.debug("Skipping zombie cleanup: previous run still in progress");
+          }
         }
       } catch (Throwable t) {
         log.warn("Failed to schedule zombie cleanup", t);
       }
 
-      // Offload orphan cleanup (non-blocking)
+      // Offload orphan cleanup (non-blocking) — pre-gated by cadence to avoid per-second submits
       try {
-        if (orphanCleanupRunning.compareAndSet(false, true)) {
+        long intervalMs = config.getOrphanIntervalMs();
+        long lastSubmit = lastOrphanSubmitEpochMs.get();
+        boolean dueToSubmit = isPeriodElapsed(lastSubmit, intervalMs);
+        if (dueToSubmit && orphanCleanupRunning.compareAndSet(false, true)) {
+          lastOrphanSubmitEpochMs.set(currentTimeMillis());
           orphanCleanupExecutor.submit(
               () -> {
                 try {
@@ -347,7 +393,11 @@ public class PriorityAgentScheduler extends CatsModuleAware
                 }
               });
         } else if (log.isDebugEnabled()) {
-          log.debug("Skipping orphan cleanup: previous run still in progress");
+          if (!dueToSubmit) {
+            log.debug("Skipping orphan cleanup submission: interval not elapsed");
+          } else {
+            log.debug("Skipping orphan cleanup: previous run still in progress");
+          }
         }
       } catch (Throwable t) {
         log.warn("Failed to schedule orphan cleanup", t);
@@ -767,13 +817,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
    * and will be terminated after idle period, keeping thread metrics clean during idle windows.
    */
   private static java.util.concurrent.ExecutorService newOnDemandSingleThreadExecutor(
-      String threadNamePattern) {
+      String threadNamePattern, long keepAliveMs) {
     java.util.concurrent.ThreadPoolExecutor exec =
         new java.util.concurrent.ThreadPoolExecutor(
             0,
             1,
-            60L,
-            java.util.concurrent.TimeUnit.SECONDS,
+            Math.max(1L, keepAliveMs),
+            java.util.concurrent.TimeUnit.MILLISECONDS,
             new java.util.concurrent.SynchronousQueue<>(),
             r -> {
               Thread t = new Thread(r, threadNamePattern.replace("#", "0"));
