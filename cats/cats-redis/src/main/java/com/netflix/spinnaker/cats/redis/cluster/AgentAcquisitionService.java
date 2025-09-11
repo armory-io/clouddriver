@@ -1535,6 +1535,37 @@ public class AgentAcquisitionService {
     return System.currentTimeMillis() + serverClientOffset.get();
   }
 
+  /**
+   * Compute the original ready time (in epoch seconds) for an agent currently in the working set.
+   *
+   * <p>Working score encodes the completion deadline: acquire_time + timeout. To preserve the
+   * agent's original position when re-queuing (e.g., during orphan cleanup), we subtract the
+   * provider-configured timeout to recover the original ready score used while in the waiting set.
+   *
+   * @param agentType The agent identifier
+   * @param workingScoreSeconds The score from the working set as a decimal string (epoch seconds)
+   * @return The original ready time in epoch seconds as a string, or null if unavailable
+   */
+  public String computeOriginalReadySecondsFromWorkingScore(
+      String agentType, String workingScoreSeconds) {
+    try {
+      if (agentType == null || workingScoreSeconds == null) {
+        return null;
+      }
+      Agent agent = getAgentByType(agentType);
+      if (agent == null) {
+        return null;
+      }
+      long timeoutMs = intervalProvider.getInterval(agent).getTimeout();
+      long timeoutSeconds = Math.max(0L, timeoutMs / 1000L);
+      long workingSeconds = Long.parseLong(workingScoreSeconds);
+      long originalReadySeconds = Math.max(0L, workingSeconds - timeoutSeconds);
+      return String.valueOf(originalReadySeconds);
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
   public boolean isDegraded() {
     return lastDegraded.get();
   }
@@ -2660,8 +2691,9 @@ public class AgentAcquisitionService {
         if (times != null && times.size() == 2) {
           // Redis TIME returns seconds and microseconds
           long serverTimeSeconds = Long.parseLong(times.get(0));
-          long serverTimeMs = serverTimeSeconds * 1000;
-          // Update the offset (server time - client time)
+          long serverTimeMicros = Long.parseLong(times.get(1));
+          long serverTimeMs = (serverTimeSeconds * 1000L) + (serverTimeMicros / 1000L);
+          // Update the offset (server time - client time) using ms precision
           serverClientOffset.set(serverTimeMs - now);
           lastTimeCheck.set(now);
           log.debug("Updated Redis TIME sync offset: {}ms", serverTimeMs - now);
@@ -3065,6 +3097,9 @@ public class AgentAcquisitionService {
         metrics.incrementSubmissionFailure(e.getClass().getSimpleName());
       }
 
+      // Requeue to avoid lingering working entries on submission errors
+      requeueRejectedAgent(worker);
+
       return null;
     }
   }
@@ -3079,6 +3114,14 @@ public class AgentAcquisitionService {
     String agentType = worker.getAgent().getAgentType();
 
     try (Jedis jedis = jedisPool.getResource()) {
+      // Ensure we don't leak local run-state or active tracking on submission failure
+      runStates.remove(agentType);
+      String removedScore = activeAgents.remove(agentType);
+      if (removedScore != null) {
+        activeAgentMapSize.decrementAndGet();
+        activeAgentsFutures.remove(agentType);
+      }
+
       // Calculate the score to preserve queue position
       String requeueScore;
 
@@ -3115,12 +3158,76 @@ public class AgentAcquisitionService {
             requeueScore);
       }
 
-      // Add back to waiting set
-      jedis.zadd(WAITING_SET, Double.parseDouble(requeueScore), agentType);
-      log.info(
-          "Requeued rejected agent {} with score {} - preserving queue fairness",
-          agentType,
-          requeueScore);
+      // Prefer an atomic working -> waiting move with ownership verification
+      boolean requeued = false;
+      try {
+        if (worker.acquireScore != null) {
+          Object swapResult =
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.MOVE_AGENTS_CONDITIONAL,
+                  java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                  java.util.Arrays.asList(agentType, worker.acquireScore, requeueScore));
+          if (swapResult != null && "swapped".equals(swapResult)) {
+            requeued = true;
+            log.info(
+                "Requeued rejected agent {} from working -> waiting (score preserved: {})",
+                agentType,
+                requeueScore);
+          }
+        }
+      } catch (Exception e) {
+        log.warn("Conditional move failed while requeueing rejected agent {}", agentType, e);
+      }
+
+      if (!requeued) {
+        // Fallback: remove from working if still owned (score match), then add to waiting
+        boolean removedFromWorking = false;
+        try {
+          if (worker.acquireScore != null) {
+            @SuppressWarnings("unchecked")
+            java.util.List<Object> removeResult =
+                (java.util.List<Object>)
+                    scriptManager.evalshaWithSelfHeal(
+                        jedis,
+                        RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+                        java.util.Collections.singletonList(WORKING_SET),
+                        java.util.Arrays.asList(agentType, worker.acquireScore));
+            int count =
+                removeResult != null && removeResult.size() >= 1
+                    ? ((Long) removeResult.get(0)).intValue()
+                    : 0;
+            removedFromWorking = count > 0;
+          }
+        } catch (Exception e) {
+          log.warn("Conditional remove-from-working failed for {}", agentType, e);
+        }
+
+        if (removedFromWorking || worker.acquireScore == null) {
+          // Safe to add back to waiting only if we removed from working (or have no score)
+          Object addResult =
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.ADD_AGENT,
+                  java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                  java.util.Arrays.asList(agentType, requeueScore));
+          boolean scheduled = addResult != null && ((Long) addResult).intValue() == 1;
+          if (scheduled) {
+            log.info(
+                "Requeued rejected agent {} into waiting with score {}", agentType, requeueScore);
+          } else {
+            log.debug(
+                "Agent {} already present during requeue attempt (addResult={})",
+                agentType,
+                addResult);
+          }
+        } else {
+          // Could not verify ownership to safely move; leave as-is for zombie/orphan cleanup
+          log.warn(
+              "Could not safely requeue rejected agent {} (ownership mismatch) - will rely on cleanup",
+              agentType);
+        }
+      }
 
     } catch (Exception e) {
       log.error(

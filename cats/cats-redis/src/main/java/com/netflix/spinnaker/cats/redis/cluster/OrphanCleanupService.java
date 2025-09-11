@@ -293,7 +293,7 @@ public class OrphanCleanupService {
                     .getMaxConcurrentAgents());
         batchSize = maxConcurrent;
       } catch (Exception ignore) {
-        batchSize = 50; // conservative fallback
+        batchSize = 50; // conservative fallback to default
       }
     }
     boolean batchOperationsEnabled = schedulerProperties.getBatchOperations().isEnabled();
@@ -550,9 +550,22 @@ public class OrphanCleanupService {
           }
 
           if (isStillValid) {
-            // For valid agents in working (truly orphaned due to crashes), move them to waiting for
-            // immediate rescheduling
-            String newScore = score(jedis, 0L); // Schedule for immediate execution
+            // For valid agents in working (truly orphaned due to crashes), move them to waiting
+            // and preserve their original ready time to maintain queue fairness.
+            // workingScore = acquire_time + timeout; originalReady = acquire_time
+            String preservedScore = null;
+            try {
+              if (acquisitionService != null) {
+                preservedScore =
+                    acquisitionService.computeOriginalReadySecondsFromWorkingScore(
+                        agentName, scoreInSet);
+              }
+            } catch (Throwable t) {
+              preservedScore = null; // Fail-safe below
+            }
+
+            // Fallback to immediate eligibility (now) if preservation is not possible
+            String newScore = preservedScore != null ? preservedScore : score(jedis, 0L);
             Object result =
                 scriptManager.evalshaWithSelfHeal(
                     jedis,
@@ -563,10 +576,11 @@ public class OrphanCleanupService {
             if (result != null && "swapped".equals(result)) {
               cleaned++;
               log.info(
-                  "Successfully moved orphaned agent {} (original score: {}, new score: {}) from working to waiting set.",
+                  "Successfully moved orphaned agent {} (original score: {}, new score: {}) from working to waiting set (preserveReady={}).",
                   agentName,
                   (long) score,
-                  Long.valueOf(newScore));
+                  Long.valueOf(newScore),
+                  preservedScore != null);
 
               // Also clean up local state if needed
               removeActiveAgent(agentName);
