@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-/*
- * Provides Spring bean wiring for PrioritySchedulerMetrics.
+/**
+ * Spring configuration that wires the {@link PrioritySchedulerMetrics} bean backed by Spectator's
+ * {@link com.netflix.spectator.api.Registry}.
  */
-
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import com.netflix.spectator.api.Registry;

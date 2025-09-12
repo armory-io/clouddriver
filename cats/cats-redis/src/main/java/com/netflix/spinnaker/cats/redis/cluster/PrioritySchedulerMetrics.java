@@ -69,6 +69,11 @@ public final class PrioritySchedulerMetrics {
   // Guard against duplicate PolledMeter registrations
   private volatile boolean gaugesRegistered = false;
 
+  /**
+   * Creates a new metrics collector bound to the provided registry.
+   *
+   * @param registry Spectator registry used to create meters
+   */
   public PrioritySchedulerMetrics(Registry registry) {
     this.registry = registry;
 
@@ -111,88 +116,156 @@ public final class PrioritySchedulerMetrics {
         registry.createId("cats.redisPriority.state.inconsistentActive");
   }
 
+  /**
+   * Records the duration of a scheduler run cycle.
+   *
+   * @param success whether the cycle completed successfully
+   * @param elapsedMs elapsed time in milliseconds
+   */
   public void recordRunCycle(boolean success, long elapsedMs) {
     registry
         .timer(runCycleTimeId.withTag("success", Boolean.toString(success)))
         .record(elapsedMs, TimeUnit.MILLISECONDS);
   }
 
+  /**
+   * Increments the run failure counter with a tagged reason.
+   *
+   * @param reason failure category (low-cardinality)
+   */
   public void incrementRunFailure(String reason) {
     registry.counter(runFailuresId.withTag("reason", safe(reason))).increment();
   }
 
+  /** Increments the acquisition attempts counter. */
   public void incrementAcquireAttempts() {
     registry.counter(acquireAttemptsId).increment();
   }
 
+  /**
+   * Increments the acquired counter by the provided amount if positive.
+   *
+   * @param count number of agents acquired in the cycle
+   */
   public void incrementAcquired(long count) {
     if (count > 0) {
       registry.counter(acquiredCountId).increment(count);
     }
   }
 
+  /**
+   * Records acquisition latency with a mode tag (e.g., batch/single).
+   *
+   * @param mode acquisition mode label
+   * @param elapsedMs elapsed time in milliseconds
+   */
   public void recordAcquireTime(String mode, long elapsedMs) {
     registry
         .timer(acquireTimeId.withTag("mode", safe(mode)))
         .record(elapsedMs, TimeUnit.MILLISECONDS);
   }
 
+  /**
+   * Increments submission failure counter with reason (e.g., rejected/interrupted).
+   *
+   * @param reason failure category
+   */
   public void incrementSubmissionFailure(String reason) {
     registry.counter(submissionFailuresId.withTag("reason", safe(reason))).increment();
   }
 
+  /** Increments counter for batch fallback events. */
   public void incrementBatchFallback() {
     registry.counter(batchFallbacksId).increment();
   }
 
+  /** Increments counter for detected acquisition stalls. */
   public void incrementStallDetected() {
     registry.counter(stallDetectedId).increment();
   }
 
+  /**
+   * Records a circuit breaker trip event.
+   *
+   * @param name breaker name
+   * @param reason trip reason
+   */
   public void recordCircuitBreakerTrip(String name, String reason) {
     registry
         .counter(circuitBreakerTripId.withTag("name", safe(name)).withTag("reason", safe(reason)))
         .increment();
   }
 
+  /** Records a circuit breaker recovery event. */
   public void recordCircuitBreakerRecovery(String name) {
     registry.counter(circuitBreakerRecoveryId.withTag("name", safe(name))).increment();
   }
 
+  /** Records a circuit breaker blocked event. */
   public void recordCircuitBreakerBlocked(String name) {
     registry.counter(circuitBreakerBlockedId.withTag("name", safe(name))).increment();
   }
 
+  /**
+   * Increments acquisition validation failure counter with reason.
+   *
+   * @param reason validation failure reason
+   */
   public void incrementAcquireValidationFailure(String reason) {
     registry.counter(acquireValidationFailureId.withTag("reason", safe(reason))).increment();
   }
 
+  /** Records repopulation duration. */
   public void recordRepopulateTime(long elapsedMs) {
     registry.timer(repopulateTimeId).record(elapsedMs, TimeUnit.MILLISECONDS);
   }
 
+  /**
+   * Increments repopulation added count by the provided amount if positive.
+   *
+   * @param added number of agents inserted
+   */
   public void incrementRepopulateAdded(long added) {
     if (added > 0) {
       registry.counter(repopulateAddedId).increment(added);
     }
   }
 
+  /** Increments repopulation error counter with reason. */
   public void incrementRepopulateError(String reason) {
     registry.counter(repopulateErrorsId.withTag("reason", safe(reason))).increment();
   }
 
+  /**
+   * Records cleanup duration tagged by type (zombie/orphan/reconcile).
+   *
+   * @param type cleanup type label
+   * @param elapsedMs elapsed time in milliseconds
+   */
   public void recordCleanupTime(String type, long elapsedMs) {
     registry
         .timer(cleanupTimeId.withTag("type", safe(type)))
         .record(elapsedMs, TimeUnit.MILLISECONDS);
   }
 
+  /**
+   * Increments cleaned counter by type when positive.
+   *
+   * @param type cleanup type
+   * @param cleaned number of items cleaned
+   */
   public void incrementCleanupCleaned(String type, long cleaned) {
     if (cleaned > 0) {
       registry.counter(cleanupCleanedId.withTag("type", safe(type))).increment(cleaned);
     }
   }
 
+  /**
+   * Records a script evaluation event and latency.
+   *
+   * @param script script name
+   * @param elapsedMs elapsed time in milliseconds
+   */
   public void recordScriptEval(String script, long elapsedMs) {
     registry.counter(scriptsEvalId.withTag("script", safe(script))).increment();
     registry
@@ -200,28 +273,34 @@ public final class PrioritySchedulerMetrics {
         .record(elapsedMs, TimeUnit.MILLISECONDS);
   }
 
+  /** Increments script error counter tagged by script and reason. */
   public void incrementScriptError(String script, String reason) {
     registry
         .counter(scriptsErrorsId.withTag("script", safe(script)).withTag("reason", safe(reason)))
         .increment();
   }
 
+  /** Increments script reload counter. */
   public void incrementScriptsReload() {
     registry.counter(scriptsReloadsId).increment();
   }
 
+  /** Increments invalid Redis member counter with location tag. */
   public void incrementInvalidMember(String where) {
     registry.counter(invalidMemberId.withTag("where", safe(where))).increment();
   }
 
+  /** Increments invalid pair counter with phase tag. */
   public void incrementInvalidPair(String phase) {
     registry.counter(invalidPairId.withTag("phase", safe(phase))).increment();
   }
 
+  /** Increments type error counter for script results. */
   public void incrementScriptResultTypeError(String script) {
     registry.counter(scriptResultTypeErrorId.withTag("script", safe(script))).increment();
   }
 
+  /** Increments counter for inconsistent active state observations. */
   public void incrementStateInconsistentActive() {
     registry.counter(stateInconsistentActiveId).increment();
   }

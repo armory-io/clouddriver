@@ -23,7 +23,7 @@ import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** Minimal utility methods for the Priority Scheduler. */
+/** Utility methods for the Priority Redis Scheduler. */
 final class SchedulerUtils {
   private static final Logger log = LoggerFactory.getLogger(SchedulerUtils.class);
 

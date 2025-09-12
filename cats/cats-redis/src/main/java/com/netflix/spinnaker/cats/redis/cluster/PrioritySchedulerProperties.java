@@ -165,7 +165,18 @@ public class PrioritySchedulerProperties {
     this.jitter = jitter != null ? jitter : new JitterProperties();
   }
 
-  /** Returns the configured Redis key naming and namespacing options. */
+  /**
+   * Returns the configured Redis key naming and namespacing options. Never returns null.
+   *
+   * @return key naming configuration
+   */
+  public Keys getKeys() {
+    if (keys == null) {
+      keys = new Keys();
+    }
+    return keys;
+  }
+
   /** Sets the Redis key naming and namespacing options. */
   public void setKeys(Keys keys) {
     this.keys = keys != null ? keys : new Keys();
