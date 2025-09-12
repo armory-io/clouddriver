@@ -295,7 +295,7 @@ public final class PrioritySchedulerMetrics {
     return n.doubleValue();
   }
 
-  private static String safe(String s) {
-    return (s == null || s.isEmpty()) ? "unknown" : s;
+  private static String safe(String value) {
+    return (value == null || value.isEmpty()) ? "unknown" : value;
   }
 }

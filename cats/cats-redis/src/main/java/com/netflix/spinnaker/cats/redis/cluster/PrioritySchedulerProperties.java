@@ -363,26 +363,26 @@ public class PrioritySchedulerProperties {
     }
   }
 
-  private static void validatePositive(long v, String name) {
-    if (v <= 0) {
-      throw new IllegalArgumentException(name + " must be > 0 (was " + v + ")");
+  private static void validatePositive(long value, String name) {
+    if (value <= 0) {
+      throw new IllegalArgumentException(name + " must be > 0 (was " + value + ")");
     }
   }
 
-  private static void validatePositive(int v, String name) {
-    if (v <= 0) {
-      throw new IllegalArgumentException(name + " must be > 0 (was " + v + ")");
+  private static void validatePositive(int value, String name) {
+    if (value <= 0) {
+      throw new IllegalArgumentException(name + " must be > 0 (was " + value + ")");
     }
   }
 
-  private static void validateNonNegative(int v, String name) {
-    if (v < 0) {
-      throw new IllegalArgumentException(name + " must be >= 0 (was " + v + ")");
+  private static void validateNonNegative(int value, String name) {
+    if (value < 0) {
+      throw new IllegalArgumentException(name + " must be >= 0 (was " + value + ")");
     }
   }
 
-  private static boolean isBlank(String s) {
-    return s == null || s.trim().isEmpty();
+  private static boolean isBlank(String str) {
+    return str == null || str.trim().isEmpty();
   }
 
   /**

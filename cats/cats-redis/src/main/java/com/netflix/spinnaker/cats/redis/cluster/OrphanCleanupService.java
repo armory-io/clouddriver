@@ -273,8 +273,8 @@ public class OrphanCleanupService {
       int numericRemoved = 0;
       if (WAITING_SET.equals(setName)
           && schedulerProperties.getOrphanCleanup().isRemoveNumericWaiting()) {
-        for (Tuple t : new java.util.ArrayList<>(potentialOrphans)) {
-          String name = t.getElement();
+        for (Tuple tuple : new java.util.ArrayList<>(potentialOrphans)) {
+          String name = tuple.getElement();
           if (name != null && name.matches("^\\d+$")) {
             try {
               Object res =

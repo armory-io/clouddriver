@@ -1114,21 +1114,21 @@ public class AgentAcquisitionService {
             candidateAgents.size());
 
         // Process each candidate agent to see if it was successfully acquired
-        for (int i = 0; i < candidateAgents.size(); i++) {
-          String agentType = candidateAgents.get(i);
+        for (int candidateIndex = 0; candidateIndex < candidateAgents.size(); candidateIndex++) {
+          String agentType = candidateAgents.get(candidateIndex);
 
           if (acquiredAgentTypes.contains(agentType)) {
             // SUCCESS: This pod acquired the agent - set up for execution
-            AgentWorker worker = candidateWorkers.get(i);
+            AgentWorker worker = candidateWorkers.get(candidateIndex);
 
             // Extract the agent's score from agentScorePairs array
             // Array structure: [agent1, score1, agent2, score2, ...]
-            // For agent at index i: score is at position (i * 2 + 1)
+            // For agent at index candidateIndex: score is at position (candidateIndex * 2 + 1)
 
             // CRITICAL: Validate index and score format to prevent corruption
             // from dynamic account updates during batch acquisition
             String acquireScore = null;
-            int scoreIndex = i * 2 + 1;
+            int scoreIndex = candidateIndex * 2 + 1;
 
             if (scoreIndex < agentScorePairs.size()) {
               String scoreCandidate = agentScorePairs.get(scoreIndex);
@@ -1191,7 +1191,7 @@ public class AgentAcquisitionService {
       log.warn("Unexpected batch acquisition result: {}", result);
       // Release all semaphore permits on batch failure
       if (runningAgents != null) {
-        for (int i = 0; i < candidateAgents.size(); i++) {
+        for (int releaseIndex = 0; releaseIndex < candidateAgents.size(); releaseIndex++) {
           runningAgents.release();
         }
       }
@@ -1201,7 +1201,7 @@ public class AgentAcquisitionService {
       log.error("Batch agent acquisition failed, falling back to individual mode", e);
       // Release all semaphore permits on batch failure
       if (runningAgents != null) {
-        for (int i = 0; i < candidateAgents.size(); i++) {
+        for (int releaseIndex = 0; releaseIndex < candidateAgents.size(); releaseIndex++) {
           runningAgents.release();
         }
       }
@@ -1701,15 +1701,15 @@ public class AgentAcquisitionService {
           expectedScore,
           nextScore);
       // Check current state in Redis before attempting swap
-      Double currentWorkzScore = jedis.zscore(WORKING_SET, agentType);
-      Double currentWaitzScore = jedis.zscore(WAITING_SET, agentType);
+      Double currentWorkingScore = jedis.zscore(WORKING_SET, agentType);
+      Double currentWaitingScore = jedis.zscore(WAITING_SET, agentType);
       log.debug(
           "Redis state before swap: {} {}={} {}={}",
           agentType,
           WORKING_SET,
-          currentWorkzScore,
+          currentWorkingScore,
           WAITING_SET,
-          currentWaitzScore);
+          currentWaitingScore);
 
       // Use MOVE_AGENTS_CONDITIONAL - only moves if agent is in working with expected score
       Object result =
@@ -1720,15 +1720,15 @@ public class AgentAcquisitionService {
               java.util.Arrays.asList(agentType, expectedScore, nextScore));
 
       // Check final state
-      Double finalWorkzScore = jedis.zscore(WORKING_SET, agentType);
-      Double finalWaitzScore = jedis.zscore(WAITING_SET, agentType);
+      Double finalWorkingScore = jedis.zscore(WORKING_SET, agentType);
+      Double finalWaitingScore = jedis.zscore(WAITING_SET, agentType);
       log.debug(
           "Redis state after swap: {} {}={} {}={} result={}",
           agentType,
           WORKING_SET,
-          finalWorkzScore,
+          finalWorkingScore,
           WAITING_SET,
-          finalWaitzScore,
+          finalWaitingScore,
           result);
 
       if (result != null && "swapped".equals(result)) {
@@ -1738,8 +1738,8 @@ public class AgentAcquisitionService {
             "Agent {} not re-queued (already completed or moved during shutdown) (expected_working={}, current_working={}, current_waiting={}, result={})",
             agentType,
             expectedScore,
-            currentWorkzScore,
-            currentWaitzScore,
+            currentWorkingScore,
+            currentWaitingScore,
             result);
       }
 
@@ -1896,10 +1896,10 @@ public class AgentAcquisitionService {
 
       // Results format: [agent, workScore|'null', waitScore|'null', ...]
       Set<String> allAgents = new HashSet<>();
-      for (int i = 0; i < results.size(); i += 3) {
-        String agent = results.get(i);
-        String workScore = results.get(i + 1);
-        String waitScore = results.get(i + 2);
+      for (int resultIndex = 0; resultIndex < results.size(); resultIndex += 3) {
+        String agent = results.get(resultIndex);
+        String workScore = results.get(resultIndex + 1);
+        String waitScore = results.get(resultIndex + 2);
         if (!"null".equals(workScore) || !"null".equals(waitScore)) {
           allAgents.add(agent);
         }
@@ -1940,9 +1940,9 @@ public class AgentAcquisitionService {
       AgentWorker worker = agents.get(agentType);
       if (worker != null) {
         long jitterSec = computeInitialRegistrationJitterSeconds();
-        String s = score(jedis, jitterSec * 1000L);
+        String registrationScore = score(jedis, jitterSec * 1000L);
         // Validate pair: agent must not be numeric; score must be numeric
-        boolean scoreNumeric = s != null && s.matches("^\\d+$");
+        boolean scoreNumeric = registrationScore != null && registrationScore.matches("^\\d+$");
         boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
         if (!scoreNumeric || agentNumeric) {
           if (metrics != null) {
@@ -1951,7 +1951,7 @@ public class AgentAcquisitionService {
           continue;
         }
         batchArgs.add(agentType);
-        batchArgs.add(s);
+        batchArgs.add(registrationScore);
       }
     }
 
@@ -2076,8 +2076,8 @@ public class AgentAcquisitionService {
       List<String> batchArgs = new ArrayList<>();
       for (Map.Entry<String, String> entry : agentScores.entrySet()) {
         String agentType = entry.getKey();
-        String s = entry.getValue();
-        boolean scoreNumeric = s != null && s.matches("^\\d+$");
+        String acquireScoreStr = entry.getValue();
+        boolean scoreNumeric = acquireScoreStr != null && acquireScoreStr.matches("^\\d+$");
         boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
         if (!scoreNumeric || agentNumeric) {
           if (metrics != null) {
@@ -2086,7 +2086,7 @@ public class AgentAcquisitionService {
           continue;
         }
         batchArgs.add(agentType); // agent name
-        batchArgs.add(s); // score
+        batchArgs.add(acquireScoreStr); // score
         processed++;
 
         // Process batch when we reach batch size or end of agents
@@ -2119,11 +2119,11 @@ public class AgentAcquisitionService {
 
             // Fallback: Use pipeline with individual ADD_AGENT script
             Pipeline pipeline = jedis.pipelined();
-            for (int i = 0; i < batchArgs.size(); i += 2) {
+            for (int argIndex = 0; argIndex < batchArgs.size(); argIndex += 2) {
               pipeline.evalsha(
                   scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
                   Arrays.asList(WORKING_SET, WAITING_SET),
-                  Arrays.asList(batchArgs.get(i), batchArgs.get(i + 1)));
+                  Arrays.asList(batchArgs.get(argIndex), batchArgs.get(argIndex + 1)));
             }
             List<Object> pipelineResults = pipeline.syncAndReturnAll();
 
@@ -2386,9 +2386,10 @@ public class AgentAcquisitionService {
     if (jitterRatio <= 0.0) {
       return baseMs;
     }
-    double r = Math.max(0.0, Math.min(1.0, jitterRatio));
-    java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
-    double delta = (rnd.nextDouble() * 2.0 * r) - r; // [-r, +r]
+    double boundedRatio = Math.max(0.0, Math.min(1.0, jitterRatio));
+    java.util.concurrent.ThreadLocalRandom random =
+        java.util.concurrent.ThreadLocalRandom.current();
+    double delta = (random.nextDouble() * 2.0 * boundedRatio) - boundedRatio; // [-ratio, +ratio]
     double jittered = baseMs * (1.0 + delta);
     if (jittered < 0.0) {
       return 0L;
@@ -2441,8 +2442,8 @@ public class AgentAcquisitionService {
       List<String> batchArgs = new ArrayList<>();
       for (AgentCompletion completion : completions) {
         String agentType = completion.agent.getAgentType();
-        String s = score(jedis, offset);
-        boolean scoreNumeric = s != null && s.matches("^\\d+$");
+        String completionScore = score(jedis, offset);
+        boolean scoreNumeric = completionScore != null && completionScore.matches("^\\d+$");
         boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
         if (!scoreNumeric || agentNumeric) {
           if (metrics != null) {
@@ -2451,7 +2452,7 @@ public class AgentAcquisitionService {
           continue;
         }
         batchArgs.add(agentType);
-        batchArgs.add(s);
+        batchArgs.add(completionScore);
       }
 
       @SuppressWarnings("unchecked")
@@ -2588,8 +2589,8 @@ public class AgentAcquisitionService {
         }
 
         boolean numeric = true;
-        for (int i = 0; i < scoreStr.length(); i++) {
-          char ch = scoreStr.charAt(i);
+        for (int charIndex = 0; charIndex < scoreStr.length(); charIndex++) {
+          char ch = scoreStr.charAt(charIndex);
           if (ch < '0' || ch > '9') {
             numeric = false;
             break;
@@ -2716,10 +2717,10 @@ public class AgentAcquisitionService {
                   Collectors.toMap(
                       worker -> worker.getAgent().getAgentType(), AgentWorker::getAgent));
 
-      for (int i = 0; i < results.size(); i += 3) {
-        String agentType = results.get(i);
-        String workingScoreStr = results.get(i + 1);
-        String waitingScoreStr = results.get(i + 2);
+      for (int resultIndex = 0; resultIndex < results.size(); resultIndex += 3) {
+        String agentType = results.get(resultIndex);
+        String workingScoreStr = results.get(resultIndex + 1);
+        String waitingScoreStr = results.get(resultIndex + 2);
 
         Agent agent = agentMap.get(agentType);
         if (agent == null) {
@@ -2968,8 +2969,8 @@ public class AgentAcquisitionService {
     if (windowSec <= 0) {
       return 0L;
     }
-    int s = java.util.concurrent.ThreadLocalRandom.current().nextInt(1, windowSec + 1);
-    return s * 1000L;
+    int seconds = java.util.concurrent.ThreadLocalRandom.current().nextInt(1, windowSec + 1);
+    return seconds * 1000L;
   }
 
   /**
