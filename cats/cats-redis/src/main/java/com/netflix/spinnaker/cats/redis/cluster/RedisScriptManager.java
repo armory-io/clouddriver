@@ -191,6 +191,34 @@ public class RedisScriptManager {
       }
       metrics.incrementScriptError(scriptName, e.getClass().getSimpleName());
       throw e;
+    } catch (ClassCastException cce) {
+      // Defensive: result type mismatch (e.g., Redis/Jedis returns a different shape)
+      // Attempt one-time reload of scripts and retry this call
+      try {
+        metrics.incrementScriptResultTypeError(scriptName);
+      } catch (Exception ignoreMetric) {
+      }
+
+      try {
+        loadAllScripts(jedis);
+        metrics.incrementScriptsReload();
+        long retryStart = System.nanoTime();
+        Object result = jedis.evalsha(getScriptSha(scriptName), keys, args);
+        metrics.recordScriptEval(
+            scriptName, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - retryStart));
+        return result;
+      } catch (Exception retry) {
+        // Fall back to EVAL body
+        String body = getScriptBody(scriptName);
+        if (body != null) {
+          long evalStart = System.nanoTime();
+          Object result = jedis.eval(body, keys, args);
+          metrics.recordScriptEval(
+              scriptName, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - evalStart));
+          return result;
+        }
+        throw cce; // rethrow original CCE if we have no body
+      }
     }
   }
 
@@ -283,11 +311,14 @@ public class RedisScriptManager {
             + "for i=1,#ARGV,2 do\n"
             + "  local agent = ARGV[i]\n"
             + "  local score = ARGV[i+1]\n"
-            + "  local exists = redis.call('zscore', KEYS[1], agent) or redis.call('zscore', KEYS[2], agent)\n"
-            + "  if not exists then\n"
-            + "    redis.call('zadd', KEYS[2], score, agent)\n"
-            + "    table.insert(added, agent)\n"
-            + "    count = count + 1\n"
+            + "  -- Guards: score must be numeric and agent must not be numeric\n"
+            + "  if tonumber(score) ~= nil and tonumber(agent) == nil then\n"
+            + "    local exists = redis.call('zscore', KEYS[1], agent) or redis.call('zscore', KEYS[2], agent)\n"
+            + "    if not exists then\n"
+            + "      redis.call('zadd', KEYS[2], score, agent)\n"
+            + "      table.insert(added, agent)\n"
+            + "      count = count + 1\n"
+            + "    end\n"
             + "  end\n"
             + "end\n"
             + "return {count, added}\n");
@@ -381,12 +412,14 @@ public class RedisScriptManager {
             + "for i=1,#ARGV,2 do\n"
             + "  local agent = ARGV[i]\n"
             + "  local newScore = ARGV[i+1]\n"
-            + "  local waitingScore = redis.call('zscore', KEYS[2], agent)\n"
-            + "  if waitingScore then\n"
-            + "    redis.call('zrem', KEYS[2], agent)\n"
-            + "    redis.call('zadd', KEYS[1], newScore, agent)\n"
-            + "    table.insert(acquired, agent)\n"
-            + "    count = count + 1\n"
+            + "  if tonumber(newScore) ~= nil then\n"
+            + "    local waitingScore = redis.call('zscore', KEYS[2], agent)\n"
+            + "    if waitingScore then\n"
+            + "      redis.call('zrem', KEYS[2], agent)\n"
+            + "      redis.call('zadd', KEYS[1], newScore, agent)\n"
+            + "      table.insert(acquired, agent)\n"
+            + "      count = count + 1\n"
+            + "    end\n"
             + "  end\n"
             + "end\n"
             + "return {count, acquired}\n");

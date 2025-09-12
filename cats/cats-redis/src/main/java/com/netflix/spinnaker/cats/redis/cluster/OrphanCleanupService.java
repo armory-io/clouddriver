@@ -228,7 +228,7 @@ public class OrphanCleanupService {
       // Working set: score = completion deadline (acquire_time + timeout)
       // Orphan detection: current_time > (score + threshold)
       // Rearranged: score < (current_time - threshold)
-      // These are agents that should have completed but their pod crashed
+      // These are agents that should have completed but their pod might have crashed
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
       cutoffScore = (currentTimeMillis() - orphanThreshold) / 1000;
       thresholdForLogging = orphanThreshold;
@@ -245,6 +245,36 @@ public class OrphanCleanupService {
       if (potentialOrphans.isEmpty()) {
         log.debug("Orphan scan completed: {} set analyzed, 0 orphans found", setName);
         return 0;
+      }
+
+      // Optional: remove numeric-only members in WAITING set (repair corruption)
+      int numericRemoved = 0;
+      if (WAITING_SET.equals(setName)
+          && schedulerProperties.getOrphanCleanup().isRemoveNumericWaiting()) {
+        for (Tuple t : new java.util.ArrayList<>(potentialOrphans)) {
+          String name = t.getElement();
+          if (name != null && name.matches("^\\d+$")) {
+            try {
+              Object res =
+                  scriptManager.evalshaWithSelfHeal(
+                      jedis,
+                      RedisScriptManager.REMOVE_AGENT,
+                      java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                      java.util.Collections.singletonList(name));
+              boolean removed = res != null && ((Long) res).intValue() == 1;
+              if (removed) {
+                numericRemoved++;
+                if (metrics != null) {
+                  metrics.incrementInvalidMember("waiting_numeric_removed");
+                }
+              }
+            } catch (Exception ignore) {
+            }
+          }
+        }
+        if (numericRemoved > 0) {
+          log.warn("Removed {} numeric-only waiting members during orphan cleanup", numericRemoved);
+        }
       }
 
       log.warn(

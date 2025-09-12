@@ -754,6 +754,27 @@ public class PriorityAgentScheduler extends CatsModuleAware
           acquisitionService.unregisterAgent(agent);
         }
       }
+
+      // Lightweight local state validation: ensure activeAgents keys belong to registered agents
+      try {
+        java.util.Map<String, String> active = acquisitionService.getActiveAgentsMap();
+        for (java.util.Map.Entry<String, String> e : active.entrySet()) {
+          String agentType = e.getKey();
+          String scoreStr = e.getValue();
+          boolean numeric = scoreStr != null && scoreStr.matches("^\\d+$");
+          if (acquisitionService.getRegisteredAgent(agentType) == null || !numeric) {
+            // Inconsistent local tracking; clean it up to avoid leaks
+            acquisitionService.removeActiveAgent(agentType);
+            if (metrics != null) {
+              metrics.incrementStateInconsistentActive();
+            }
+          }
+        }
+      } catch (Exception ignore) {
+      }
+
+      // Note: numeric-only waiting member detection and any repair is handled by
+      // OrphanCleanupService on cadence. No reconcile-time sampling is performed here.
     } catch (Exception e) {
       log.warn("Failed to reconcile known agents with current shard/config", e);
     }

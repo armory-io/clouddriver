@@ -105,7 +105,11 @@ class ZombieCleanupServiceTest {
     void shouldDetectZombieAgentsOlderThanThreshold() {
       // Given - Set up local tracking with an agent that has been running too long
       // Zombie cleanup scans LOCAL activeAgents map, not Redis
-      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000; // 1 minute ago
+      long oldScoreSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowSec = Long.parseLong(j.time().get(0));
+        oldScoreSeconds = nowSec - 60; // 1 minute ago
+      }
 
       // Also add to Redis for cleanup to work properly
       try (Jedis jedis = jedisPool.getResource()) {
@@ -137,8 +141,11 @@ class ZombieCleanupServiceTest {
     @DisplayName("Should not clean up agents within threshold")
     void shouldNotCleanUpAgentsWithinThreshold() {
       // Given - Add recent agent to WORKING set
-      long recentScore =
-          System.currentTimeMillis() - 10000; // 10 seconds ago (within 30s threshold)
+      long recentScore;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowMs = Long.parseLong(j.time().get(0)) * 1000L;
+        recentScore = nowMs - 10000; // 10 seconds ago (within 30s threshold)
+      }
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.zadd("working", recentScore, "recent-agent");
       }
@@ -163,7 +170,11 @@ class ZombieCleanupServiceTest {
     void shouldDetectAndCleanupMultipleZombieAgentsIndividually() {
       // Given - Clean up and add multiple old agents
       // Redis scores are stored as seconds since epoch, not milliseconds
-      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
+      long oldScoreSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowSec = Long.parseLong(j.time().get(0));
+        oldScoreSeconds = nowSec - 60;
+      }
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
         jedis.del("working", "waiting");
@@ -208,7 +219,11 @@ class ZombieCleanupServiceTest {
     void shouldCancelFuturesForZombieAgents() {
       // Given
       // Redis scores are stored as seconds since epoch, not milliseconds
-      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
+      long oldScoreSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowSec = Long.parseLong(j.time().get(0));
+        oldScoreSeconds = nowSec - 60;
+      }
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.zadd("working", oldScoreSeconds, "zombie-agent");
       }
@@ -237,7 +252,11 @@ class ZombieCleanupServiceTest {
     void shouldHandleAlreadyCompletedFuturesGracefully() {
       // Given
       // Redis scores are stored as seconds since epoch, not milliseconds
-      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
+      long oldScoreSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowSec = Long.parseLong(j.time().get(0));
+        oldScoreSeconds = nowSec - 60;
+      }
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.zadd("working", oldScoreSeconds, "zombie-agent");
       }

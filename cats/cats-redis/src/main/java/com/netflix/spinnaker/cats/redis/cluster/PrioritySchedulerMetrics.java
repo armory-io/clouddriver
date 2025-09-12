@@ -60,6 +60,12 @@ public final class PrioritySchedulerMetrics {
   private final Id scriptsLatencyId;
   private final Id scriptsReloadsId;
 
+  // Validation/consistency metrics
+  private final Id invalidMemberId;
+  private final Id invalidPairId;
+  private final Id scriptResultTypeErrorId;
+  private final Id stateInconsistentActiveId;
+
   // Guard against duplicate PolledMeter registrations
   private volatile boolean gaugesRegistered = false;
 
@@ -96,6 +102,13 @@ public final class PrioritySchedulerMetrics {
     this.scriptsErrorsId = registry.createId("cats.redisPriority.scripts.errors");
     this.scriptsLatencyId = registry.createId("cats.redisPriority.scripts.latency");
     this.scriptsReloadsId = registry.createId("cats.redisPriority.scripts.reloads");
+
+    // Validation/consistency
+    this.invalidMemberId = registry.createId("cats.redisPriority.redis.invalidMember");
+    this.invalidPairId = registry.createId("cats.redisPriority.add.invalidPair");
+    this.scriptResultTypeErrorId = registry.createId("cats.redisPriority.scripts.resultTypeError");
+    this.stateInconsistentActiveId =
+        registry.createId("cats.redisPriority.state.inconsistentActive");
   }
 
   public void recordRunCycle(boolean success, long elapsedMs) {
@@ -195,6 +208,22 @@ public final class PrioritySchedulerMetrics {
 
   public void incrementScriptsReload() {
     registry.counter(scriptsReloadsId).increment();
+  }
+
+  public void incrementInvalidMember(String where) {
+    registry.counter(invalidMemberId.withTag("where", safe(where))).increment();
+  }
+
+  public void incrementInvalidPair(String phase) {
+    registry.counter(invalidPairId.withTag("phase", safe(phase))).increment();
+  }
+
+  public void incrementScriptResultTypeError(String script) {
+    registry.counter(scriptResultTypeErrorId.withTag("script", safe(script))).increment();
+  }
+
+  public void incrementStateInconsistentActive() {
+    registry.counter(stateInconsistentActiveId).increment();
   }
 
   /** Register gauges that are shared across scheduler services. Safe to call multiple times. */

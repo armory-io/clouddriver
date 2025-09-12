@@ -617,6 +617,9 @@ class OrphanCleanupProperties {
   private long executorShutdownForceAwaitMs = 5000L;
   /** Optional max runtime budget per cleanup pass (milliseconds). 0 disables. */
   private long runBudgetMs = 0L;
+
+  /** When true, numeric-only members in the waiting set are removed during orphan cleanup. */
+  private boolean removeNumericWaiting = true;
 }
 
 /** Reconcile executor shutdown tuning knobs. */

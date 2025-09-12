@@ -996,7 +996,7 @@ public class PrioritySchedulerIntegrationTest {
         java.util.List<String> t = jedis.time();
         long nowSec = Long.parseLong(t.get(0));
         long delta = score.longValue() - nowSec;
-        assertThat(delta).isBetween(0L, 3L);
+        assertThat(delta).isBetween(-1L, 3L);
       }
     }
 

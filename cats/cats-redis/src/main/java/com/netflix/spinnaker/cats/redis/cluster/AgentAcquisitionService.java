@@ -1012,6 +1012,20 @@ public class AgentAcquisitionService {
         long agentTimeout = intervalProvider.getInterval(worker.getAgent()).getTimeout();
         String acquireScore = score(jedis, agentTimeout);
 
+        // Validate pair before adding: agent non-numeric, score numeric
+        boolean scoreNumeric = acquireScore != null && acquireScore.matches("^\\d+$");
+        boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
+        if (!scoreNumeric || agentNumeric) {
+          if (metrics != null) {
+            metrics.incrementInvalidPair("acquire_batch");
+          }
+          // Skip invalid pair; release semaphore since we won't attempt this one
+          if (runningAgents != null) {
+            runningAgents.release();
+          }
+          continue;
+        }
+
         // Add to script arguments: agent name, then its score
         agentScorePairs.add(agentType); // Even index: agent name
         agentScorePairs.add(acquireScore); // Odd index: agent score
@@ -1027,9 +1041,43 @@ public class AgentAcquisitionService {
 
       // PHASE 3: Process batch acquisition results
       if (result instanceof List) {
-        List<Object> resultList = (List<Object>) result;
-        long successCount = (Long) resultList.get(0);
-        List<String> acquiredAgentTypes = (List<String>) resultList.get(1);
+        // ACQUIRE_AGENTS returns a Lua array: [count, [acquiredAgent1, acquiredAgent2, ...]]
+        // Jedis can surface elements as Long, String, or byte[] depending on codec/version.
+        // Coerce types defensively to avoid ClassCastException and keep the pod progressing.
+        List<?> resultList = (List<?>) result;
+        long successCount = 0L;
+        try {
+          Object c0 = resultList.size() > 0 ? resultList.get(0) : 0L;
+          if (c0 instanceof Long) {
+            successCount = (Long) c0;
+          } else if (c0 instanceof String) {
+            successCount = Long.parseLong((String) c0);
+          } else if (c0 instanceof byte[]) {
+            successCount =
+                Long.parseLong(new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
+          }
+        } catch (Exception ex) {
+          if (metrics != null) {
+            metrics.incrementAcquireValidationFailure("batch_result_count_parse");
+          }
+        }
+
+        List<String> acquiredAgentTypes = new ArrayList<>();
+        if (resultList.size() > 1) {
+          Object list1 = resultList.get(1);
+          if (list1 instanceof List) {
+            for (Object o : (List<?>) list1) {
+              if (o instanceof String) {
+                acquiredAgentTypes.add((String) o);
+              } else if (o instanceof byte[]) {
+                acquiredAgentTypes.add(
+                    new String((byte[]) o, java.nio.charset.StandardCharsets.UTF_8));
+              } else if (o != null) {
+                acquiredAgentTypes.add(String.valueOf(o));
+              }
+            }
+          }
+        }
 
         log.debug(
             "Batch acquisition completed: {} successes out of {} attempts",
@@ -1862,23 +1910,51 @@ public class AgentAcquisitionService {
     for (String agentType : agentsToAdd) {
       AgentWorker worker = agents.get(agentType);
       if (worker != null) {
-        batchArgs.add(agentType);
         long jitterSec = computeInitialRegistrationJitterSeconds();
-        batchArgs.add(score(jedis, jitterSec * 1000L));
+        String s = score(jedis, jitterSec * 1000L);
+        // Validate pair: agent must not be numeric; score must be numeric
+        boolean scoreNumeric = s != null && s.matches("^\\d+$");
+        boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
+        if (!scoreNumeric || agentNumeric) {
+          if (metrics != null) {
+            metrics.incrementInvalidPair("repopulate_missing_batch");
+          }
+          continue;
+        }
+        batchArgs.add(agentType);
+        batchArgs.add(s);
       }
     }
 
     if (!batchArgs.isEmpty()) {
       try {
         @SuppressWarnings("unchecked")
-        List<Object> result =
-            (List<Object>)
+        List<?> result =
+            (List<?>)
                 scriptManager.evalshaWithSelfHeal(
                     jedis,
                     RedisScriptManager.ADD_AGENTS,
                     Arrays.asList(WORKING_SET, WAITING_SET),
                     batchArgs);
-        int added = result.size() >= 1 ? ((Long) result.get(0)).intValue() : 0;
+        int added = 0;
+        if (!result.isEmpty()) {
+          Object c0 = result.get(0);
+          if (c0 instanceof Long) {
+            added = ((Long) c0).intValue();
+          } else if (c0 instanceof String) {
+            try {
+              added = Integer.parseInt((String) c0);
+            } catch (Exception ignore) {
+            }
+          } else if (c0 instanceof byte[]) {
+            try {
+              added =
+                  Integer.parseInt(
+                      new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
+            } catch (Exception ignore) {
+            }
+          }
+        }
         log.debug("Batch added {} missing agents to Redis", added);
         if (metrics != null && added > 0) {
           metrics.incrementRepopulateAdded(added);
@@ -1970,8 +2046,18 @@ public class AgentAcquisitionService {
 
       List<String> batchArgs = new ArrayList<>();
       for (Map.Entry<String, String> entry : agentScores.entrySet()) {
-        batchArgs.add(entry.getKey()); // agent name
-        batchArgs.add(entry.getValue()); // score
+        String agentType = entry.getKey();
+        String s = entry.getValue();
+        boolean scoreNumeric = s != null && s.matches("^\\d+$");
+        boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
+        if (!scoreNumeric || agentNumeric) {
+          if (metrics != null) {
+            metrics.incrementInvalidPair("repopulate_fallback_batch");
+          }
+          continue;
+        }
+        batchArgs.add(agentType); // agent name
+        batchArgs.add(s); // score
         processed++;
 
         // Process batch when we reach batch size or end of agents
@@ -2325,20 +2411,47 @@ public class AgentAcquisitionService {
     try {
       List<String> batchArgs = new ArrayList<>();
       for (AgentCompletion completion : completions) {
-        batchArgs.add(completion.agent.getAgentType());
-        batchArgs.add(score(jedis, offset));
+        String agentType = completion.agent.getAgentType();
+        String s = score(jedis, offset);
+        boolean scoreNumeric = s != null && s.matches("^\\d+$");
+        boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
+        if (!scoreNumeric || agentNumeric) {
+          if (metrics != null) {
+            metrics.incrementInvalidPair("completion_batch");
+          }
+          continue;
+        }
+        batchArgs.add(agentType);
+        batchArgs.add(s);
       }
 
       @SuppressWarnings("unchecked")
-      List<Object> result =
-          (List<Object>)
+      List<?> result =
+          (List<?>)
               scriptManager.evalshaWithSelfHeal(
                   jedis,
                   RedisScriptManager.ADD_AGENTS,
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   batchArgs);
 
-      int scheduled = result.size() >= 1 ? ((Long) result.get(0)).intValue() : 0;
+      int scheduled = 0;
+      if (!result.isEmpty()) {
+        Object c0 = result.get(0);
+        if (c0 instanceof Long) {
+          scheduled = ((Long) c0).intValue();
+        } else if (c0 instanceof String) {
+          try {
+            scheduled = Integer.parseInt((String) c0);
+          } catch (Exception ignore) {
+          }
+        } else if (c0 instanceof byte[]) {
+          try {
+            scheduled =
+                Integer.parseInt(new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
+          } catch (Exception ignore) {
+          }
+        }
+      }
       log.debug("Batch scheduled {} completions with offset {}ms", scheduled, offset);
       return scheduled;
 
