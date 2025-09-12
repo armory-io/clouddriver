@@ -103,6 +103,28 @@ public class OrphanCleanupService {
       return;
     }
 
+    // Guard against long-running loops: if previous pass is still considered running for too long
+    // (e.g., due to a bug), skip starting another pass to avoid monopolizing cleanup leadership.
+    long maxPassDurationMs =
+        Math.max(1_000L, schedulerProperties.getOrphanCleanup().getRunBudgetMs());
+    if (lastOrphanCleanup > 0 && maxPassDurationMs > 0) {
+      long sinceLast = currentTimeMillis() - lastOrphanCleanup;
+      // If we haven't updated lastOrphanCleanup for > 10x budget, assume the previous pass hung
+      if (sinceLast > (10L * maxPassDurationMs)) {
+        log.warn(
+            "Skipping orphan cleanup: previous pass appears hung ({}ms since last update > budget {}ms). Releasing leadership defensively.",
+            sinceLast,
+            maxPassDurationMs);
+        try {
+          releaseCleanupLeadership();
+        } catch (Exception ignore) {
+        }
+        // Bump the timestamp to avoid log spam; next cycle will attempt again
+        lastOrphanCleanup = currentTimeMillis();
+        return;
+      }
+    }
+
     // Check if enough time has passed since last cleanup
     long intervalMs = schedulerProperties.getOrphanCleanup().getIntervalMs();
     if (!isPeriodElapsed(lastOrphanCleanup, intervalMs)) {
@@ -330,7 +352,7 @@ public class OrphanCleanupService {
     int totalCleaned = 0;
 
     if (WAITING_SET.equals(setName)) {
-      // Priority 0: Never purge valid waiting by age. Batch-remove only invalid entries.
+      // CRITICAL: Never purge valid waiting by age. Batch-remove only invalid entries.
       if (batchOperationsEnabled) {
         List<String> invalidArgs = new ArrayList<>();
         for (Tuple orphan : orphans) {
@@ -367,7 +389,8 @@ public class OrphanCleanupService {
         totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startTs);
       }
     } else {
-      // working: Prefer individual path to allow validity checks and conditional moves, and to skip
+      // CRITICAL: Prefer individual path to allow validity checks and conditional moves, and to
+      // skip
       // locally active work.
       for (int i = 0; i < orphans.size(); i += batchSize) {
         if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {

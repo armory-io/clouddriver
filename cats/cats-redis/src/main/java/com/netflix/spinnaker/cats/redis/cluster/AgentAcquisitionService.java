@@ -103,6 +103,35 @@ public class AgentAcquisitionService {
         new java.util.concurrent.atomic.AtomicBoolean(true);
   }
 
+  /**
+   * Early release the semaphore permit for a running agent if still held, and increment
+   * zombies-in-flight compensation. This enables fairness when zombie cleanup cancels a task whose
+   * thread may linger.
+   *
+   * <p>Exactly-once semantics are enforced via the per-agent {@code RunState.permitHeld} flag.
+   *
+   * @param agentType the agent whose permit should be pre-released if still held
+   */
+  public void earlyReleasePermitIfHeld(String agentType) {
+    try {
+      RunState rs = runStates.get(agentType);
+      if (rs != null && rs.permitHeld.compareAndSet(true, false)) {
+        if (runningAgentsRef != null) {
+          runningAgentsRef.release();
+        }
+        zombiesInFlight.incrementAndGet();
+      }
+    } catch (Exception e) {
+      // Best-effort; do not propagate exceptions to callers in cleanup paths
+      log.debug("earlyReleasePermitIfHeld failed for {}", agentType, e);
+    }
+  }
+
+  /** Current number of zombies whose permits were pre-released but threads still running. */
+  public int getZombiesInFlight() {
+    return zombiesInFlight.get();
+  }
+
   // Backlog/health snapshots and rate-limiting
   private final AtomicLong lastBacklogWarnEpochMs = new AtomicLong(0);
   private final AtomicLong lastStallWarnEpochMs = new AtomicLong(0);
@@ -2818,8 +2847,15 @@ public class AgentAcquisitionService {
     }
 
     // Get the current time accounting for server-client offset
-    long adjustedTimeMs = now + serverClientOffset.get() + offset;
-    long adjustedTimeSeconds = adjustedTimeMs / 1000;
+    long adjustedTimeMs = now + serverClientOffset.get() + (offset != null ? offset : 0L);
+    long adjustedTimeSeconds;
+    // For non-negative offsets (most scheduling), round up to the next second to avoid
+    // scheduling in the past due to flooring and small negative skew between client/server.
+    if (offset != null && offset >= 0L) {
+      adjustedTimeSeconds = (adjustedTimeMs + 999L) / 1000L;
+    } else {
+      adjustedTimeSeconds = adjustedTimeMs / 1000L;
+    }
 
     return String.valueOf(adjustedTimeSeconds);
   }

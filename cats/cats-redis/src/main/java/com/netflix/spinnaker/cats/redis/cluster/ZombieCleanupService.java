@@ -624,6 +624,19 @@ public class ZombieCleanupService {
         } else {
           activeAgents.remove(agentType);
         }
+
+        // Early-permit fairness: pre-release the semaphore permit exactly once so capacity
+        // is not artificially constrained while the cancelled thread unwinds.
+        if (acquisitionService != null) {
+          try {
+            acquisitionService.earlyReleasePermitIfHeld(agentType);
+          } catch (Exception e) {
+            log.debug(
+                "Failed early-permit release during individual zombie cleanup for {}",
+                agentType,
+                e);
+          }
+        }
       } else {
         log.debug("Zombie agent {} was not cleaned (may have been updated): {}", agentType, result);
       }

@@ -447,8 +447,10 @@ public class PriorityAgentScheduler extends CatsModuleAware
     int availablePermits =
         config.getRunningAgents() != null ? config.getRunningAgents().availablePermits() : -1;
 
+    int zombiesInFlight = acquisitionService.getZombiesInFlight();
+
     log.info(
-        "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={} health={}{} oldest_overdue={}s queueDepth={} permitsAvailable={}",
+        "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={} health={}{} oldest_overdue={}s queueDepth={} permitsAvailable={} zombiesInFlight={}",
         stats.getRegisteredAgents(),
         stats.getActiveAgents(),
         acquisitionService.getFuturesMapSize(),
@@ -460,7 +462,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
         stats.isDegraded() ? (" reason=" + stats.getDegradedReason()) : "",
         stats.getOldestOverdueSeconds(),
         queueDepth,
-        availablePermits);
+        availablePermits,
+        zombiesInFlight);
   }
 
   /**
