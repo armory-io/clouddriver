@@ -208,7 +208,6 @@ public class AgentAcquisitionService {
     final Agent agent;
     final String acquireScore;
     final boolean success;
-    final long timestamp;
     final FailureClass failureClass; // null when success
     final String throwableClassName; // optional; may be null
 
@@ -216,7 +215,6 @@ public class AgentAcquisitionService {
       this.agent = agent;
       this.acquireScore = acquireScore;
       this.success = success;
-      this.timestamp = currentTimeMillis();
       this.failureClass = null;
       this.throwableClassName = null;
     }
@@ -230,7 +228,6 @@ public class AgentAcquisitionService {
       this.agent = agent;
       this.acquireScore = acquireScore;
       this.success = success;
-      this.timestamp = currentTimeMillis();
       this.failureClass = failureClass;
       this.throwableClassName = throwableClassName;
     }
@@ -538,11 +535,10 @@ public class AgentAcquisitionService {
         return 0;
       }
 
-      long readyLimit = (readyCount >= 0) ? readyCount : Long.MAX_VALUE;
-      int effectiveMaxToAcquire =
-          unbounded
-              ? (int) Math.min(Integer.MAX_VALUE, readyLimit)
-              : (int) Math.min(availableSlotsForNewAgents, Math.max(0L, readyLimit));
+      // Do NOT cap by diagnostic-ready count; we intentionally probed only a single element.
+      // Acquisition capacity should reflect concurrency slots when bounded, or be effectively
+      // unbounded when maxConcurrentAgents <= 0.
+      int effectiveMaxToAcquire = unbounded ? Integer.MAX_VALUE : availableSlotsForNewAgents;
 
       // Evaluate health/degradation and rate-limited WARNing.
       // Avoid false positives by excluding known-orphan/zombie cases: the decision is based purely
@@ -603,19 +599,18 @@ public class AgentAcquisitionService {
           queueDepthDebug);
 
       // PHASE 5: Acquire up to available slots in chunks of batch-size
-      int remainingToAcquire = availableSlotsForNewAgents;
+      int remainingToAcquire = effectiveMaxToAcquire;
       int chunkOffset = 0; // Track offset for pagination through ready agents
 
       // Calculate max chunk attempts based on actual need and filtering expectations
       int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
       if (configuredBatchSize <= 0) {
-        configuredBatchSize =
-            availableSlotsForNewAgents; // Use all slots if batch size not configured
+        configuredBatchSize = effectiveMaxToAcquire; // Use all slots if batch size not configured
       }
 
       // Base calculation: how many chunks we need to fill available slots
       int baseAttempts =
-          (availableSlotsForNewAgents + configuredBatchSize - 1)
+          (effectiveMaxToAcquire + configuredBatchSize - 1)
               / configuredBatchSize; // ceiling division
 
       // Apply multiplier for filtering scenarios
@@ -636,7 +631,7 @@ public class AgentAcquisitionService {
         log.debug(
             "Calculated chunk attempts: {} (slots: {} / batch: {} = {} base × {} multiplier)",
             maxChunkAttempts,
-            availableSlotsForNewAgents,
+            effectiveMaxToAcquire,
             configuredBatchSize,
             baseAttempts,
             multiplier);
@@ -730,7 +725,7 @@ public class AgentAcquisitionService {
 
       if (chunkAttempts >= maxChunkAttempts && remainingToAcquire > 0) {
         // Check if we have significant unfilled slots with evidence of filtering
-        double unfilledRatio = (double) remainingToAcquire / availableSlotsForNewAgents;
+        double unfilledRatio = (double) remainingToAcquire / effectiveMaxToAcquire;
         int scannedButNotAcquired = chunkOffset - agentsAcquiredThisCycle;
 
         if (unfilledRatio > 0.2 && scannedButNotAcquired > 0) {
@@ -889,7 +884,7 @@ public class AgentAcquisitionService {
    * for schedulers to decide whether to skip acquisition on the same tick.
    */
   public boolean repopulateIfDueNow() {
-    long now = SchedulerUtils.currentTimeMillis();
+    long now = currentTimeMillis();
     long refreshPeriodMs = Math.max(1L, schedulerProperties.getRefreshPeriodSeconds()) * 1000L;
     long last = lastRepopulateEpochMs.get();
     if (last == 0L) {
@@ -897,7 +892,7 @@ public class AgentAcquisitionService {
       // on first run when required by tests/config.
       return false;
     }
-    if (!SchedulerUtils.isPeriodElapsed(last, refreshPeriodMs)) {
+    if (!isPeriodElapsed(last, refreshPeriodMs)) {
       return false;
     }
     if (!lastRepopulateEpochMs.compareAndSet(last, now)) {
@@ -934,6 +929,12 @@ public class AgentAcquisitionService {
     long now = System.currentTimeMillis();
     long last = lastEpochMs.get();
     return now - last >= periodMs;
+  }
+
+  /** Overload for callers that already read the last epoch value. */
+  private static boolean isPeriodElapsed(long lastEpochMsValue, long periodMs) {
+    long now = System.currentTimeMillis();
+    return now - lastEpochMsValue >= periodMs;
   }
 
   /**
@@ -1957,7 +1958,6 @@ public class AgentAcquisitionService {
 
     if (!batchArgs.isEmpty()) {
       try {
-        @SuppressWarnings("unchecked")
         List<?> result =
             (List<?>)
                 scriptManager.evalshaWithSelfHeal(
@@ -2455,7 +2455,6 @@ public class AgentAcquisitionService {
         batchArgs.add(completionScore);
       }
 
-      @SuppressWarnings("unchecked")
       List<?> result =
           (List<?>)
               scriptManager.evalshaWithSelfHeal(
@@ -3124,41 +3123,6 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Performs a startup consistency check to ensure all agents are properly registered in Redis.
-   * Verifies that all local agents are synchronized to the Redis state.
-   */
-  private void performStartupConsistencyCheck() {
-    log.info("Performing startup consistency check for agent reliability");
-
-    // Take snapshot to prevent concurrent modifications during startup check
-    Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
-
-    try (Jedis jedis = jedisPool.getResource()) {
-      // Get current Redis state from both sets
-      Set<String> localAgents = agentsSnapshot.keySet();
-      Set<String> redisAgents = getCurrentRedisAgents(jedis, localAgents);
-
-      // Calculate what needs to be added (missing agents)
-      Set<String> toAdd =
-          localAgents.stream()
-              .filter(agent -> !redisAgents.contains(agent))
-              .collect(Collectors.toSet());
-
-      if (toAdd.isEmpty()) {
-        log.info("Startup consistency check: All agents properly registered in Redis");
-      } else {
-        log.warn(
-            "Startup consistency check: Found {} agents missing from Redis, adding now",
-            toAdd.size());
-        // Add missing agents with immediate execution to ensure they run soon
-        addMissingAgents(jedis, toAdd);
-      }
-    } catch (Exception e) {
-      log.error("Error during startup consistency check", e);
-    }
-  }
-
-  /**
    * Checks if graceful shutdown is in progress. This flag affects agent handling during shutdown -
    * graceful shutdown attempts to re-queue in-progress agents back to Redis for pickup after
    * restart.
@@ -3167,28 +3131,6 @@ public class AgentAcquisitionService {
    */
   public boolean isGracefulShutdown() {
     return gracefulShutdown.get();
-  }
-
-  /**
-   * Simple data holder for Redis acquisition and release scores. This ensures atomic score
-   * management and prevents race conditions.
-   */
-  private static class ScoreTuple {
-    private final String acquireScore;
-    private final String releaseScore;
-
-    public ScoreTuple(String acquireScore, String releaseScore) {
-      this.acquireScore = acquireScore;
-      this.releaseScore = releaseScore;
-    }
-
-    public String getAcquireScore() {
-      return acquireScore;
-    }
-
-    public String getReleaseScore() {
-      return releaseScore;
-    }
   }
 
   /**
@@ -3427,8 +3369,6 @@ public class AgentAcquisitionService {
         acquisitionService.agentsExecuted.increment(); // Track successful executions
         log.debug("Agent {} execution completed successfully", agentType);
       } catch (Throwable cause) {
-        long elapsedMs = System.currentTimeMillis() - startTimeMs;
-
         if (cause instanceof InterruptedException) {
           log.warn(
               "Agent {} execution was interrupted (likely due to zombie cleanup or shutdown)",

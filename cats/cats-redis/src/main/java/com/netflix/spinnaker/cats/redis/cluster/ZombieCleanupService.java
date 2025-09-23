@@ -280,16 +280,8 @@ public class ZombieCleanupService {
         List<String> zombieBatch = new ArrayList<>();
         int configured = schedulerProperties.getBatchOperations().getBatchSize();
         if (configured <= 0) {
-          // Align with convention: default to max-concurrent-agents when batch-size <= 0
-          try {
-            int maxConcurrent =
-                new PrioritySchedulerConfiguration(
-                        new PriorityAgentProperties(), schedulerProperties)
-                    .getMaxConcurrentAgents();
-            configured = Math.max(1, maxConcurrent);
-          } catch (Exception ignore) {
-            configured = 50; // conservative fallback to default
-          }
+          // Simple, non-magic fallback: process up to the current number of candidates.
+          configured = Math.max(1, zombieAgentTypes.size());
         }
         int batchSize = Math.min(configured, zombieAgentTypes.size());
         if (log.isDebugEnabled()) {
@@ -480,14 +472,34 @@ public class ZombieCleanupService {
       Map<String, Future<?>> activeAgentsFutures) {
 
     int cleaned = 0;
-    if (result instanceof List) {
-      List<Object> resultList = (List<Object>) result;
+    if (result instanceof List<?>) {
+      List<?> resultList = (List<?>) result;
       // Lua script returns: [count, [agent_names]] format
       if (resultList.size() >= 2) {
         // First element: number of agents actually cleaned from Redis
-        cleaned = ((Long) resultList.get(0)).intValue();
+        Object countObj = resultList.get(0);
+        if (countObj instanceof Number) {
+          cleaned = ((Number) countObj).intValue();
+        } else {
+          log.warn(
+              "Unexpected count element type in Lua result: {}",
+              countObj != null ? countObj.getClass().getSimpleName() : "null");
+          cleaned = 0;
+        }
         // Second element: list of agent names that were successfully cleaned
-        List<String> cleanedAgents = (List<String>) resultList.get(1);
+        Object cleanedObj = resultList.get(1);
+        List<String> cleanedAgents = new ArrayList<>();
+        if (cleanedObj instanceof List<?>) {
+          for (Object elem : (List<?>) cleanedObj) {
+            if (elem instanceof String) {
+              cleanedAgents.add((String) elem);
+            }
+          }
+        } else {
+          log.warn(
+              "Unexpected second element type in Lua result: {}",
+              cleanedObj != null ? cleanedObj.getClass().getSimpleName() : "null");
+        }
 
         // Log batch-level summary at INFO for operational visibility
         if (cleaned > 0) {
@@ -526,8 +538,8 @@ public class ZombieCleanupService {
           // Fairness: if acquisition service is present, perform exactly-once early permit release
           if (acquisitionService != null) {
             try {
-              java.util.concurrent.ConcurrentHashMap<String, ?> rsMap =
-                  (java.util.concurrent.ConcurrentHashMap<String, ?>)
+              java.util.Map<?, ?> rsMap =
+                  (java.util.Map<?, ?>)
                       AgentAcquisitionService.class
                           .getDeclaredField("runStates")
                           .get(acquisitionService);
@@ -603,7 +615,7 @@ public class ZombieCleanupService {
 
       // Cancel the future if it exists
       if (future != null && !future.isDone()) {
-        boolean cancelled = future.cancel(true);
+        future.cancel(true);
         log.info("Cancelled zombie agent execution: {}", agentType);
       }
 
@@ -616,32 +628,33 @@ public class ZombieCleanupService {
               java.util.Collections.singletonList(agentType));
 
       boolean removed = result != null && ((Long) result).intValue() == 1;
-      if (removed) {
-        log.debug("Removed zombie agent {} from Redis working set", agentType);
-        // Ensure in-memory counters are updated consistently
-        if (acquisitionService != null) {
-          acquisitionService.removeActiveAgent(agentType);
-        } else {
-          activeAgents.remove(agentType);
-        }
 
-        // Early-permit fairness: pre-release the semaphore permit exactly once so capacity
-        // is not artificially constrained while the cancelled thread unwinds.
-        if (acquisitionService != null) {
-          try {
-            acquisitionService.earlyReleasePermitIfHeld(agentType);
-          } catch (Exception e) {
-            log.debug(
-                "Failed early-permit release during individual zombie cleanup for {}",
-                agentType,
-                e);
-          }
-        }
+      // ALWAYS clean local state and perform fairness, regardless of Redis outcome.
+      // This prevents permit leaks and stuck 'running' counts when Redis removal races or fails.
+      if (acquisitionService != null) {
+        acquisitionService.removeActiveAgent(agentType);
       } else {
-        log.debug("Zombie agent {} was not cleaned (may have been updated): {}", agentType, result);
+        activeAgents.remove(agentType);
       }
 
-      return removed;
+      if (acquisitionService != null) {
+        try {
+          acquisitionService.earlyReleasePermitIfHeld(agentType);
+        } catch (Exception e) {
+          log.debug(
+              "Failed early-permit release during individual zombie cleanup for {}", agentType, e);
+        }
+      }
+
+      if (removed) {
+        log.debug("Removed zombie agent {} from Redis working set", agentType);
+      } else {
+        log.debug(
+            "Zombie agent {} not found in Redis during cleanup (result={})", agentType, result);
+      }
+
+      // Count as cleaned once we've definitively stopped local execution and freed capacity.
+      return true;
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
       log.warn("Redis connection error removing zombie {} from Redis", agentType, e);

@@ -334,19 +334,8 @@ public class OrphanCleanupService {
 
     int batchSize = schedulerProperties.getBatchOperations().getBatchSize();
     if (batchSize <= 0) {
-      // Align with system convention: when batch-size is 0 or negative, default to instance
-      // concurrency to keep passes bounded and predictable.
-      try {
-        int maxConcurrent =
-            Math.max(
-                1,
-                new PrioritySchedulerConfiguration(
-                        new PriorityAgentProperties(), schedulerProperties)
-                    .getMaxConcurrentAgents());
-        batchSize = maxConcurrent;
-      } catch (Exception ignore) {
-        batchSize = 50; // conservative fallback to default
-      }
+      // Simple, non-magic fallback: process up to the current number of candidates.
+      batchSize = Math.max(1, orphans.size());
     }
     boolean batchOperationsEnabled = schedulerProperties.getBatchOperations().isEnabled();
     int totalCleaned = 0;
@@ -390,8 +379,7 @@ public class OrphanCleanupService {
       }
     } else {
       // CRITICAL: Prefer individual path to allow validity checks and conditional moves, and to
-      // skip
-      // locally active work.
+      // skip locally active work.
       for (int i = 0; i < orphans.size(); i += batchSize) {
         if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
           log.warn("Aborting working-batch processing due to budget/interrupt");
@@ -404,80 +392,6 @@ public class OrphanCleanupService {
     }
 
     return totalCleaned;
-  }
-
-  /**
-   * Clean up a single batch of orphaned agents from the specified Redis set.
-   *
-   * <p>This method executes a Lua script to atomically remove orphaned agents that match both the
-   * agent name and score (timestamp) criteria. The script ensures consistency by verifying that
-   * agents haven't been updated by other instances since detection.
-   *
-   * @param jedis Redis connection
-   * @param setName Redis set name (working or waiting)
-   * @param batch List of orphaned agents with their scores
-   * @return Number of agents actually cleaned up
-   */
-  private int cleanupSingleBatch(Jedis jedis, String setName, List<Tuple> batch) {
-    try {
-      // Transform agent tuples into flat argument list for Lua script
-      // Format: [agent1, score1, agent2, score2, ...] for efficient script processing
-      List<String> batchArgs = new ArrayList<>(batch.size() * 2);
-
-      for (Tuple orphan : batch) {
-        // Agent name (e.g., "aws-ec2-agent")
-        batchArgs.add(orphan.getElement());
-        // Agent's last activity timestamp as score (used for verification)
-        batchArgs.add(
-            String.valueOf(
-                (long) orphan.getScore())); // Convert to long to match score() method format
-      }
-
-      // Execute atomic Lua script to remove orphaned agents from Redis set
-      // Script verifies agent score hasn't changed (prevents race conditions)
-      // and removes only agents that are still orphaned at the same timestamp
-      Object result =
-          scriptManager.evalshaWithSelfHeal(
-              jedis,
-              RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
-              java.util.Collections.singletonList(setName),
-              batchArgs);
-
-      // Parse Lua script response: [numRemoved, [removedAgent1, removedAgent2, ...]]
-      // Script returns both count and list for verification and logging
-      if (result instanceof List) {
-        List<Object> resultList = (List<Object>) result;
-        // Validate expected Lua return format: [count, agent_list]
-        if (resultList.size() >= 2) {
-          // First element: actual number of agents removed from Redis
-          int cleaned = ((Long) resultList.get(0)).intValue();
-          // Second element: list of agent names that were successfully removed
-          List<String> removedAgents = (List<String>) resultList.get(1);
-
-          if (cleaned > 0) {
-            log.info("Cleaned {} orphaned agents from {}: {}", cleaned, setName, removedAgents);
-          }
-
-          return cleaned;
-        } else {
-          log.warn(
-              "Unexpected Lua script result format from {}: expected [count, list], got: {}",
-              setName,
-              result);
-        }
-      } else {
-        log.warn(
-            "Unexpected Lua script result type from {}: expected List, got: {}",
-            setName,
-            result != null ? result.getClass().getSimpleName() : "null");
-      }
-
-      return 0;
-
-    } catch (Exception e) {
-      log.error("Error cleaning orphan batch from {}", setName, e);
-      return 0;
-    }
   }
 
   /**

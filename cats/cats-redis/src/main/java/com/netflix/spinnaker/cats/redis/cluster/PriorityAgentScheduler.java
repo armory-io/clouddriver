@@ -69,7 +69,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
   // External dependencies
   private final NodeStatusProvider nodeStatusProvider;
-  private final AgentIntervalProvider intervalProvider;
   private final ShardingFilter shardingFilter;
 
   // Runtime state
@@ -101,7 +100,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
    *
    * @param jedisPool Redis connection pool
    * @param nodeStatusProvider Node enablement state provider
-   * @param intervalProvider Agent interval/timeout provider
    * @param shardingFilter Shard ownership filter
    * @param agentProperties Agent configuration
    * @param schedulerProperties Scheduler configuration
@@ -155,7 +153,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     // Store external dependencies
     this.nodeStatusProvider = nodeStatusProvider;
-    this.intervalProvider = intervalProvider;
     this.shardingFilter = shardingFilter;
 
     // Dedicated on-demand single-thread executors so the scheduler loop never blocks.
@@ -292,7 +289,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Check if Redis repopulation is due. If we repopulate, skip acquisition
       // this cycle to avoid race conditions during initial agent registration
-      long beforeRepop = acquisitionService.getRegisteredAgentCount();
       boolean repopulatedThisCycle = acquisitionService.repopulateIfDueNow();
 
       // Acquire ready agents and submit them for execution first to guarantee forward progress
@@ -734,7 +730,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
    */
   private void reconcileKnownAgentsIfNeeded(long currentRun) {
     try {
-      long intervalMs = config.getSchedulerIntervalMs();
       long refreshPeriodSeconds = config.getRedisRefreshPeriod();
       long refreshPeriodMs = Math.max(1, refreshPeriodSeconds) * 1000L;
       long now = currentTimeMillis();
