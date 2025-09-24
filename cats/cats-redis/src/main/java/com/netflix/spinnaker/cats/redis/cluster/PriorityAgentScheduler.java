@@ -95,6 +95,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
   // Local submission gate for zombie cleanup to avoid per-second submits
   private final AtomicLong lastZombieSubmitEpochMs = new AtomicLong(0);
 
+  // Watchdog streak counters (single-threaded scheduler loop)
+  private int watchdogLeakStreak = 0;
+  private int watchdogSkewStreak = 0;
+  private int watchdogZeroProgressStreak = 0;
+  private int watchdogRedisStallStreak = 0;
+
   /**
    * Creates a PriorityAgentScheduler with required dependencies.
    *
@@ -135,21 +141,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     // Set up service references for advanced cleanup processing
     this.orphanService.setAcquisitionService(this.acquisitionService);
-    // Provide acquisition service to zombie cleanup for fairness bookkeeping (optional wiring).
-    //
-    // Optional = not required for correctness. Without this, zombie cleanup still cancels futures
-    // and cleans Redis. When present, it additionally performs early semaphore permit release via
-    // an exactly-once handshake and compensates capacity using a zombiesInFlight counter, avoiding
-    // temporary under-filling if cancelled threads linger.
-    try {
-      java.lang.reflect.Method m =
-          ZombieCleanupService.class.getDeclaredMethod(
-              "setAcquisitionService", AgentAcquisitionService.class);
-      m.setAccessible(true);
-      m.invoke(this.zombieService, this.acquisitionService);
-    } catch (Exception e) {
-      log.debug("Optional zombie cleanup fairness wiring failed; continuing without it", e);
-    }
+    // Provide acquisition service and fairness handler without reflection
+    this.zombieService.setAcquisitionService(this.acquisitionService);
+    this.zombieService.setFairnessHandler(this.acquisitionService);
 
     // Store external dependencies
     this.nodeStatusProvider = nodeStatusProvider;
@@ -161,7 +155,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     // zombie-cleanup interval as keep-alive. With a positive budget, keep-alive equals the budget
     // so the worker retires shortly after work finishes.
     this.zombieCleanupExecutor =
-        newOnDemandSingleThreadExecutor(
+        ExecutorUtils.newOnDemandSingleThreadExecutor(
             "PriorityAgentCleanup-Zombie-#",
             config.getZombieRunBudgetMs() > 0
                 ? config.getZombieRunBudgetMs()
@@ -171,7 +165,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     // thread churn and makes APM attribution clearer. When a positive budget is configured, use it
     // as the keep-alive so the worker retires shortly after work finishes.
     this.orphanCleanupExecutor =
-        newOnDemandSingleThreadExecutor(
+        ExecutorUtils.newOnDemandSingleThreadExecutor(
             "PriorityAgentCleanup-Orphan-#",
             config.getOrphanRunBudgetMs() > 0
                 ? config.getOrphanRunBudgetMs()
@@ -179,7 +173,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     // For reconcile, fall back to the Redis refresh cadence when no budget is set, to keep the
     // worker thread parked between reconciliation passes.
     this.reconcileExecutor =
-        newOnDemandSingleThreadExecutor(
+        ExecutorUtils.newOnDemandSingleThreadExecutor(
             "PriorityAgentReconcile-#",
             config.getReconcileRunBudgetMs() > 0
                 ? config.getReconcileRunBudgetMs()
@@ -212,7 +206,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
             double cap = acquisitionService.getCapacityPerCycleSnapshot();
             double ready = acquisitionService.getReadyCountSnapshot();
             return cap > 0 ? (ready / cap) : 0;
-          });
+          },
+          () -> (double) acquisitionService.getZombiesInFlight());
     } catch (Exception e) {
       log.debug("Failed to register scheduler gauges", e);
     }
@@ -256,7 +251,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Reconcile agent registrations with current sharding/enablement state (offloaded)
       long refreshPeriodMs = Math.max(1, config.getRedisRefreshPeriod()) * 1000L;
-      boolean reconcileDue = isPeriodElapsed(lastReconcileEpochMs.get(), refreshPeriodMs);
+      boolean reconcileDue =
+          CadenceGuard.isPeriodElapsed(lastReconcileEpochMs.get(), refreshPeriodMs);
       if (reconcileDue && reconcileRunning.compareAndSet(false, true)) {
         if (log.isDebugEnabled()) {
           log.debug("Begin reconcileKnownAgents offload for run {}", currentRun);
@@ -303,11 +299,119 @@ public class PriorityAgentScheduler extends CatsModuleAware
             "Skipping acquisition on repopulation cycle {} to prevent first-run races", currentRun);
       }
 
+      // Watchdog: detect possible permit starvation and related stalls via ratio-based heuristics
+      try {
+        java.util.concurrent.Semaphore sem = config.getRunningAgents();
+        int permits = sem != null ? sem.availablePermits() : -1;
+        int poolActive = 0;
+        if (config.getAgentWorkPool() instanceof java.util.concurrent.ThreadPoolExecutor) {
+          poolActive =
+              ((java.util.concurrent.ThreadPoolExecutor) config.getAgentWorkPool())
+                  .getActiveCount();
+        }
+        int maxConcurrent =
+            acquisitionService != null
+                ? acquisitionService.getAgentProperties().getMaxConcurrentAgents()
+                : 0;
+        int activeCount = acquisitionService.getActiveAgentCount();
+        long ready = acquisitionService.getReadyCountSnapshot();
+        int zif = acquisitionService.getZombiesInFlight();
+        int effectiveCapacity = Math.max(1, Math.max(0, maxConcurrent - (activeCount + zif)));
+        double permitsFreePct =
+            maxConcurrent > 0
+                ? Math.max(0d, Math.min(1d, (double) permits / (double) maxConcurrent))
+                : 0d;
+        double activePct =
+            maxConcurrent > 0
+                ? Math.max(0d, Math.min(1d, (double) activeCount / (double) maxConcurrent))
+                : 0d;
+        double acquiredFillPct =
+            effectiveCapacity > 0
+                ? Math.max(0d, Math.min(1d, (double) agentsAcquired / (double) effectiveCapacity))
+                : 0d;
+
+        boolean redisStall = false;
+        try {
+          String redisState =
+              String.valueOf(acquisitionService.getCircuitBreakerStatus().get("redis"));
+          redisStall = (redisState != null && !"CLOSED".equalsIgnoreCase(redisState));
+        } catch (Throwable t) {
+          log.debug("Watchdog: unable to read redis breaker state; assuming CLOSED", t);
+        }
+
+        // Consecutive-tick streaks to avoid flapping
+        // Leak suspect: almost no free permits AND pool idle AND ready backlog
+        if (maxConcurrent > 0 && permitsFreePct < 0.01 && poolActive == 0 && ready > 0) {
+          watchdogLeakStreak++;
+        } else {
+          watchdogLeakStreak = 0;
+        }
+        if (watchdogLeakStreak >= 3) {
+          log.warn(
+              "Watchdog: PERMIT_LEAK_SUSPECT permitsFreePct={} activePct={} ready={} poolActive={} maxConcurrent={}",
+              String.format("%.2f", permitsFreePct),
+              String.format("%.2f", activePct),
+              ready,
+              poolActive,
+              maxConcurrent);
+          watchdogLeakStreak = 0;
+        }
+
+        // Capacity skew (zIF): lots of free permits but we barely acquired
+        if (ready > 0 && permitsFreePct > 0.90 && acquiredFillPct < 0.10) {
+          watchdogSkewStreak++;
+        } else {
+          watchdogSkewStreak = 0;
+        }
+        if (watchdogSkewStreak >= 3) {
+          log.warn(
+              "Watchdog: CAPACITY_SKEW_ZIF permitsFreePct={} acquiredFillPct={} ready={} zIF={} effectiveCapacity={}",
+              String.format("%.2f", permitsFreePct),
+              String.format("%.2f", acquiredFillPct),
+              ready,
+              zif,
+              effectiveCapacity);
+          watchdogSkewStreak = 0;
+        }
+
+        // Zero progress (no acquisitions while ready) and not a redis stall
+        if (ready > 0 && agentsAcquired == 0 && !redisStall) {
+          watchdogZeroProgressStreak++;
+        } else {
+          watchdogZeroProgressStreak = 0;
+        }
+        if (watchdogZeroProgressStreak >= 3) {
+          log.warn(
+              "Watchdog: ZERO_PROGRESS ready={} acquiredThisTick={} redisStall={} permits={} active={} zIF={}",
+              ready,
+              agentsAcquired,
+              redisStall,
+              permits,
+              activeCount,
+              zif);
+          watchdogZeroProgressStreak = 0;
+        }
+
+        // Redis stall streak (breaker open)
+        if (redisStall) {
+          watchdogRedisStallStreak++;
+        } else {
+          watchdogRedisStallStreak = 0;
+        }
+        if (watchdogRedisStallStreak >= 3) {
+          log.warn("Watchdog: REDIS_STALL breaker open; skipping acquisitions until recovery");
+          watchdogRedisStallStreak = 0;
+        }
+      } catch (Exception e) {
+        log.debug("Watchdog check failed; continuing", e);
+      }
+
       // Offload zombie cleanup (non-blocking) — pre-gated by cadence to avoid per-second submits
       try {
         long zombieIntervalMs = config.getZombieIntervalMs();
         long lastZombieSubmit = lastZombieSubmitEpochMs.get();
-        boolean zombieDueToSubmit = isPeriodElapsed(lastZombieSubmit, zombieIntervalMs);
+        boolean zombieDueToSubmit =
+            CadenceGuard.isPeriodElapsed(lastZombieSubmit, zombieIntervalMs);
         if (zombieDueToSubmit && zombieCleanupRunning.compareAndSet(false, true)) {
           lastZombieSubmitEpochMs.set(currentTimeMillis());
           zombieCleanupExecutor.submit(
@@ -357,7 +461,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       try {
         long intervalMs = config.getOrphanIntervalMs();
         long lastSubmit = lastOrphanSubmitEpochMs.get();
-        boolean dueToSubmit = isPeriodElapsed(lastSubmit, intervalMs);
+        boolean dueToSubmit = CadenceGuard.isPeriodElapsed(lastSubmit, intervalMs);
         if (dueToSubmit && orphanCleanupRunning.compareAndSet(false, true)) {
           lastOrphanSubmitEpochMs.set(currentTimeMillis());
           orphanCleanupExecutor.submit(
@@ -427,7 +531,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
   private void maybeLogHealthSummary() {
     long now = currentTimeMillis();
     long last = lastHealthLogEpochMs.get();
-    if (!isPeriodElapsed(last, 10 * 60 * 1000L)) {
+    if (!CadenceGuard.isPeriodElapsed(last, 10 * 60 * 1000L)) {
       return;
     }
     if (!lastHealthLogEpochMs.compareAndSet(last, now)) {
@@ -440,10 +544,29 @@ public class PriorityAgentScheduler extends CatsModuleAware
       queueDepth =
           ((java.util.concurrent.ThreadPoolExecutor) config.getAgentWorkPool()).getQueue().size();
     }
-    int availablePermits =
-        config.getRunningAgents() != null ? config.getRunningAgents().availablePermits() : -1;
-
+    java.util.concurrent.Semaphore sem = config.getRunningAgents();
+    int availablePermits = sem != null ? sem.availablePermits() : -1;
+    int maxConcurrent = acquisitionService.getAgentProperties().getMaxConcurrentAgents();
+    int activeCount = acquisitionService.getActiveAgentCount();
     int zombiesInFlight = acquisitionService.getZombiesInFlight();
+
+    // Permit reconciliation: warn and mark degraded if heldPermits > active + zombiesInFlight
+    boolean permitMismatch = false;
+    if (sem != null && maxConcurrent > 0) {
+      int heldPermits = Math.max(0, maxConcurrent - availablePermits);
+      int accounted = activeCount + zombiesInFlight;
+      if (heldPermits > accounted) {
+        permitMismatch = true;
+        log.warn(
+            "Permit reconciliation warning: heldPermits={} > accounted={} (active={} + zombiesInFlight={}); maxConcurrent={} availablePermits={}. This suggests a stuck permit or lingering worker.",
+            heldPermits,
+            accounted,
+            activeCount,
+            zombiesInFlight,
+            maxConcurrent,
+            availablePermits);
+      }
+    }
 
     log.info(
         "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={} health={}{} oldest_overdue={}s queueDepth={} permitsAvailable={} zombiesInFlight={}",
@@ -454,8 +577,14 @@ public class PriorityAgentScheduler extends CatsModuleAware
         stats.getZombiesCleanedUp(),
         stats.getOrphansCleanedUp(),
         stats.isRunning(),
-        stats.isDegraded() ? "DEGRADED" : "HEALTHY",
-        stats.isDegraded() ? (" reason=" + stats.getDegradedReason()) : "",
+        (stats.isDegraded() || permitMismatch) ? "DEGRADED" : "HEALTHY",
+        (stats.isDegraded() || permitMismatch)
+            ? (" reason="
+                + (permitMismatch
+                    ? "permit_mismatch: heldPermits > active + zombiesInFlight; "
+                    : "")
+                + stats.getDegradedReason())
+            : "",
         stats.getOldestOverdueSeconds(),
         queueDepth,
         availablePermits,
@@ -734,7 +863,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       long refreshPeriodMs = Math.max(1, refreshPeriodSeconds) * 1000L;
       long now = currentTimeMillis();
       long last = lastReconcileEpochMs.get();
-      if (!isPeriodElapsed(last, refreshPeriodMs)) {
+      if (!CadenceGuard.isPeriodElapsed(last, refreshPeriodMs)) {
         return;
       }
       lastReconcileEpochMs.set(now);
@@ -828,29 +957,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
             TimeUnit.MILLISECONDS);
 
     log.info("Scheduler started with interval {}ms", intervalMs);
-  }
-
-  /**
-   * Create an on-demand single-thread executor: no core threads, one max thread, 60s keep alive,
-   * and daemon threads with a friendly name. The thread is created only when a task is submitted
-   * and will be terminated after idle period, keeping thread metrics clean during idle windows.
-   */
-  private static java.util.concurrent.ExecutorService newOnDemandSingleThreadExecutor(
-      String threadNamePattern, long keepAliveMs) {
-    java.util.concurrent.ThreadPoolExecutor exec =
-        new java.util.concurrent.ThreadPoolExecutor(
-            0,
-            1,
-            Math.max(1L, keepAliveMs),
-            java.util.concurrent.TimeUnit.MILLISECONDS,
-            new java.util.concurrent.SynchronousQueue<>(),
-            r -> {
-              Thread t = new Thread(r, threadNamePattern.replace("#", "0"));
-              t.setDaemon(true);
-              return t;
-            });
-    exec.allowCoreThreadTimeOut(true);
-    return exec;
   }
 
   /**

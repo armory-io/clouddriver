@@ -72,7 +72,8 @@ class PrioritySchedulerGaugesTest {
         zero, // semaphoreAvailable
         zero, // completionQueueSize
         zero, // timeOffsetMs
-        ratio // readyToCapacityRatio
+        ratio, // readyToCapacityRatio
+        zero // zombiesInFlight
         );
 
     double v = gaugeValue(registry, "cats.redisPriority.readyToCapacityRatio");
@@ -88,7 +89,8 @@ class PrioritySchedulerGaugesTest {
     JedisPool pool = new JedisPool(new JedisPoolConfig(), "localhost");
     try {
       Supplier<Number> zero = () -> 0;
-      m.registerGauges(pool, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero);
+      m.registerGauges(
+          pool, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero);
 
       double active = gaugeValue(registry, "cats.redisPriority.redisPool.active");
       double idle = gaugeValue(registry, "cats.redisPriority.redisPool.idle");

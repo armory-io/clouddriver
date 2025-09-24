@@ -59,7 +59,7 @@ import redis.clients.jedis.Tuple;
  */
 @Component
 @Slf4j
-public class AgentAcquisitionService {
+public class AgentAcquisitionService implements PermitFairnessHandler {
 
   // Redis key names (injected via properties)
   private final String WAITING_SET;
@@ -101,6 +101,10 @@ public class AgentAcquisitionService {
   private static final class RunState {
     final java.util.concurrent.atomic.AtomicBoolean permitHeld =
         new java.util.concurrent.atomic.AtomicBoolean(true);
+    final java.util.concurrent.atomic.AtomicBoolean started =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    final java.util.concurrent.atomic.AtomicBoolean zifIncremented =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
   }
 
   /**
@@ -114,17 +118,26 @@ public class AgentAcquisitionService {
    */
   public void earlyReleasePermitIfHeld(String agentType) {
     try {
-      RunState rs = runStates.get(agentType);
-      if (rs != null && rs.permitHeld.compareAndSet(true, false)) {
+      RunState runStateForAgent = runStates.get(agentType);
+      if (runStateForAgent != null && runStateForAgent.permitHeld.compareAndSet(true, false)) {
         if (runningAgentsRef != null) {
           runningAgentsRef.release();
         }
-        zombiesInFlight.incrementAndGet();
+        // Increment zIF only if the worker actually started running
+        if (runStateForAgent.started.get()) {
+          zombiesInFlight.incrementAndGet();
+          runStateForAgent.zifIncremented.set(true);
+        }
       }
     } catch (Exception e) {
       // Best-effort; do not propagate exceptions to callers in cleanup paths
       log.debug("earlyReleasePermitIfHeld failed for {}", agentType, e);
     }
+  }
+
+  @Override
+  public void tryEarlyPermitReleaseAndMaybeIncrementZif(String agentType) {
+    earlyReleasePermitIfHeld(agentType);
   }
 
   /** Current number of zombies whose permits were pre-released but threads still running. */
@@ -371,6 +384,31 @@ public class AgentAcquisitionService {
         return 0;
       }
 
+      // Defensive reconciliation: cap zombiesInFlight to real headroom so capacity accounting
+      // cannot be skewed by cancelled-but-never-started tasks.
+      if (!unbounded && runningAgents != null) {
+        try {
+          int availablePermits = runningAgents.availablePermits();
+          int heldPermits = Math.max(0, maxConcurrentAgents - availablePermits);
+          int cap = Math.max(0, heldPermits - currentlyRunning);
+          int zif = zombiesInFlight.get();
+          if (zif > cap) {
+            int delta = cap - zif; // negative
+            zombiesInFlight.addAndGet(delta);
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Reconciled zombiesInFlight from {} to {} (held={}, active={})",
+                  zif,
+                  cap,
+                  heldPermits,
+                  currentlyRunning);
+            }
+          }
+        } catch (Exception e) {
+          log.debug("zIF reconciliation skipped due to error; keeping previous values", e);
+        }
+      }
+
       // PHASE 1: Process queued agent completions
       processQueuedCompletions(jedis);
 
@@ -399,9 +437,9 @@ public class AgentAcquisitionService {
       final long DIAG_PERIOD_MS = Math.max(3L * Math.max(1L, schedulerIntervalMs), 10_000L);
       boolean emitDiag =
           log.isDebugEnabled()
-              || isPeriodElapsed(lastBacklogWarnEpochMs, 600_000L)
-              || isPeriodElapsed(lastStallWarnEpochMs, 300_000L)
-              || isPeriodElapsed(lastDiagEpochMs, DIAG_PERIOD_MS);
+              || CadenceGuard.isPeriodElapsed(lastBacklogWarnEpochMs.get(), 600_000L)
+              || CadenceGuard.isPeriodElapsed(lastStallWarnEpochMs.get(), 300_000L)
+              || CadenceGuard.isPeriodElapsed(lastDiagEpochMs.get(), DIAG_PERIOD_MS);
 
       long readyCountForDiagnostics = -1L;
       boolean earlyEmptyReady = false;
@@ -549,18 +587,8 @@ public class AgentAcquisitionService {
       boolean degraded = oldestOverdueSec > minIntervalSec && minIntervalSec > 0L;
       int capacityPerCycle = availableSlotsForNewAgents;
 
-      if (degraded && shouldWarnNow(lastBacklogWarnEpochMs, 600_000)) {
-        log.warn(
-            "PriorityScheduler degraded: oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
-            oldestOverdueSec,
-            minIntervalSec,
-            readyCount,
-            capacityPerCycle,
-            currentlyRunning,
-            maxConcurrentAgents);
-      } else if (degraded && log.isDebugEnabled()) {
-        log.debug(
-            "PriorityScheduler degraded (suppressed WARN): oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
+      if (degraded) {
+        logDegradedBacklog(
             oldestOverdueSec,
             minIntervalSec,
             readyCount,
@@ -579,12 +607,11 @@ public class AgentAcquisitionService {
               : "";
 
       // Persist initial snapshots (will be updated after slot filling check if needed)
-      if (emitDiag) {
-        lastOldestOverdueSeconds.set(oldestOverdueSec);
-        lastReadyCount.set(Math.max(0L, readyCount));
-        lastCapacityPerCycle.set(capacityPerCycle);
-        // Degradation status will be finalized after slot filling check
-      }
+      // Always keep snapshots up to date for health logging
+      lastOldestOverdueSeconds.set(oldestOverdueSec);
+      lastReadyCount.set(Math.max(0L, readyCount));
+      lastCapacityPerCycle.set(capacityPerCycle);
+      // Degradation status will be finalized after slot filling check
       int queueDepthDebug = -1;
       if (agentWorkPool instanceof java.util.concurrent.ThreadPoolExecutor) {
         queueDepthDebug =
@@ -892,7 +919,7 @@ public class AgentAcquisitionService {
       // on first run when required by tests/config.
       return false;
     }
-    if (!isPeriodElapsed(last, refreshPeriodMs)) {
+    if (!CadenceGuard.isPeriodElapsed(last, refreshPeriodMs)) {
       return false;
     }
     if (!lastRepopulateEpochMs.compareAndSet(last, now)) {
@@ -925,16 +952,32 @@ public class AgentAcquisitionService {
     return false;
   }
 
-  private static boolean isPeriodElapsed(AtomicLong lastEpochMs, long periodMs) {
-    long now = System.currentTimeMillis();
-    long last = lastEpochMs.get();
-    return now - last >= periodMs;
-  }
-
-  /** Overload for callers that already read the last epoch value. */
-  private static boolean isPeriodElapsed(long lastEpochMsValue, long periodMs) {
-    long now = System.currentTimeMillis();
-    return now - lastEpochMsValue >= periodMs;
+  private void logDegradedBacklog(
+      long oldestOverdueSec,
+      long minIntervalSec,
+      long readyCount,
+      int capacityPerCycle,
+      int currentlyRunning,
+      int maxConcurrentAgents) {
+    if (shouldWarnNow(lastBacklogWarnEpochMs, 600_000)) {
+      log.warn(
+          "PriorityScheduler degraded: oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
+          oldestOverdueSec,
+          minIntervalSec,
+          readyCount,
+          capacityPerCycle,
+          currentlyRunning,
+          maxConcurrentAgents);
+    } else if (log.isDebugEnabled()) {
+      log.debug(
+          "PriorityScheduler degraded (suppressed WARN): oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
+          oldestOverdueSec,
+          minIntervalSec,
+          readyCount,
+          capacityPerCycle,
+          currentlyRunning,
+          maxConcurrentAgents);
+    }
   }
 
   /**
@@ -1662,6 +1705,15 @@ public class AgentAcquisitionService {
     status.put("acquisition", acquisitionCircuitBreaker.getStatus());
     status.put("redis", redisCircuitBreaker.getStatus());
     return status;
+  }
+
+  /**
+   * Expose agent properties for scheduler diagnostics/watchdog decisions.
+   *
+   * @return current {@link PriorityAgentProperties}
+   */
+  public PriorityAgentProperties getAgentProperties() {
+    return agentProperties;
   }
 
   /** Reset circuit breakers (for recovery/testing). */
@@ -3330,7 +3382,7 @@ public class AgentAcquisitionService {
   }
 
   /** Runnable wrapper for agent execution that handles resource management and monitoring. */
-  public static class AgentWorker implements Runnable {
+  static class AgentWorker implements Runnable {
     private final Agent agent;
     private final AgentExecution agentExecution;
     private final ExecutionInstrumentation executionInstrumentation;
@@ -3361,6 +3413,15 @@ public class AgentAcquisitionService {
       Throwable capturedCause = null;
 
       try {
+        // Mark as started for fairness accounting
+        try {
+          RunState runStateForAgent = acquisitionService.runStates.get(agentType);
+          if (runStateForAgent != null) {
+            runStateForAgent.started.set(true);
+          }
+        } catch (Exception e) {
+          log.debug("Failed to mark run-state started for {}", agentType, e);
+        }
         log.debug("Starting execution of agent {}", agentType);
         executionInstrumentation.executionStarted(agent);
         agentExecution.executeAgent(agent);
@@ -3393,22 +3454,25 @@ public class AgentAcquisitionService {
             agent, acquireScore, success, failureClass, capturedCause);
 
         // CRITICAL: Exactly-once permit release
-        RunState rs = acquisitionService.runStates.remove(agentType);
-        if (rs == null) {
+        RunState runStateForAgent = acquisitionService.runStates.remove(agentType);
+        if (runStateForAgent == null) {
           // No run-state (e.g., tests calling AgentWorker directly) -> release as before
           if (runningAgents != null) {
             runningAgents.release();
             log.debug("Released semaphore permit for agent {} (no run-state)", agentType);
           }
-        } else if (rs.permitHeld.compareAndSet(true, false)) {
+        } else if (runStateForAgent.permitHeld.compareAndSet(true, false)) {
           // Normal path: release once
           if (runningAgents != null) {
             runningAgents.release();
             log.debug("Released semaphore permit for agent {}", agentType);
           }
         } else {
-          // Permit was pre-released by zombie cleanup; decrement in-flight compensation
-          acquisitionService.zombiesInFlight.decrementAndGet();
+          // Permit was pre-released by zombie cleanup. Decrement zIF only if we had incremented it
+          // earlier (worker actually started and early-release performed accounting).
+          if (runStateForAgent.zifIncremented.get()) {
+            acquisitionService.zombiesInFlight.decrementAndGet();
+          }
         }
 
         log.debug("Agent {} execution cleanup completed", agentType);

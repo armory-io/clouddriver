@@ -96,9 +96,15 @@ public class ZombieCleanupService {
   // Tests or alternate constructors may omit the wiring for simplicity; the main scheduler wires
   // it in to enable the fairness behavior in production.
   private AgentAcquisitionService acquisitionService;
+  private PermitFairnessHandler fairnessHandler;
 
   void setAcquisitionService(AgentAcquisitionService acquisitionService) {
     this.acquisitionService = acquisitionService;
+    this.fairnessHandler = acquisitionService; // backward-compatible default
+  }
+
+  void setFairnessHandler(PermitFairnessHandler fairnessHandler) {
+    this.fairnessHandler = fairnessHandler;
   }
 
   /**
@@ -155,7 +161,7 @@ public class ZombieCleanupService {
     long now = currentTimeMillis();
     long zombieCleanupInterval = schedulerProperties.getZombieCleanup().getIntervalMs();
 
-    if (isPeriodElapsed(lastZombieCleanup, zombieCleanupInterval)) {
+    if (CadenceGuard.isPeriodElapsed(lastZombieCleanup, zombieCleanupInterval)) {
       int cleaned = cleanupZombieAgents(activeAgents, activeAgentsFutures);
       lastZombieCleanup = now;
 
@@ -191,7 +197,8 @@ public class ZombieCleanupService {
     int validAgentsScanned = 0;
 
     for (Map.Entry<String, String> entry : activeAgents.entrySet()) {
-      if (overBudget(start) || Thread.currentThread().isInterrupted()) {
+      if (CadenceGuard.overBudget(start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
+          || Thread.currentThread().isInterrupted()) {
         log.warn("Stopping zombie scan early due to budget/interrupt");
         break;
       }
@@ -263,7 +270,9 @@ public class ZombieCleanupService {
         }
 
         for (String agentType : zombieAgentTypes) {
-          if (overBudget(start) || Thread.currentThread().isInterrupted()) {
+          if (CadenceGuard.overBudget(
+                  start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
+              || Thread.currentThread().isInterrupted()) {
             log.warn("Stopping zombie individual cleanup due to budget/interrupt");
             break;
           }
@@ -292,14 +301,18 @@ public class ZombieCleanupService {
         }
 
         for (String agentType : zombieAgentTypes) {
-          if (overBudget(start) || Thread.currentThread().isInterrupted()) {
+          if (CadenceGuard.overBudget(
+                  start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
+              || Thread.currentThread().isInterrupted()) {
             log.warn("Stopping zombie batch preparation due to budget/interrupt");
             break;
           }
           zombieBatch.add(agentType);
 
           if (zombieBatch.size() >= batchSize) {
-            if (overBudget(start) || Thread.currentThread().isInterrupted()) {
+            if (CadenceGuard.overBudget(
+                    start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
+                || Thread.currentThread().isInterrupted()) {
               log.warn("Skipping zombie batch execution due to budget/interrupt");
               break;
             }
@@ -311,7 +324,9 @@ public class ZombieCleanupService {
 
         // Process remaining zombies
         if (!zombieBatch.isEmpty()) {
-          if (!overBudget(start) && !Thread.currentThread().isInterrupted()) {
+          if (!CadenceGuard.overBudget(
+                  start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
+              && !Thread.currentThread().isInterrupted()) {
             totalCleaned +=
                 cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures, start);
           }
@@ -392,7 +407,9 @@ public class ZombieCleanupService {
         List<String> batchArgs = new ArrayList<>(zombieAgentTypes.size() * 2);
 
         for (String agentType : zombieAgentTypes) {
-          if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+          if (CadenceGuard.overBudget(
+                  startTs, schedulerProperties.getZombieCleanup().getRunBudgetMs())
+              || Thread.currentThread().isInterrupted()) {
             log.warn("Stopping zombie batch build due to budget/interrupt");
             break;
           }
@@ -439,7 +456,8 @@ public class ZombieCleanupService {
     }
     int totalCleaned = 0;
     for (String agentType : zombieAgentTypes) {
-      if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+      if (CadenceGuard.overBudget(startTs, schedulerProperties.getZombieCleanup().getRunBudgetMs())
+          || Thread.currentThread().isInterrupted()) {
         log.warn("Stopping zombie individual fallback due to budget/interrupt");
         break;
       }
@@ -535,38 +553,10 @@ public class ZombieCleanupService {
             activeAgents.remove(agentType);
           }
 
-          // Fairness: if acquisition service is present, perform exactly-once early permit release
-          if (acquisitionService != null) {
+          // Fairness: if handler is present, perform exactly-once early permit release
+          if (fairnessHandler != null) {
             try {
-              java.util.Map<?, ?> rsMap =
-                  (java.util.Map<?, ?>)
-                      AgentAcquisitionService.class
-                          .getDeclaredField("runStates")
-                          .get(acquisitionService);
-              Object rs = rsMap != null ? rsMap.get(agentType) : null;
-              if (rs != null) {
-                java.util.concurrent.atomic.AtomicBoolean permitHeld =
-                    (java.util.concurrent.atomic.AtomicBoolean)
-                        rs.getClass().getDeclaredField("permitHeld").get(rs);
-                if (permitHeld != null && permitHeld.compareAndSet(true, false)) {
-                  java.util.concurrent.Semaphore sem =
-                      (java.util.concurrent.Semaphore)
-                          AgentAcquisitionService.class
-                              .getDeclaredField("runningAgentsRef")
-                              .get(acquisitionService);
-                  if (sem != null) {
-                    sem.release();
-                  }
-                  java.util.concurrent.atomic.AtomicInteger zif =
-                      (java.util.concurrent.atomic.AtomicInteger)
-                          AgentAcquisitionService.class
-                              .getDeclaredField("zombiesInFlight")
-                              .get(acquisitionService);
-                  if (zif != null) {
-                    zif.incrementAndGet();
-                  }
-                }
-              }
+              fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
             } catch (Exception e) {
               log.debug("Fairness handshake during zombie cleanup failed; continuing", e);
             }
@@ -637,9 +627,9 @@ public class ZombieCleanupService {
         activeAgents.remove(agentType);
       }
 
-      if (acquisitionService != null) {
+      if (fairnessHandler != null) {
         try {
-          acquisitionService.earlyReleasePermitIfHeld(agentType);
+          fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
         } catch (Exception e) {
           log.debug(
               "Failed early-permit release during individual zombie cleanup for {}", agentType, e);

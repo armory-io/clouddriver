@@ -318,7 +318,8 @@ public final class PrioritySchedulerMetrics {
       Supplier<Number> semaphoreAvailable,
       Supplier<Number> completionQueueSize,
       Supplier<Number> timeOffsetMs,
-      Supplier<Number> readyToCapacityRatio) {
+      Supplier<Number> readyToCapacityRatio,
+      Supplier<Number> zombiesInFlight) {
 
     if (gaugesRegistered) {
       return;
@@ -336,6 +337,7 @@ public final class PrioritySchedulerMetrics {
     registerGauge("cats.redisPriority.completionQueue.size", completionQueueSize);
     registerGauge("cats.redisPriority.timeOffsetMs", timeOffsetMs);
     registerGauge("cats.redisPriority.readyToCapacityRatio", readyToCapacityRatio);
+    registerGauge("cats.redisPriority.zombiesInFlight", zombiesInFlight);
 
     // JedisPool gauges
     if (jedisPool != null) {

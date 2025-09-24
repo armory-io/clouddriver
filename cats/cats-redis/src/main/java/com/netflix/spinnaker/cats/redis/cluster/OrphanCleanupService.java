@@ -127,7 +127,7 @@ public class OrphanCleanupService {
 
     // Check if enough time has passed since last cleanup
     long intervalMs = schedulerProperties.getOrphanCleanup().getIntervalMs();
-    if (!isPeriodElapsed(lastOrphanCleanup, intervalMs)) {
+    if (!CadenceGuard.isPeriodElapsed(lastOrphanCleanup, intervalMs)) {
       long remaining = intervalMs - (currentTimeMillis() - lastOrphanCleanup);
       log.debug("Skipping orphan cleanup - interval not elapsed ({}ms remaining)", remaining);
       return;
@@ -143,7 +143,7 @@ public class OrphanCleanupService {
     try (Jedis jedis = jedisPool.getResource()) {
       int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start);
       // If we already exceeded the budget on working, do not attempt waiting
-      if (overBudget(start)) {
+      if (CadenceGuard.overBudget(start, schedulerProperties.getOrphanCleanup().getRunBudgetMs())) {
         log.warn("Orphan cleanup budget exceeded after working set; skipping waiting set");
         lastOrphanCleanup = currentTimeMillis();
         return;
@@ -257,7 +257,8 @@ public class OrphanCleanupService {
     }
 
     try {
-      if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+      if (CadenceGuard.overBudget(startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
+          || Thread.currentThread().isInterrupted()) {
         log.warn("Skipping {} orphan scan due to budget/interrupt", setName);
         return 0;
       }
@@ -381,7 +382,9 @@ public class OrphanCleanupService {
       // CRITICAL: Prefer individual path to allow validity checks and conditional moves, and to
       // skip locally active work.
       for (int i = 0; i < orphans.size(); i += batchSize) {
-        if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+        if (CadenceGuard.overBudget(
+                startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
+            || Thread.currentThread().isInterrupted()) {
           log.warn("Aborting working-batch processing due to budget/interrupt");
           break;
         }

@@ -109,6 +109,6 @@ class ZombieCleanupPermitReleaseTest {
     assertThat(cleaned).isEqualTo(1);
     verify(mockFuture).cancel(true);
     verify(acquisition).removeActiveAgent(agentType);
-    verify(acquisition).earlyReleasePermitIfHeld(agentType);
+    verify(acquisition).tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
   }
 }
