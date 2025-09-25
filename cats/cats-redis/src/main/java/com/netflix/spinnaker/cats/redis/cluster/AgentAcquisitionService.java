@@ -43,6 +43,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import javax.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.Jedis;
@@ -98,6 +99,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   private final ConcurrentHashMap<String, RunState> runStates = new ConcurrentHashMap<>();
   private volatile Semaphore runningAgentsRef; // Provided by scheduler when calling saturatePool
 
+  // Dead-man timer scheduler for early cancellation at (deadline + threshold)
+  private final java.util.concurrent.ScheduledExecutorService deadmanScheduler;
+
+  // Compiled exceptional-agents pattern to mirror zombie cleanup semantics
+  private volatile java.util.regex.Pattern zombieExceptionalAgentsPattern;
+
   private static final class RunState {
     final java.util.concurrent.atomic.AtomicBoolean permitHeld =
         new java.util.concurrent.atomic.AtomicBoolean(true);
@@ -105,6 +112,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         new java.util.concurrent.atomic.AtomicBoolean(false);
     final java.util.concurrent.atomic.AtomicBoolean zifIncremented =
         new java.util.concurrent.atomic.AtomicBoolean(false);
+    volatile java.util.concurrent.ScheduledFuture<?> deadmanHandle;
   }
 
   /**
@@ -138,6 +146,39 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   @Override
   public void tryEarlyPermitReleaseAndMaybeIncrementZif(String agentType) {
     earlyReleasePermitIfHeld(agentType);
+  }
+
+  /** Determine zombie threshold for the agent, honoring exceptional agents config. */
+  private long getZombieThresholdForAgent(String agentType) {
+    try {
+      if (zombieExceptionalAgentsPattern != null
+          && agentType != null
+          && zombieExceptionalAgentsPattern.matcher(agentType).matches()) {
+        return schedulerProperties.getZombieCleanup().getExceptionalAgents().getThresholdMs();
+      }
+      return schedulerProperties.getZombieCleanup().getThresholdMs();
+    } catch (Exception e) {
+      return schedulerProperties.getZombieCleanup().getThresholdMs();
+    }
+  }
+
+  /** Dead-man timeout action: interrupt and perform fairness early-release. */
+  private void onDeadmanTimeout(String agentType) {
+    try {
+      java.util.concurrent.Future<?> f = activeAgentsFutures.get(agentType);
+      if (f != null && !f.isDone()) {
+        boolean cancelled = f.cancel(true);
+        if (cancelled) {
+          tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
+          log.warn(
+              "Dead-man timeout fired for {}: future cancelled and permit released", agentType);
+        } else {
+          log.debug("Dead-man timeout fired for {}: cancel returned false", agentType);
+        }
+      }
+    } catch (Throwable t) {
+      log.debug("Dead-man timeout handling failed for {}", agentType, t);
+    }
   }
 
   /** Current number of zombies whose permits were pre-released but threads still running. */
@@ -322,6 +363,37 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     }
 
     this.redisRefreshPeriod = schedulerProperties.getRefreshPeriodSeconds();
+
+    // Compile exceptional-agents pattern to share semantics with ZombieCleanupService
+    try {
+      this.zombieExceptionalAgentsPattern =
+          schedulerProperties.getExceptionalAgentsPatternCompiled();
+    } catch (Exception e) {
+      log.error("Failed to compile exceptional agents pattern for dead-man timing", e);
+      this.zombieExceptionalAgentsPattern = null;
+    }
+
+    // Initialize dead-man scheduler (single thread, daemon, remove cancelled tasks)
+    java.util.concurrent.ScheduledThreadPoolExecutor dmExec =
+        new java.util.concurrent.ScheduledThreadPoolExecutor(
+            1,
+            r -> {
+              Thread t = new Thread(r, "DeadmanTimer-0");
+              t.setDaemon(true);
+              return t;
+            });
+    dmExec.setRemoveOnCancelPolicy(true);
+    this.deadmanScheduler = dmExec;
+  }
+
+  @PreDestroy
+  public void shutdownDeadmanScheduler() {
+    try {
+      if (deadmanScheduler != null) {
+        deadmanScheduler.shutdownNow();
+      }
+    } catch (Exception ignore) {
+    }
   }
 
   /**
@@ -804,7 +876,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       // PHASE 6: Submit all acquired agents for execution
       // Submit each agent individually to handle rejections properly
       for (AgentWorker worker : workersToSubmit) {
-        // CRITICAL: Set semaphore before execution so it can be released when done
+        // Critical: Set semaphore before execution so it can be released when done
         worker.setRunningAgents(runningAgents);
         // Initialize run-state for exactly-once permit release
         runStates.put(worker.getAgent().getAgentType(), new RunState());
@@ -815,6 +887,29 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
         if (future != null) {
           activeAgentsFutures.put(worker.getAgent().getAgentType(), future);
+          // Schedule dead-man cancellation exactly at (completion deadline + threshold)
+          try {
+            if (schedulerProperties.getZombieCleanup().isEnabled()) {
+              String agentType = worker.getAgent().getAgentType();
+              if (worker.acquireScore != null && worker.acquireScore.matches("^\\d+$")) {
+                long thresholdMs = getZombieThresholdForAgent(agentType);
+                // acquireScore encodes the completion deadline in epoch seconds
+                long completionDeadlineMs = Long.parseLong(worker.acquireScore) * 1000L;
+                long delayMs =
+                    Math.max(0L, (completionDeadlineMs + thresholdMs) - nowMsWithOffset());
+                RunState runState = runStates.get(agentType);
+                if (runState != null) {
+                  runState.deadmanHandle =
+                      deadmanScheduler.schedule(
+                          () -> onDeadmanTimeout(agentType),
+                          delayMs,
+                          java.util.concurrent.TimeUnit.MILLISECONDS);
+                }
+              }
+            }
+          } catch (Exception e) {
+            log.debug("Dead-man scheduling failed for {}", worker.getAgent().getAgentType(), e);
+          }
           log.debug("Submitted agent {} for execution", worker.getAgent().getAgentType());
         }
       }
@@ -1020,7 +1115,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
 
     // PHASE 1: Build candidate list and acquire semaphore permits
-    // Note: We respect BOTH the concurrency limit (maxToAcquire) AND batch size limit
+    // Note: We respect both the concurrency limit (maxToAcquire) and batch size limit
     for (String agentType : readyAgents) {
       if (attemptedThisCycle != null && attemptedThisCycle.contains(agentType)) {
         continue;
@@ -1169,7 +1264,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             // Array structure: [agent1, score1, agent2, score2, ...]
             // For agent at index candidateIndex: score is at position (candidateIndex * 2 + 1)
 
-            // CRITICAL: Validate index and score format to prevent corruption
+            // Critical: Validate index and score format to prevent corruption
             // from dynamic account updates during batch acquisition
             String acquireScore = null;
             int scoreIndex = candidateIndex * 2 + 1;
@@ -1520,7 +1615,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * @param agentType The type identifier of the agent to remove
    */
   public void removeActiveAgent(String agentType) {
-    // CRITICAL: Capture removed value to ensure atomic consistency between map and counter
+    // Critical: Capture removed value to ensure atomic consistency between map and counter
     String removedScore = activeAgents.remove(agentType);
     if (removedScore != null) {
       // Only decrement counter if we actually removed something
@@ -1528,7 +1623,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       // Remove future tracking - this cleanup is non-critical if it fails
       activeAgentsFutures.remove(agentType);
 
-      // CRITICAL: Remove from Redis sets - behavior depends on shutdown state
+      // Critical: Remove from Redis sets - behavior depends on shutdown state
       try (Jedis jedis = jedisPool.getResource()) {
         if (shuttingDown.get()) {
           // During shutdown: Only remove from working to preserve waiting entries
@@ -3199,9 +3294,37 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     String agentType = worker.getAgent().getAgentType();
 
     try {
-      // Submit worker directly to thread pool
-      java.util.concurrent.Future<?> future = agentWorkPool.submit(worker);
+      // Wrap the worker to attach a completion listener that guarantees exactly-once
+      // semaphore release even if cancelled before run() starts (pre-start cancellation).
+      java.util.concurrent.FutureTask<Void> futureTask =
+          new java.util.concurrent.FutureTask<Void>(worker, null) {
+            @Override
+            protected void done() {
+              try {
+                // Remove from tracking map when the task completes (best-effort)
+                activeAgentsFutures.remove(agentType, this);
 
+                // Exactly-once permit release fallback: if the worker's finally block did not
+                // run (e.g., cancelled before start), release the permit here.
+                RunState runStateForAgent = runStates.remove(agentType);
+                if (runStateForAgent != null
+                    && runStateForAgent.permitHeld.compareAndSet(true, false)) {
+                  Semaphore semaphoreToRelease =
+                      runningAgents != null ? runningAgents : runningAgentsRef;
+                  if (semaphoreToRelease != null) {
+                    semaphoreToRelease.release();
+                    log.debug(
+                        "Released semaphore permit for agent {} in completion listener", agentType);
+                  }
+                }
+              } catch (Throwable t) {
+                // Never propagate from listener
+                log.debug("Completion listener failed for {}", agentType, t);
+              }
+            }
+          };
+
+      java.util.concurrent.Future<?> future = agentWorkPool.submit(futureTask);
       log.debug("Successfully submitted agent {} to thread pool", agentType);
       return future;
 
@@ -3210,10 +3333,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       log.warn(
           "Agent {} submission rejected by thread pool (queue full or pool shutdown)", agentType);
 
-      // CRITICAL: Release the semaphore permit since the agent won't be executed
-      if (runningAgents != null) {
-        runningAgents.release();
-        log.debug("Released semaphore permit for rejected agent {}", agentType);
+      // Critical: Release the semaphore permit since the agent won't be executed
+      try {
+        Semaphore semaphoreToRelease = runningAgents != null ? runningAgents : runningAgentsRef;
+        if (semaphoreToRelease != null) {
+          semaphoreToRelease.release();
+          log.debug("Released semaphore permit for rejected agent {}", agentType);
+        }
+      } catch (Exception ignore) {
       }
 
       // Track rejection metric
@@ -3230,10 +3357,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       // Handle other submission errors
       log.error("Failed to submit agent {} due to unexpected error", agentType, e);
 
-      // CRITICAL: Release the semaphore permit for any submission failure
-      if (runningAgents != null) {
-        runningAgents.release();
-        log.debug("Released semaphore permit for failed submission of agent {}", agentType);
+      // Critical: Release the semaphore permit for any submission failure
+      try {
+        Semaphore semaphoreToRelease = runningAgents != null ? runningAgents : runningAgentsRef;
+        if (semaphoreToRelease != null) {
+          semaphoreToRelease.release();
+          log.debug("Released semaphore permit for failed submission of agent {}", agentType);
+        }
+      } catch (Exception ignore) {
       }
 
       // Track generic submission failure
@@ -3449,11 +3580,26 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         // This removes the agent from activeAgents map and working Redis set
         acquisitionService.removeActiveAgent(agentType);
 
+        // Cancel any scheduled dead-man action
+        try {
+          RunState runState = acquisitionService.runStates.get(agentType);
+          if (runState != null && runState.deadmanHandle != null) {
+            try {
+              runState.deadmanHandle.cancel(false);
+            } catch (Exception cancelEx) {
+              log.debug("Dead-man handle cancel failed for {}", agentType, cancelEx);
+            }
+            runState.deadmanHandle = null;
+          }
+        } catch (Exception ex) {
+          log.debug("Dead-man cleanup failed for {}", agentType, ex);
+        }
+
         // Handle conditional agent release (re-queuing on failure/shutdown)
         acquisitionService.conditionalReleaseAgent(
             agent, acquireScore, success, failureClass, capturedCause);
 
-        // CRITICAL: Exactly-once permit release
+        // Critical: Exactly-once permit release
         RunState runStateForAgent = acquisitionService.runStates.remove(agentType);
         if (runStateForAgent == null) {
           // No run-state (e.g., tests calling AgentWorker directly) -> release as before
@@ -3591,7 +3737,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   /**
    * Try to manually acquire a lock on an agent.
    *
-   * <p>NOTE: Manual locking is not supported by this scheduler to maintain thread safety and proper
+   * <p>Note: Manual locking is not supported by this scheduler to maintain thread safety and proper
    * coordination between multiple scheduler instances. Manual locking would bypass the carefully
    * designed Redis-based coordination mechanisms.
    *

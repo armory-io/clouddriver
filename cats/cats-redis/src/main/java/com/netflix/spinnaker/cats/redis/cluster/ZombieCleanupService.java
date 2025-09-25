@@ -112,18 +112,17 @@ public class ZombieCleanupService {
    * initialization and can be called again if configuration changes.
    */
   private void compileExceptionalAgentsPattern() {
-    String pattern = schedulerProperties.getZombieCleanup().getExceptionalAgents().getPattern();
-    if (pattern != null && !pattern.trim().isEmpty()) {
-      try {
-        this.exceptionalAgentsPattern = Pattern.compile(pattern);
-        log.info("Compiled exceptional agents pattern: {}", pattern);
-      } catch (Exception e) {
-        log.error("Failed to compile exceptional agents pattern '{}'", pattern, e);
-        this.exceptionalAgentsPattern = null;
+    try {
+      this.exceptionalAgentsPattern = schedulerProperties.getExceptionalAgentsPatternCompiled();
+      if (this.exceptionalAgentsPattern != null) {
+        log.info(
+            "Compiled exceptional agents pattern: {}", this.exceptionalAgentsPattern.pattern());
+      } else {
+        log.debug("No exceptional agents pattern configured");
       }
-    } else {
+    } catch (Exception e) {
       this.exceptionalAgentsPattern = null;
-      log.debug("No exceptional agents pattern configured");
+      log.error("Failed to obtain exceptional agents pattern", e);
     }
   }
 
@@ -429,11 +428,45 @@ public class ZombieCleanupService {
                   java.util.Collections.singletonList(WORKING_SET), // Redis key (working)
                   batchArgs); // [agent1, score1, agent2, score2, ...]
 
-          // Parse Lua script return value: [numCleaned, [cleanedAgent1, cleanedAgent2, ...]]
-          int cleaned =
-              parseBatchCleanupResult(
-                  result, zombieAgentTypes.size(), activeAgents, activeAgentsFutures);
+          // Parse Lua script return value and synchronize local state
+          ScriptResults.BatchRemovalResult parsed =
+              ScriptResults.parseRemoveAgentsConditional(result);
+          int cleaned = parsed.getRemovedCount();
           if (cleaned > 0) {
+            log.info(
+                "Zombie cleanup batch processed: {} agents cleaned from {} candidates",
+                cleaned,
+                zombieAgentTypes.size());
+            for (String agentType : parsed.getMembers()) {
+              Future<?> future = activeAgentsFutures.remove(agentType);
+              if (future != null && !future.isDone()) {
+                boolean cancelled = future.cancel(true);
+                if (log.isDebugEnabled()) {
+                  log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
+                }
+              }
+              if (acquisitionService != null) {
+                try {
+                  acquisitionService.removeActiveAgent(agentType);
+                } catch (Exception e) {
+                  log.debug(
+                      "Failed to remove active agent via service; falling back to map removal", e);
+                  activeAgents.remove(agentType);
+                }
+              } else {
+                activeAgents.remove(agentType);
+              }
+              if (fairnessHandler != null) {
+                try {
+                  fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
+                } catch (Exception e) {
+                  log.debug("Fairness handshake during zombie cleanup failed; continuing", e);
+                }
+              }
+              if (log.isDebugEnabled()) {
+                log.debug("Cleaned up zombie agent: {}", agentType);
+              }
+            }
             return cleaned;
           }
         }
@@ -475,110 +508,6 @@ public class ZombieCleanupService {
   }
 
   /**
-   * Parse the result from batch cleanup Lua script and update local state.
-   *
-   * @param result Result from batch cleanup Lua script
-   * @param candidateCount Number of candidates processed
-   * @param activeAgents Map of active agents (agentType -> completionDeadline)
-   * @param activeAgentsFutures Map of agent futures for cancellation
-   * @return Number of agents cleaned up
-   */
-  private int parseBatchCleanupResult(
-      Object result,
-      int candidateCount,
-      Map<String, String> activeAgents,
-      Map<String, Future<?>> activeAgentsFutures) {
-
-    int cleaned = 0;
-    if (result instanceof List<?>) {
-      List<?> resultList = (List<?>) result;
-      // Lua script returns: [count, [agent_names]] format
-      if (resultList.size() >= 2) {
-        // First element: number of agents actually cleaned from Redis
-        Object countObj = resultList.get(0);
-        if (countObj instanceof Number) {
-          cleaned = ((Number) countObj).intValue();
-        } else {
-          log.warn(
-              "Unexpected count element type in Lua result: {}",
-              countObj != null ? countObj.getClass().getSimpleName() : "null");
-          cleaned = 0;
-        }
-        // Second element: list of agent names that were successfully cleaned
-        Object cleanedObj = resultList.get(1);
-        List<String> cleanedAgents = new ArrayList<>();
-        if (cleanedObj instanceof List<?>) {
-          for (Object elem : (List<?>) cleanedObj) {
-            if (elem instanceof String) {
-              cleanedAgents.add((String) elem);
-            }
-          }
-        } else {
-          log.warn(
-              "Unexpected second element type in Lua result: {}",
-              cleanedObj != null ? cleanedObj.getClass().getSimpleName() : "null");
-        }
-
-        // Log batch-level summary at INFO for operational visibility
-        if (cleaned > 0) {
-          log.info(
-              "Zombie cleanup batch processed: {} agents cleaned from {} candidates",
-              cleaned,
-              candidateCount);
-        }
-
-        // Synchronize local Java state with Redis cleanup results
-        // Only clean up local state for agents that were actually removed from Redis
-        for (String agentType : cleanedAgents) {
-          // Cancel the Java Future to stop any running agent execution
-          Future<?> future = activeAgentsFutures.remove(agentType);
-          if (future != null && !future.isDone()) {
-            boolean cancelled = future.cancel(true);
-            if (log.isDebugEnabled()) {
-              log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
-            }
-          }
-
-          // Delegate active tracking removal to acquisition service so counters stay consistent
-          if (acquisitionService != null) {
-            try {
-              acquisitionService.removeActiveAgent(agentType);
-            } catch (Exception e) {
-              log.debug(
-                  "Failed to remove active agent via service; falling back to map removal", e);
-              // Fall back to direct map removal if service-based cleanup fails
-              activeAgents.remove(agentType);
-            }
-          } else {
-            activeAgents.remove(agentType);
-          }
-
-          // Fairness: if handler is present, perform exactly-once early permit release
-          if (fairnessHandler != null) {
-            try {
-              fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
-            } catch (Exception e) {
-              log.debug("Fairness handshake during zombie cleanup failed; continuing", e);
-            }
-          }
-
-          if (log.isDebugEnabled()) {
-            log.debug("Cleaned up zombie agent: {}", agentType);
-          }
-        }
-      } else {
-        log.warn("Unexpected Lua script result format: expected [count, list], got: {}", result);
-      }
-    } else {
-      log.warn(
-          "Unexpected Lua script result type: expected List, got: {}",
-          result != null ? result.getClass().getSimpleName() : "null");
-    }
-
-    return cleaned;
-  }
-
-  /**
    * Clean up a single zombie agent individually.
    *
    * @param jedis Jedis connection for Redis operations
@@ -609,15 +538,52 @@ public class ZombieCleanupService {
         log.info("Cancelled zombie agent execution: {}", agentType);
       }
 
-      // Remove from Redis using REMOVE_AGENT_SCRIPT (removes from both working and waiting)
+      // Remove from WORKING only by default to preserve any legitimate waiting entry that
+      // should allow immediate reacquisition. This matches batch behavior and avoids delaying
+      // the next run. If a duplicate exists in WAITING (corruption), it will be handled by
+      // orphan cleanup's optional repair or a targeted check below.
       Object result =
           scriptManager.evalshaWithSelfHeal(
               jedis,
-              RedisScriptManager.REMOVE_AGENT,
-              java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-              java.util.Collections.singletonList(agentType));
+              RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+              java.util.Collections.singletonList(WORKING_SET),
+              java.util.Arrays.asList(agentType, acquireScore));
 
-      boolean removed = result != null && ((Long) result).intValue() == 1;
+      boolean removed = false;
+      try {
+        if (result instanceof java.util.List) {
+          java.util.List<?> list = (java.util.List<?>) result;
+          if (!list.isEmpty() && list.get(0) instanceof Number) {
+            removed = ((Number) list.get(0)).intValue() > 0;
+          }
+        }
+      } catch (Exception parseEx) {
+        log.debug(
+            "Failed to parse REMOVE_AGENTS_CONDITIONAL result for {}: {}",
+            agentType,
+            result,
+            parseEx);
+        removed = false;
+      }
+
+      if (!removed) {
+        try {
+          Object fallback =
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.REMOVE_AGENT,
+                  java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                  java.util.Collections.singletonList(agentType));
+          removed = fallback != null && ((Long) fallback).intValue() == 1;
+          if (removed) {
+            log.debug(
+                "Fallback REMOVE_AGENT removed {} from working/waiting (score mismatch)",
+                agentType);
+          }
+        } catch (Exception fbEx) {
+          log.warn("Fallback REMOVE_AGENT failed for {}", agentType, fbEx);
+        }
+      }
 
       // ALWAYS clean local state and perform fairness, regardless of Redis outcome.
       // This prevents permit leaks and stuck 'running' counts when Redis removal races or fails.
@@ -638,9 +604,29 @@ public class ZombieCleanupService {
 
       if (removed) {
         log.debug("Removed zombie agent {} from Redis working set", agentType);
+        // Optional: targeted repair. If a duplicate exists in WAITING, remove it now.
+        try {
+          Double waitScore = jedis.zscore(WAITING_SET, agentType);
+          if (waitScore != null) {
+            Object remRes =
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.REMOVE_AGENT,
+                    java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                    java.util.Collections.singletonList(agentType));
+            if (remRes != null && ((Long) remRes).intValue() == 1) {
+              log.warn(
+                  "Removed duplicate waiting entry for zombie agent {} during cleanup", agentType);
+            }
+          }
+        } catch (Exception ignore) {
+          // Best-effort duplicate repair; ignore failures
+        }
       } else {
         log.debug(
-            "Zombie agent {} not found in Redis during cleanup (result={})", agentType, result);
+            "Zombie agent {} not found in Redis working set during cleanup (result={})",
+            agentType,
+            result);
       }
 
       // Count as cleaned once we've definitively stopped local execution and freed capacity.
@@ -653,10 +639,5 @@ public class ZombieCleanupService {
       log.warn("Failed to remove zombie agent {} from Redis", agentType, e);
       return false;
     }
-  }
-
-  private boolean overBudget(long startTs) {
-    long budgetMs = schedulerProperties.getZombieCleanup().getRunBudgetMs();
-    return budgetMs > 0 && (currentTimeMillis() - startTs) > budgetMs;
   }
 }

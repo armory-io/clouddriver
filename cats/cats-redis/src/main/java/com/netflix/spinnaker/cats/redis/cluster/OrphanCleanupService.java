@@ -342,11 +342,13 @@ public class OrphanCleanupService {
     int totalCleaned = 0;
 
     if (WAITING_SET.equals(setName)) {
-      // CRITICAL: Never purge valid waiting by age. Batch-remove only invalid entries.
+      // Critical: Never purge valid waiting by age. Batch-remove only invalid entries.
       if (batchOperationsEnabled) {
         List<String> invalidArgs = new ArrayList<>();
         for (Tuple orphan : orphans) {
-          if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+          if (CadenceGuard.overBudget(
+                  startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
+              || Thread.currentThread().isInterrupted()) {
             log.warn("Aborting waiting-batch build due to budget/interrupt");
             break;
           }
@@ -364,12 +366,9 @@ public class OrphanCleanupService {
                     RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
                     java.util.Collections.singletonList(WAITING_SET),
                     invalidArgs);
-            if (result instanceof java.util.List) {
-              java.util.List<?> list = (java.util.List<?>) result;
-              if (!list.isEmpty()) {
-                totalCleaned += ((Long) list.get(0)).intValue();
-              }
-            }
+            ScriptResults.BatchRemovalResult parsed =
+                ScriptResults.parseRemoveAgentsConditional(result);
+            totalCleaned += parsed.getRemovedCount();
           } catch (Exception e) {
             log.warn("Batch removal of invalid waiting agents failed, using individual path", e);
             totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startTs);
@@ -379,7 +378,7 @@ public class OrphanCleanupService {
         totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startTs);
       }
     } else {
-      // CRITICAL: Prefer individual path to allow validity checks and conditional moves, and to
+      // Critical: Prefer individual path to allow validity checks and conditional moves, and to
       // skip locally active work.
       for (int i = 0; i < orphans.size(); i += batchSize) {
         if (CadenceGuard.overBudget(
@@ -480,7 +479,8 @@ public class OrphanCleanupService {
     int cleaned = 0;
 
     for (Tuple orphan : orphans) {
-      if (overBudget(startTs) || Thread.currentThread().isInterrupted()) {
+      if (CadenceGuard.overBudget(startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
+          || Thread.currentThread().isInterrupted()) {
         log.warn("Stopping individual orphan cleanup early due to budget/interrupt");
         break;
       }
@@ -650,14 +650,6 @@ public class OrphanCleanupService {
     }
 
     return cleaned;
-  }
-
-  // Cooperative time-budget guard. Prevents long orphan passes from monopolizing cleanup threads
-  // when many entries are present. Network calls inside a single Redis operation still rely on
-  // Jedis socket timeouts; this guard stops between operations.
-  private boolean overBudget(long startTs) {
-    long budgetMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
-    return budgetMs > 0 && (currentTimeMillis() - startTs) > budgetMs;
   }
 
   /**

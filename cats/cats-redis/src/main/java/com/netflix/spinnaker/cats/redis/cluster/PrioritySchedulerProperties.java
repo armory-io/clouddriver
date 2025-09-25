@@ -242,6 +242,27 @@ public class PrioritySchedulerProperties {
     return zombieCleanup.getExceptionalAgents().getThresholdMs();
   }
 
+  // Lazily compiled exceptional-agents regex for reuse across services
+  private volatile java.util.regex.Pattern exceptionalAgentsPatternCache;
+
+  public java.util.regex.Pattern getExceptionalAgentsPatternCompiled() {
+    try {
+      String pattern = getExceptionalAgentsPattern();
+      if (pattern == null || pattern.trim().isEmpty()) {
+        exceptionalAgentsPatternCache = null;
+        return null;
+      }
+      java.util.regex.Pattern cached = exceptionalAgentsPatternCache;
+      if (cached == null || !pattern.equals(cached.pattern())) {
+        exceptionalAgentsPatternCache = java.util.regex.Pattern.compile(pattern);
+      }
+      return exceptionalAgentsPatternCache;
+    } catch (Exception e) {
+      exceptionalAgentsPatternCache = null;
+      return null;
+    }
+  }
+
   public boolean isOrphanCleanupEnabled() {
     return orphanCleanup.isEnabled();
   }

@@ -802,10 +802,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
               log.debug("Interrupted agent {} during shutdown", agentType);
             }
 
-            // Release semaphore permit for interrupted agent
-            SchedulerUtils.safeRelease(config.getRunningAgents(), 1);
-            if (config.getRunningAgents() != null) {
-              log.debug("Released semaphore permit for interrupted agent {}", agentType);
+            // Prefer exactly-once early-release handshake to avoid double releases when a
+            // completion listener also handles cancellation before start.
+            try {
+              acquisitionService.earlyReleasePermitIfHeld(agentType);
+              log.debug("Requested early permit release for interrupted agent {}", agentType);
+            } catch (Exception e) {
+              log.debug("Early-release during shutdown failed for {}", agentType, e);
             }
           }
         } catch (Exception e) {
@@ -900,7 +903,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       } catch (Exception ignore) {
       }
 
-      // Note: numeric-only waiting member detection and any repair is handled by
+      // Note: Numeric-only waiting member detection and any repair is handled by
       // OrphanCleanupService on cadence. No reconcile-time sampling is performed here.
     } catch (Exception e) {
       log.warn("Failed to reconcile known agents with current shard/config", e);
