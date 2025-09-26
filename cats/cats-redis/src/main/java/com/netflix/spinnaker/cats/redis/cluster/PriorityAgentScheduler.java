@@ -339,69 +339,19 @@ public class PriorityAgentScheduler extends CatsModuleAware
           log.debug("Watchdog: unable to read redis breaker state; assuming CLOSED", t);
         }
 
-        // Consecutive-tick streaks to avoid flapping
-        // Leak suspect: almost no free permits AND pool idle AND ready backlog
-        if (maxConcurrent > 0 && permitsFreePct < 0.01 && poolActive == 0 && ready > 0) {
-          watchdogLeakStreak++;
-        } else {
-          watchdogLeakStreak = 0;
-        }
-        if (watchdogLeakStreak >= 3) {
-          log.warn(
-              "Watchdog: PERMIT_LEAK_SUSPECT permitsFreePct={} activePct={} ready={} poolActive={} maxConcurrent={}",
-              String.format("%.2f", permitsFreePct),
-              String.format("%.2f", activePct),
-              ready,
-              poolActive,
-              maxConcurrent);
-          watchdogLeakStreak = 0;
-        }
-
-        // Capacity skew (zIF): lots of free permits but we barely acquired
-        if (ready > 0 && permitsFreePct > 0.90 && acquiredFillPct < 0.10) {
-          watchdogSkewStreak++;
-        } else {
-          watchdogSkewStreak = 0;
-        }
-        if (watchdogSkewStreak >= 3) {
-          log.warn(
-              "Watchdog: CAPACITY_SKEW_ZIF permitsFreePct={} acquiredFillPct={} ready={} zIF={} effectiveCapacity={}",
-              String.format("%.2f", permitsFreePct),
-              String.format("%.2f", acquiredFillPct),
-              ready,
-              zif,
-              effectiveCapacity);
-          watchdogSkewStreak = 0;
-        }
-
-        // Zero progress (no acquisitions while ready) and not a redis stall
-        if (ready > 0 && agentsAcquired == 0 && !redisStall) {
-          watchdogZeroProgressStreak++;
-        } else {
-          watchdogZeroProgressStreak = 0;
-        }
-        if (watchdogZeroProgressStreak >= 3) {
-          log.warn(
-              "Watchdog: ZERO_PROGRESS ready={} acquiredThisTick={} redisStall={} permits={} active={} zIF={}",
-              ready,
-              agentsAcquired,
-              redisStall,
-              permits,
-              activeCount,
-              zif);
-          watchdogZeroProgressStreak = 0;
-        }
-
-        // Redis stall streak (breaker open)
-        if (redisStall) {
-          watchdogRedisStallStreak++;
-        } else {
-          watchdogRedisStallStreak = 0;
-        }
-        if (watchdogRedisStallStreak >= 3) {
-          log.warn("Watchdog: REDIS_STALL breaker open; skipping acquisitions until recovery");
-          watchdogRedisStallStreak = 0;
-        }
+        evaluateWatchdog(
+            permitsFreePct,
+            activePct,
+            acquiredFillPct,
+            ready,
+            poolActive,
+            agentsAcquired,
+            redisStall,
+            maxConcurrent,
+            activeCount,
+            zif,
+            effectiveCapacity,
+            permits);
       } catch (Exception e) {
         log.debug("Watchdog check failed; continuing", e);
       }
@@ -997,6 +947,81 @@ public class PriorityAgentScheduler extends CatsModuleAware
   private boolean isAgentDisabled(String agentType) {
     return config.getDisabledAgentPattern() != null
         && config.getDisabledAgentPattern().matcher(agentType).matches();
+  }
+
+  /** Evaluate watchdog heuristics and emit warnings for consecutive trigger conditions. */
+  public void evaluateWatchdog(
+      double permitsFreePct,
+      double activePct,
+      double acquiredFillPct,
+      long ready,
+      int poolActive,
+      int agentsAcquired,
+      boolean redisStall,
+      int maxConcurrent,
+      int activeCount,
+      int zombiesInFlight,
+      int effectiveCapacity,
+      int permitsAvailable) {
+
+    if (maxConcurrent > 0 && permitsFreePct < 0.01 && poolActive == 0 && ready > 0) {
+      watchdogLeakStreak++;
+    } else {
+      watchdogLeakStreak = 0;
+    }
+    if (watchdogLeakStreak >= 3) {
+      log.warn(
+          "Watchdog: PERMIT_LEAK_SUSPECT permitsFreePct={} activePct={} ready={} poolActive={} maxConcurrent={}",
+          String.format("%.2f", permitsFreePct),
+          String.format("%.2f", activePct),
+          ready,
+          poolActive,
+          maxConcurrent);
+      watchdogLeakStreak = 0;
+    }
+
+    if (ready > 0 && permitsFreePct > 0.90 && acquiredFillPct < 0.10) {
+      watchdogSkewStreak++;
+    } else {
+      watchdogSkewStreak = 0;
+    }
+    if (watchdogSkewStreak >= 3) {
+      log.warn(
+          "Watchdog: CAPACITY_SKEW_ZIF permitsFreePct={} acquiredFillPct={} ready={} zIF={} effectiveCapacity={}",
+          String.format("%.2f", permitsFreePct),
+          String.format("%.2f", acquiredFillPct),
+          ready,
+          zombiesInFlight,
+          effectiveCapacity);
+      watchdogSkewStreak = 0;
+    }
+
+    if (ready > 0 && agentsAcquired == 0 && !redisStall) {
+      watchdogZeroProgressStreak++;
+    } else {
+      watchdogZeroProgressStreak = 0;
+    }
+    if (watchdogZeroProgressStreak >= 3) {
+      log.warn(
+          "Watchdog: ZERO_PROGRESS ready={} acquiredThisTick={} redisStall={} permits={} active={} zIF={}",
+          ready,
+          agentsAcquired,
+          redisStall,
+          permitsAvailable,
+          activeCount,
+          zombiesInFlight);
+      watchdogZeroProgressStreak = 0;
+    }
+
+    if (redisStall) {
+      watchdogRedisStallStreak++;
+    } else {
+      watchdogRedisStallStreak = 0;
+    }
+    if (watchdogRedisStallStreak >= 3) {
+      log.warn("Watchdog: REDIS_STALL breaker open; skipping acquisitions until recovery");
+      watchdogRedisStallStreak = 0;
+    }
   }
 
   /**

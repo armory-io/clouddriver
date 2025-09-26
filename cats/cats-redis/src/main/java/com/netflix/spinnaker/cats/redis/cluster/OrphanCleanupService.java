@@ -133,6 +133,7 @@ public class OrphanCleanupService {
       return;
     }
 
+    // Leadership: forceAllPods only skips election; it does NOT bypass shard gating anywhere.
     // Use leadership election to prevent multiple instances from running cleanup simultaneously
     boolean forceCleanup = schedulerProperties.getOrphanCleanup().isForceAllPods();
     if (!forceCleanup && !tryAcquireCleanupLeadership()) {
@@ -354,8 +355,22 @@ public class OrphanCleanupService {
           }
           String agentName = orphan.getElement();
           if (!isAgentStillValid(agentName)) {
-            invalidArgs.add(agentName);
-            invalidArgs.add(String.valueOf((long) orphan.getScore()));
+            // Shard-aware gating: Only remove invalid entries owned by this shard
+            boolean belongsToThisShard;
+            if (acquisitionService == null) {
+              belongsToThisShard = true;
+            } else {
+              try {
+                belongsToThisShard = acquisitionService.belongsToThisShard(agentName);
+              } catch (Throwable t) {
+                belongsToThisShard = false; // fail-safe preserve
+              }
+            }
+
+            if (belongsToThisShard) {
+              invalidArgs.add(agentName);
+              invalidArgs.add(String.valueOf((long) orphan.getScore()));
+            }
           }
         }
         if (!invalidArgs.isEmpty()) {
@@ -561,10 +576,8 @@ public class OrphanCleanupService {
                   (long) score);
             }
           } else {
-            // For invalid agents, removal is shard-aware unless explicitly forced for all pods
-            boolean forceAllPods = schedulerProperties.getOrphanCleanup().isForceAllPods();
-
-            if (forceAllPods || belongsToThisShard) {
+            // For invalid agents, removal is shard-aware
+            if (belongsToThisShard) {
               // Remove invalid agent using individual script
               Object result =
                   scriptManager.evalshaWithSelfHeal(
@@ -585,11 +598,10 @@ public class OrphanCleanupService {
                       setName);
                 } else {
                   log.info(
-                      "Successfully removed invalid orphaned agent {} (original score: {}) from {} set{}.",
+                      "Successfully removed invalid orphaned agent {} (original score: {}) from {} set.",
                       agentName,
                       (long) score,
-                      setName,
-                      forceAllPods ? " (forceAllPods)" : "");
+                      setName);
                 }
 
                 // Also clean up local state if needed
@@ -608,10 +620,8 @@ public class OrphanCleanupService {
             }
           }
         } else if (WAITING_SET.equals(setName)) {
-          // waiting: Only remove invalid entries; shard gating may be skipped when forceAllPods
-          boolean forceAllPods = schedulerProperties.getOrphanCleanup().isForceAllPods();
-          // Avoid potentially blocking shard check when forceAllPods is enabled
-          boolean removeCandidate = !isStillValid && (forceAllPods || belongsToThisShard);
+          // waiting: Only remove invalid entries; always respect shard gating
+          boolean removeCandidate = !isStillValid && belongsToThisShard;
           if (removeCandidate) {
             Object result =
                 scriptManager.evalshaWithSelfHeal(

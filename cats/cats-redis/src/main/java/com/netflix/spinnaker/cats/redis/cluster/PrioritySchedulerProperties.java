@@ -197,10 +197,10 @@ public class PrioritySchedulerProperties {
   @Setter
   public static class BatchOperations {
     /** Enable batch operations globally (acquisition, cleanup, completion, repopulation). */
-    private boolean enabled = false;
+    private boolean enabled = true;
 
-    /** Maximum number of items to process in a single batch. Default: 50. */
-    private int batchSize = 50;
+    /** Maximum number of items to process in a single batch. Default: 0 (no limit). */
+    private int batchSize = 0;
 
     /**
      * Multiplier for chunk attempts during acquisition to handle filtering. The base number of
@@ -337,6 +337,13 @@ public class PrioritySchedulerProperties {
     validatePositive(refreshPeriodSeconds, "redis.scheduler.refresh-period-seconds");
     validateNonNegative(
         batchOperations.getBatchSize(), "redis.scheduler.batch-operations.batch-size");
+    double multiplier = batchOperations.getChunkAttemptMultiplier();
+    if (multiplier < 0 || !Double.isFinite(multiplier)) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.batch-operations.chunk-attempt-multiplier must be >= 0 and finite (was "
+              + multiplier
+              + ")");
+    }
 
     // Keys validation: non-empty base names
     if (keys == null) {

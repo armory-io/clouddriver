@@ -44,9 +44,8 @@ public class ConfigurationValidationTest {
     @Test
     @DisplayName("Should have sensible default values")
     void shouldHaveSensibleDefaultValues() {
-      assertThat(properties.getBatchOperations().isEnabled()).isFalse(); // Conservative default
-      assertThat(properties.getBatchOperations().getBatchSize())
-          .isEqualTo(50); // Reasonable default
+      assertThat(properties.getBatchOperations().isEnabled()).isTrue();
+      assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(0);
     }
 
     @Test
@@ -87,6 +86,34 @@ public class ConfigurationValidationTest {
       properties.getBatchOperations().setBatchSize(Integer.MAX_VALUE);
       assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(Integer.MAX_VALUE);
       assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(Integer.MAX_VALUE);
+    }
+
+    @Test
+    @DisplayName("Should reject negative chunk attempt multiplier values")
+    void shouldRejectNegativeChunkAttemptMultiplierValues() {
+      properties.getBatchOperations().setChunkAttemptMultiplier(-0.1d);
+
+      assertThatThrownBy(() -> properties.validate())
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining("chunk-attempt-multiplier");
+    }
+
+    @Test
+    @DisplayName("Should reject non-finite chunk attempt multiplier values")
+    void shouldRejectNonFiniteChunkAttemptMultiplierValues() {
+      properties.getBatchOperations().setChunkAttemptMultiplier(Double.NaN);
+
+      assertThatThrownBy(() -> properties.validate())
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining("chunk-attempt-multiplier");
+    }
+
+    @Test
+    @DisplayName("Should allow finite non-negative chunk attempt multiplier values")
+    void shouldAllowFiniteNonNegativeChunkAttemptMultiplierValues() {
+      properties.getBatchOperations().setChunkAttemptMultiplier(2.5d);
+
+      assertThatCode(() -> properties.validate()).doesNotThrowAnyException();
     }
   }
 

@@ -701,10 +701,11 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       int remainingToAcquire = effectiveMaxToAcquire;
       int chunkOffset = 0; // Track offset for pagination through ready agents
 
-      // Calculate max chunk attempts based on actual need and filtering expectations
+      // Calculate max chunk attempts based on actual need and filtering expectations.
+      // batch-size <= 0 means "no per-chunk cap" so each attempt can try every remaining slot.
       int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
       if (configuredBatchSize <= 0) {
-        configuredBatchSize = effectiveMaxToAcquire; // Use all slots if batch size not configured
+        configuredBatchSize = effectiveMaxToAcquire; // Default 0 = use all remaining slots
       }
 
       // Base calculation: how many chunks we need to fill available slots
@@ -741,7 +742,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       while (remainingToAcquire > 0 && chunkAttempts < maxChunkAttempts) {
         chunkAttempts++;
 
-        // Use configured batch size when positive; otherwise treat as unlimited for this chunk
+        // Use configured batch size when positive; otherwise treat as unlimited for this chunk.
+        // With the default (0), we effectively make a single pass that can include every remaining
+        // slot.
         int configuredBatch = schedulerProperties.getBatchOperations().getBatchSize();
         int perChunkLimit = configuredBatch > 0 ? configuredBatch : remainingToAcquire;
         int chunkSize = Math.min(remainingToAcquire, perChunkLimit);
@@ -1461,11 +1464,13 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
   /**
    * Determine if the provided agent type belongs to this shard according to the configured {@link
-   * ShardingFilter}. When the agent is not registered locally, a lightweight stub is used to
-   * evaluate sharding based on agentType alone (providerName defaults to "unknown").
+   * ShardingFilter}.
    *
-   * <p>Returns false if the shard ownership cannot be determined to avoid cross-shard deletions in
-   * cleanup flows.
+   * <p>Details: - Uses the registered {@link Agent} if available; otherwise uses a lightweight stub
+   * based on agentType only (providerName defaults to "unknown"). - When sharding is disabled, a
+   * {@link com.netflix.spinnaker.cats.cluster.NoopShardingFilter} is wired which always returns
+   * true, so ownership checks pass and cleanup proceeds. - Returns false on unexpected errors to
+   * avoid cross-shard deletions in cleanup flows.
    */
   public boolean belongsToThisShard(String agentType) {
     try {
