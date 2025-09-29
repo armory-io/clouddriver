@@ -964,6 +964,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
       int effectiveCapacity,
       int permitsAvailable) {
 
+    // Consecutive-tick streaks to avoid flapping
+    // Leak suspect: almost no free permits AND pool idle AND ready backlog
     if (maxConcurrent > 0 && permitsFreePct < 0.01 && poolActive == 0 && ready > 0) {
       watchdogLeakStreak++;
     } else {
@@ -980,6 +982,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogLeakStreak = 0;
     }
 
+    // Capacity skew (zIF): lots of free permits but we barely acquired anything
     if (ready > 0 && permitsFreePct > 0.90 && acquiredFillPct < 0.10) {
       watchdogSkewStreak++;
     } else {
@@ -996,6 +999,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogSkewStreak = 0;
     }
 
+    // Zero progress: ready > 0 but acquired = 0, not a Redis stall
     if (ready > 0 && agentsAcquired == 0 && !redisStall) {
       watchdogZeroProgressStreak++;
     } else {
@@ -1013,6 +1017,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogZeroProgressStreak = 0;
     }
 
+    // Redis stall: Redis breaker not CLOSED for several ticks
     if (redisStall) {
       watchdogRedisStallStreak++;
     } else {

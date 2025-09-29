@@ -53,11 +53,8 @@ public class RedisScriptManager {
   public static final String ADD_AGENT = "addAgent"; // Single agent addition
   public static final String ADD_AGENTS = "addAgents"; // Batch agent addition
   public static final String REMOVE_AGENT = "removeAgent"; // Single agent removal
-  public static final String REMOVE_AGENTS =
-      "removeAgents"; // Batch agent unconditional removal from both sets
 
   // === STATE TRANSITIONS ===
-  public static final String MOVE_AGENT = "moveAgent"; // Single agent waiting→working movement
   public static final String MOVE_AGENTS =
       "moveAgents"; // Unconditional waiting→working for agent acquisition
   public static final String MOVE_AGENTS_CONDITIONAL =
@@ -65,8 +62,6 @@ public class RedisScriptManager {
 
   // === QUERIES ===
   public static final String SCORE_AGENTS = "scoreAgents"; // Batch score lookup for multiple agents
-  public static final String VALIDATE_OWNERSHIP =
-      "validateOwnership"; // Check agent ownership by score
 
   // === ADVANCED OPERATIONS ===
   public static final String ACQUIRE_AGENTS =
@@ -276,25 +271,6 @@ public class RedisScriptManager {
             + "redis.call('zrem', KEYS[2], ARGV[1])\n"
             + "return 1  -- Always successful: Redis ZREM is idempotent\n");
 
-    // MOVE_AGENT: Atomically move single agent from the waiting set to the working set.
-    // Invariants:
-    // - Transition is atomic: agent is removed from waiting and added to working with new score.
-    // - Returns 1 on success, 0 if agent was not waiting (no-op, safe under races).
-    // ARGS: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=newScore
-    // RETURNS: 1 if agent was moved successfully, 0 if agent was not in the waiting set
-    // USAGE: Individual agent acquisition, pipeline-friendly conditional move
-    bodies.put(
-        MOVE_AGENT,
-        "-- Attempt to remove agent from the waiting set\n"
-            + "local removed = redis.call('zrem', KEYS[2], ARGV[1])\n"
-            + "if removed == 1 then\n"
-            + "  -- Agent existed in waiting, move to working with new score\n"
-            + "  redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n"
-            + "  return 1  -- Success: agent moved waiting → working\n"
-            + "else\n"
-            + "  return 0  -- Failure: agent was not in the waiting set\n"
-            + "end\n");
-
     // --- BATCH OPERATIONS ---
 
     // ADD_AGENTS: Add single or multiple agents to the waiting set (consolidated from ADD_AGENT +
@@ -322,13 +298,6 @@ public class RedisScriptManager {
             + "  end\n"
             + "end\n"
             + "return {count, added}\n");
-
-    // REMOVE_AGENTS: Unconditional removal (single-arg variant kept for compatibility).
-    bodies.put(
-        REMOVE_AGENTS,
-        "redis.call('zrem', KEYS[1], ARGV[1])\n"
-            + "redis.call('zrem', KEYS[2], ARGV[1])\n"
-            + "return 1\n");
 
     // --- AGENT STATE TRANSITION SCRIPTS ---
 
@@ -365,14 +334,6 @@ public class RedisScriptManager {
             + "  redis.call('zrem', KEYS[1], ARGV[1])\n"
             + "  redis.call('zadd', KEYS[2], ARGV[3], ARGV[1])\n"
             + "  return 'swapped'\n"
-            + "else return nil end\n");
-
-    // VALIDATE_OWNERSHIP: Check if we still own the agent lock (score validation).
-    bodies.put(
-        VALIDATE_OWNERSHIP,
-        "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
-            + "if score and tonumber(score) == tonumber(ARGV[2]) then\n"
-            + "  return score\n"
             + "else return nil end\n");
 
     // --- ADVANCED CLEANUP SCRIPTS ---

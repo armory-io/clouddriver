@@ -86,7 +86,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(12);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(9);
     }
 
     @Test
@@ -99,11 +99,9 @@ class RedisScriptManagerTest {
       // Individual scripts
       assertThat(scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT)).isNotEmpty();
       assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT)).isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENT)).isNotEmpty();
 
       // Batch scripts
       assertThat(scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS)).isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS)).isNotEmpty();
       assertThat(scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS)).isNotEmpty();
       assertThat(scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL))
           .isNotEmpty();
@@ -111,7 +109,6 @@ class RedisScriptManagerTest {
       assertThat(scriptManager.getScriptSha(RedisScriptManager.SCORE_AGENTS)).isNotEmpty();
       assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL))
           .isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.VALIDATE_OWNERSHIP)).isNotEmpty();
       assertThat(scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP)).isNotEmpty();
     }
 
@@ -127,7 +124,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(firstSha).isEqualTo(secondSha);
-      assertThat(scriptManager.getScriptCount()).isEqualTo(12);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(9);
     }
   }
 
@@ -164,7 +161,7 @@ class RedisScriptManagerTest {
       // Then
       assertThat(threadException[0]).isNull();
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(12);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(9);
     }
   }
 
@@ -264,48 +261,6 @@ class RedisScriptManagerTest {
         assertThat(result).isEqualTo(newScore);
         assertThat(jedis.zscore("working", "test-agent")).isEqualTo(200.0);
         assertThat(jedis.zscore("waiting", "test-agent")).isNull();
-      }
-    }
-
-    @Test
-    @DisplayName("Should execute VALID_SCORE_SCRIPT correctly")
-    void shouldExecuteValidScoreScriptCorrectly() {
-      try (Jedis jedis = jedisPool.getResource()) {
-        // Given - Add agent to WORKING set
-        jedis.zadd("working", 150, "test-agent");
-
-        // When - Check valid score
-        Object result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.VALIDATE_OWNERSHIP),
-                1, // Key count
-                "working",
-                "test-agent",
-                "150");
-
-        // Then
-        assertThat(result).isEqualTo("150");
-      }
-    }
-
-    @Test
-    @DisplayName("Should return null for invalid score in VALID_SCORE_SCRIPT")
-    void shouldReturnNullForInvalidScoreInValidScoreScript() {
-      try (Jedis jedis = jedisPool.getResource()) {
-        // Given - Add agent with different score
-        jedis.zadd("working", 150, "test-agent");
-
-        // When - Check with wrong score
-        Object result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.VALIDATE_OWNERSHIP),
-                1, // Key count
-                "working",
-                "test-agent",
-                "999");
-
-        // Then
-        assertThat(result).isNull();
       }
     }
 
@@ -424,38 +379,6 @@ class RedisScriptManagerTest {
         assertThat(jedis.zscore("working", "agent1")).isNull();
         assertThat(jedis.zscore("waiting", "agent1")).isNull();
         assertThat(jedis.zscore("waiting", "agent2")).isEqualTo(200.0); // Other agent untouched
-      }
-    }
-
-    @Test
-    @DisplayName("Should execute MOVE_AGENT script correctly")
-    void shouldExecuteMoveAgentScriptCorrectly() {
-      try (Jedis jedis = jedisPool.getResource()) {
-        // Given - Add agent to WAITING set
-        jedis.zadd("waiting", 100, "test-agent");
-
-        // When - Move agent to WORKING set
-        Object result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENT),
-                java.util.Arrays.asList("working", "waiting"),
-                java.util.Arrays.asList("test-agent", "150"));
-
-        // Then - Returns 1 and moves agent
-        assertThat(result).isEqualTo(1L);
-        assertThat(jedis.zscore("waiting", "test-agent")).isNull(); // Removed from WAITING
-        assertThat(jedis.zscore("working", "test-agent")).isEqualTo(150.0); // Added to WORKING
-
-        // When - Try to move agent that's not in WAITING set
-        result =
-            jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENT),
-                java.util.Arrays.asList("working", "waiting"),
-                java.util.Arrays.asList("nonexistent-agent", "200"));
-
-        // Then - Returns 0 for failure
-        assertThat(result).isEqualTo(0L);
-        assertThat(jedis.zscore("working", "nonexistent-agent")).isNull(); // Not added to WORKING
       }
     }
   }
@@ -675,12 +598,9 @@ class RedisScriptManagerTest {
       String[] scriptNames = {
         RedisScriptManager.ADD_AGENT,
         RedisScriptManager.REMOVE_AGENT,
-        RedisScriptManager.MOVE_AGENT,
         RedisScriptManager.ADD_AGENTS,
-        RedisScriptManager.REMOVE_AGENTS,
         RedisScriptManager.MOVE_AGENTS,
         RedisScriptManager.MOVE_AGENTS_CONDITIONAL,
-        RedisScriptManager.VALIDATE_OWNERSHIP,
         RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
         RedisScriptManager.ACQUIRE_AGENTS,
         RedisScriptManager.SCORE_AGENTS,
