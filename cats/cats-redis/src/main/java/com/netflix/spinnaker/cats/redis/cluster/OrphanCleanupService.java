@@ -346,6 +346,8 @@ public class OrphanCleanupService {
       // Critical: Never purge valid waiting by age. Batch-remove only invalid entries.
       if (batchOperationsEnabled) {
         List<String> invalidArgs = new ArrayList<>();
+        // Also track which invalid agents we attempted to remove in this batch
+        List<String> attemptedInvalid = new ArrayList<>();
         for (Tuple orphan : orphans) {
           if (CadenceGuard.overBudget(
                   startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
@@ -370,6 +372,7 @@ public class OrphanCleanupService {
             if (belongsToThisShard) {
               invalidArgs.add(agentName);
               invalidArgs.add(String.valueOf((long) orphan.getScore()));
+              attemptedInvalid.add(agentName);
             }
           }
         }
@@ -384,9 +387,92 @@ public class OrphanCleanupService {
             ScriptResults.BatchRemovalResult parsed =
                 ScriptResults.parseRemoveAgentsConditional(result);
             totalCleaned += parsed.getRemovedCount();
+            // Per-item fallback for any attempted invalid entries not removed by batch (partial
+            // success)
+            if (parsed.getRemovedCount() < attemptedInvalid.size()) {
+              java.util.Set<String> removedSet = new java.util.HashSet<>(parsed.getMembers());
+              for (String agentName : attemptedInvalid) {
+                if (CadenceGuard.overBudget(
+                        startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
+                    || Thread.currentThread().isInterrupted()) {
+                  log.warn("Stopping per-item fallback due to budget/interrupt");
+                  break;
+                }
+                if (!removedSet.contains(agentName)) {
+                  String scoreStr;
+                  try {
+                    Double s = jedis.zscore(WAITING_SET, agentName);
+                    scoreStr = s != null ? String.valueOf(s.longValue()) : null;
+                  } catch (Exception ignore) {
+                    scoreStr = null;
+                  }
+                  try {
+                    if (scoreStr != null) {
+                      Object one =
+                          scriptManager.evalshaWithSelfHeal(
+                              jedis,
+                              RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+                              java.util.Collections.singletonList(WAITING_SET),
+                              java.util.Arrays.asList(agentName, scoreStr));
+                      ScriptResults.BatchRemovalResult oneParsed =
+                          ScriptResults.parseRemoveAgentsConditional(one);
+                      totalCleaned += oneParsed.getRemovedCount();
+                      if (oneParsed.getRemovedCount() == 0) {
+                        Object fallback =
+                            scriptManager.evalshaWithSelfHeal(
+                                jedis,
+                                RedisScriptManager.REMOVE_AGENT,
+                                java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                                java.util.Collections.singletonList(agentName));
+                        if (fallback != null && ((Long) fallback).intValue() == 1) {
+                          totalCleaned += 1;
+                        }
+                      }
+                    }
+                  } catch (Exception ex) {
+                    log.debug("Per-item fallback removal failed for {}: {}", agentName, ex);
+                  }
+                }
+              }
+            }
           } catch (Exception e) {
             log.warn("Batch removal of invalid waiting agents failed, using individual path", e);
-            totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startTs);
+            // Batch-first per-item: try conditional remove one-by-one, then fallback to
+            // REMOVE_AGENT
+            for (Tuple orphan : orphans) {
+              if (CadenceGuard.overBudget(
+                      startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
+                  || Thread.currentThread().isInterrupted()) {
+                log.warn("Stopping individual conditional removal due to budget/interrupt");
+                break;
+              }
+              String agentName = orphan.getElement();
+              String scoreStr = String.valueOf((long) orphan.getScore());
+              try {
+                Object one =
+                    scriptManager.evalshaWithSelfHeal(
+                        jedis,
+                        RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+                        java.util.Collections.singletonList(WAITING_SET),
+                        java.util.Arrays.asList(agentName, scoreStr));
+                ScriptResults.BatchRemovalResult oneParsed =
+                    ScriptResults.parseRemoveAgentsConditional(one);
+                totalCleaned += oneParsed.getRemovedCount();
+                if (oneParsed.getRemovedCount() == 0) {
+                  Object fallback =
+                      scriptManager.evalshaWithSelfHeal(
+                          jedis,
+                          RedisScriptManager.REMOVE_AGENT,
+                          java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                          java.util.Collections.singletonList(agentName));
+                  if (fallback != null && ((Long) fallback).intValue() == 1) {
+                    totalCleaned += 1;
+                  }
+                }
+              } catch (Exception ex) {
+                log.debug("Individual conditional removal failed for {}: {}", agentName, ex);
+              }
+            }
           }
         }
       } else {

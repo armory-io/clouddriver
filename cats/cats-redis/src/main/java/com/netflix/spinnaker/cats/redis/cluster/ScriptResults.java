@@ -85,4 +85,32 @@ final class ScriptResults {
 
     return new BatchRemovalResult(count, cleaned);
   }
+
+  /** Parse the count returned by ADD_AGENTS script which typically returns [count, ...]. */
+  static int parseAddAgentsCount(Object result) {
+    try {
+      if (result instanceof java.util.List) {
+        java.util.List<?> list = (java.util.List<?>) result;
+        if (!list.isEmpty()) {
+          Object c0 = list.get(0);
+          if (c0 instanceof Number) {
+            return ((Number) c0).intValue();
+          } else if (c0 instanceof String) {
+            try {
+              return Integer.parseInt((String) c0);
+            } catch (Exception ignore) {
+            }
+          } else if (c0 instanceof byte[]) {
+            try {
+              return Integer.parseInt(
+                  new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
+            } catch (Exception ignore) {
+            }
+          }
+        }
+      }
+    } catch (Exception ignore) {
+    }
+    return 0;
+  }
 }

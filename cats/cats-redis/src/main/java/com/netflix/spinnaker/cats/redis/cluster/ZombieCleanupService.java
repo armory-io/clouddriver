@@ -399,11 +399,15 @@ public class ZombieCleanupService {
       return 0;
     }
 
-    // Try batch operation first if there are multiple agents
-    if (zombieAgentTypes.size() > 1) {
+    // Try batch operation first (even for a single agent)
+    if (!zombieAgentTypes.isEmpty()) {
       try {
         // Build arguments for batch cleanup: [agent1, score1, agent2, score2, ...]
         List<String> batchArgs = new ArrayList<>(zombieAgentTypes.size() * 2);
+        // Track the specific agents we actually attempted in the batch (acquireScore present)
+        List<String> attemptedCandidates = new ArrayList<>();
+        // Snapshot of input candidates to compute leftover set for per-item fallback
+        List<String> inputCandidates = new ArrayList<>(zombieAgentTypes);
 
         for (String agentType : zombieAgentTypes) {
           if (CadenceGuard.overBudget(
@@ -416,6 +420,7 @@ public class ZombieCleanupService {
           if (acquireScore != null) {
             batchArgs.add(agentType);
             batchArgs.add(acquireScore);
+            attemptedCandidates.add(agentType);
           }
         }
 
@@ -431,11 +436,11 @@ public class ZombieCleanupService {
           // Parse Lua script return value and synchronize local state
           ScriptResults.BatchRemovalResult parsed =
               ScriptResults.parseRemoveAgentsConditional(result);
-          int cleaned = parsed.getRemovedCount();
-          if (cleaned > 0) {
+          int cleanedByBatch = parsed.getRemovedCount();
+          if (cleanedByBatch > 0) {
             log.info(
                 "Zombie cleanup batch processed: {} agents cleaned from {} candidates",
-                cleaned,
+                cleanedByBatch,
                 zombieAgentTypes.size());
             for (String agentType : parsed.getMembers()) {
               Future<?> future = activeAgentsFutures.remove(agentType);
@@ -467,7 +472,43 @@ public class ZombieCleanupService {
                 log.debug("Cleaned up zombie agent: {}", agentType);
               }
             }
-            return cleaned;
+            // Do not return early; fall through to per-item cleanup for any remaining original
+            // candidates
+            // that were not removed by the batch operation. We compute leftovers from the full
+            // input set.
+            java.util.Set<String> removedSet = new java.util.HashSet<>(parsed.getMembers());
+            List<String> remainingForFallback = new ArrayList<>();
+            for (String a : inputCandidates) {
+              if (!removedSet.contains(a)) {
+                remainingForFallback.add(a);
+              }
+            }
+            // Perform per-item fallback over remaining candidates and add to cleanedByBatch
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Using individual cleanup for {} remaining zombie agents after batch",
+                  remainingForFallback.size());
+            }
+            int fallbackCleaned = 0;
+            for (String agentType : remainingForFallback) {
+              if (CadenceGuard.overBudget(
+                      startTs, schedulerProperties.getZombieCleanup().getRunBudgetMs())
+                  || Thread.currentThread().isInterrupted()) {
+                log.warn("Stopping zombie individual fallback due to budget/interrupt");
+                break;
+              }
+              try {
+                if (cleanupIndividualZombieAgent(
+                    jedis, agentType, activeAgents, activeAgentsFutures)) {
+                  fallbackCleaned++;
+                }
+              } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+                log.warn("Redis connection error while cleaning zombie {}", agentType, e);
+              } catch (Exception e) {
+                log.warn("Failed to cleanup individual zombie {}", agentType, e);
+              }
+            }
+            return cleanedByBatch + fallbackCleaned;
           }
         }
       } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
@@ -568,20 +609,14 @@ public class ZombieCleanupService {
 
       if (!removed) {
         try {
-          Object fallback =
-              scriptManager.evalshaWithSelfHeal(
-                  jedis,
-                  RedisScriptManager.REMOVE_AGENT,
-                  java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                  java.util.Collections.singletonList(agentType));
-          removed = fallback != null && ((Long) fallback).intValue() == 1;
+          // Preserve waiting entries: remove only from WORKING as a conservative fallback
+          Long zrem = jedis.zrem(WORKING_SET, agentType);
+          removed = zrem != null && zrem.longValue() > 0L;
           if (removed) {
-            log.debug(
-                "Fallback REMOVE_AGENT removed {} from working/waiting (score mismatch)",
-                agentType);
+            log.debug("Fallback ZREM removed {} from working set (preserved waiting)", agentType);
           }
         } catch (Exception fbEx) {
-          log.warn("Fallback REMOVE_AGENT failed for {}", agentType, fbEx);
+          log.warn("Fallback working-set removal failed for {}", agentType, fbEx);
         }
       }
 

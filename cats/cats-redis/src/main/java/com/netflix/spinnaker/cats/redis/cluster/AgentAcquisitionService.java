@@ -764,7 +764,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         }
 
         int acquiredThisChunk = 0;
-        if (schedulerProperties.getBatchOperations().isEnabled() && readyChunk.size() > 1) {
+        long chunkStartMs = System.currentTimeMillis();
+        if (schedulerProperties.getBatchOperations().isEnabled() && !readyChunk.isEmpty()) {
           try {
             acquiredThisChunk =
                 saturatePoolBatch(
@@ -774,8 +775,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     runningAgents,
                     workersToSubmit,
                     attemptedThisCycle);
+            if (metrics != null) {
+              metrics.recordAcquireTime("batch", System.currentTimeMillis() - chunkStartMs);
+            }
           } catch (Exception e) {
             log.warn("Batch acquisition failed for chunk, falling back to individual", e);
+            if (metrics != null) {
+              metrics.incrementBatchFallback();
+            }
             workersToSubmit.clear();
             acquiredThisChunk =
                 saturatePoolIndividual(
@@ -785,11 +792,17 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     runningAgents,
                     workersToSubmit,
                     attemptedThisCycle);
+            if (metrics != null) {
+              metrics.recordAcquireTime("fallback", System.currentTimeMillis() - chunkStartMs);
+            }
           }
         } else {
           acquiredThisChunk =
               saturatePoolIndividual(
                   jedis, readyChunk, chunkSize, runningAgents, workersToSubmit, attemptedThisCycle);
+          if (metrics != null) {
+            metrics.recordAcquireTime("individual", System.currentTimeMillis() - chunkStartMs);
+          }
         }
 
         if (acquiredThisChunk <= 0) {
@@ -2080,7 +2093,10 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * @param agentsToAdd Set of agent types to add to Redis
    */
   private void addMissingAgents(Jedis jedis, Set<String> agentsToAdd) {
-    if (schedulerProperties.getBatchOperations().isEnabled() && agentsToAdd.size() > 1) {
+    if (agentsToAdd == null || agentsToAdd.isEmpty()) {
+      return;
+    }
+    if (schedulerProperties.getBatchOperations().isEnabled()) {
       addMissingAgentsBatch(jedis, agentsToAdd);
     } else {
       addMissingAgentsIndividual(jedis, agentsToAdd);
@@ -2094,13 +2110,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       if (worker != null) {
         long jitterSec = computeInitialRegistrationJitterSeconds();
         String registrationScore = score(jedis, jitterSec * 1000L);
-        // Validate pair: agent must not be numeric; score must be numeric
-        boolean scoreNumeric = registrationScore != null && registrationScore.matches("^\\d+$");
-        boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
-        if (!scoreNumeric || agentNumeric) {
-          if (metrics != null) {
-            metrics.incrementInvalidPair("repopulate_missing_batch");
-          }
+        if (!validateAgentScorePair(agentType, registrationScore, "repopulate_missing_batch")) {
           continue;
         }
         batchArgs.add(agentType);
@@ -2117,25 +2127,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     RedisScriptManager.ADD_AGENTS,
                     Arrays.asList(WORKING_SET, WAITING_SET),
                     batchArgs);
-        int added = 0;
-        if (!result.isEmpty()) {
-          Object c0 = result.get(0);
-          if (c0 instanceof Long) {
-            added = ((Long) c0).intValue();
-          } else if (c0 instanceof String) {
-            try {
-              added = Integer.parseInt((String) c0);
-            } catch (Exception ignore) {
-            }
-          } else if (c0 instanceof byte[]) {
-            try {
-              added =
-                  Integer.parseInt(
-                      new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
-            } catch (Exception ignore) {
-            }
-          }
-        }
+        int added = parseAddAgentsCount(result);
         log.debug("Batch added {} missing agents to Redis", added);
         if (metrics != null && added > 0) {
           metrics.incrementRepopulateAdded(added);
@@ -2339,7 +2331,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       long offset = entry.getKey();
       List<AgentCompletion> group = entry.getValue();
 
-      if (schedulerProperties.getBatchOperations().isEnabled() && group.size() > 1) {
+      if (schedulerProperties.getBatchOperations().isEnabled()) {
         totalProcessed += batchScheduleCompletions(jedis, group, offset);
       } else {
         totalProcessed += individualScheduleCompletions(jedis, group, offset);
@@ -2595,12 +2587,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       for (AgentCompletion completion : completions) {
         String agentType = completion.agent.getAgentType();
         String completionScore = score(jedis, offset);
-        boolean scoreNumeric = completionScore != null && completionScore.matches("^\\d+$");
-        boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
-        if (!scoreNumeric || agentNumeric) {
-          if (metrics != null) {
-            metrics.incrementInvalidPair("completion_batch");
-          }
+        if (!validateAgentScorePair(agentType, completionScore, "completion_batch")) {
           continue;
         }
         batchArgs.add(agentType);
@@ -2615,24 +2602,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   batchArgs);
 
-      int scheduled = 0;
-      if (!result.isEmpty()) {
-        Object c0 = result.get(0);
-        if (c0 instanceof Long) {
-          scheduled = ((Long) c0).intValue();
-        } else if (c0 instanceof String) {
-          try {
-            scheduled = Integer.parseInt((String) c0);
-          } catch (Exception ignore) {
-          }
-        } else if (c0 instanceof byte[]) {
-          try {
-            scheduled =
-                Integer.parseInt(new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
-          } catch (Exception ignore) {
-          }
-        }
-      }
+      int scheduled = ScriptResults.parseAddAgentsCount(result);
       log.debug("Batch scheduled {} completions with offset {}ms", scheduled, offset);
       return scheduled;
 
@@ -2659,6 +2629,10 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
     for (AgentCompletion completion : completions) {
       try {
+        if (!validateAgentScorePair(
+            completion.agent.getAgentType(), offsetScore, "completion_fallback")) {
+          continue;
+        }
         Object result =
             scriptManager.evalshaWithSelfHeal(
                 jedis,
@@ -2682,6 +2656,50 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     }
 
     return scheduled;
+  }
+
+  /**
+   * Validate that an agent/score pair is safe to send to Redis scripts. Increments invalid-pair
+   * metrics with the given context on failure.
+   */
+  private boolean validateAgentScorePair(String agentType, String score, String context) {
+    boolean scoreNumeric = score != null && score.matches("^\\d+$");
+    boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
+    if (!scoreNumeric || agentNumeric) {
+      if (metrics != null) {
+        metrics.incrementInvalidPair(context);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /** Parse the count returned by ADD_AGENTS script which typically returns [count, ...]. */
+  private int parseAddAgentsCount(Object result) {
+    try {
+      if (result instanceof java.util.List) {
+        java.util.List<?> list = (java.util.List<?>) result;
+        if (!list.isEmpty()) {
+          Object c0 = list.get(0);
+          if (c0 instanceof Number) {
+            return ((Number) c0).intValue();
+          } else if (c0 instanceof String) {
+            try {
+              return Integer.parseInt((String) c0);
+            } catch (Exception ignore) {
+            }
+          } else if (c0 instanceof byte[]) {
+            try {
+              return Integer.parseInt(
+                  new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
+            } catch (Exception ignore) {
+            }
+          }
+        }
+      }
+    } catch (Exception ignore) {
+    }
+    return 0;
   }
 
   /**
