@@ -513,6 +513,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               || CadenceGuard.isPeriodElapsed(lastStallWarnEpochMs.get(), 300_000L)
               || CadenceGuard.isPeriodElapsed(lastDiagEpochMs.get(), DIAG_PERIOD_MS);
 
+      // Cycle-long registry snapshot: consistent view of registered agents for the entire cycle
+      final java.util.Map<String, AgentWorker> registrySnapshot = new java.util.HashMap<>(agents);
+
       long readyCountForDiagnostics = -1L;
       boolean earlyEmptyReady = false;
       if (emitDiag) {
@@ -549,7 +552,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     jedis.zrangeWithScores(WAITING_SET, 0, Math.max(0, window - 1));
                 for (Tuple t : earliest) {
                   String agentType = t.getElement();
-                  AgentWorker local = agents.get(agentType);
+                  AgentWorker local = registrySnapshot.get(agentType);
                   if (local != null && isAgentEnabled(local.getAgent())) {
                     earliestLocalWaitingScore = (long) t.getScore();
                     break;
@@ -609,7 +612,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", currentScore, 0, window);
           for (Tuple t : oldestWindow) {
             String agentType = t.getElement();
-            AgentWorker local = agents.get(agentType);
+            AgentWorker local = registrySnapshot.get(agentType);
             if (local != null && isAgentEnabled(local.getAgent())) {
               long oldestScore = (long) t.getScore();
               oldestOverdueSec = Math.max(0L, nowSec - oldestScore);
@@ -774,7 +777,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     chunkSize,
                     runningAgents,
                     workersToSubmit,
-                    attemptedThisCycle);
+                    attemptedThisCycle,
+                    registrySnapshot);
             if (metrics != null) {
               metrics.recordAcquireTime("batch", System.currentTimeMillis() - chunkStartMs);
             }
@@ -791,7 +795,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     chunkSize,
                     runningAgents,
                     workersToSubmit,
-                    attemptedThisCycle);
+                    attemptedThisCycle,
+                    registrySnapshot);
             if (metrics != null) {
               metrics.recordAcquireTime("fallback", System.currentTimeMillis() - chunkStartMs);
             }
@@ -799,7 +804,13 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         } else {
           acquiredThisChunk =
               saturatePoolIndividual(
-                  jedis, readyChunk, chunkSize, runningAgents, workersToSubmit, attemptedThisCycle);
+                  jedis,
+                  readyChunk,
+                  chunkSize,
+                  runningAgents,
+                  workersToSubmit,
+                  attemptedThisCycle,
+                  registrySnapshot);
           if (metrics != null) {
             metrics.recordAcquireTime("individual", System.currentTimeMillis() - chunkStartMs);
           }
@@ -902,7 +913,6 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             submitAgentWithRejectionHandling(worker, agentWorkPool, runningAgents);
 
         if (future != null) {
-          activeAgentsFutures.put(worker.getAgent().getAgentType(), future);
           // Schedule dead-man cancellation exactly at (completion deadline + threshold)
           try {
             if (schedulerProperties.getZombieCleanup().isEnabled()) {
@@ -1109,7 +1119,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       int maxToAcquire,
       Semaphore runningAgents,
       Set<AgentWorker> workersToSubmit,
-      java.util.Set<String> attemptedThisCycle) {
+      java.util.Set<String> attemptedThisCycle,
+      java.util.Map<String, AgentWorker> registrySnapshot) {
 
     // Calculate batch size to prevent memory/Redis overload
     int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
@@ -1125,10 +1136,6 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     int candidateCount = 0;
     List<String> candidateAgents = new ArrayList<>();
     List<AgentWorker> candidateWorkers = new ArrayList<>();
-
-    // Snapshot agents to prevent concurrent modification during batch processing
-    // Critical for avoiding race conditions with dynamic account updates
-    Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
 
     // PHASE 1: Build candidate list and acquire semaphore permits
     // Note: We respect both the concurrency limit (maxToAcquire) and batch size limit
@@ -1147,7 +1154,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         break;
       }
 
-      AgentWorker worker = agentsSnapshot.get(agentType);
+      AgentWorker worker = registrySnapshot.get(agentType);
       if (worker == null) {
         log.warn(
             "Agent {} not found in local registry, skipping (may have been dynamically removed)",
@@ -1368,7 +1375,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           maxToAcquire,
           runningAgents,
           workersToSubmit,
-          attemptedThisCycle);
+          attemptedThisCycle,
+          registrySnapshot);
     }
   }
 
@@ -1389,7 +1397,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       int maxToAcquire,
       Semaphore runningAgents,
       Set<AgentWorker> workersToSubmit,
-      java.util.Set<String> attemptedThisCycle) {
+      java.util.Set<String> attemptedThisCycle,
+      java.util.Map<String, AgentWorker> registrySnapshot) {
 
     log.debug(
         "Using individual agent acquisition for {} ready agents (max: {})",
@@ -1421,7 +1430,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       // at a time
       // The dynamic account plugin race primarily affects batch acquisition where indices can be
       // corrupted
-      AgentWorker worker = agents.get(agentType);
+      AgentWorker worker = registrySnapshot.get(agentType);
       if (worker == null) {
         log.warn(
             "Ready agent {} not found in local agents map, releasing semaphore permit and skipping.",
@@ -3347,7 +3356,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             }
           };
 
+      // Submit to pool; only track the future after a successful submit
       java.util.concurrent.Future<?> future = agentWorkPool.submit(futureTask);
+      activeAgentsFutures.put(agentType, future);
       log.debug("Successfully submitted agent {} to thread pool", agentType);
       return future;
 
