@@ -364,7 +364,7 @@ public class OrphanCleanupService {
             } else {
               try {
                 belongsToThisShard = acquisitionService.belongsToThisShard(agentName);
-              } catch (Throwable t) {
+              } catch (Exception e) {
                 belongsToThisShard = false; // fail-safe preserve
               }
             }
@@ -604,7 +604,7 @@ public class OrphanCleanupService {
         } else {
           try {
             belongsToThisShard = acquisitionService.belongsToThisShard(agentName);
-          } catch (Throwable t) {
+          } catch (Exception e) {
             belongsToThisShard = false; // fail-safe preserve
           }
         }
@@ -631,7 +631,7 @@ public class OrphanCleanupService {
                     acquisitionService.computeOriginalReadySecondsFromWorkingScore(
                         agentName, scoreInSet);
               }
-            } catch (Throwable t) {
+            } catch (Exception e) {
               preservedScore = null; // Fail-safe below
             }
 

@@ -176,8 +176,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           log.debug("Dead-man timeout fired for {}: cancel returned false", agentType);
         }
       }
-    } catch (Throwable t) {
-      log.debug("Dead-man timeout handling failed for {}", agentType, t);
+    } catch (Exception e) {
+      log.debug("Dead-man timeout handling failed for {}", agentType, e);
     }
   }
 
@@ -968,11 +968,21 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
       }
       return 0;
-    } catch (Exception e) {
+
+      // Design note: Catch Throwable as final safety net for acquisition cycle.
+      // - Most permit-related failures are handled by inner catch(Throwable) blocks in batch
+      //   acquisition and submission, but this ensures we handle Errors in other parts of the
+      //   acquisition flow (e.g., during diagnostics, metrics, submission loop setup).
+      // - While the scheduler's outer catch(Throwable) would eventually catch these, handling
+      //   them here allows proper circuit breaker recording and prevents Error propagation from
+      //   disrupting other scheduler services.
+    } catch (Throwable e) {
       log.error("Error during agent acquisition cycle", e);
 
-      // Record general failure to acquisition circuit breaker
-      acquisitionCircuitBreaker.recordFailure(e);
+      // Record general failure to acquisition circuit breaker (only for Exceptions)
+      if (e instanceof Exception) {
+        acquisitionCircuitBreaker.recordFailure((Exception) e);
+      }
 
       if (metrics != null) {
         metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
@@ -1359,7 +1369,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
       return 0;
 
-    } catch (Exception e) {
+      // Design note: Catch Throwable to ensure permit cleanup on all failure modes.
+      // - Critical: Phase 1 acquired permits for all candidates. If an Error (e.g.,
+      // OutOfMemoryError)
+      //   occurs during Phase 2 (Redis batch) or Phase 3 (result processing), we must release
+      //   all acquired permits to prevent permit leaks.
+      // - The scheduler's outer catch(Throwable) would eventually catch Errors, but by then permits
+      //   are already leaked, causing permanent capacity loss until pod restart.
+    } catch (Throwable e) {
       log.error("Batch agent acquisition failed, falling back to individual mode", e);
       // Release all semaphore permits on batch failure
       if (runningAgents != null) {
@@ -3413,9 +3430,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                         "Released semaphore permit for agent {} in completion listener", agentType);
                   }
                 }
-              } catch (Throwable t) {
+              } catch (Exception e) {
                 // Never propagate from listener
-                log.debug("Completion listener failed for {}", agentType, t);
+                log.debug("Completion listener failed for {}", agentType, e);
               }
             }
           };
@@ -3451,7 +3468,11 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
       return null;
 
-    } catch (Exception e) {
+      // Design note: Catch Throwable to handle all submission failure modes.
+      // - Critical: A permit was acquired before calling this method. If an Error occurs during
+      //   FutureTask creation or executor.submit(), we must release the permit to prevent leaks.
+      // - Examples: OutOfMemoryError creating FutureTask, ThreadDeath during submit, etc.
+    } catch (Throwable e) {
       // Handle other submission errors
       log.error("Failed to submit agent {} due to unexpected error", agentType, e);
 
@@ -3658,12 +3679,29 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         success = true;
         acquisitionService.agentsExecuted.increment(); // Track successful executions
         log.debug("Agent {} execution completed successfully", agentType);
+
+        // Design note: Catch Throwable (not just Exception) to handle all failure modes.
+        // - Purpose: Ensure cleanup and requeueing occur even for Errors (OutOfMemoryError,
+        //   StackOverflowError, etc.) that agents may encounter during cloud provider API calls
+        //   or data processing.
+        // - Critical: If we only caught Exception, Errors would bypass failure classification and
+        //   proper requeueing, leaving orphaned entries in the working set that orphan cleanup
+        //   would need to handle later.
+        // - Policy: The finally block guarantees permit release and Redis cleanup regardless of
+        //   failure type. This catch block ensures we properly classify the failure and requeue
+        //   with appropriate backoff (e.g., OutOfMemoryError → THROTTLED with exponential backoff).
       } catch (Throwable cause) {
         if (cause instanceof InterruptedException) {
           log.warn(
               "Agent {} execution was interrupted (likely due to zombie cleanup or shutdown)",
               agentType);
           Thread.currentThread().interrupt(); // Restore interrupt status
+        } else if (cause instanceof Error) {
+          log.error(
+              "Agent {} execution failed with Error after {}ms - this may indicate serious JVM issues",
+              agentType,
+              elapsedTimeMs(startTimeMs),
+              cause);
         } else {
           log.error(
               "Agent {} execution failed after {}ms", agentType, elapsedTimeMs(startTimeMs), cause);

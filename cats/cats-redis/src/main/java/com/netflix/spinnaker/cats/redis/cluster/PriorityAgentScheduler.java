@@ -266,10 +266,10 @@ public class PriorityAgentScheduler extends CatsModuleAware
             () -> {
               try {
                 reconcileKnownAgentsIfNeeded(currentRun);
-              } catch (Throwable t) {
-                log.warn("Reconcile known agents failed", t);
+              } catch (Exception e) {
+                log.warn("Reconcile known agents failed", e);
                 try {
-                  metrics.incrementRunFailure(t.getClass().getSimpleName());
+                  metrics.incrementRunFailure(e.getClass().getSimpleName());
                 } catch (Exception me) {
                   log.debug("Failed to record reconcile failure metric", me);
                 }
@@ -341,8 +341,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
           String redisState =
               String.valueOf(acquisitionService.getCircuitBreakerStatus().get("redis"));
           redisStall = (redisState != null && !"CLOSED".equalsIgnoreCase(redisState));
-        } catch (Throwable t) {
-          log.debug("Watchdog: unable to read redis breaker state; assuming CLOSED", t);
+        } catch (Exception e) {
+          log.debug("Watchdog: unable to read redis breaker state; assuming CLOSED", e);
         }
 
         evaluateWatchdog(
@@ -421,14 +421,14 @@ public class PriorityAgentScheduler extends CatsModuleAware
                     // Cooperative hard stop: interrupt to signal budget breach
                     Thread.currentThread().interrupt();
                   }
-                } catch (Throwable t) {
-                  if (t instanceof InterruptedException) {
+                } catch (Exception e) {
+                  if (e instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                     return;
                   }
-                  log.warn("Zombie cleanup failed", t);
+                  log.warn("Zombie cleanup failed", e);
                   try {
-                    metrics.incrementRunFailure(t.getClass().getSimpleName());
+                    metrics.incrementRunFailure(e.getClass().getSimpleName());
                   } catch (Exception me) {
                     log.debug("Failed to record zombie cleanup failure metric", me);
                   }
@@ -443,8 +443,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
             log.debug("Skipping zombie cleanup: previous run still in progress");
           }
         }
-      } catch (Throwable t) {
-        log.warn("Failed to schedule zombie cleanup", t);
+      } catch (Exception e) {
+        log.warn("Failed to schedule zombie cleanup", e);
       }
 
       // Offload orphan cleanup (non-blocking) — pre-gated by cadence to avoid per-second submits
@@ -467,14 +467,14 @@ public class PriorityAgentScheduler extends CatsModuleAware
                     Thread.currentThread().interrupt();
                     return;
                   }
-                } catch (Throwable t) {
-                  if (t instanceof InterruptedException) {
+                } catch (Exception e) {
+                  if (e instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                     return;
                   }
-                  log.warn("Orphan cleanup failed", t);
+                  log.warn("Orphan cleanup failed", e);
                   try {
-                    metrics.incrementRunFailure(t.getClass().getSimpleName());
+                    metrics.incrementRunFailure(e.getClass().getSimpleName());
                   } catch (Exception me) {
                     log.debug("Failed to record orphan cleanup failure metric", me);
                   }
@@ -489,8 +489,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
             log.debug("Skipping orphan cleanup: previous run still in progress");
           }
         }
-      } catch (Throwable t) {
-        log.warn("Failed to schedule orphan cleanup", t);
+      } catch (Exception e) {
+        log.warn("Failed to schedule orphan cleanup", e);
       }
 
       if (log.isDebugEnabled() && agentsAcquired > 0) {
@@ -503,6 +503,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       metrics.recordRunCycle(true, currentTimeMillis() - start);
 
+      // Design note: This is the only broad catch(Throwable) in the scheduler by intent.
+      // - Purpose: ensure the periodic scheduler loop never dies due to unexpected Errors or
+      //   unchecked Throwables (e.g., linkage errors, OOMEs bubbling up, rare VM errors).
+      // - Policy: all inner blocks use catch(Exception) and explicitly handle InterruptedException
+      //   (restoring interrupt) to allow cooperative cancellation. Only this outer guard remains
+      //   a safety net to preserve liveness of the scheduling thread.
     } catch (Throwable t) {
       log.error("Critical error in scheduler run cycle {}", runCount.get(), t);
       metrics.incrementRunFailure(t.getClass().getSimpleName());
