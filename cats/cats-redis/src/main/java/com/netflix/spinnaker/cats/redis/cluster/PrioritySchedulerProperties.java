@@ -199,7 +199,13 @@ public class PrioritySchedulerProperties {
     /** Enable batch operations globally (acquisition, cleanup, completion, repopulation). */
     private boolean enabled = true;
 
-    /** Maximum number of items to process in a single batch. Default: 0 (no limit). */
+    /**
+     * Maximum number of items to process in a single batch operation.
+     *
+     * <p>Applies to all batch operations: agent acquisition, completions, cleanup, repopulation.
+     *
+     * <p>Default: 0 (unbounded - process all available items)
+     */
     private int batchSize = 0;
 
     /**

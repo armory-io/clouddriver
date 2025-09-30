@@ -2059,37 +2059,76 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       return java.util.Collections.emptySet();
     }
 
+    // Primary: Use ZMSCORE batches to check presence in working/waiting with minimal Redis work
     try {
-      @SuppressWarnings("unchecked")
-      List<String> results =
-          (List<String>)
-              scriptManager.evalshaWithSelfHeal(
-                  jedis,
-                  RedisScriptManager.SCORE_AGENTS,
-                  Arrays.asList(WORKING_SET, WAITING_SET),
-                  agentNames);
-
-      // Results format: [agent, workScore|'null', waitScore|'null', ...]
+      int batchSize;
+      int configured = 0;
+      try {
+        configured = schedulerProperties.getBatchOperations().getBatchSize();
+      } catch (Exception ignore) {
+        // best effort
+      }
+      if (configured > 0) {
+        batchSize = configured;
+      } else {
+        batchSize = agentNames.size();
+      }
       Set<String> allAgents = new HashSet<>();
-      for (int resultIndex = 0; resultIndex < results.size(); resultIndex += 3) {
-        String agent = results.get(resultIndex);
-        String workScore = results.get(resultIndex + 1);
-        String waitScore = results.get(resultIndex + 2);
-        if (!"null".equals(workScore) || !"null".equals(waitScore)) {
-          allAgents.add(agent);
+      for (int start = 0; start < agentNames.size(); start += batchSize) {
+        int end = Math.min(start + batchSize, agentNames.size());
+        List<String> batch = agentNames.subList(start, end);
+
+        @SuppressWarnings("unchecked")
+        List<Long> presence =
+            (List<Long>)
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.ZMSCORE_AGENTS,
+                    Arrays.asList(WORKING_SET, WAITING_SET),
+                    batch);
+
+        for (int i = 0; i < batch.size(); i++) {
+          Long p = (presence != null && i < presence.size()) ? presence.get(i) : 0L;
+          if (p != null && p != 0L) {
+            allAgents.add(batch.get(i));
+          }
         }
       }
       return allAgents;
-    } catch (Exception e) {
-      // Fallback: full-set scan if script fails
-      log.warn("Repopulation presence check failed, falling back to full-set scan", e);
-      Pipeline pipeline = jedis.pipelined();
-      Response<Set<String>> waitingAgents = pipeline.zrange(WAITING_SET, 0, -1);
-      Response<Set<String>> workingAgents = pipeline.zrange(WORKING_SET, 0, -1);
-      pipeline.sync();
-      Set<String> allAgents = new HashSet<>(waitingAgents.get());
-      allAgents.addAll(workingAgents.get());
-      return allAgents;
+    } catch (Exception zmscoreEx) {
+      // Fallback 1: Use existing Lua script query to avoid full scans
+      log.warn("ZMSCORE presence check failed, falling back to Lua script", zmscoreEx);
+      try {
+        @SuppressWarnings("unchecked")
+        List<String> results =
+            (List<String>)
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.SCORE_AGENTS,
+                    Arrays.asList(WORKING_SET, WAITING_SET),
+                    agentNames);
+
+        Set<String> allAgents = new HashSet<>();
+        for (int resultIndex = 0; resultIndex < results.size(); resultIndex += 3) {
+          String agent = results.get(resultIndex);
+          String workScore = results.get(resultIndex + 1);
+          String waitScore = results.get(resultIndex + 2);
+          if (!"null".equals(workScore) || !"null".equals(waitScore)) {
+            allAgents.add(agent);
+          }
+        }
+        return allAgents;
+      } catch (Exception luaEx) {
+        // Fallback 2: Full-set scan
+        log.warn("Lua presence check failed, falling back to full-set scan", luaEx);
+        Pipeline pipeline = jedis.pipelined();
+        Response<Set<String>> waitingAgents = pipeline.zrange(WAITING_SET, 0, -1);
+        Response<Set<String>> workingAgents = pipeline.zrange(WORKING_SET, 0, -1);
+        pipeline.sync();
+        Set<String> allAgents = new HashSet<>(waitingAgents.get());
+        allAgents.addAll(workingAgents.get());
+        return allAgents;
+      }
     }
   }
 

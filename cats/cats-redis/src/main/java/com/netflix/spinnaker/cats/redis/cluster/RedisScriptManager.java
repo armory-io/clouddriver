@@ -62,6 +62,8 @@ public class RedisScriptManager {
 
   // === QUERIES ===
   public static final String SCORE_AGENTS = "scoreAgents"; // Batch score lookup for multiple agents
+  public static final String ZMSCORE_AGENTS =
+      "zmscoreAgents"; // Atomic ZMSCORE for both sets; returns [1/0 per arg] ORed across sets
 
   // === ADVANCED OPERATIONS ===
   public static final String ACQUIRE_AGENTS =
@@ -386,6 +388,31 @@ public class RedisScriptManager {
             + "return {count, acquired}\n");
 
     // --- QUERY SCRIPTS ---
+
+    // ZMSCORE_AGENTS: Batch presence check across working and waiting sets.
+    // Invariants:
+    // - Atomically evaluates both sets within one script execution per batch
+    // - Returns [1|0, 1|0, ...] aligned with ARGV order (1 if present in either set)
+    // - Read-only; no state is modified
+    bodies.put(
+        ZMSCORE_AGENTS,
+        "-- Input validation: ensure at least one agent name provided\n"
+            + "if #ARGV == 0 then\n"
+            + "  return {}\n"
+            + "end\n"
+            + "local workingScores = redis.call('zmscore', KEYS[1], unpack(ARGV))\n"
+            + "local waitingScores = redis.call('zmscore', KEYS[2], unpack(ARGV))\n"
+            + "local presence = {}\n"
+            + "for i=1,#ARGV do\n"
+            + "  local workingScore = workingScores[i]\n"
+            + "  local waitingScore = waitingScores[i]\n"
+            + "  if workingScore or waitingScore then\n"
+            + "    table.insert(presence, 1)\n"
+            + "  else\n"
+            + "    table.insert(presence, 0)\n"
+            + "  end\n"
+            + "end\n"
+            + "return presence\n");
 
     // SCORE_AGENTS: Batch score lookup for multiple agents.
     // Invariants:

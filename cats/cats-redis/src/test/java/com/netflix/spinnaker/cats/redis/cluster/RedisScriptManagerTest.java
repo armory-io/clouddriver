@@ -86,7 +86,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(9);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
     }
 
     @Test
@@ -124,7 +124,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(firstSha).isEqualTo(secondSha);
-      assertThat(scriptManager.getScriptCount()).isEqualTo(9);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
     }
   }
 
@@ -161,7 +161,7 @@ class RedisScriptManagerTest {
       // Then
       assertThat(threadException[0]).isNull();
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(9);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
     }
   }
 
@@ -315,6 +315,35 @@ class RedisScriptManagerTest {
         assertThat(result).isNull();
         assertThat(jedis.zscore("working", agentType)).isEqualTo(workingScore); // Still in working
         assertThat(jedis.zscore("waiting", agentType)).isNull();
+      }
+    }
+
+    @Test
+    @DisplayName("Should execute ZMSCORE_AGENTS script correctly for presence mapping")
+    void shouldExecuteZmscoreAgentsScriptCorrectly() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Given: agent1 in waiting, agent2 in working, agent3 in neither
+        jedis.zrem("working", "agent1");
+        jedis.zrem("waiting", "agent1");
+        jedis.zrem("working", "agent2");
+        jedis.zrem("waiting", "agent2");
+        jedis.zrem("working", "agent3");
+        jedis.zrem("waiting", "agent3");
+
+        jedis.zadd("waiting", 100, "agent1");
+        jedis.zadd("working", 200, "agent2");
+
+        // When
+        @SuppressWarnings("unchecked")
+        java.util.List<Long> res =
+            (java.util.List<Long>)
+                jedis.evalsha(
+                    scriptManager.getScriptSha(RedisScriptManager.ZMSCORE_AGENTS),
+                    java.util.Arrays.asList("working", "waiting"),
+                    java.util.Arrays.asList("agent1", "agent2", "agent3"));
+
+        // Then: presence is [1,1,0]
+        assertThat(res).containsExactly(1L, 1L, 0L);
       }
     }
   }
