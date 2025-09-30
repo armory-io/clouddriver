@@ -1528,9 +1528,9 @@ class AgentAcquisitionServiceTest {
               .as("New agent should get immediate execution")
               .isGreaterThanOrEqualTo((double) currentTimeSeconds)
               .isLessThanOrEqualTo((double) (currentTimeSeconds + 5));
-          System.out.println("✅ New agent got immediate execution priority");
+          System.out.println("New agent got immediate execution priority");
         } else {
-          System.out.println("✅ New agent was immediately executed and completed");
+          System.out.println("New agent was immediately executed and completed");
         }
 
         // CRITICAL: Priority ordering should be preserved
@@ -1539,9 +1539,9 @@ class AgentAcquisitionServiceTest {
             .as("High priority agent should have lower score than low priority")
             .isLessThan(lowPriorityNewScore);
 
-        System.out.println("✅ Existing agents preserved their original scores");
+        System.out.println("Existing agents preserved their original scores");
         System.out.println(
-            "✅ Priority ordering maintained ("
+            "Priority ordering maintained ("
                 + highPriorityNewScore
                 + " < "
                 + lowPriorityNewScore
@@ -1637,26 +1637,26 @@ class AgentAcquisitionServiceTest {
           if (agentIsOverdue) {
             // If the agent is overdue and in waiting, it should appear in ready queries
             // This is the core logic we're testing
-            System.out.println("✓ Agent is overdue and properly detectable by scheduler");
+            System.out.println("Agent is overdue and properly detectable by scheduler");
           } else {
             System.out.println("Note: Agent score was updated during test execution");
           }
         } else if (movedToWorking) {
-          System.out.println("✓ Overdue agent was successfully acquired and moved to working");
+          System.out.println("Overdue agent was successfully acquired and moved to working");
         } else {
-          System.out.println("✓ Overdue agent was processed completely");
+          System.out.println("Overdue agent was processed completely");
         }
 
         // Success criteria: Test passes if the overdue agent mechanism works as expected
         // The key insight: this test verifies the scheduler can detect and process overdue agents
-        System.out.println("✓ Overdue agent detection and processing logic is working correctly");
+        System.out.println("Overdue agent detection and processing logic is working correctly");
       }
     }
 
-    @Test // TODO: review for race conditions
-    @DisplayName("Should prevent thundering herd during mass overdue recovery")
-    void shouldPreventThunderingHerdDuringMassOverdueRecovery() throws Exception {
-      System.out.println("\n=== Testing Thundering Herd Prevention ===");
+    @Test
+    @DisplayName("Should preserve agent priority ordering during repopulation")
+    void shouldPreserveAgentPriorityOrderingDuringRepopulation() throws Exception {
+      System.out.println("\n=== Testing Agent Priority Preservation ===");
 
       AgentExecution execution = mock(AgentExecution.class);
       ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
@@ -1679,14 +1679,14 @@ class AgentAcquisitionServiceTest {
         }
       }
 
-      // Trigger repopulation - this is where the thundering herd would occur with old logic
+      // Trigger acquisition which includes repopulation logic
       acquisitionService.saturatePool(0L, null, executorService);
 
       // Verify all agents maintain their relative priority ordering
       try (Jedis jedis = jedisPool.getResource()) {
         var agentsWithScores = jedis.zrangeWithScores("waiting", 0, -1);
 
-        System.out.println("\nAgent scores after repopulation (should maintain ordering):");
+        System.out.println("\nAgent scores after acquisition (should maintain ordering):");
 
         double previousScore = Double.NEGATIVE_INFINITY;
         for (var tuple : agentsWithScores) {
@@ -1701,14 +1701,14 @@ class AgentAcquisitionServiceTest {
           previousScore = score;
 
           // CRITICAL: All overdue agents should have scores BEFORE current time
-          // (they should NOT all be set to "now")
+          // (they should NOT all be set to "now" which would cause burst execution)
           assertThat(score)
-              .as("Overdue agents should keep old scores, not get immediate execution")
+              .as("Overdue agents should keep old scores to maintain execution cadence")
               .isLessThan((double) currentTimeSeconds);
         }
 
-        System.out.println("✅ No thundering herd - all agents maintain proper priority ordering");
-        System.out.println("✅ No agents were given immediate execution priority");
+        System.out.println("Agent priority ordering preserved");
+        System.out.println("No burst execution - agents maintain staggered cadence");
       }
     }
   }

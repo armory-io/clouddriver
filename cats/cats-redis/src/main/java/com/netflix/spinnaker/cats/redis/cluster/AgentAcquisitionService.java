@@ -821,7 +821,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           // 1. All agents in chunk were acquired by other pods (normal contention)
           // 2. All agents were filtered out (sharding/disabled)
           // 3. Semaphore exhausted
-          // Continue to next chunk to avoid starvation of agents deeper in queue
+          // Continue to next chunk to maintain throughput - agents deeper in queue may still
+          // be eligible, and with high filter rates stopping here reduces effective capacity
           log.debug(
               "No agents acquired from chunk (size: {}) at offset {}, checking for more ready agents",
               readyChunk.size(),
@@ -1298,7 +1299,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             // For agent at index candidateIndex: score is at position (candidateIndex * 2 + 1)
 
             // Critical: Validate index and score format to prevent corruption
-            // from dynamic account updates during batch acquisition
+            // from concurrent external modifications during batch acquisition
             String acquireScore = null;
             int scoreIndex = candidateIndex * 2 + 1;
 
@@ -1309,14 +1310,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                 acquireScore = scoreCandidate;
               } else {
                 log.error(
-                    "Invalid acquire score detected for agent {} at index {}: '{}' - likely corruption from dynamic account update",
+                    "Invalid acquire score detected for agent {} at index {}: '{}' - likely corruption from concurrent external modification",
                     agentType,
                     scoreIndex,
                     scoreCandidate);
               }
             } else {
               log.error(
-                  "Score index {} out of bounds for agent {} (agentScorePairs.size={}). Dynamic account modification likely occurred during batch acquisition.",
+                  "Score index {} out of bounds for agent {} (agentScorePairs.size={}). Concurrent external modification likely occurred during batch acquisition.",
                   scoreIndex,
                   agentType,
                   agentScorePairs.size());
@@ -1443,10 +1444,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
 
       // Semaphore permit acquired
-      // Note: Individual acquisition is less prone to race conditions since it processes one agent
-      // at a time
-      // The dynamic account plugin race primarily affects batch acquisition where indices can be
-      // corrupted
+      // Note: Individual acquisition processes agents sequentially, making it more resilient
+      // to concurrent external modifications that can corrupt batch operation indices
       AgentWorker worker = registrySnapshot.get(agentType);
       if (worker == null) {
         log.warn(

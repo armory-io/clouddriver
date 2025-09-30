@@ -236,7 +236,7 @@ class AgentAcquisitionServiceFairnessTest {
         service1Acquired.get() > 0 || service2Acquired.get() > 0,
         "At least one service should acquire agents");
 
-    // With our fairness fix, if one service gets all from first chunk,
+    // Fairness behavior: if one service gets all from first chunk,
     // it should continue to acquire from subsequent chunks
     // Since batch size is 10 and we have 30 agents, at least one service
     // should get more than 10 (proving it continued past first chunk)
@@ -331,7 +331,7 @@ class AgentAcquisitionServiceFairnessTest {
       }
     }
 
-    // With our fairness fix, should acquire all enabled agents
+    // Fairness behavior: should acquire all enabled agents
     // even if they're spread across multiple chunks
     assertEquals(
         expectedAcquired,

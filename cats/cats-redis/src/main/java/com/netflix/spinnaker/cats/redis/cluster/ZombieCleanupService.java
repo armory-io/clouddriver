@@ -178,10 +178,11 @@ public class ZombieCleanupService {
    * processing. Unlike orphaned agents (which have no running instance), zombies are still
    * executing but have exceeded their expected runtime.
    *
-   * <p>This cleanup mechanism is important for preventing resource exhaustion on the local
-   * instance. It works by checking the local activeAgents map for agents that have exceeded their
-   * completion deadline (current_time + agent_timeout), then performs cleanup in Redis to remove
-   * the agents from both working and waiting sets.
+   * <p>This cleanup prevents thread pool exhaustion: stuck agents hold executor threads
+   * indefinitely, eventually saturating the pool and blocking all new work. The cleanup cancels
+   * stuck futures and frees threads for other agents. Checks the local activeAgents map for agents
+   * that have exceeded their completion deadline (current_time + agent_timeout), then performs
+   * cleanup in Redis to remove the agents from both working and waiting sets.
    *
    * @param activeAgents Map of active agents (agentType -> completionDeadline)
    * @param activeAgentsFutures Map of agent futures for cancellation
@@ -233,10 +234,10 @@ public class ZombieCleanupService {
         log.warn("Invalid acquire score for agent {}: {}", agentType, acquireScore, e);
 
         // Force cleanup invalid scores to prevent permanent stuck state
-        // Can occur during concurrent dynamic account updates
+        // Defensive against external modifications
         zombieAgentTypes.add(agentType);
         log.error(
-            "Force cleaning zombie agent {} with corrupted acquire score '{}' - likely caused by dynamic account update race condition",
+            "Force cleaning zombie agent {} with corrupted acquire score '{}' - likely external modification during acquisition",
             agentType,
             acquireScore);
       }

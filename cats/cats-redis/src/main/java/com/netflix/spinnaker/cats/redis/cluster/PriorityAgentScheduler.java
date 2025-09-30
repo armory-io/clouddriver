@@ -288,12 +288,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
         }
       }
 
-      // Check if Redis repopulation is due. If we repopulate, skip acquisition
-      // this cycle to avoid race conditions during initial agent registration
+      // Check if Redis repopulation is due. If we repopulate, skip acquisition this cycle
+      // to let initial registration jitter settle - prevents all new agents from executing
+      // immediately on first scheduler cycle (which would defeat jitter purpose)
       boolean repopulatedThisCycle = acquisitionService.repopulateIfDueNow();
 
       // Acquire ready agents and submit them for execution first to guarantee forward progress
-      // Skip if we just repopulated to let Redis stabilize
+      // Skip if we just repopulated to allow jitter-based score distribution to take effect
       int agentsAcquired = 0;
       if (!repopulatedThisCycle) {
         agentsAcquired =
@@ -301,7 +302,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
                 currentRun, config.getRunningAgents(), config.getAgentWorkPool());
       } else {
         log.debug(
-            "Skipping acquisition on repopulation cycle {} to prevent first-run races", currentRun);
+            "Skipping acquisition on repopulation cycle {} to allow jitter distribution",
+            currentRun);
       }
 
       // Watchdog: detect possible permit starvation and related stalls via ratio-based heuristics
@@ -778,7 +780,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     log.info("Gracefully releasing {} active agents during shutdown", activeCount);
 
     try {
-      // Set graceful shutdown flag to prevent race condition with normal agent completion
+      // Set graceful shutdown flag (coordination marker for shutdown sequence)
       acquisitionService.setGracefulShutdown(true);
 
       // PHASE 1: Interrupt any running futures

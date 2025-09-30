@@ -324,7 +324,7 @@ public class RedisScriptManager {
     // MOVE_AGENTS_CONDITIONAL: Conditionally move working → waiting with ownership verification.
     // Invariants:
     // - Score encodes lock ownership. Only the owning scorer may requeue.
-    // - Used by graceful shutdown and local zombie/orphan fixes.
+    // - Used by graceful shutdown and local zombie/orphan cleanup.
     // ARGS: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=expectedScore,
     // ARGV[3]=newScore
     // RETURNS: 'swapped' if agent moved successfully, nil if ownership verification failed
