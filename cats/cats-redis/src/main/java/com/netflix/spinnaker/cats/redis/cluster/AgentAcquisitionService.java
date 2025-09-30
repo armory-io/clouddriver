@@ -2351,8 +2351,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   }
 
   /**
-   * Drain the completion queue in a thread-safe manner. Extracts all agent completions from the
-   * queue for processing.
+   * Drain all pending agent completions from the queue for processing.
+   *
+   * <p>Thread-safety: Only called from single-threaded scheduler executor, but queue accepts offers
+   * from agent work pool threads.
+   *
+   * @return List of all pending completions, or empty list if none.
    */
   private List<AgentCompletion> drainCompletionQueue() {
     List<AgentCompletion> completions = new ArrayList<>();

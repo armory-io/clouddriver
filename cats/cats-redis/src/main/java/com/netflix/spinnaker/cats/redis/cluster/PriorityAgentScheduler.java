@@ -101,6 +101,11 @@ public class PriorityAgentScheduler extends CatsModuleAware
   private int watchdogZeroProgressStreak = 0;
   private int watchdogRedisStallStreak = 0;
 
+  // Sustained degraded backlog detection (code-level alerting)
+  private long degradedBacklogStartEpochMs = 0L;
+  private long degradedBacklogBaselineOldestOverdueSec = 0L;
+  private boolean degradedBacklogWarned = false;
+
   /**
    * Creates a PriorityAgentScheduler with required dependencies.
    *
@@ -316,7 +321,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
         int activeCount = acquisitionService.getActiveAgentCount();
         long ready = acquisitionService.getReadyCountSnapshot();
         int zif = acquisitionService.getZombiesInFlight();
-        int effectiveCapacity = Math.max(1, Math.max(0, maxConcurrent - (activeCount + zif)));
+        // Allow zero capacity visibility (do not clamp to 1)
+        int effectiveCapacity = Math.max(0, maxConcurrent - (activeCount + zif));
         double permitsFreePct =
             maxConcurrent > 0
                 ? Math.max(0d, Math.min(1d, (double) permits / (double) maxConcurrent))
@@ -352,6 +358,40 @@ public class PriorityAgentScheduler extends CatsModuleAware
             zif,
             effectiveCapacity,
             permits);
+
+        // Sustained degraded backlog alerting (fine-grained, in-code)
+        // Condition: degraded AND ready backlog present AND oldest overdue rising over window
+        boolean degraded = acquisitionService.isDegraded();
+        long oldestOverdueSec = acquisitionService.getOldestOverdueSeconds();
+        if (degraded && ready > 0) {
+          if (degradedBacklogStartEpochMs == 0L) {
+            degradedBacklogStartEpochMs = currentTimeMillis();
+            degradedBacklogBaselineOldestOverdueSec = oldestOverdueSec;
+            degradedBacklogWarned = false;
+          } else {
+            long elapsed = currentTimeMillis() - degradedBacklogStartEpochMs;
+            // 5 minutes window; ensure the backlog is worsening (oldest overdue increasing)
+            if (elapsed >= 5 * 60 * 1000L
+                && oldestOverdueSec > degradedBacklogBaselineOldestOverdueSec
+                && !degradedBacklogWarned) {
+              log.warn(
+                  "PriorityScheduler sustained degraded backlog: degraded=1 for {} ms, ready={}, oldest_overdue={}s (baseline={}s), effectiveCapacity={}, active={}, maxConcurrent={}",
+                  elapsed,
+                  ready,
+                  oldestOverdueSec,
+                  degradedBacklogBaselineOldestOverdueSec,
+                  effectiveCapacity,
+                  activeCount,
+                  maxConcurrent);
+              degradedBacklogWarned = true; // avoid repeated warns each cycle
+            }
+          }
+        } else {
+          // Reset if not degraded or no backlog
+          degradedBacklogStartEpochMs = 0L;
+          degradedBacklogBaselineOldestOverdueSec = 0L;
+          degradedBacklogWarned = false;
+        }
       } catch (Exception e) {
         log.debug("Watchdog check failed; continuing", e);
       }
