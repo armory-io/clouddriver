@@ -3076,6 +3076,27 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
       // Queue completion for batch processing in next scheduler cycle
       if (!success) {
+        // If failure is due to an OutOfMemoryError, emit additional diagnostics
+        if (cause instanceof java.lang.OutOfMemoryError) {
+          String msg = String.valueOf(cause.getMessage());
+          String oomType = "unknown";
+          if (msg != null) {
+            String lower = msg.toLowerCase(java.util.Locale.ROOT);
+            if (lower.contains("heap") || lower.contains("gc overhead")) {
+              oomType = "heap";
+            } else if (lower.contains("direct buffer")) {
+              oomType = "direct";
+            } else if (lower.contains("metaspace")) {
+              oomType = "metaspace";
+            } else if (lower.contains("unable to create new native thread")) {
+              oomType = "native-thread";
+            }
+          }
+          log.warn(
+              "Agent {} encountered OutOfMemoryError (type={}) — applying throttled backoff",
+              agentType,
+              oomType);
+        }
         completionQueue.offer(
             new AgentCompletion(
                 agent,
@@ -3705,11 +3726,41 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       return FailureClass.TRANSIENT;
     }
 
+    // Treat memory pressure as throttling to exponentially back off agent executions
+    if (cause instanceof java.lang.OutOfMemoryError) {
+      return FailureClass.THROTTLED;
+    }
+
     if (cause instanceof java.net.SocketTimeoutException
         || cause instanceof java.net.ConnectException
         || cause instanceof java.net.SocketException
         || cause instanceof java.io.IOException) {
       return FailureClass.TRANSIENT;
+    }
+
+    // Reflective checks to avoid hard dependencies on provider libraries
+    try {
+      Class<?> sceClass = Class.forName("com.amazonaws.SdkClientException");
+      if (sceClass.isAssignableFrom(cause.getClass())) {
+        return FailureClass.TRANSIENT;
+      }
+    } catch (ClassNotFoundException ignored) {
+    }
+
+    try {
+      Class<?> aceClass = Class.forName("com.amazonaws.AmazonClientException");
+      if (aceClass.isAssignableFrom(cause.getClass())) {
+        return FailureClass.TRANSIENT;
+      }
+    } catch (ClassNotFoundException ignored) {
+    }
+
+    try {
+      Class<?> jooqDae = Class.forName("org.jooq.exception.DataAccessException");
+      if (jooqDae.isAssignableFrom(cause.getClass())) {
+        return FailureClass.TRANSIENT;
+      }
+    } catch (ClassNotFoundException ignored) {
     }
 
     try {
@@ -3732,6 +3783,19 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             errorCode = (String) ec;
           }
         } catch (Exception ignored) {
+        }
+
+        // Some throttling variants are communicated via errorCode even with 400s
+        if (errorCode != null) {
+          String codeLower = errorCode.toLowerCase(java.util.Locale.ROOT);
+          if (codeLower.contains("throttl")
+              || codeLower.contains("toomanyrequests")
+              || codeLower.contains("requestlimitexceeded")
+              || codeLower.contains("slowdown")
+              || codeLower.contains("provisionedthroughputexceeded")
+              || codeLower.contains("requestthrottled")) {
+            return FailureClass.THROTTLED;
+          }
         }
 
         if (status != null) {
