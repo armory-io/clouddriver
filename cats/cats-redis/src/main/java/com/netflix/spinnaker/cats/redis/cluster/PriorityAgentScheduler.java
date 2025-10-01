@@ -705,6 +705,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Step 2: Stop the scheduler executor
       config.getSchedulerExecutorService().shutdown();
+      // Intentional: reuse orphan cleanup timeouts so executor shutdown behavior stays consistent
+      // across scheduler/orphan flows until a dedicated knob is introduced.
       long schedAwait = config.getOrphanExecutorShutdownAwaitMs();
       long schedForceAwait = config.getOrphanExecutorShutdownForceAwaitMs();
       if (!config

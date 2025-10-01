@@ -3720,7 +3720,10 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           RunState runState = acquisitionService.runStates.get(agentType);
           if (runState != null && runState.deadmanHandle != null) {
             try {
-              runState.deadmanHandle.cancel(false);
+              boolean cancelled = runState.deadmanHandle.cancel(false);
+              if (!cancelled && log.isDebugEnabled()) {
+                log.debug("Dead-man timer already fired for {}", agentType);
+              }
             } catch (Exception cancelEx) {
               log.debug("Dead-man handle cancel failed for {}", agentType, cancelEx);
             }

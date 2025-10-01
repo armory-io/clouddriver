@@ -110,7 +110,9 @@ public class OrphanCleanupService {
     if (lastOrphanCleanup > 0 && maxPassDurationMs > 0) {
       long sinceLast = currentTimeMillis() - lastOrphanCleanup;
       // If we haven't updated lastOrphanCleanup for > 10x budget, assume the previous pass hung
-      if (sinceLast > (10L * maxPassDurationMs)) {
+      // Use capped multiplication to avoid theoretical overflow when budget is extremely large.
+      long threshold = Math.min(Long.MAX_VALUE / 10L, maxPassDurationMs) * 10L;
+      if (sinceLast > threshold) {
         log.warn(
             "Skipping orphan cleanup: previous pass appears hung ({}ms since last update > budget {}ms). Releasing leadership defensively.",
             sinceLast,
@@ -596,25 +598,16 @@ public class OrphanCleanupService {
 
         // Shard-aware protection: For waiting entries, only this shard should consider removal.
         // If ownership cannot be determined or belongs to other shard, preserve.
-        boolean belongsToThisShard;
-        if (acquisitionService == null) {
-          // Test environments may not wire acquisitionService. In that case,
-          // treat entries as belonging to this shard for consistent cleanup behavior.
-          belongsToThisShard = true;
-        } else {
-          try {
-            belongsToThisShard = acquisitionService.belongsToThisShard(agentName);
-          } catch (Exception e) {
-            belongsToThisShard = false; // fail-safe preserve
-          }
-        }
+        // Fail-safe shard gating: false on unexpected errors to avoid cross-shard deletions;
+        // when acquisitionService is not wired (tests), default to true for consistent behavior.
+        boolean belongsToThisShard = safeBelongsToShard(agentName);
 
         if (WORKING_SET.equals(setName)) {
           // Skip locally active agents; zombie cleanup manages overruns
-          boolean locallyActive =
-              acquisitionService != null
-                  && acquisitionService.getActiveAgentsMap() != null
-                  && acquisitionService.getActiveAgentsMap().containsKey(agentName);
+          // Defensive: avoid double map access that could race to null; read once and check.
+          java.util.Map<String, String> activeMap =
+              acquisitionService != null ? acquisitionService.getActiveAgentsMap() : null;
+          boolean locallyActive = activeMap != null && activeMap.containsKey(agentName);
           if (locallyActive) {
             log.debug("Skipping locally active working agent {} during orphan cleanup", agentName);
             continue;
@@ -746,6 +739,35 @@ public class OrphanCleanupService {
     }
 
     return cleaned;
+  }
+
+  /**
+   * Determine shard ownership for the given agent in a fail-safe way.
+   *
+   * <p>Behavior:
+   *
+   * <ul>
+   *   <li>Uses {@code acquisitionService.belongsToThisShard(agentName)} when available.
+   *   <li>Returns {@code false} on any unexpected error to preserve entries (avoid cross-shard
+   *       delete).
+   *   <li>Returns {@code true} when {@code acquisitionService} is not wired (e.g., in tests) to
+   *       maintain consistent behavior without blocking cleanup flows.
+   * </ul>
+   *
+   * @param agentName agent identifier used for shard ownership check
+   * @return true if this shard should act on the agent, false otherwise
+   */
+  private boolean safeBelongsToShard(String agentName) {
+    if (acquisitionService == null) {
+      // In tests or when not wired, preserve entries by default in waiting; for working we gate
+      // elsewhere.
+      return true;
+    }
+    try {
+      return acquisitionService.belongsToThisShard(agentName);
+    } catch (Exception e) {
+      return false;
+    }
   }
 
   /**
