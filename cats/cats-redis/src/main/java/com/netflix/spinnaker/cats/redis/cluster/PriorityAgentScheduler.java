@@ -84,6 +84,22 @@ public class PriorityAgentScheduler extends CatsModuleAware
   private final AtomicBoolean orphanCleanupRunning = new AtomicBoolean(false);
   private final AtomicBoolean reconcileRunning = new AtomicBoolean(false);
 
+  // Simple starvation counter: increments when permits==0 and pool activeCount==0. Resets
+  // otherwise.
+  private final java.util.concurrent.atomic.AtomicInteger permitStarvationConsecutive =
+      new java.util.concurrent.atomic.AtomicInteger(0);
+  // Snapshot of starvation state for inclusion in 10-minute health summary
+  private final java.util.concurrent.atomic.AtomicBoolean lastStarvationSuspected =
+      new java.util.concurrent.atomic.AtomicBoolean(false);
+  private final java.util.concurrent.atomic.AtomicInteger lastStarvationTicks =
+      new java.util.concurrent.atomic.AtomicInteger(0);
+  private final java.util.concurrent.atomic.AtomicLong lastStarvationDegradedMs =
+      new java.util.concurrent.atomic.AtomicLong(0L);
+  private final java.util.concurrent.atomic.AtomicLong lastStarvationWarnEpochMs =
+      new java.util.concurrent.atomic.AtomicLong(0L);
+  private final java.util.concurrent.atomic.AtomicLong lastDegradedWarnEpochMs =
+      new java.util.concurrent.atomic.AtomicLong(0L);
+
   // Track all agents provided via schedule(), regardless of current sharding gating
   private final java.util.concurrent.ConcurrentMap<String, KnownAgent> knownAgents =
       new java.util.concurrent.ConcurrentHashMap<>();
@@ -104,7 +120,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
   // Sustained degraded backlog detection (code-level alerting)
   private long degradedBacklogStartEpochMs = 0L;
   private long degradedBacklogBaselineOldestOverdueSec = 0L;
-  private boolean degradedBacklogWarned = false;
 
   /**
    * Creates a PriorityAgentScheduler with required dependencies.
@@ -361,6 +376,51 @@ public class PriorityAgentScheduler extends CatsModuleAware
             effectiveCapacity,
             permits);
 
+        // Simple permit-starvation detector: no permits available and pool idle for N consecutive
+        // cycles.
+        // This often correlates with degraded health when there's a backlog but no effective
+        // execution.
+        try {
+          int consecutive = permitStarvationConsecutive.get();
+          if (sem != null && permits == 0 && poolActive == 0) {
+            consecutive = permitStarvationConsecutive.incrementAndGet();
+          } else {
+            permitStarvationConsecutive.set(0);
+            consecutive = 0;
+          }
+          // Tie into degraded reasoning: if degraded and sustained starvation, surface a clear WARN
+          boolean degraded = acquisitionService.isDegraded();
+          if (consecutive >= 3 && degraded) {
+            long degradedMs =
+                degradedBacklogStartEpochMs > 0L
+                    ? (currentTimeMillis() - degradedBacklogStartEpochMs)
+                    : 0L;
+            // 10-minute cadence for starvation WARNs, aligned with health summaries
+            long last = lastStarvationWarnEpochMs.get();
+            if (CadenceGuard.isPeriodElapsed(last, 10 * 60 * 1000L)) {
+              if (lastStarvationWarnEpochMs.compareAndSet(last, currentTimeMillis())) {
+                log.warn(
+                    "Permit-starvation suspected: degraded=1 for {} ms (starvation_ticks={}) ready={} active={} maxConcurrent={} permits={} zIF={}",
+                    degradedMs,
+                    consecutive,
+                    ready,
+                    activeCount,
+                    maxConcurrent,
+                    permits,
+                    zif);
+              }
+            }
+            lastStarvationSuspected.set(true);
+            lastStarvationTicks.set(consecutive);
+            lastStarvationDegradedMs.set(degradedMs);
+          } else {
+            lastStarvationSuspected.set(false);
+            lastStarvationTicks.set(0);
+            lastStarvationDegradedMs.set(0L);
+          }
+        } catch (Exception ignore) {
+        }
+
         // Sustained degraded backlog alerting (fine-grained, in-code)
         // Condition: degraded AND ready backlog present AND oldest overdue rising over window
         boolean degraded = acquisitionService.isDegraded();
@@ -369,30 +429,31 @@ public class PriorityAgentScheduler extends CatsModuleAware
           if (degradedBacklogStartEpochMs == 0L) {
             degradedBacklogStartEpochMs = currentTimeMillis();
             degradedBacklogBaselineOldestOverdueSec = oldestOverdueSec;
-            degradedBacklogWarned = false;
           } else {
             long elapsed = currentTimeMillis() - degradedBacklogStartEpochMs;
-            // 5 minutes window; ensure the backlog is worsening (oldest overdue increasing)
-            if (elapsed >= 5 * 60 * 1000L
-                && oldestOverdueSec > degradedBacklogBaselineOldestOverdueSec
-                && !degradedBacklogWarned) {
-              log.warn(
-                  "PriorityScheduler sustained degraded backlog: degraded=1 for {} ms, ready={}, oldest_overdue={}s (baseline={}s), effectiveCapacity={}, active={}, maxConcurrent={}",
-                  elapsed,
-                  ready,
-                  oldestOverdueSec,
-                  degradedBacklogBaselineOldestOverdueSec,
-                  effectiveCapacity,
-                  activeCount,
-                  maxConcurrent);
-              degradedBacklogWarned = true; // avoid repeated warns each cycle
+            // 10-minute cadence; ensure the backlog is worsening (oldest overdue increasing)
+            long last = lastDegradedWarnEpochMs.get();
+            if (CadenceGuard.isPeriodElapsed(last, 10 * 60 * 1000L)
+                && oldestOverdueSec > degradedBacklogBaselineOldestOverdueSec) {
+              if (lastDegradedWarnEpochMs.compareAndSet(last, currentTimeMillis())) {
+                log.warn(
+                    "PriorityScheduler sustained degraded backlog: degraded=1 for {} ms, ready={}, oldest_overdue={}s (baseline={}s), effectiveCapacity={}, active={}, maxConcurrent={}",
+                    elapsed,
+                    ready,
+                    oldestOverdueSec,
+                    degradedBacklogBaselineOldestOverdueSec,
+                    effectiveCapacity,
+                    activeCount,
+                    maxConcurrent);
+                // Reset baseline so next 10-min warn requires continued increase
+                degradedBacklogBaselineOldestOverdueSec = oldestOverdueSec;
+              }
             }
           }
         } else {
           // Reset if not degraded or no backlog
           degradedBacklogStartEpochMs = 0L;
           degradedBacklogBaselineOldestOverdueSec = 0L;
-          degradedBacklogWarned = false;
         }
       } catch (Exception e) {
         log.debug("Watchdog check failed; continuing", e);
@@ -567,7 +628,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     }
 
     log.info(
-        "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={} health={}{} oldest_overdue={}s queueDepth={} permitsAvailable={} zombiesInFlight={}",
+        "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={} health={}{} oldest_overdue={}s queueDepth={} permitsAvailable={} zombiesInFlight={}{}",
         stats.getRegisteredAgents(),
         stats.getActiveAgents(),
         acquisitionService.getFuturesMapSize(),
@@ -586,7 +647,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
         stats.getOldestOverdueSeconds(),
         queueDepth,
         availablePermits,
-        zombiesInFlight);
+        zombiesInFlight,
+        lastStarvationSuspected.get()
+            ? String.format(
+                " [starvation suspected: degradedForMs=%d ticks=%d]",
+                lastStarvationDegradedMs.get(), lastStarvationTicks.get())
+            : "");
   }
 
   /**
@@ -706,7 +772,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // Step 2: Stop the scheduler executor
       config.getSchedulerExecutorService().shutdown();
       // Intentional: reuse orphan cleanup timeouts so executor shutdown behavior stays consistent
-      // across scheduler/orphan flows until a dedicated knob is introduced.
+      // across scheduler/orphan flows.
       long schedAwait = config.getOrphanExecutorShutdownAwaitMs();
       long schedForceAwait = config.getOrphanExecutorShutdownForceAwaitMs();
       if (!config
