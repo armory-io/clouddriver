@@ -109,9 +109,8 @@ public class OrphanCleanupService {
         Math.max(1_000L, schedulerProperties.getOrphanCleanup().getRunBudgetMs());
     if (lastOrphanCleanup > 0 && maxPassDurationMs > 0) {
       long sinceLast = currentTimeMillis() - lastOrphanCleanup;
-      // If we haven't updated lastOrphanCleanup for > 10x budget, assume the previous pass hung
-      // Use capped multiplication to avoid theoretical overflow when budget is extremely large.
-      long threshold = Math.min(Long.MAX_VALUE / 10L, maxPassDurationMs) * 10L;
+      // If we haven't updated lastOrphanCleanup for > runBudgetMs, assume the previous pass hung
+      long threshold = maxPassDurationMs;
       if (sinceLast > threshold) {
         log.warn(
             "Skipping orphan cleanup: previous pass appears hung ({}ms since last update > budget {}ms). Releasing leadership defensively.",
@@ -260,59 +259,76 @@ public class OrphanCleanupService {
     }
 
     try {
-      if (CadenceGuard.overBudget(startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
-          || Thread.currentThread().isInterrupted()) {
-        log.warn("Skipping {} orphan scan due to budget/interrupt", setName);
-        return 0;
-      }
-      // Find all agents in set older than threshold
-      Set<Tuple> potentialOrphans = jedis.zrangeByScoreWithScores(setName, 0, cutoffScore);
+      int totalCleaned = 0;
+      while (true) {
+        if (CadenceGuard.overBudget(
+                startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
+            || Thread.currentThread().isInterrupted()) {
+          log.warn("Stopping {} orphan scan due to budget/interrupt", setName);
+          break;
+        }
 
-      if (potentialOrphans.isEmpty()) {
-        log.debug("Orphan scan completed: {} set analyzed, 0 orphans found", setName);
-        return 0;
-      }
+        Set<Tuple> potentialOrphans = jedis.zrangeByScoreWithScores(setName, 0, cutoffScore);
+        if (potentialOrphans.isEmpty()) {
+          if (log.isDebugEnabled()) {
+            log.debug("Orphan scan: {} set analyzed, 0 candidates found", setName);
+          }
+          break;
+        }
 
-      // Optional: remove numeric-only members in WAITING set (repair corruption)
-      int numericRemoved = 0;
-      if (WAITING_SET.equals(setName)
-          && schedulerProperties.getOrphanCleanup().isRemoveNumericWaiting()) {
-        for (Tuple tuple : new java.util.ArrayList<>(potentialOrphans)) {
-          String name = tuple.getElement();
-          if (name != null && name.matches("^\\d+$")) {
-            try {
-              Object res =
-                  scriptManager.evalshaWithSelfHeal(
-                      jedis,
-                      RedisScriptManager.REMOVE_AGENT,
-                      java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                      java.util.Collections.singletonList(name));
-              boolean removed = res != null && ((Long) res).intValue() == 1;
-              if (removed) {
-                numericRemoved++;
-                if (metrics != null) {
-                  metrics.incrementInvalidMember("waiting_numeric_removed");
+        // Optional: remove numeric-only members in WAITING set (repair corruption)
+        int numericRemoved = 0;
+        if (WAITING_SET.equals(setName)
+            && schedulerProperties.getOrphanCleanup().isRemoveNumericWaiting()) {
+          for (Tuple tuple : new java.util.ArrayList<>(potentialOrphans)) {
+            String name = tuple.getElement();
+            if (name != null && name.matches("^\\d+$")) {
+              try {
+                Object res =
+                    scriptManager.evalshaWithSelfHeal(
+                        jedis,
+                        RedisScriptManager.REMOVE_AGENT,
+                        java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                        java.util.Collections.singletonList(name));
+                boolean removed = res != null && ((Long) res).intValue() == 1;
+                if (removed) {
+                  numericRemoved++;
+                  if (metrics != null) {
+                    metrics.incrementInvalidMember("waiting_numeric_removed");
+                  }
                 }
+              } catch (Exception ignore) {
               }
-            } catch (Exception ignore) {
             }
           }
+          if (numericRemoved > 0) {
+            log.warn(
+                "Removed {} numeric-only waiting members during orphan cleanup", numericRemoved);
+          }
         }
-        if (numericRemoved > 0) {
-          log.warn("Removed {} numeric-only waiting members during orphan cleanup", numericRemoved);
+
+        if (log.isWarnEnabled()) {
+          log.warn(
+              "Orphan scan: {} set analyzed, {} candidates (older than {}ms) - processing",
+              setName,
+              potentialOrphans.size(),
+              thresholdForLogging);
+        }
+
+        List<Tuple> orphanList = new ArrayList<>(potentialOrphans);
+        int cleanedThisPass = processOrphanBatch(jedis, setName, orphanList, startTs);
+        totalCleaned += cleanedThisPass;
+
+        // Break when no progress was made to avoid infinite loops on valid-only candidates
+        if (cleanedThisPass == 0) {
+          log.warn(
+              "Orphan scan: {} set made no progress this pass; exiting early before budget is exhausted",
+              setName);
+          break;
         }
       }
 
-      log.warn(
-          "Orphan scan completed: {} set analyzed, {} orphans found (older than {}ms) - cleaning up: {}",
-          setName,
-          potentialOrphans.size(),
-          thresholdForLogging,
-          potentialOrphans.stream().map(Tuple::getElement).limit(5).toArray());
-
-      // Process orphans with batch operations and fallback
-      List<Tuple> orphanList = new ArrayList<>(potentialOrphans);
-      return processOrphanBatch(jedis, setName, orphanList, startTs);
+      return totalCleaned;
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
       log.warn("Redis connection error while scanning {} for orphans", setName, e);
