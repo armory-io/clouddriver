@@ -191,15 +191,20 @@ public class ZombieCleanupService {
   public int cleanupZombieAgents(
       Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
     long start = currentTimeMillis();
+    final long budgetMs = schedulerProperties.getZombieCleanup().getRunBudgetMs();
+    final long deadlineEpochMs = budgetMs > 0 ? (start + budgetMs) : Long.MAX_VALUE;
     long currentTime = currentTimeMillis();
     List<String> zombieAgentTypes = new ArrayList<>();
 
     int validAgentsScanned = 0;
 
     for (Map.Entry<String, String> entry : activeAgents.entrySet()) {
-      if (CadenceGuard.overBudget(start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
-          || Thread.currentThread().isInterrupted()) {
-        log.warn("Stopping zombie scan early due to budget/interrupt");
+      if (Thread.currentThread().isInterrupted()) {
+        log.warn("Stopping zombie scan early due to interrupt");
+        break;
+      }
+      if (currentTimeMillis() > deadlineEpochMs) {
+        log.warn("Stopping zombie scan early due to budget deadline");
         break;
       }
       currentTime = currentTimeMillis();
@@ -270,10 +275,12 @@ public class ZombieCleanupService {
         }
 
         for (String agentType : zombieAgentTypes) {
-          if (CadenceGuard.overBudget(
-                  start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
-              || Thread.currentThread().isInterrupted()) {
-            log.warn("Stopping zombie individual cleanup due to budget/interrupt");
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Stopping zombie individual cleanup due to interrupt");
+            break;
+          }
+          if (currentTimeMillis() > deadlineEpochMs) {
+            log.warn("Stopping zombie individual cleanup due to budget deadline");
             break;
           }
           try {
@@ -301,34 +308,38 @@ public class ZombieCleanupService {
         }
 
         for (String agentType : zombieAgentTypes) {
-          if (CadenceGuard.overBudget(
-                  start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
-              || Thread.currentThread().isInterrupted()) {
-            log.warn("Stopping zombie batch preparation due to budget/interrupt");
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Stopping zombie batch preparation due to interrupt");
+            break;
+          }
+          if (currentTimeMillis() > deadlineEpochMs) {
+            log.warn("Stopping zombie batch preparation due to budget deadline");
             break;
           }
           zombieBatch.add(agentType);
 
           if (zombieBatch.size() >= batchSize) {
-            if (CadenceGuard.overBudget(
-                    start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
-                || Thread.currentThread().isInterrupted()) {
-              log.warn("Skipping zombie batch execution due to budget/interrupt");
+            if (Thread.currentThread().isInterrupted()) {
+              log.warn("Skipping zombie batch execution due to interrupt");
+              break;
+            }
+            if (currentTimeMillis() > deadlineEpochMs) {
+              log.warn("Skipping zombie batch execution due to budget deadline");
               break;
             }
             totalCleaned +=
-                cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures, start);
+                cleanupZombieBatch(
+                    jedis, zombieBatch, activeAgents, activeAgentsFutures, deadlineEpochMs);
             zombieBatch.clear();
           }
         }
 
         // Process remaining zombies
         if (!zombieBatch.isEmpty()) {
-          if (!CadenceGuard.overBudget(
-                  start, schedulerProperties.getZombieCleanup().getRunBudgetMs())
-              && !Thread.currentThread().isInterrupted()) {
+          if (!Thread.currentThread().isInterrupted() && currentTimeMillis() <= deadlineEpochMs) {
             totalCleaned +=
-                cleanupZombieBatch(jedis, zombieBatch, activeAgents, activeAgentsFutures, start);
+                cleanupZombieBatch(
+                    jedis, zombieBatch, activeAgents, activeAgentsFutures, deadlineEpochMs);
           }
         }
       }
@@ -394,7 +405,7 @@ public class ZombieCleanupService {
       List<String> zombieAgentTypes,
       Map<String, String> activeAgents,
       Map<String, Future<?>> activeAgentsFutures,
-      long startTs) {
+      long deadlineEpochMs) {
 
     if (zombieAgentTypes.isEmpty()) {
       return 0;
@@ -411,10 +422,12 @@ public class ZombieCleanupService {
         List<String> inputCandidates = new ArrayList<>(zombieAgentTypes);
 
         for (String agentType : zombieAgentTypes) {
-          if (CadenceGuard.overBudget(
-                  startTs, schedulerProperties.getZombieCleanup().getRunBudgetMs())
-              || Thread.currentThread().isInterrupted()) {
-            log.warn("Stopping zombie batch build due to budget/interrupt");
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Stopping zombie batch build due to interrupt");
+            break;
+          }
+          if (currentTimeMillis() > deadlineEpochMs) {
+            log.warn("Stopping zombie batch build due to budget deadline");
             break;
           }
           String acquireScore = activeAgents.get(agentType);
@@ -492,10 +505,12 @@ public class ZombieCleanupService {
             }
             int fallbackCleaned = 0;
             for (String agentType : remainingForFallback) {
-              if (CadenceGuard.overBudget(
-                      startTs, schedulerProperties.getZombieCleanup().getRunBudgetMs())
-                  || Thread.currentThread().isInterrupted()) {
-                log.warn("Stopping zombie individual fallback due to budget/interrupt");
+              if (Thread.currentThread().isInterrupted()) {
+                log.warn("Stopping zombie individual fallback due to interrupt");
+                break;
+              }
+              if (currentTimeMillis() > deadlineEpochMs) {
+                log.warn("Stopping zombie individual fallback due to budget deadline");
                 break;
               }
               try {
@@ -531,9 +546,12 @@ public class ZombieCleanupService {
     }
     int totalCleaned = 0;
     for (String agentType : zombieAgentTypes) {
-      if (CadenceGuard.overBudget(startTs, schedulerProperties.getZombieCleanup().getRunBudgetMs())
-          || Thread.currentThread().isInterrupted()) {
-        log.warn("Stopping zombie individual fallback due to budget/interrupt");
+      if (Thread.currentThread().isInterrupted()) {
+        log.warn("Stopping zombie individual fallback due to interrupt");
+        break;
+      }
+      if (currentTimeMillis() > deadlineEpochMs) {
+        log.warn("Stopping zombie individual fallback due to budget deadline");
         break;
       }
       try {

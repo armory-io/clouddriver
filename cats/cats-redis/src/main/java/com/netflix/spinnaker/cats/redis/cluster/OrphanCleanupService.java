@@ -143,14 +143,16 @@ public class OrphanCleanupService {
     }
 
     try (Jedis jedis = jedisPool.getResource()) {
-      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start);
-      // If we already exceeded the budget on working, do not attempt waiting
-      if (CadenceGuard.overBudget(start, schedulerProperties.getOrphanCleanup().getRunBudgetMs())) {
+      final long budgetMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
+      final long deadlineEpochMs = budgetMs > 0 ? (start + budgetMs) : Long.MAX_VALUE;
+
+      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, deadlineEpochMs);
+      if (currentTimeMillis() > deadlineEpochMs) {
         log.warn("Orphan cleanup budget exceeded after working set; skipping waiting set");
         lastOrphanCleanup = currentTimeMillis();
         return;
       }
-      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, start);
+      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, deadlineEpochMs);
       int totalCleaned = workingCleaned + waitingCleaned;
 
       if (totalCleaned > 0) {
@@ -190,8 +192,10 @@ public class OrphanCleanupService {
 
     try (Jedis jedis = jedisPool.getResource()) {
       long start = currentTimeMillis();
-      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start);
-      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, start);
+      final long budgetMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
+      final long deadlineEpochMs = budgetMs > 0 ? (start + budgetMs) : Long.MAX_VALUE;
+      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, deadlineEpochMs);
+      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, deadlineEpochMs);
       int totalCleaned = workingCleaned + waitingCleaned;
 
       if (totalCleaned > 0) {
@@ -237,7 +241,7 @@ public class OrphanCleanupService {
    * @param setName The name of the Redis set to clean up
    * @return The number of orphaned agents cleaned up
    */
-  private int cleanupOrphanedAgentsFromSet(Jedis jedis, String setName, long startTs) {
+  private int cleanupOrphanedAgentsFromSet(Jedis jedis, String setName, long deadlineEpochMs) {
     long cutoffScore;
     long thresholdForLogging;
 
@@ -261,10 +265,12 @@ public class OrphanCleanupService {
     try {
       int totalCleaned = 0;
       while (true) {
-        if (CadenceGuard.overBudget(
-                startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
-            || Thread.currentThread().isInterrupted()) {
-          log.warn("Stopping {} orphan scan due to budget/interrupt", setName);
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("Stopping {} orphan scan due to interrupt", setName);
+          break;
+        }
+        if (currentTimeMillis() > deadlineEpochMs) {
+          log.warn("Stopping {} orphan scan due to budget deadline", setName);
           break;
         }
 
@@ -279,7 +285,7 @@ public class OrphanCleanupService {
         // Optional: remove numeric-only members in WAITING set (repair corruption)
         int numericRemoved = 0;
         if (WAITING_SET.equals(setName)
-            && schedulerProperties.getOrphanCleanup().isRemoveNumericWaiting()) {
+            && schedulerProperties.getOrphanCleanup().isRemoveNumericOnlyAgents()) {
           for (Tuple tuple : new java.util.ArrayList<>(potentialOrphans)) {
             String name = tuple.getElement();
             if (name != null && name.matches("^\\d+$")) {
@@ -316,7 +322,7 @@ public class OrphanCleanupService {
         }
 
         List<Tuple> orphanList = new ArrayList<>(potentialOrphans);
-        int cleanedThisPass = processOrphanBatch(jedis, setName, orphanList, startTs);
+        int cleanedThisPass = processOrphanBatch(jedis, setName, orphanList, deadlineEpochMs);
         totalCleaned += cleanedThisPass;
 
         // Break when no progress was made to avoid infinite loops on valid-only candidates
@@ -347,7 +353,8 @@ public class OrphanCleanupService {
    * @param orphans List of orphaned agents to process
    * @return The number of orphaned agents cleaned up
    */
-  private int processOrphanBatch(Jedis jedis, String setName, List<Tuple> orphans, long startTs) {
+  private int processOrphanBatch(
+      Jedis jedis, String setName, List<Tuple> orphans, long deadlineEpochMs) {
     if (orphans.isEmpty()) {
       return 0;
     }
@@ -367,10 +374,12 @@ public class OrphanCleanupService {
         // Also track which invalid agents we attempted to remove in this batch
         List<String> attemptedInvalid = new ArrayList<>();
         for (Tuple orphan : orphans) {
-          if (CadenceGuard.overBudget(
-                  startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
-              || Thread.currentThread().isInterrupted()) {
-            log.warn("Aborting waiting-batch build due to budget/interrupt");
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Aborting waiting-batch build due to interrupt");
+            break;
+          }
+          if (currentTimeMillis() > deadlineEpochMs) {
+            log.warn("Aborting waiting-batch build due to budget deadline");
             break;
           }
           String agentName = orphan.getElement();
@@ -410,10 +419,12 @@ public class OrphanCleanupService {
             if (parsed.getRemovedCount() < attemptedInvalid.size()) {
               java.util.Set<String> removedSet = new java.util.HashSet<>(parsed.getMembers());
               for (String agentName : attemptedInvalid) {
-                if (CadenceGuard.overBudget(
-                        startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
-                    || Thread.currentThread().isInterrupted()) {
-                  log.warn("Stopping per-item fallback due to budget/interrupt");
+                if (Thread.currentThread().isInterrupted()) {
+                  log.warn("Stopping per-item fallback due to interrupt");
+                  break;
+                }
+                if (currentTimeMillis() > deadlineEpochMs) {
+                  log.warn("Stopping per-item fallback due to budget deadline");
                   break;
                 }
                 if (!removedSet.contains(agentName)) {
@@ -458,10 +469,12 @@ public class OrphanCleanupService {
             // Batch-first per-item: try conditional remove one-by-one, then fallback to
             // REMOVE_AGENT
             for (Tuple orphan : orphans) {
-              if (CadenceGuard.overBudget(
-                      startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
-                  || Thread.currentThread().isInterrupted()) {
-                log.warn("Stopping individual conditional removal due to budget/interrupt");
+              if (Thread.currentThread().isInterrupted()) {
+                log.warn("Stopping individual conditional removal due to interrupt");
+                break;
+              }
+              if (currentTimeMillis() > deadlineEpochMs) {
+                log.warn("Stopping individual conditional removal due to budget deadline");
                 break;
               }
               String agentName = orphan.getElement();
@@ -494,21 +507,23 @@ public class OrphanCleanupService {
           }
         }
       } else {
-        totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startTs);
+        totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, deadlineEpochMs);
       }
     } else {
       // Critical: Prefer individual path to allow validity checks and conditional moves, and to
       // skip locally active work.
       for (int i = 0; i < orphans.size(); i += batchSize) {
-        if (CadenceGuard.overBudget(
-                startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
-            || Thread.currentThread().isInterrupted()) {
-          log.warn("Aborting working-batch processing due to budget/interrupt");
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("Aborting working-batch processing due to interrupt");
+          break;
+        }
+        if (currentTimeMillis() > deadlineEpochMs) {
+          log.warn("Aborting working-batch processing due to budget deadline");
           break;
         }
         int endIndex = Math.min(i + batchSize, orphans.size());
         List<Tuple> batch = orphans.subList(i, endIndex);
-        totalCleaned += cleanupIndividualOrphans(jedis, setName, batch, startTs);
+        totalCleaned += cleanupIndividualOrphans(jedis, setName, batch, deadlineEpochMs);
       }
     }
 
@@ -594,13 +609,16 @@ public class OrphanCleanupService {
    * @return Number of agents successfully cleaned up
    */
   private int cleanupIndividualOrphans(
-      Jedis jedis, String setName, List<Tuple> orphans, long startTs) {
+      Jedis jedis, String setName, List<Tuple> orphans, long deadlineEpochMs) {
     int cleaned = 0;
 
     for (Tuple orphan : orphans) {
-      if (CadenceGuard.overBudget(startTs, schedulerProperties.getOrphanCleanup().getRunBudgetMs())
-          || Thread.currentThread().isInterrupted()) {
-        log.warn("Stopping individual orphan cleanup early due to budget/interrupt");
+      if (Thread.currentThread().isInterrupted()) {
+        log.warn("Stopping individual orphan cleanup early due to interrupt");
+        break;
+      }
+      if (currentTimeMillis() > deadlineEpochMs) {
+        log.warn("Stopping individual orphan cleanup early due to budget deadline");
         break;
       }
       try {

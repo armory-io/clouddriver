@@ -959,6 +959,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
     try {
       long refreshPeriodSeconds = config.getRedisRefreshPeriod();
       long refreshPeriodMs = Math.max(1, refreshPeriodSeconds) * 1000L;
+      long budgetMs = config.getReconcileRunBudgetMs();
+      final long deadlineEpochMs = budgetMs > 0 ? (currentTimeMillis() + budgetMs) : Long.MAX_VALUE;
       long now = currentTimeMillis();
       long last = lastReconcileEpochMs.get();
       if (!CadenceGuard.isPeriodElapsed(last, refreshPeriodMs)) {
@@ -967,6 +969,14 @@ public class PriorityAgentScheduler extends CatsModuleAware
       lastReconcileEpochMs.set(now);
 
       for (KnownAgent ka : knownAgents.values()) {
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("Reconcile pass stopping early due to interrupt");
+          break;
+        }
+        if (currentTimeMillis() > deadlineEpochMs) {
+          log.warn("Reconcile pass stopping early due to budget deadline");
+          break;
+        }
         Agent agent = ka.agent;
         boolean enabledNow = isAgentEnabled(agent);
         Agent registered = acquisitionService.getRegisteredAgent(agent.getAgentType());
@@ -984,6 +994,14 @@ public class PriorityAgentScheduler extends CatsModuleAware
       try {
         java.util.Map<String, String> active = acquisitionService.getActiveAgentsMap();
         for (java.util.Map.Entry<String, String> e : active.entrySet()) {
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Reconcile validation stopping early due to interrupt");
+            break;
+          }
+          if (currentTimeMillis() > deadlineEpochMs) {
+            log.warn("Reconcile validation stopping early due to budget deadline");
+            break;
+          }
           String agentType = e.getKey();
           String scoreStr = e.getValue();
           boolean numeric = scoreStr != null && scoreStr.matches("^\\d+$");
