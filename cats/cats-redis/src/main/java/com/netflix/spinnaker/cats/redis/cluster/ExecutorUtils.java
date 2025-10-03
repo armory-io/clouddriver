@@ -16,12 +16,15 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import lombok.extern.slf4j.Slf4j;
+
 /**
  * Utility helpers for creating executors used by the Priority Redis Scheduler.
  *
  * <p>Provides factories that minimize idle threads and standardize thread naming. Keeps the class
  * package-private to limit API surface.
  */
+@Slf4j
 final class ExecutorUtils {
   private ExecutorUtils() {}
 
@@ -45,12 +48,11 @@ final class ExecutorUtils {
               t.setDaemon(true);
               t.setUncaughtExceptionHandler(
                   (thread, throwable) ->
-                      org.slf4j.LoggerFactory.getLogger(ExecutorUtils.class)
-                          .error(
-                              "Uncaught exception in {}: {}",
-                              thread.getName(),
-                              String.valueOf(throwable.getMessage()),
-                              throwable));
+                      log.error(
+                          "Uncaught exception in {}: {}",
+                          thread.getName(),
+                          String.valueOf(throwable.getMessage()),
+                          throwable));
               return t;
             });
     exec.allowCoreThreadTimeOut(true);

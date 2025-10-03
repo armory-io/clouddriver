@@ -20,8 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Circuit breaker protecting the scheduler from cascading failures.
@@ -30,8 +29,8 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Trips open after threshold failures, cools down, then tests recovery.
  */
+@Slf4j
 public class PrioritySchedulerCircuitBreaker {
-  private static final Logger log = LoggerFactory.getLogger(PrioritySchedulerCircuitBreaker.class);
 
   public enum State {
     CLOSED, // Normal operation

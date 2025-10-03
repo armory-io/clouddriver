@@ -20,12 +20,11 @@ import com.google.common.base.Preconditions;
 import java.util.concurrent.Semaphore;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 /** Utility methods for the Priority Redis Scheduler. */
+@Slf4j
 final class SchedulerUtils {
-  private static final Logger log = LoggerFactory.getLogger(SchedulerUtils.class);
 
   private SchedulerUtils() {
     // Utility class
