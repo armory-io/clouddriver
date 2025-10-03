@@ -145,7 +145,7 @@ public class AgentSchedulerConfig {
       PrioritySchedulerProperties schedulerProperties,
       PrioritySchedulerMetrics metrics,
       RedisConfigurationProperties redisConfigurationProperties) {
-    log.info("Creating PriorityAgentScheduler (priority)");
+    log.info("Creating PriorityAgentScheduler [priority]");
 
     int parallelism = redisConfigurationProperties.getScheduler().getParallelism();
     if (parallelism != 0) {
@@ -163,7 +163,7 @@ public class AgentSchedulerConfig {
           agentProperties.getDisabledPattern());
     }
 
-    // Log scheduler configuration for operational visibility (grouped one-liners)
+    // Log scheduler configuration for operational visibility
     log.info(
         "[priority] core: max-concurrent-agents={} interval-ms={} refresh-period-seconds={} time-cache-duration-ms={}",
         agentProperties.getMaxConcurrentAgents(),
@@ -182,7 +182,7 @@ public class AgentSchedulerConfig {
         healthSummarySec,
         (healthSummarySec <= 0 ? "disabled" : "enabled"));
 
-    // Circuit breaker one-liner
+    // Circuit breaker
     log.info(
         "[priority] circuit-breaker: enabled={} failure-threshold={} failure-window-ms={} cooldown-ms={} half-open-duration-ms={}",
         schedulerProperties.getCircuitBreaker().isEnabled(),
@@ -190,6 +190,23 @@ public class AgentSchedulerConfig {
         schedulerProperties.getCircuitBreaker().getFailureWindowMs(),
         schedulerProperties.getCircuitBreaker().getCooldownMs(),
         schedulerProperties.getCircuitBreaker().getHalfOpenDurationMs());
+
+    // Jitter
+    log.info(
+        "[priority] jitter: initial-registration-seconds={} shutdown-seconds={} failure-backoff-ratio={}",
+        schedulerProperties.getJitterInitialRegistrationSeconds(),
+        schedulerProperties.getJitterShutdownSeconds(),
+        schedulerProperties.getJitterFailureBackoffRatio());
+
+    // Failure-aware backoff
+    log.info(
+        "[priority] failure-backoff: enabled={} max-immediate-retries={} permanent-forbidden-ms={} throttled[base-ms={},multiplier={},cap-ms={}]",
+        schedulerProperties.isFailureBackoffEnabled(),
+        schedulerProperties.getFailureBackoffMaxImmediateRetries(),
+        schedulerProperties.getFailureBackoffPermanentForbiddenBackoffMs(),
+        schedulerProperties.getFailureBackoffThrottledBaseMs(),
+        schedulerProperties.getFailureBackoffThrottledMultiplier(),
+        schedulerProperties.getFailureBackoffThrottledCapMs());
 
     // Cleanup blocks
     log.info(
@@ -209,17 +226,18 @@ public class AgentSchedulerConfig {
     }
 
     log.info(
-        "[priority] orphan-cleanup: enabled={} threshold-ms={} interval-ms={} leadership-ttl-ms={} force-all-pods={} run-budget-ms={} shutdown[await-ms={},force-await-ms={}]",
+        "[priority] orphan-cleanup: enabled={} threshold-ms={} interval-ms={} leadership-ttl-ms={} force-all-pods={} remove-numeric-only-agents={} run-budget-ms={} shutdown[await-ms={},force-await-ms={}]",
         schedulerProperties.isOrphanCleanupEnabled(),
         schedulerProperties.getOrphanThresholdMs(),
         schedulerProperties.getOrphanIntervalMs(),
         schedulerProperties.getOrphanLeadershipTtlMs(),
         schedulerProperties.isOrphanForceAllPods(),
+        schedulerProperties.isOrphanRemoveNumericOnlyAgents(),
         schedulerProperties.getOrphanRunBudgetMs(),
         schedulerProperties.getOrphanExecutorShutdownAwaitMs(),
         schedulerProperties.getOrphanExecutorShutdownForceAwaitMs());
 
-    // Batch ops & reconcile
+    // Batch operations & reconcile
     log.info(
         "[priority] batch-operations: enabled={} batch-size={} chunk-attempt-multiplier={}",
         schedulerProperties.getBatchOperations().isEnabled(),
@@ -232,7 +250,7 @@ public class AgentSchedulerConfig {
         schedulerProperties.getReconcileExecutorShutdownForceAwaitMs(),
         schedulerProperties.getReconcileRunBudgetMs());
 
-    // Redis keys
+    // Redis key structure
     log.info(
         "[priority] keys: prefix='{}' hash-tag='{}' waiting='{}' working='{}' cleanup-leader='{}'",
         schedulerProperties.getKeys().getPrefix(),

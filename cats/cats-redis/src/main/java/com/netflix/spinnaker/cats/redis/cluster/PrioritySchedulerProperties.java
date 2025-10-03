@@ -298,6 +298,76 @@ public class PrioritySchedulerProperties {
     return orphanCleanup.isForceAllPods();
   }
 
+  /**
+   * Whether numeric-only members in the waiting set should be removed during orphan cleanup.
+   *
+   * <p>Public proxy to avoid leaking package-private nested type.
+   */
+  public boolean isOrphanRemoveNumericOnlyAgents() {
+    return orphanCleanup.isRemoveNumericOnlyAgents();
+  }
+
+  // === JITTER (public proxies) ===
+
+  /** Initial registration jitter in whole seconds (0 disables). */
+  public int getJitterInitialRegistrationSeconds() {
+    JitterProperties j = getJitter();
+    return j != null ? j.getInitialRegistrationSeconds() : 0;
+  }
+
+  /** Shutdown smoothing jitter in whole seconds (0 disables). */
+  public int getJitterShutdownSeconds() {
+    JitterProperties j = getJitter();
+    return j != null ? j.getShutdownSeconds() : 0;
+  }
+
+  /** Ratio applied to non-zero failure backoff delays. Range [0.0, 1.0]. */
+  public double getJitterFailureBackoffRatio() {
+    JitterProperties j = getJitter();
+    return j != null ? j.getFailureBackoffRatio() : 0.0d;
+  }
+
+  // === FAILURE BACKOFF (public proxies) ===
+
+  /** Master switch for failure-aware backoff. */
+  public boolean isFailureBackoffEnabled() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    return fb != null && fb.isEnabled();
+  }
+
+  /** Immediate retry count before applying error interval for transient/server errors. */
+  public int getFailureBackoffMaxImmediateRetries() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    return fb != null ? fb.getMaxImmediateRetries() : 0;
+  }
+
+  /** Fixed backoff for permanent forbidden errors (e.g., 403/AccessDenied). */
+  public long getFailureBackoffPermanentForbiddenBackoffMs() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    return fb != null ? fb.getPermanentForbiddenBackoffMs() : 0L;
+  }
+
+  /** Starting backoff for throttled errors. */
+  public long getFailureBackoffThrottledBaseMs() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    FailureBackoffProperties.ThrottledPolicy tp = fb != null ? fb.getThrottled() : null;
+    return tp != null ? tp.getBaseMs() : 0L;
+  }
+
+  /** Exponential multiplier for throttled errors. */
+  public double getFailureBackoffThrottledMultiplier() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    FailureBackoffProperties.ThrottledPolicy tp = fb != null ? fb.getThrottled() : null;
+    return tp != null ? tp.getMultiplier() : 0.0d;
+  }
+
+  /** Upper cap for throttled exponential backoff. */
+  public long getFailureBackoffThrottledCapMs() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    FailureBackoffProperties.ThrottledPolicy tp = fb != null ? fb.getThrottled() : null;
+    return tp != null ? tp.getCapMs() : 0L;
+  }
+
   // Public proxies to avoid leaking package-private types to other modules
   public long getZombieExecutorShutdownAwaitMs() {
     return zombieCleanup.getExecutorShutdownAwaitMs();
@@ -673,7 +743,7 @@ class OrphanCleanupProperties {
   private long runBudgetMs = 0L;
 
   /** When true, numeric-only members in the waiting set are removed during orphan cleanup. */
-  private boolean removeNumericWaiting = true;
+  private boolean removeNumericOnlyAgents = true;
 }
 
 /** Reconcile executor shutdown tuning knobs. */
