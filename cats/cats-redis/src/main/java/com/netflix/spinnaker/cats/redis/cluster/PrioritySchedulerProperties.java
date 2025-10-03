@@ -69,6 +69,15 @@ public class PrioritySchedulerProperties {
   private int refreshPeriodSeconds = 30;
 
   /**
+   * Period between health summary logs (seconds). Default: 600 (10 minutes).
+   *
+   * <p>If set to a value <= 0, the periodic health summary logging is disabled.
+   *
+   * <p>Config key: {@code redis.scheduler.health-summary-period-seconds}
+   */
+  private int healthSummaryPeriodSeconds = 600;
+
+  /**
    * How long to cache Redis server time to reduce TIME command calls (milliseconds). Higher values
    * reduce Redis calls but may drift from server time. Config key: {@code
    * redis.scheduler.time-cache-duration-ms}

@@ -98,7 +98,14 @@ class HealthSummaryUnitTest {
               .map(ILoggingEvent::getFormattedMessage)
               .findFirst()
               .orElse("");
-      // Content assertions within cadence limits
+      // Content assertions adapted to the consolidated summary format
+      assertThat(msg).contains("Scheduler health:");
+      assertThat(msg).contains("degraded=");
+      assertThat(msg).contains("ready=");
+      assertThat(msg).contains("oldest_overdue=");
+      assertThat(msg).contains("capacityPerCycle=");
+      assertThat(msg).contains("permitsFree=");
+      assertThat(msg).contains("activePct=");
       assertThat(msg).contains("registered=");
       assertThat(msg).contains("active=");
       assertThat(msg).contains("futures=");
@@ -107,7 +114,6 @@ class HealthSummaryUnitTest {
       assertThat(msg).contains("orphans_cleaned=");
       assertThat(msg).contains("running=");
       assertThat(msg).contains("health=");
-      assertThat(msg).contains("oldest_overdue=");
       assertThat(msg).contains("queueDepth=");
       assertThat(msg).contains("permitsAvailable=");
 

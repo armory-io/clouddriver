@@ -463,21 +463,22 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           int availablePermits = runningAgents.availablePermits();
           int heldPermits = Math.max(0, maxConcurrentAgents - availablePermits);
           int cap = Math.max(0, heldPermits - currentlyRunning);
-          int zif = zombiesInFlight.get();
-          if (zif > cap) {
-            int delta = cap - zif; // negative
+          int zombiesInFlightCount = zombiesInFlight.get();
+          if (zombiesInFlightCount > cap) {
+            int delta = cap - zombiesInFlightCount; // negative
             zombiesInFlight.addAndGet(delta);
             if (log.isDebugEnabled()) {
               log.debug(
                   "Reconciled zombiesInFlight from {} to {} (held={}, active={})",
-                  zif,
+                  zombiesInFlightCount,
                   cap,
                   heldPermits,
                   currentlyRunning);
             }
           }
         } catch (Exception e) {
-          log.debug("zIF reconciliation skipped due to error; keeping previous values", e);
+          log.debug(
+              "zombiesInFlight reconciliation skipped due to error; keeping previous values", e);
         }
       }
 

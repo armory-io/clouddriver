@@ -150,6 +150,15 @@ public class PrioritySchedulerConfiguration {
   }
 
   /**
+   * Health summary logging period in milliseconds. If configured as <= 0 seconds, returns 0 to
+   * indicate the feature is disabled.
+   */
+  public long getHealthSummaryPeriodMs() {
+    int sec = schedulerProperties.getHealthSummaryPeriodSeconds();
+    return sec <= 0 ? 0L : java.util.concurrent.TimeUnit.SECONDS.toMillis(sec);
+  }
+
+  /**
    * Get the maximum concurrent agents.
    *
    * @return max concurrent agents

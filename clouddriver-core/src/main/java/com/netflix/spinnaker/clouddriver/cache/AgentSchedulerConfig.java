@@ -163,68 +163,78 @@ public class AgentSchedulerConfig {
           agentProperties.getDisabledPattern());
     }
 
-    // Log scheduler configuration for operational visibility
+    // Log scheduler configuration for operational visibility (grouped one-liners)
     log.info(
-        "PriorityAgentScheduler configuration: max-concurrent-agents={}, interval-ms={}, refresh-period-seconds={}, time-cache-duration-ms={}",
+        "[priority] core: max-concurrent-agents={} interval-ms={} refresh-period-seconds={} time-cache-duration-ms={}",
         agentProperties.getMaxConcurrentAgents(),
         schedulerProperties.getIntervalMs(),
         schedulerProperties.getRefreshPeriodSeconds(),
         schedulerProperties.getTimeCacheDurationMs());
 
     log.info(
-        "PriorityAgentScheduler agent filtering: enabled-pattern='{}', disabled-pattern='{}'",
+        "[priority] filters: enabled-pattern='{}' disabled-pattern='{}'",
         agentProperties.getEnabledPattern(),
         agentProperties.getDisabledPattern());
 
+    int healthSummarySec = schedulerProperties.getHealthSummaryPeriodSeconds();
     log.info(
-        "PriorityAgentScheduler zombie cleanup: enabled={}, threshold-ms={}, interval-ms={}",
+        "[priority] health: health-summary-period-seconds={} ({})",
+        healthSummarySec,
+        (healthSummarySec <= 0 ? "disabled" : "enabled"));
+
+    // Circuit breaker one-liner
+    log.info(
+        "[priority] circuit-breaker: enabled={} failure-threshold={} failure-window-ms={} cooldown-ms={} half-open-duration-ms={}",
+        schedulerProperties.getCircuitBreaker().isEnabled(),
+        schedulerProperties.getCircuitBreaker().getFailureThreshold(),
+        schedulerProperties.getCircuitBreaker().getFailureWindowMs(),
+        schedulerProperties.getCircuitBreaker().getCooldownMs(),
+        schedulerProperties.getCircuitBreaker().getHalfOpenDurationMs());
+
+    // Cleanup blocks
+    log.info(
+        "[priority] zombie-cleanup: enabled={} threshold-ms={} interval-ms={} run-budget-ms={} shutdown[await-ms={},force-await-ms={}]",
         schedulerProperties.isZombieCleanupEnabled(),
         schedulerProperties.getZombieThresholdMs(),
-        schedulerProperties.getZombieIntervalMs());
-    log.info(
-        "PriorityAgentScheduler zombie cleanup shutdown: await-ms={}, force-await-ms={}",
+        schedulerProperties.getZombieIntervalMs(),
+        schedulerProperties.getZombieRunBudgetMs(),
         schedulerProperties.getZombieExecutorShutdownAwaitMs(),
         schedulerProperties.getZombieExecutorShutdownForceAwaitMs());
-    log.info(
-        "PriorityAgentScheduler zombie cleanup run budget: {}ms",
-        schedulerProperties.getZombieRunBudgetMs());
 
     if (schedulerProperties.hasExceptionalAgents()) {
       log.info(
-          "PriorityAgentScheduler exceptional agents: pattern='{}', threshold-ms={}",
+          "[priority] zombie-cleanup.exceptional: pattern='{}' threshold-ms={}",
           schedulerProperties.getExceptionalAgentsPattern(),
           schedulerProperties.getExceptionalAgentsThresholdMs());
     }
 
     log.info(
-        "PriorityAgentScheduler orphan cleanup: enabled={}, threshold-ms={}, interval-ms={}, leadership-ttl-ms={}, force-all-pods={}",
+        "[priority] orphan-cleanup: enabled={} threshold-ms={} interval-ms={} leadership-ttl-ms={} force-all-pods={} run-budget-ms={} shutdown[await-ms={},force-await-ms={}]",
         schedulerProperties.isOrphanCleanupEnabled(),
         schedulerProperties.getOrphanThresholdMs(),
         schedulerProperties.getOrphanIntervalMs(),
         schedulerProperties.getOrphanLeadershipTtlMs(),
-        schedulerProperties.isOrphanForceAllPods());
-    log.info(
-        "PriorityAgentScheduler orphan cleanup shutdown: await-ms={}, force-await-ms={}",
+        schedulerProperties.isOrphanForceAllPods(),
+        schedulerProperties.getOrphanRunBudgetMs(),
         schedulerProperties.getOrphanExecutorShutdownAwaitMs(),
         schedulerProperties.getOrphanExecutorShutdownForceAwaitMs());
-    log.info(
-        "PriorityAgentScheduler orphan cleanup run budget: {}ms",
-        schedulerProperties.getOrphanRunBudgetMs());
 
+    // Batch ops & reconcile
     log.info(
-        "PriorityAgentScheduler batch operations: enabled={}, batch-size={}, chunk-attempt-multiplier={}",
+        "[priority] batch-operations: enabled={} batch-size={} chunk-attempt-multiplier={}",
         schedulerProperties.getBatchOperations().isEnabled(),
         schedulerProperties.getBatchOperations().getBatchSize(),
         schedulerProperties.getBatchOperations().getChunkAttemptMultiplier());
 
     log.info(
-        "PriorityAgentScheduler reconcile shutdown: await-ms={}, force-await-ms={}, run-budget-ms={}",
+        "[priority] reconcile: shutdown[await-ms={},force-await-ms={}] run-budget-ms={}",
         schedulerProperties.getReconcileExecutorShutdownAwaitMs(),
         schedulerProperties.getReconcileExecutorShutdownForceAwaitMs(),
         schedulerProperties.getReconcileRunBudgetMs());
 
+    // Redis keys
     log.info(
-        "PriorityAgentScheduler Redis keys: prefix='{}', hash-tag='{}', waiting-set='{}', working-set='{}', cleanup-leader-key='{}'",
+        "[priority] keys: prefix='{}' hash-tag='{}' waiting='{}' working='{}' cleanup-leader='{}'",
         schedulerProperties.getKeys().getPrefix(),
         schedulerProperties.getKeys().getHashTag(),
         schedulerProperties.getKeys().getWaitingSet(),

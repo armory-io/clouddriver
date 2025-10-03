@@ -150,8 +150,8 @@ class PriorityAgentSchedulerUnitTest {
   }
 
   @Test
-  @DisplayName("Watchdog emits expected warnings for consecutive trigger conditions")
-  void watchdogEmitsWarningsForConsecutiveTriggers() {
+  @DisplayName("Watchdog records triggers without immediate WARN logging and surfaces in summary")
+  void watchdogRecordsTriggersWithoutImmediateWarns() {
     JedisPool jedisPool = new JedisPool(new JedisPoolConfig(), "localhost");
     try {
       PriorityAgentScheduler scheduler = newScheduler(jedisPool);
@@ -175,7 +175,7 @@ class PriorityAgentSchedulerUnitTest {
                       e.getLevel() == Level.WARN
                           && e.getFormattedMessage().contains("PERMIT_LEAK_SUSPECT"))
               .count();
-      assertThat(leakWarnings).isEqualTo(1);
+      assertThat(leakWarnings).isEqualTo(0);
 
       // Reset streaks with a healthy sample
       scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 0, 10, 10);
@@ -192,7 +192,7 @@ class PriorityAgentSchedulerUnitTest {
                       e.getLevel() == Level.WARN
                           && e.getFormattedMessage().contains("ZERO_PROGRESS"))
               .count();
-      assertThat(zeroProgressWarnings).isEqualTo(1);
+      assertThat(zeroProgressWarnings).isEqualTo(0);
 
       // Reset
       scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 0, 10, 10);
@@ -209,7 +209,7 @@ class PriorityAgentSchedulerUnitTest {
                       e.getLevel() == Level.WARN
                           && e.getFormattedMessage().contains("CAPACITY_SKEW_ZIF"))
               .count();
-      assertThat(skewWarnings).isEqualTo(1);
+      assertThat(skewWarnings).isEqualTo(0);
 
       // Reset
       scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 0, 10, 10);
@@ -225,7 +225,20 @@ class PriorityAgentSchedulerUnitTest {
                   e ->
                       e.getLevel() == Level.WARN && e.getFormattedMessage().contains("REDIS_STALL"))
               .count();
-      assertThat(stallWarnings).isEqualTo(1);
+      assertThat(stallWarnings).isEqualTo(0);
+
+      // Force health summary emission and ensure watchdogs appear
+      scheduler.run();
+      String msg =
+          appender.list.stream()
+              .filter(
+                  e ->
+                      (e.getLevel() == Level.INFO || e.getLevel() == Level.WARN)
+                          && e.getFormattedMessage().contains("Scheduler health"))
+              .map(ILoggingEvent::getFormattedMessage)
+              .findFirst()
+              .orElse("");
+      assertThat(msg).contains("watchdogs=");
 
       logger.detachAppender(appender);
     } finally {

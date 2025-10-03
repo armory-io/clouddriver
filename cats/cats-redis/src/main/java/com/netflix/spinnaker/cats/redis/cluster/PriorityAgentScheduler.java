@@ -95,10 +95,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       new java.util.concurrent.atomic.AtomicInteger(0);
   private final java.util.concurrent.atomic.AtomicLong lastStarvationDegradedMs =
       new java.util.concurrent.atomic.AtomicLong(0L);
-  private final java.util.concurrent.atomic.AtomicLong lastStarvationWarnEpochMs =
-      new java.util.concurrent.atomic.AtomicLong(0L);
-  private final java.util.concurrent.atomic.AtomicLong lastDegradedWarnEpochMs =
-      new java.util.concurrent.atomic.AtomicLong(0L);
+  // Removed per-WARN cadence fields; consolidated into periodic health summary
 
   // Track all agents provided via schedule(), regardless of current sharding gating
   private final java.util.concurrent.ConcurrentMap<String, KnownAgent> knownAgents =
@@ -116,6 +113,16 @@ public class PriorityAgentScheduler extends CatsModuleAware
   private int watchdogSkewStreak = 0;
   private int watchdogZeroProgressStreak = 0;
   private int watchdogRedisStallStreak = 0;
+
+  // Watchdog last-trigger timestamps (folded into periodic health summary)
+  private final java.util.concurrent.atomic.AtomicLong watchdogLeakLastEpochMs =
+      new java.util.concurrent.atomic.AtomicLong(0L);
+  private final java.util.concurrent.atomic.AtomicLong watchdogSkewLastEpochMs =
+      new java.util.concurrent.atomic.AtomicLong(0L);
+  private final java.util.concurrent.atomic.AtomicLong watchdogZeroProgressLastEpochMs =
+      new java.util.concurrent.atomic.AtomicLong(0L);
+  private final java.util.concurrent.atomic.AtomicLong watchdogRedisStallLastEpochMs =
+      new java.util.concurrent.atomic.AtomicLong(0L);
 
   // Sustained degraded backlog detection (code-level alerting)
   private long degradedBacklogStartEpochMs = 0L;
@@ -323,8 +330,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Watchdog: detect possible permit starvation and related stalls via ratio-based heuristics
       try {
-        java.util.concurrent.Semaphore sem = config.getRunningAgents();
-        int permits = sem != null ? sem.availablePermits() : -1;
+        java.util.concurrent.Semaphore runningAgentsSemaphore = config.getRunningAgents();
+        int availablePermitsNow =
+            runningAgentsSemaphore != null ? runningAgentsSemaphore.availablePermits() : -1;
         int poolActive = 0;
         if (config.getAgentWorkPool() instanceof java.util.concurrent.ThreadPoolExecutor) {
           poolActive =
@@ -337,12 +345,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
                 : 0;
         int activeCount = acquisitionService.getActiveAgentCount();
         long ready = acquisitionService.getReadyCountSnapshot();
-        int zif = acquisitionService.getZombiesInFlight();
+        int zombiesInFlightCount = acquisitionService.getZombiesInFlight();
         // Allow zero capacity visibility (do not clamp to 1)
-        int effectiveCapacity = Math.max(0, maxConcurrent - (activeCount + zif));
+        int effectiveCapacity = Math.max(0, maxConcurrent - (activeCount + zombiesInFlightCount));
         double permitsFreePct =
             maxConcurrent > 0
-                ? Math.max(0d, Math.min(1d, (double) permits / (double) maxConcurrent))
+                ? Math.max(0d, Math.min(1d, (double) availablePermitsNow / (double) maxConcurrent))
                 : 0d;
         double activePct =
             maxConcurrent > 0
@@ -372,9 +380,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
             redisStall,
             maxConcurrent,
             activeCount,
-            zif,
+            zombiesInFlightCount,
             effectiveCapacity,
-            permits);
+            availablePermitsNow);
 
         // Simple permit-starvation detector: no permits available and pool idle for N consecutive
         // cycles.
@@ -382,7 +390,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         // execution.
         try {
           int consecutive = permitStarvationConsecutive.get();
-          if (sem != null && permits == 0 && poolActive == 0) {
+          if (runningAgentsSemaphore != null && availablePermitsNow == 0 && poolActive == 0) {
             consecutive = permitStarvationConsecutive.incrementAndGet();
           } else {
             permitStarvationConsecutive.set(0);
@@ -395,21 +403,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
                 degradedBacklogStartEpochMs > 0L
                     ? (currentTimeMillis() - degradedBacklogStartEpochMs)
                     : 0L;
-            // 10-minute cadence for starvation WARNs, aligned with health summaries
-            long last = lastStarvationWarnEpochMs.get();
-            if (CadenceGuard.isPeriodElapsed(last, 10 * 60 * 1000L)) {
-              if (lastStarvationWarnEpochMs.compareAndSet(last, currentTimeMillis())) {
-                log.warn(
-                    "Permit-starvation suspected: degraded=1 for {} ms (starvation_ticks={}) ready={} active={} maxConcurrent={} permits={} zIF={}",
-                    degradedMs,
-                    consecutive,
-                    ready,
-                    activeCount,
-                    maxConcurrent,
-                    permits,
-                    zif);
-              }
-            }
             lastStarvationSuspected.set(true);
             lastStarvationTicks.set(consecutive);
             lastStarvationDegradedMs.set(degradedMs);
@@ -421,8 +414,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         } catch (Exception ignore) {
         }
 
-        // Sustained degraded backlog alerting (fine-grained, in-code)
-        // Condition: degraded AND ready backlog present AND oldest overdue rising over window
+        // Track degraded backlog window without emitting immediate warnings; folded into summary
         boolean degraded = acquisitionService.isDegraded();
         long oldestOverdueSec = acquisitionService.getOldestOverdueSeconds();
         if (degraded && ready > 0) {
@@ -430,24 +422,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
             degradedBacklogStartEpochMs = currentTimeMillis();
             degradedBacklogBaselineOldestOverdueSec = oldestOverdueSec;
           } else {
-            long elapsed = currentTimeMillis() - degradedBacklogStartEpochMs;
-            // 10-minute cadence; ensure the backlog is worsening (oldest overdue increasing)
-            long last = lastDegradedWarnEpochMs.get();
-            if (CadenceGuard.isPeriodElapsed(last, 10 * 60 * 1000L)
-                && oldestOverdueSec > degradedBacklogBaselineOldestOverdueSec) {
-              if (lastDegradedWarnEpochMs.compareAndSet(last, currentTimeMillis())) {
-                log.warn(
-                    "PriorityScheduler sustained degraded backlog: degraded=1 for {} ms, ready={}, oldest_overdue={}s (baseline={}s), effectiveCapacity={}, active={}, maxConcurrent={}",
-                    elapsed,
-                    ready,
-                    oldestOverdueSec,
-                    degradedBacklogBaselineOldestOverdueSec,
-                    effectiveCapacity,
-                    activeCount,
-                    maxConcurrent);
-                // Reset baseline so next 10-min warn requires continued increase
-                degradedBacklogBaselineOldestOverdueSec = oldestOverdueSec;
-              }
+            // If backlog continues worsening, update baseline for future comparisons
+            if (oldestOverdueSec > degradedBacklogBaselineOldestOverdueSec) {
+              degradedBacklogBaselineOldestOverdueSec = oldestOverdueSec;
             }
           }
         } else {
@@ -589,8 +566,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
    */
   private void maybeLogHealthSummary() {
     long now = currentTimeMillis();
+    long periodMs = config.getHealthSummaryPeriodMs();
+    if (periodMs <= 0L) {
+      return; // disabled
+    }
     long last = lastHealthLogEpochMs.get();
-    if (!CadenceGuard.isPeriodElapsed(last, 10 * 60 * 1000L)) {
+    if (!CadenceGuard.isPeriodElapsed(last, periodMs)) {
       return;
     }
     if (!lastHealthLogEpochMs.compareAndSet(last, now)) {
@@ -603,56 +584,104 @@ public class PriorityAgentScheduler extends CatsModuleAware
       queueDepth =
           ((java.util.concurrent.ThreadPoolExecutor) config.getAgentWorkPool()).getQueue().size();
     }
-    java.util.concurrent.Semaphore sem = config.getRunningAgents();
-    int availablePermits = sem != null ? sem.availablePermits() : -1;
+    java.util.concurrent.Semaphore runningAgentsSemaphore = config.getRunningAgents();
+    int availablePermits =
+        runningAgentsSemaphore != null ? runningAgentsSemaphore.availablePermits() : -1;
     int maxConcurrent = acquisitionService.getAgentProperties().getMaxConcurrentAgents();
     int activeCount = acquisitionService.getActiveAgentCount();
     int zombiesInFlight = acquisitionService.getZombiesInFlight();
+    long readySnapshot = acquisitionService.getReadyCountSnapshot();
+    long oldestOverdueSecondsNow = acquisitionService.getOldestOverdueSeconds();
+    double capacityPerCycle = acquisitionService.getCapacityPerCycleSnapshot();
+    double permitsFreePct =
+        maxConcurrent > 0
+            ? Math.max(0d, Math.min(1d, (double) availablePermits / (double) maxConcurrent))
+            : 0d;
+    double activePct =
+        maxConcurrent > 0
+            ? Math.max(0d, Math.min(1d, (double) activeCount / (double) maxConcurrent))
+            : 0d;
 
     // Permit reconciliation: warn and mark degraded if heldPermits > active + zombiesInFlight
     boolean permitMismatch = false;
-    if (sem != null && maxConcurrent > 0) {
+    if (runningAgentsSemaphore != null && maxConcurrent > 0) {
       int heldPermits = Math.max(0, maxConcurrent - availablePermits);
       int accounted = activeCount + zombiesInFlight;
       if (heldPermits > accounted) {
         permitMismatch = true;
-        log.warn(
-            "Permit reconciliation warning: heldPermits={} > accounted={} (active={} + zombiesInFlight={}); maxConcurrent={} availablePermits={}. This suggests a stuck permit or lingering worker.",
-            heldPermits,
-            accounted,
-            activeCount,
-            zombiesInFlight,
-            maxConcurrent,
-            availablePermits);
+        // Do not emit immediate WARN; include in periodic summary instead
       }
     }
 
-    log.info(
-        "Scheduler health [registered={}, active={}, futures={}, scripts={}] [zombies_cleaned={}, orphans_cleaned={}] running={} health={}{} oldest_overdue={}s queueDepth={} permitsAvailable={} zombiesInFlight={}{}",
-        stats.getRegisteredAgents(),
-        stats.getActiveAgents(),
-        acquisitionService.getFuturesMapSize(),
-        scriptManager.getScriptCount(),
-        stats.getZombiesCleanedUp(),
-        stats.getOrphansCleanedUp(),
-        stats.isRunning(),
-        (stats.isDegraded() || permitMismatch) ? "DEGRADED" : "HEALTHY",
-        (stats.isDegraded() || permitMismatch)
-            ? (" reason="
-                + (permitMismatch
-                    ? "permit_mismatch: heldPermits > active + zombiesInFlight; "
-                    : "")
-                + stats.getDegradedReason())
-            : "",
-        stats.getOldestOverdueSeconds(),
-        queueDepth,
-        availablePermits,
-        zombiesInFlight,
-        lastStarvationSuspected.get()
-            ? String.format(
-                " [starvation suspected: degradedForMs=%d ticks=%d]",
-                lastStarvationDegradedMs.get(), lastStarvationTicks.get())
-            : "");
+    // Consolidate watchdog triggers in the last 10 minutes
+    java.util.List<String> watchdogs = new java.util.ArrayList<>();
+    long ttlMs = periodMs;
+    if (watchdogLeakLastEpochMs.get() > 0 && (now - watchdogLeakLastEpochMs.get()) < ttlMs) {
+      watchdogs.add("permit_leak_suspect");
+    }
+    if (watchdogSkewLastEpochMs.get() > 0 && (now - watchdogSkewLastEpochMs.get()) < ttlMs) {
+      watchdogs.add("capacity_skew");
+    }
+    if (watchdogZeroProgressLastEpochMs.get() > 0
+        && (now - watchdogZeroProgressLastEpochMs.get()) < ttlMs) {
+      watchdogs.add("zero_progress");
+    }
+    if (watchdogRedisStallLastEpochMs.get() > 0
+        && (now - watchdogRedisStallLastEpochMs.get()) < ttlMs) {
+      watchdogs.add("redis_stall");
+    }
+
+    String watchdogSegment =
+        watchdogs.isEmpty() ? "watchdogs=none" : ("watchdogs=" + String.join(",", watchdogs));
+
+    boolean warnLevel = (stats.isDegraded() || permitMismatch);
+    String reason = "";
+    if (warnLevel) {
+      java.util.List<String> reasonTokens = new java.util.ArrayList<>();
+      if (permitMismatch) {
+        reasonTokens.add("permit_mismatch");
+      }
+      String degradedReason = stats.getDegradedReason();
+      if (degradedReason != null && !degradedReason.isEmpty()) {
+        reasonTokens.add(degradedReason);
+      }
+      reason = reasonTokens.isEmpty() ? "" : (" reason=" + String.join("; ", reasonTokens));
+    }
+
+    // Retain operationally useful fields from legacy summary
+    String msg =
+        String.format(
+            "Scheduler health: degraded=%s ready=%d oldest_overdue=%ds capacityPerCycle=%.2f permitsFree=%.2f activePct=%.2f registered=%d active=%d futures=%d scripts=%d zombies_cleaned=%d orphans_cleaned=%d running=%s health=%s queueDepth=%d permitsAvailable=%d zombiesInFlight=%d %s%s%s",
+            warnLevel ? 1 : 0,
+            readySnapshot,
+            oldestOverdueSecondsNow,
+            capacityPerCycle,
+            permitsFreePct,
+            activePct,
+            stats.getRegisteredAgents(),
+            stats.getActiveAgents(),
+            acquisitionService.getFuturesMapSize(),
+            scriptManager.getScriptCount(),
+            stats.getZombiesCleanedUp(),
+            stats.getOrphansCleanedUp(),
+            stats.isRunning(),
+            (stats.isDegraded() || permitMismatch) ? "DEGRADED" : "HEALTHY",
+            queueDepth,
+            availablePermits,
+            zombiesInFlight,
+            watchdogSegment,
+            lastStarvationSuspected.get()
+                ? String.format(
+                    " [starvation suspected: degradedForMs=%d ticks=%d]",
+                    lastStarvationDegradedMs.get(), lastStarvationTicks.get())
+                : "",
+            warnLevel ? reason : "");
+
+    if (warnLevel) {
+      log.warn(msg);
+    } else {
+      log.info(msg);
+    }
   }
 
   /**
@@ -1088,13 +1117,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogLeakStreak = 0;
     }
     if (watchdogLeakStreak >= 3) {
-      log.warn(
-          "Watchdog: PERMIT_LEAK_SUSPECT permitsFreePct={} activePct={} ready={} poolActive={} maxConcurrent={}",
-          String.format("%.2f", permitsFreePct),
-          String.format("%.2f", activePct),
-          ready,
-          poolActive,
-          maxConcurrent);
+      watchdogLeakLastEpochMs.set(System.currentTimeMillis());
+      // Reset streak after recording trigger
       watchdogLeakStreak = 0;
     }
 
@@ -1105,13 +1129,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogSkewStreak = 0;
     }
     if (watchdogSkewStreak >= 3) {
-      log.warn(
-          "Watchdog: CAPACITY_SKEW_ZIF permitsFreePct={} acquiredFillPct={} ready={} zIF={} effectiveCapacity={}",
-          String.format("%.2f", permitsFreePct),
-          String.format("%.2f", acquiredFillPct),
-          ready,
-          zombiesInFlight,
-          effectiveCapacity);
+      watchdogSkewLastEpochMs.set(System.currentTimeMillis());
       watchdogSkewStreak = 0;
     }
 
@@ -1122,14 +1140,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogZeroProgressStreak = 0;
     }
     if (watchdogZeroProgressStreak >= 3) {
-      log.warn(
-          "Watchdog: ZERO_PROGRESS ready={} acquiredThisTick={} redisStall={} permits={} active={} zIF={}",
-          ready,
-          agentsAcquired,
-          redisStall,
-          permitsAvailable,
-          activeCount,
-          zombiesInFlight);
+      watchdogZeroProgressLastEpochMs.set(System.currentTimeMillis());
       watchdogZeroProgressStreak = 0;
     }
 
@@ -1140,7 +1151,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogRedisStallStreak = 0;
     }
     if (watchdogRedisStallStreak >= 3) {
-      log.warn("Watchdog: REDIS_STALL breaker open; skipping acquisitions until recovery");
+      watchdogRedisStallLastEpochMs.set(System.currentTimeMillis());
       watchdogRedisStallStreak = 0;
     }
   }
