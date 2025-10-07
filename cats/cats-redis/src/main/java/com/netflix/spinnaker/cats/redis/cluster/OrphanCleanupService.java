@@ -143,13 +143,15 @@ public class OrphanCleanupService {
       return;
     }
 
+    // Update timestamp immediately after acquiring leadership (or confirming forced run)
+    lastOrphanCleanup = nowMs();
+
     try (Jedis jedis = jedisPool.getResource()) {
       final long budgetMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
 
       int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start, budgetMs);
       if (overBudget(start, budgetMs)) {
         log.warn("Orphan cleanup budget exceeded after working set; skipping waiting set");
-        lastOrphanCleanup = nowMs();
         return;
       }
       int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, start, budgetMs);
@@ -167,8 +169,6 @@ public class OrphanCleanupService {
         metrics.recordCleanupTime("orphan", nowMs() - start);
         metrics.incrementCleanupCleaned("orphan", totalCleaned);
       }
-      // Update the last cleanup timestamp
-      lastOrphanCleanup = nowMs();
     } catch (Exception e) {
       log.error("Failed to cleanup orphaned agents", e);
     } finally {
