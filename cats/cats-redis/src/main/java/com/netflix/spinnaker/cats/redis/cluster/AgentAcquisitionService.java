@@ -1166,9 +1166,26 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     List<String> candidateAgents = new ArrayList<>();
     List<AgentWorker> candidateWorkers = new ArrayList<>();
 
-    // PHASE 1: Build candidate list and acquire semaphore permits
-    // Note: We respect both the concurrency limit (maxToAcquire) and batch size limit
+    // PHASE 1: Pre-filter ready agents using local registry + enablement/sharding
+    // This avoids acquiring permits for agents we will filter out anyway during candidate building,
+    // reducing wasted work and permit churn under heavy filtering.
+    List<String> eligibleAgents = new ArrayList<>();
     for (String agentType : readyAgents) {
+      AgentWorker worker = registrySnapshot.get(agentType);
+      if (worker == null) {
+        log.debug("Agent {} not in registry during pre-filter, skipping", agentType);
+        continue;
+      }
+      if (!isAgentEnabled(worker.getAgent())) {
+        log.debug("Agent {} filtered by enablement/sharding during pre-filter", agentType);
+        continue;
+      }
+      eligibleAgents.add(agentType);
+    }
+
+    // PHASE 2: Build candidate list and acquire semaphore permits
+    // Note: We respect both the concurrency limit (maxToAcquire) and batch size limit
+    for (String agentType : eligibleAgents) {
       if (attemptedThisCycle != null && attemptedThisCycle.contains(agentType)) {
         continue;
       }
@@ -1218,7 +1235,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       return 0;
     }
 
-    // PHASE 2: Batch acquire agents using Redis Lua script
+    // PHASE 3: Batch acquire agents using Redis Lua script
     try {
       // Prepare Redis Lua script arguments: [agent1, score1, agent2, score2, ...]
       // The Lua script expects alternating agent names and scores
@@ -1259,7 +1276,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               Arrays.asList(WORKING_SET, WAITING_SET),
               agentScorePairs);
 
-      // PHASE 3: Process batch acquisition results
+      // PHASE 4: Process batch acquisition results
       if (result instanceof List) {
         // ACQUIRE_AGENTS returns a Lua array: [count, [acquiredAgent1, acquiredAgent2, ...]]
         // Jedis can surface elements as Long, String, or byte[] depending on codec/version.
@@ -1389,10 +1406,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       return 0;
 
       // Design note: Catch Throwable to ensure permit cleanup on all failure modes.
-      // - Critical: Phase 1 acquired permits for all candidates. If an Error (e.g.,
-      // OutOfMemoryError)
-      //   occurs during Phase 2 (Redis batch) or Phase 3 (result processing), we must release
-      //   all acquired permits to prevent permit leaks.
+      // - Critical: Phase 2 acquired permits for all candidates. If an Error (e.g.,
+      //   OutOfMemoryError) occurs during Phase 3 (Redis batch) or Phase 4 (result processing),
+      //   we must release all acquired permits to prevent permit leaks.
       // - The scheduler's outer catch(Throwable) would eventually catch Errors, but by then permits
       //   are already leaked, causing permanent capacity loss until pod restart.
     } catch (Throwable e) {
