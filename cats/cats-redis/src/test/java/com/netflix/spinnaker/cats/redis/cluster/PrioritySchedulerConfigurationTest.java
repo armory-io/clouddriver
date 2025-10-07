@@ -124,11 +124,12 @@ class PrioritySchedulerConfigurationTest {
     void shouldReturnNullSemaphoreWhenConcurrencyControlDisabled() {
       // Given - Disable concurrency control
       agentProperties.setMaxConcurrentAgents(0);
+      PrioritySchedulerConfiguration disabledConfig =
+          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
 
-      // Then - Expect configuration to reject non-positive values
-      org.junit.jupiter.api.Assertions.assertThrows(
-          IllegalArgumentException.class,
-          () -> new PrioritySchedulerConfiguration(agentProperties, schedulerProperties));
+      // Then - Expect null semaphore in unbounded mode
+      Semaphore semaphore = disabledConfig.getRunningAgents();
+      assertThat(semaphore).isNull();
     }
 
     @Test
@@ -136,11 +137,12 @@ class PrioritySchedulerConfigurationTest {
     void shouldHandleNegativeConcurrentAgentsAsDisabled() {
       // Given
       agentProperties.setMaxConcurrentAgents(-1);
+      PrioritySchedulerConfiguration disabledConfig =
+          new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
 
-      // Then - Expect configuration to reject non-positive values
-      org.junit.jupiter.api.Assertions.assertThrows(
-          IllegalArgumentException.class,
-          () -> new PrioritySchedulerConfiguration(agentProperties, schedulerProperties));
+      // Then - Expect null semaphore in unbounded mode
+      Semaphore semaphore = disabledConfig.getRunningAgents();
+      assertThat(semaphore).isNull();
     }
 
     @Test

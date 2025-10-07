@@ -16,8 +16,9 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
-import static com.netflix.spinnaker.cats.redis.cluster.SchedulerUtils.*;
+import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.*;
 
+import com.netflix.spinnaker.cats.redis.cluster.support.ScriptResults;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -100,7 +101,8 @@ public class ZombieCleanupService {
 
   void setAcquisitionService(AgentAcquisitionService acquisitionService) {
     this.acquisitionService = acquisitionService;
-    this.fairnessHandler = acquisitionService; // backward-compatible default
+    // Backward-compatible default: wire acquisition service as fairness handler
+    this.fairnessHandler = acquisitionService;
   }
 
   void setFairnessHandler(PermitFairnessHandler fairnessHandler) {
@@ -157,10 +159,10 @@ public class ZombieCleanupService {
    */
   public void cleanupZombieAgentsIfNeeded(
       Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
-    long now = currentTimeMillis();
+    long now = nowMs();
     long zombieCleanupInterval = schedulerProperties.getZombieCleanup().getIntervalMs();
 
-    if (CadenceGuard.isPeriodElapsed(lastZombieCleanup, zombieCleanupInterval)) {
+    if (isPeriodElapsed(lastZombieCleanup, zombieCleanupInterval)) {
       int cleaned = cleanupZombieAgents(activeAgents, activeAgentsFutures);
       lastZombieCleanup = now;
 
@@ -190,10 +192,9 @@ public class ZombieCleanupService {
    */
   public int cleanupZombieAgents(
       Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
-    long start = currentTimeMillis();
+    long start = nowMs();
     final long budgetMs = schedulerProperties.getZombieCleanup().getRunBudgetMs();
-    final long deadlineEpochMs = budgetMs > 0 ? (start + budgetMs) : Long.MAX_VALUE;
-    long currentTime = currentTimeMillis();
+    long currentTime = nowMs();
     List<String> zombieAgentTypes = new ArrayList<>();
 
     int validAgentsScanned = 0;
@@ -203,11 +204,11 @@ public class ZombieCleanupService {
         log.warn("Stopping zombie scan early due to interrupt");
         break;
       }
-      if (currentTimeMillis() > deadlineEpochMs) {
+      if (overBudget(start, budgetMs)) {
         log.warn("Stopping zombie scan early due to budget deadline");
         break;
       }
-      currentTime = currentTimeMillis();
+      currentTime = nowMs();
       String agentType = entry.getKey();
       String acquireScore = entry.getValue();
 
@@ -279,7 +280,7 @@ public class ZombieCleanupService {
             log.warn("Stopping zombie individual cleanup due to interrupt");
             break;
           }
-          if (currentTimeMillis() > deadlineEpochMs) {
+          if (overBudget(start, budgetMs)) {
             log.warn("Stopping zombie individual cleanup due to budget deadline");
             break;
           }
@@ -312,7 +313,7 @@ public class ZombieCleanupService {
             log.warn("Stopping zombie batch preparation due to interrupt");
             break;
           }
-          if (currentTimeMillis() > deadlineEpochMs) {
+          if (overBudget(start, budgetMs)) {
             log.warn("Stopping zombie batch preparation due to budget deadline");
             break;
           }
@@ -323,30 +324,30 @@ public class ZombieCleanupService {
               log.warn("Skipping zombie batch execution due to interrupt");
               break;
             }
-            if (currentTimeMillis() > deadlineEpochMs) {
+            if (overBudget(start, budgetMs)) {
               log.warn("Skipping zombie batch execution due to budget deadline");
               break;
             }
             totalCleaned +=
                 cleanupZombieBatch(
-                    jedis, zombieBatch, activeAgents, activeAgentsFutures, deadlineEpochMs);
+                    jedis, zombieBatch, activeAgents, activeAgentsFutures, start, budgetMs);
             zombieBatch.clear();
           }
         }
 
         // Process remaining zombies
         if (!zombieBatch.isEmpty()) {
-          if (!Thread.currentThread().isInterrupted() && currentTimeMillis() <= deadlineEpochMs) {
+          if (!Thread.currentThread().isInterrupted() && !overBudget(start, budgetMs)) {
             totalCleaned +=
                 cleanupZombieBatch(
-                    jedis, zombieBatch, activeAgents, activeAgentsFutures, deadlineEpochMs);
+                    jedis, zombieBatch, activeAgents, activeAgentsFutures, start, budgetMs);
           }
         }
       }
 
       zombiesCleanedUp.add(totalCleaned);
       if (metrics != null) {
-        metrics.recordCleanupTime("zombie", currentTimeMillis() - start);
+        metrics.recordCleanupTime("zombie", nowMs() - start);
         metrics.incrementCleanupCleaned("zombie", totalCleaned);
       }
       if (log.isDebugEnabled()) {
@@ -357,7 +358,7 @@ public class ZombieCleanupService {
     } catch (Exception e) {
       log.error("Error during zombie agent cleanup", e);
       if (metrics != null) {
-        metrics.recordCleanupTime("zombie", currentTimeMillis() - start);
+        metrics.recordCleanupTime("zombie", nowMs() - start);
       }
       return 0;
     }
@@ -405,7 +406,8 @@ public class ZombieCleanupService {
       List<String> zombieAgentTypes,
       Map<String, String> activeAgents,
       Map<String, Future<?>> activeAgentsFutures,
-      long deadlineEpochMs) {
+      long startEpochMs,
+      long budgetMs) {
 
     if (zombieAgentTypes.isEmpty()) {
       return 0;
@@ -426,7 +428,7 @@ public class ZombieCleanupService {
             log.warn("Stopping zombie batch build due to interrupt");
             break;
           }
-          if (currentTimeMillis() > deadlineEpochMs) {
+          if (overBudget(startEpochMs, budgetMs)) {
             log.warn("Stopping zombie batch build due to budget deadline");
             break;
           }
@@ -509,7 +511,7 @@ public class ZombieCleanupService {
                 log.warn("Stopping zombie individual fallback due to interrupt");
                 break;
               }
-              if (currentTimeMillis() > deadlineEpochMs) {
+              if (overBudget(startEpochMs, budgetMs)) {
                 log.warn("Stopping zombie individual fallback due to budget deadline");
                 break;
               }
@@ -550,7 +552,7 @@ public class ZombieCleanupService {
         log.warn("Stopping zombie individual fallback due to interrupt");
         break;
       }
-      if (currentTimeMillis() > deadlineEpochMs) {
+      if (overBudget(startEpochMs, budgetMs)) {
         log.warn("Stopping zombie individual fallback due to budget deadline");
         break;
       }

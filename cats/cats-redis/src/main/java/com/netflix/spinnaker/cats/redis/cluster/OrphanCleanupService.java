@@ -16,9 +16,10 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
-import static com.netflix.spinnaker.cats.redis.cluster.SchedulerUtils.*;
+import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.*;
 
 import com.netflix.spinnaker.cats.agent.Agent;
+import com.netflix.spinnaker.cats.redis.cluster.support.ScriptResults;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.List;
@@ -98,7 +99,7 @@ public class OrphanCleanupService {
 
   /** Cleanup orphaned agents if needed, with configurable intervals and leadership coordination. */
   public void cleanupOrphanedAgentsIfNeeded() {
-    long start = currentTimeMillis();
+    long start = nowMs();
     if (!schedulerProperties.getOrphanCleanup().isEnabled()) {
       return;
     }
@@ -108,7 +109,7 @@ public class OrphanCleanupService {
     long maxPassDurationMs =
         Math.max(1_000L, schedulerProperties.getOrphanCleanup().getRunBudgetMs());
     if (lastOrphanCleanup > 0 && maxPassDurationMs > 0) {
-      long sinceLast = currentTimeMillis() - lastOrphanCleanup;
+      long sinceLast = nowMs() - lastOrphanCleanup;
       // If we haven't updated lastOrphanCleanup for > runBudgetMs, assume the previous pass hung
       long threshold = maxPassDurationMs;
       if (sinceLast > threshold) {
@@ -121,15 +122,15 @@ public class OrphanCleanupService {
         } catch (Exception ignore) {
         }
         // Bump the timestamp to avoid log spam; next cycle will attempt again
-        lastOrphanCleanup = currentTimeMillis();
+        lastOrphanCleanup = nowMs();
         return;
       }
     }
 
     // Check if enough time has passed since last cleanup
     long intervalMs = schedulerProperties.getOrphanCleanup().getIntervalMs();
-    if (!CadenceGuard.isPeriodElapsed(lastOrphanCleanup, intervalMs)) {
-      long remaining = intervalMs - (currentTimeMillis() - lastOrphanCleanup);
+    if (!isPeriodElapsed(lastOrphanCleanup, intervalMs)) {
+      long remaining = intervalMs - (nowMs() - lastOrphanCleanup);
       log.debug("Skipping orphan cleanup - interval not elapsed ({}ms remaining)", remaining);
       return;
     }
@@ -144,15 +145,14 @@ public class OrphanCleanupService {
 
     try (Jedis jedis = jedisPool.getResource()) {
       final long budgetMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
-      final long deadlineEpochMs = budgetMs > 0 ? (start + budgetMs) : Long.MAX_VALUE;
 
-      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, deadlineEpochMs);
-      if (currentTimeMillis() > deadlineEpochMs) {
+      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start, budgetMs);
+      if (overBudget(start, budgetMs)) {
         log.warn("Orphan cleanup budget exceeded after working set; skipping waiting set");
-        lastOrphanCleanup = currentTimeMillis();
+        lastOrphanCleanup = nowMs();
         return;
       }
-      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, deadlineEpochMs);
+      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, start, budgetMs);
       int totalCleaned = workingCleaned + waitingCleaned;
 
       if (totalCleaned > 0) {
@@ -164,11 +164,11 @@ public class OrphanCleanupService {
             waitingCleaned);
       }
       if (metrics != null) {
-        metrics.recordCleanupTime("orphan", currentTimeMillis() - start);
+        metrics.recordCleanupTime("orphan", nowMs() - start);
         metrics.incrementCleanupCleaned("orphan", totalCleaned);
       }
       // Update the last cleanup timestamp
-      lastOrphanCleanup = currentTimeMillis();
+      lastOrphanCleanup = nowMs();
     } catch (Exception e) {
       log.error("Failed to cleanup orphaned agents", e);
     } finally {
@@ -191,11 +191,10 @@ public class OrphanCleanupService {
     }
 
     try (Jedis jedis = jedisPool.getResource()) {
-      long start = currentTimeMillis();
+      long start = nowMs();
       final long budgetMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
-      final long deadlineEpochMs = budgetMs > 0 ? (start + budgetMs) : Long.MAX_VALUE;
-      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, deadlineEpochMs);
-      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, deadlineEpochMs);
+      int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start, budgetMs);
+      int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, start, budgetMs);
       int totalCleaned = workingCleaned + waitingCleaned;
 
       if (totalCleaned > 0) {
@@ -207,7 +206,7 @@ public class OrphanCleanupService {
             waitingCleaned);
       }
       // Update the last cleanup timestamp
-      lastOrphanCleanup = currentTimeMillis();
+      lastOrphanCleanup = nowMs();
       return totalCleaned;
     } catch (Exception e) {
       log.error("Failed to force cleanup orphaned agents", e);
@@ -239,9 +238,12 @@ public class OrphanCleanupService {
    *
    * @param jedis The Jedis connection to the Redis server
    * @param setName The name of the Redis set to clean up
+   * @param startEpochMs Epoch time when cleanup operation started (for budget checking)
+   * @param budgetMs Maximum runtime budget in milliseconds (0 = disabled)
    * @return The number of orphaned agents cleaned up
    */
-  private int cleanupOrphanedAgentsFromSet(Jedis jedis, String setName, long deadlineEpochMs) {
+  private int cleanupOrphanedAgentsFromSet(
+      Jedis jedis, String setName, long startEpochMs, long budgetMs) {
     long cutoffScore;
     long thresholdForLogging;
 
@@ -250,7 +252,7 @@ public class OrphanCleanupService {
       // Orphan detection: score < (current_time - threshold)
       // These are agents scheduled far in the past that never executed
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
-      cutoffScore = (currentTimeMillis() - orphanThreshold) / 1000;
+      cutoffScore = (nowMs() - orphanThreshold) / 1000;
       thresholdForLogging = orphanThreshold;
     } else {
       // Working set: score = completion deadline (acquire_time + timeout)
@@ -258,7 +260,7 @@ public class OrphanCleanupService {
       // Rearranged: score < (current_time - threshold)
       // These are agents that should have completed but their pod might have crashed
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
-      cutoffScore = (currentTimeMillis() - orphanThreshold) / 1000;
+      cutoffScore = (nowMs() - orphanThreshold) / 1000;
       thresholdForLogging = orphanThreshold;
     }
 
@@ -269,7 +271,7 @@ public class OrphanCleanupService {
           log.warn("Stopping {} orphan scan due to interrupt", setName);
           break;
         }
-        if (currentTimeMillis() > deadlineEpochMs) {
+        if (overBudget(startEpochMs, budgetMs)) {
           log.warn("Stopping {} orphan scan due to budget deadline", setName);
           break;
         }
@@ -322,7 +324,8 @@ public class OrphanCleanupService {
         }
 
         List<Tuple> orphanList = new ArrayList<>(potentialOrphans);
-        int cleanedThisPass = processOrphanBatch(jedis, setName, orphanList, deadlineEpochMs);
+        int cleanedThisPass =
+            processOrphanBatch(jedis, setName, orphanList, startEpochMs, budgetMs);
         totalCleaned += cleanedThisPass;
 
         // Break when no progress was made to avoid infinite loops on valid-only candidates
@@ -351,10 +354,12 @@ public class OrphanCleanupService {
    * @param jedis The Jedis connection to the Redis server
    * @param setName The name of the Redis set to clean up
    * @param orphans List of orphaned agents to process
+   * @param startEpochMs Epoch time when cleanup operation started (for budget checking)
+   * @param budgetMs Maximum runtime budget in milliseconds (0 = disabled)
    * @return The number of orphaned agents cleaned up
    */
   private int processOrphanBatch(
-      Jedis jedis, String setName, List<Tuple> orphans, long deadlineEpochMs) {
+      Jedis jedis, String setName, List<Tuple> orphans, long startEpochMs, long budgetMs) {
     if (orphans.isEmpty()) {
       return 0;
     }
@@ -378,7 +383,7 @@ public class OrphanCleanupService {
             log.warn("Aborting waiting-batch build due to interrupt");
             break;
           }
-          if (currentTimeMillis() > deadlineEpochMs) {
+          if (overBudget(startEpochMs, budgetMs)) {
             log.warn("Aborting waiting-batch build due to budget deadline");
             break;
           }
@@ -423,7 +428,7 @@ public class OrphanCleanupService {
                   log.warn("Stopping per-item fallback due to interrupt");
                   break;
                 }
-                if (currentTimeMillis() > deadlineEpochMs) {
+                if (overBudget(startEpochMs, budgetMs)) {
                   log.warn("Stopping per-item fallback due to budget deadline");
                   break;
                 }
@@ -473,7 +478,7 @@ public class OrphanCleanupService {
                 log.warn("Stopping individual conditional removal due to interrupt");
                 break;
               }
-              if (currentTimeMillis() > deadlineEpochMs) {
+              if (overBudget(startEpochMs, budgetMs)) {
                 log.warn("Stopping individual conditional removal due to budget deadline");
                 break;
               }
@@ -507,7 +512,7 @@ public class OrphanCleanupService {
           }
         }
       } else {
-        totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, deadlineEpochMs);
+        totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startEpochMs, budgetMs);
       }
     } else {
       // Critical: Prefer individual path to allow validity checks and conditional moves, and to
@@ -517,13 +522,13 @@ public class OrphanCleanupService {
           log.warn("Aborting working-batch processing due to interrupt");
           break;
         }
-        if (currentTimeMillis() > deadlineEpochMs) {
+        if (overBudget(startEpochMs, budgetMs)) {
           log.warn("Aborting working-batch processing due to budget deadline");
           break;
         }
         int endIndex = Math.min(i + batchSize, orphans.size());
         List<Tuple> batch = orphans.subList(i, endIndex);
-        totalCleaned += cleanupIndividualOrphans(jedis, setName, batch, deadlineEpochMs);
+        totalCleaned += cleanupIndividualOrphans(jedis, setName, batch, startEpochMs, budgetMs);
       }
     }
 
@@ -606,10 +611,12 @@ public class OrphanCleanupService {
    * @param jedis Redis connection
    * @param setName Redis set name (working or waiting)
    * @param orphans List of orphaned agents to clean up
+   * @param startEpochMs Epoch time when cleanup operation started (for budget checking)
+   * @param budgetMs Maximum runtime budget in milliseconds (0 = disabled)
    * @return Number of agents successfully cleaned up
    */
   private int cleanupIndividualOrphans(
-      Jedis jedis, String setName, List<Tuple> orphans, long deadlineEpochMs) {
+      Jedis jedis, String setName, List<Tuple> orphans, long startEpochMs, long budgetMs) {
     int cleaned = 0;
 
     for (Tuple orphan : orphans) {
@@ -617,7 +624,7 @@ public class OrphanCleanupService {
         log.warn("Stopping individual orphan cleanup early due to interrupt");
         break;
       }
-      if (currentTimeMillis() > deadlineEpochMs) {
+      if (overBudget(startEpochMs, budgetMs)) {
         log.warn("Stopping individual orphan cleanup early due to budget deadline");
         break;
       }
@@ -849,33 +856,10 @@ public class OrphanCleanupService {
    * @return Score as string
    */
   private String score(Jedis jedis, long delayMs) {
-    try {
-      // Prefer a unified time source: scheduler's view of "now" (Redis time + measured offset).
-      // This keeps all components (acquisition, cleanup) consistent even across Redis failovers.
-      long nowMsWithOffset = 0L;
-      if (acquisitionService != null) {
-        nowMsWithOffset = acquisitionService.nowMsWithOffset();
-      }
-
-      // Fast path: if we have a non-zero unified time, schedule using it.
-      // Scores are stored in seconds, so convert ms→s after adding any delay.
-      if (nowMsWithOffset > 0L) {
-        return String.valueOf((nowMsWithOffset + delayMs) / 1000L);
-      }
-
-      // Fallback: query Redis TIME directly (returns [seconds, microseconds]).
-      // Convert to ms, add delay, then down-convert to seconds for the ZSET score.
-      List<String> time = jedis.time();
-      long sec = Long.parseLong(time.get(0));
-      long micros = Long.parseLong(time.get(1));
-      long targetMs = (sec * 1000) + (micros / 1000) + delayMs;
-      return String.valueOf(targetMs / 1000L);
-    } catch (Exception ignore) {
-      // Last-resort fallback: use local system clock. This is less ideal for coordination,
-      // but preserves forward progress if Redis TIME or offset lookups are unavailable.
-      long targetMs = currentTimeMillis() + delayMs;
-      return String.valueOf(targetMs / 1000L);
-    }
+    java.util.function.LongSupplier supplier =
+        acquisitionService != null ? () -> acquisitionService.nowMsWithOffset() : null;
+    return com.netflix.spinnaker.cats.redis.cluster.support.RedisTimeUtils.scoreFromMsDelay(
+        jedis, delayMs, supplier);
   }
 
   /**

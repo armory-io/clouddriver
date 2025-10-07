@@ -16,7 +16,9 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import static com.netflix.spinnaker.cats.redis.cluster.support.ExecutorUtils.newNamedCachedThreadPool;
+import static com.netflix.spinnaker.cats.redis.cluster.support.ExecutorUtils.newNamedSingleThreadScheduledExecutor;
+
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
@@ -342,17 +344,14 @@ public class PrioritySchedulerConfiguration {
 
   /** Creates the agent work pool. */
   private void createAgentWorkPool() {
-    this.agentWorkPool =
-        java.util.concurrent.Executors.newCachedThreadPool(
-            new ThreadFactoryBuilder().setNameFormat("PriorityAgentWorker-%d").build());
+    this.agentWorkPool = newNamedCachedThreadPool("PriorityAgentWorker-%d");
     log.info("Created agent work pool");
   }
 
   /** Creates the scheduler executor service. */
   private void createSchedulerExecutorService() {
     this.schedulerExecutorService =
-        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
-            new ThreadFactoryBuilder().setNameFormat("PriorityAgentScheduler-%d").build());
+        newNamedSingleThreadScheduledExecutor("PriorityAgentScheduler-%d");
 
     log.info("Created scheduler executor service");
   }
@@ -364,8 +363,9 @@ public class PrioritySchedulerConfiguration {
     int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
 
     if (maxConcurrentAgents <= 0) {
-      throw new IllegalArgumentException(
-          "redis.agent.max-concurrent-agents must be > 0 when using cached thread pool");
+      this.runningAgents = null; // unbounded mode; callers null-check
+      log.info("Concurrency semaphore disabled (unbounded mode)");
+      return;
     }
 
     this.runningAgents = new Semaphore(maxConcurrentAgents);

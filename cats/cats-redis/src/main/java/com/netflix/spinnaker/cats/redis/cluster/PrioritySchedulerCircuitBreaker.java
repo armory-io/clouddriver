@@ -25,9 +25,11 @@ import lombok.extern.slf4j.Slf4j;
 /**
  * Circuit breaker protecting the scheduler from cascading failures.
  *
- * <p>States: CLOSED (normal) → OPEN (blocking) → HALF_OPEN (testing) → CLOSED
+ * <p>Responsibilities: - Track failures and transition between CLOSED → OPEN → HALF_OPEN → CLOSED -
+ * Enforce cooldown and half-open probe windows - Emit simple counters for allowed/blocked requests
  *
- * <p>Trips open after threshold failures, cools down, then tests recovery.
+ * <p>Non-responsibilities: - Redis time sourcing (uses System clock) - Scheduling logic (callers
+ * use this as a guard)
  */
 @Slf4j
 public class PrioritySchedulerCircuitBreaker {

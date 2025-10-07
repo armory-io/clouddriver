@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package com.netflix.spinnaker.cats.redis.cluster;
+package com.netflix.spinnaker.cats.redis.cluster.support;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -22,17 +22,24 @@ import java.util.List;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
-/** Lightweight parsers for Redis Lua script results. */
+/**
+ * Lightweight parsers for Redis Lua script results.
+ *
+ * <p>Responsibilities: - Parse structured results from EVAL/EVALSHA operations into simple DTOs
+ *
+ * <p>Non-responsibilities: - Orchestrating Lua script invocation (use RedisScriptManager) -
+ * Time/cadence handling (use CadenceGuard/RedisTimeUtils)
+ */
 @Slf4j
-final class ScriptResults {
+public final class ScriptResults {
   private ScriptResults() {}
 
   @Getter
-  static final class BatchRemovalResult {
+  public static final class BatchRemovalResult {
     private final int removedCount;
     private final List<String> members;
 
-    BatchRemovalResult(int removedCount, List<String> members) {
+    public BatchRemovalResult(int removedCount, List<String> members) {
       this.removedCount = Math.max(0, removedCount);
       this.members = members == null ? Collections.emptyList() : members;
     }
@@ -42,7 +49,7 @@ final class ScriptResults {
    * Parses the result of REMOVE_AGENTS_CONDITIONAL script which returns [count, [member1, member2,
    * ...]].
    */
-  static BatchRemovalResult parseRemoveAgentsConditional(Object result) {
+  public static BatchRemovalResult parseRemoveAgentsConditional(Object result) {
     int count = 0;
     List<String> cleaned = new ArrayList<>();
 
@@ -87,7 +94,7 @@ final class ScriptResults {
   }
 
   /** Parse the count returned by ADD_AGENTS script which typically returns [count, ...]. */
-  static int parseAddAgentsCount(Object result) {
+  public static int parseAddAgentsCount(Object result) {
     try {
       if (result instanceof java.util.List) {
         java.util.List<?> list = (java.util.List<?>) result;

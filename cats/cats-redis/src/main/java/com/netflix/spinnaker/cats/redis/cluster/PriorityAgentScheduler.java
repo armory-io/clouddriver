@@ -16,7 +16,10 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
-import static com.netflix.spinnaker.cats.redis.cluster.SchedulerUtils.*;
+import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.isPeriodElapsed;
+import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.nowMs;
+import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.overBudget;
+import static com.netflix.spinnaker.cats.redis.cluster.support.ExecutorUtils.newOnDemandSingleThreadExecutor;
 
 import com.netflix.spectator.api.DefaultRegistry;
 import com.netflix.spinnaker.cats.agent.Agent;
@@ -149,7 +152,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     // Initialize services with defensive null checking
     this.metrics =
-        SchedulerUtils.getOrDefault(metrics, new PrioritySchedulerMetrics(new DefaultRegistry()));
+        (metrics != null) ? metrics : new PrioritySchedulerMetrics(new DefaultRegistry());
     this.scriptManager = new RedisScriptManager(jedisPool, this.metrics);
     this.config = new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
     this.acquisitionService =
@@ -182,7 +185,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     // zombie-cleanup interval as keep-alive. With a positive budget, keep-alive equals the budget
     // so the worker retires shortly after work finishes.
     this.zombieCleanupExecutor =
-        ExecutorUtils.newOnDemandSingleThreadExecutor(
+        newOnDemandSingleThreadExecutor(
             "PriorityAgentCleanup-Zombie-#",
             config.getZombieRunBudgetMs() > 0
                 ? config.getZombieRunBudgetMs()
@@ -192,7 +195,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     // thread churn and makes APM attribution clearer. When a positive budget is configured, use it
     // as the keep-alive so the worker retires shortly after work finishes.
     this.orphanCleanupExecutor =
-        ExecutorUtils.newOnDemandSingleThreadExecutor(
+        newOnDemandSingleThreadExecutor(
             "PriorityAgentCleanup-Orphan-#",
             config.getOrphanRunBudgetMs() > 0
                 ? config.getOrphanRunBudgetMs()
@@ -200,7 +203,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     // For reconcile, fall back to the Redis refresh cadence when no budget is set, to keep the
     // worker thread parked between reconciliation passes.
     this.reconcileExecutor =
-        ExecutorUtils.newOnDemandSingleThreadExecutor(
+        newOnDemandSingleThreadExecutor(
             "PriorityAgentReconcile-#",
             config.getReconcileRunBudgetMs() > 0
                 ? config.getReconcileRunBudgetMs()
@@ -272,14 +275,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
     }
 
     try {
-      long start = currentTimeMillis();
+      long start = nowMs();
       long currentRun = runCount.incrementAndGet();
       log.debug("Starting scheduler run cycle {}", currentRun);
 
       // Reconcile agent registrations with current sharding/enablement state (offloaded)
       long refreshPeriodMs = Math.max(1, config.getRedisRefreshPeriod()) * 1000L;
-      boolean reconcileDue =
-          CadenceGuard.isPeriodElapsed(lastReconcileEpochMs.get(), refreshPeriodMs);
+      boolean reconcileDue = isPeriodElapsed(lastReconcileEpochMs.get(), refreshPeriodMs);
       if (reconcileDue && reconcileRunning.compareAndSet(false, true)) {
         if (log.isDebugEnabled()) {
           log.debug("Begin reconcileKnownAgents offload for run {}", currentRun);
@@ -400,9 +402,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
           boolean degraded = acquisitionService.isDegraded();
           if (consecutive >= 3 && degraded) {
             long degradedMs =
-                degradedBacklogStartEpochMs > 0L
-                    ? (currentTimeMillis() - degradedBacklogStartEpochMs)
-                    : 0L;
+                degradedBacklogStartEpochMs > 0L ? (nowMs() - degradedBacklogStartEpochMs) : 0L;
             lastStarvationSuspected.set(true);
             lastStarvationTicks.set(consecutive);
             lastStarvationDegradedMs.set(degradedMs);
@@ -419,7 +419,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         long oldestOverdueSec = acquisitionService.getOldestOverdueSeconds();
         if (degraded && ready > 0) {
           if (degradedBacklogStartEpochMs == 0L) {
-            degradedBacklogStartEpochMs = currentTimeMillis();
+            degradedBacklogStartEpochMs = nowMs();
             degradedBacklogBaselineOldestOverdueSec = oldestOverdueSec;
           } else {
             // If backlog continues worsening, update baseline for future comparisons
@@ -440,10 +440,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
       try {
         long zombieIntervalMs = config.getZombieIntervalMs();
         long lastZombieSubmit = lastZombieSubmitEpochMs.get();
-        boolean zombieDueToSubmit =
-            CadenceGuard.isPeriodElapsed(lastZombieSubmit, zombieIntervalMs);
+        boolean zombieDueToSubmit = isPeriodElapsed(lastZombieSubmit, zombieIntervalMs);
         if (zombieDueToSubmit && zombieCleanupRunning.compareAndSet(false, true)) {
-          lastZombieSubmitEpochMs.set(currentTimeMillis());
+          lastZombieSubmitEpochMs.set(nowMs());
           zombieCleanupExecutor.submit(
               () -> {
                 try {
@@ -451,10 +450,10 @@ public class PriorityAgentScheduler extends CatsModuleAware
                       new java.util.HashMap<>(acquisitionService.getActiveAgentsMap());
                   java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
                       new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
-                  long startTs = currentTimeMillis();
+                  long startTs = nowMs();
                   long budgetMs = config.getZombieRunBudgetMs();
                   zombieService.cleanupZombieAgentsIfNeeded(activeAgentsSnapshot, futuresSnapshot);
-                  if (budgetMs > 0 && currentTimeMillis() - startTs > budgetMs) {
+                  if (budgetMs > 0 && nowMs() - startTs > budgetMs) {
                     log.warn(
                         "Zombie cleanup exceeded budget {}ms; subsequent work will be deferred",
                         budgetMs);
@@ -491,16 +490,16 @@ public class PriorityAgentScheduler extends CatsModuleAware
       try {
         long intervalMs = config.getOrphanIntervalMs();
         long lastSubmit = lastOrphanSubmitEpochMs.get();
-        boolean dueToSubmit = CadenceGuard.isPeriodElapsed(lastSubmit, intervalMs);
+        boolean dueToSubmit = isPeriodElapsed(lastSubmit, intervalMs);
         if (dueToSubmit && orphanCleanupRunning.compareAndSet(false, true)) {
-          lastOrphanSubmitEpochMs.set(currentTimeMillis());
+          lastOrphanSubmitEpochMs.set(nowMs());
           orphanCleanupExecutor.submit(
               () -> {
                 try {
-                  long startTs = currentTimeMillis();
+                  long startTs = nowMs();
                   long budgetMs = config.getOrphanRunBudgetMs();
                   orphanService.cleanupOrphanedAgentsIfNeeded();
-                  if (budgetMs > 0 && currentTimeMillis() - startTs > budgetMs) {
+                  if (budgetMs > 0 && nowMs() - startTs > budgetMs) {
                     log.warn(
                         "Orphan cleanup exceeded budget {}ms; subsequent work will be deferred",
                         budgetMs);
@@ -541,7 +540,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // Log health summary every 10 minutes (time-based, not cycle-based)
       maybeLogHealthSummary();
 
-      metrics.recordRunCycle(true, currentTimeMillis() - start);
+      metrics.recordRunCycle(true, nowMs() - start);
 
       // Design note: This is the only broad catch(Throwable) in the scheduler by intent.
       // - Purpose: ensure the periodic scheduler loop never dies due to unexpected Errors or
@@ -565,13 +564,14 @@ public class PriorityAgentScheduler extends CatsModuleAware
    * semaphore permits when enabled.
    */
   private void maybeLogHealthSummary() {
-    long now = currentTimeMillis();
+    long now = nowMs();
     long periodMs = config.getHealthSummaryPeriodMs();
     if (periodMs <= 0L) {
       return; // disabled
     }
     long last = lastHealthLogEpochMs.get();
-    if (!CadenceGuard.isPeriodElapsed(last, periodMs)) {
+    if (!com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.isPeriodElapsed(
+        last, periodMs)) {
       return;
     }
     if (!lastHealthLogEpochMs.compareAndSet(last, now)) {
@@ -960,20 +960,19 @@ public class PriorityAgentScheduler extends CatsModuleAware
       long refreshPeriodSeconds = config.getRedisRefreshPeriod();
       long refreshPeriodMs = Math.max(1, refreshPeriodSeconds) * 1000L;
       long budgetMs = config.getReconcileRunBudgetMs();
-      final long deadlineEpochMs = budgetMs > 0 ? (currentTimeMillis() + budgetMs) : Long.MAX_VALUE;
-      long now = currentTimeMillis();
+      long start = nowMs();
       long last = lastReconcileEpochMs.get();
-      if (!CadenceGuard.isPeriodElapsed(last, refreshPeriodMs)) {
+      if (!isPeriodElapsed(last, refreshPeriodMs)) {
         return;
       }
-      lastReconcileEpochMs.set(now);
+      lastReconcileEpochMs.set(start);
 
       for (KnownAgent ka : knownAgents.values()) {
         if (Thread.currentThread().isInterrupted()) {
           log.warn("Reconcile pass stopping early due to interrupt");
           break;
         }
-        if (currentTimeMillis() > deadlineEpochMs) {
+        if (overBudget(start, budgetMs)) {
           log.warn("Reconcile pass stopping early due to budget deadline");
           break;
         }
@@ -998,7 +997,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
             log.warn("Reconcile validation stopping early due to interrupt");
             break;
           }
-          if (currentTimeMillis() > deadlineEpochMs) {
+          if (overBudget(start, budgetMs)) {
             log.warn("Reconcile validation stopping early due to budget deadline");
             break;
           }

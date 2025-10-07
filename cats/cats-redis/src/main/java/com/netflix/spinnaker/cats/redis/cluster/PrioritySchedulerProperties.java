@@ -472,11 +472,15 @@ public class PrioritySchedulerProperties {
       throw new IllegalArgumentException(
           "redis.scheduler.zombie-cleanup.* shutdown timeouts must be >= 0");
     }
+    validateNonNegative(
+        zombieCleanup.getRunBudgetMs(), "redis.scheduler.zombie-cleanup.run-budget-ms");
     if (orphanCleanup.getExecutorShutdownAwaitMs() < 0
         || orphanCleanup.getExecutorShutdownForceAwaitMs() < 0) {
       throw new IllegalArgumentException(
           "redis.scheduler.orphan-cleanup.* shutdown timeouts must be >= 0");
     }
+    validateNonNegative(
+        orphanCleanup.getRunBudgetMs(), "redis.scheduler.orphan-cleanup.run-budget-ms");
     if (reconcile == null) {
       reconcile = new ReconcileProperties();
     }
@@ -485,6 +489,7 @@ public class PrioritySchedulerProperties {
       throw new IllegalArgumentException(
           "redis.scheduler.reconcile.* shutdown timeouts must be >= 0");
     }
+    validateNonNegative(reconcile.getRunBudgetMs(), "redis.scheduler.reconcile.run-budget-ms");
   }
 
   private static void validatePositive(long value, String name) {
@@ -500,6 +505,12 @@ public class PrioritySchedulerProperties {
   }
 
   private static void validateNonNegative(int value, String name) {
+    if (value < 0) {
+      throw new IllegalArgumentException(name + " must be >= 0 (was " + value + ")");
+    }
+  }
+
+  private static void validateNonNegative(long value, String name) {
     if (value < 0) {
       throw new IllegalArgumentException(name + " must be >= 0 (was " + value + ")");
     }

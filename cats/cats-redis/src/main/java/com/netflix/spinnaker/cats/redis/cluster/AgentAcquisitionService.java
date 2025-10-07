@@ -17,13 +17,14 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static com.netflix.spinnaker.cats.agent.ExecutionInstrumentation.elapsedTimeMs;
-import static com.netflix.spinnaker.cats.redis.cluster.SchedulerUtils.*;
+import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.*;
 
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
 import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
+import com.netflix.spinnaker.cats.redis.cluster.support.ScriptResults;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -510,9 +511,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       final long DIAG_PERIOD_MS = Math.max(3L * Math.max(1L, schedulerIntervalMs), 10_000L);
       boolean emitDiag =
           log.isDebugEnabled()
-              || CadenceGuard.isPeriodElapsed(lastBacklogWarnEpochMs.get(), 600_000L)
-              || CadenceGuard.isPeriodElapsed(lastStallWarnEpochMs.get(), 300_000L)
-              || CadenceGuard.isPeriodElapsed(lastDiagEpochMs.get(), DIAG_PERIOD_MS);
+              || isPeriodElapsed(lastBacklogWarnEpochMs.get(), 600_000L)
+              || isPeriodElapsed(lastStallWarnEpochMs.get(), 300_000L)
+              || isPeriodElapsed(lastDiagEpochMs.get(), DIAG_PERIOD_MS);
 
       // Cycle-long registry snapshot: consistent view of registered agents for the entire cycle
       final java.util.Map<String, AgentWorker> registrySnapshot = new java.util.HashMap<>(agents);
@@ -1044,7 +1045,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * for schedulers to decide whether to skip acquisition on the same tick.
    */
   public boolean repopulateIfDueNow() {
-    long now = currentTimeMillis();
+    long now = nowMs();
     long refreshPeriodMs = Math.max(1L, schedulerProperties.getRefreshPeriodSeconds()) * 1000L;
     long last = lastRepopulateEpochMs.get();
     if (last == 0L) {
@@ -1052,7 +1053,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       // on first run when required by tests/config.
       return false;
     }
-    if (!CadenceGuard.isPeriodElapsed(last, refreshPeriodMs)) {
+    if (!isPeriodElapsed(last, refreshPeriodMs)) {
       return false;
     }
     if (!lastRepopulateEpochMs.compareAndSet(last, now)) {
@@ -3057,46 +3058,30 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * @param offset Offset in milliseconds to add to current time
    * @return Score as seconds since epoch, synchronized with Redis server time
    */
-  private String score(Jedis jedis, Long offset) {
+  private String score(Jedis jedis, Long offsetMs) {
+    // Maintain and refresh the server-client offset cache when needed
     long now = System.currentTimeMillis();
     long lastCheck = lastTimeCheck.get();
-
-    // Get time cache duration from properties (default 10 seconds)
     long timeCacheDurationMs = schedulerProperties.getTimeCacheDurationMs();
-
-    // Refresh the server-client offset if needed
     if (now - lastCheck > timeCacheDurationMs) {
-      // Use Redis TIME command for server-side time coordination
       try {
         List<String> times = jedis.time();
         if (times != null && times.size() == 2) {
-          // Redis TIME returns seconds and microseconds
           long serverTimeSeconds = Long.parseLong(times.get(0));
           long serverTimeMicros = Long.parseLong(times.get(1));
           long serverTimeMs = (serverTimeSeconds * 1000L) + (serverTimeMicros / 1000L);
-          // Update the offset (server time - client time) using ms precision
           serverClientOffset.set(serverTimeMs - now);
           lastTimeCheck.set(now);
           log.debug("Updated Redis TIME sync offset: {}ms", serverTimeMs - now);
         }
       } catch (Exception e) {
-        // In case of Redis TIME command failure, we'll use client time
         log.warn("Failed to get Redis server time, using client time", e);
       }
     }
 
-    // Get the current time accounting for server-client offset
-    long adjustedTimeMs = now + serverClientOffset.get() + (offset != null ? offset : 0L);
-    long adjustedTimeSeconds;
-    // For non-negative offsets (most scheduling), round up to the next second to avoid
-    // scheduling in the past due to flooring and small negative skew between client/server.
-    if (offset != null && offset >= 0L) {
-      adjustedTimeSeconds = (adjustedTimeMs + 999L) / 1000L;
-    } else {
-      adjustedTimeSeconds = adjustedTimeMs / 1000L;
-    }
-
-    return String.valueOf(adjustedTimeSeconds);
+    java.util.function.LongSupplier supplier = this::nowMsWithOffset;
+    return com.netflix.spinnaker.cats.redis.cluster.support.RedisTimeUtils.scoreFromMsDelay(
+        jedis, offsetMs != null ? offsetMs : 0L, supplier);
   }
 
   /**
