@@ -433,6 +433,18 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     long acquireStartMs = System.currentTimeMillis();
 
     try (Jedis jedis = jedisPool.getResource()) {
+      // Fetch Redis TIME once for this cycle and reuse a cached nowMs across score() calls
+      Long nowMsCached = null;
+      try {
+        java.util.List<String> time = jedis.time();
+        if (time != null && time.size() >= 2) {
+          long sec = Long.parseLong(time.get(0));
+          long micros = Long.parseLong(time.get(1));
+          nowMsCached = (sec * 1000L) + (micros / 1000L);
+        }
+      } catch (Exception e) {
+        log.debug("Failed to fetch Redis TIME for this cycle; falling back to offset cache", e);
+      }
       // Prune completed futures (best-effort) to keep tracking map small
       try {
         for (Map.Entry<String, Future<?>> entry : new ArrayList<>(activeAgentsFutures.entrySet())) {
@@ -484,7 +496,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
 
       // PHASE 1: Process queued agent completions
-      processQueuedCompletions(jedis);
+      processQueuedCompletions(jedis, nowMsCached);
 
       // PHASE 2: Agent Repopulation (Redis Recovery, periodic)
       long nowMsForRepop = System.currentTimeMillis();
@@ -504,7 +516,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
 
       // PHASE 3: Determine current readiness state for diagnostics (gated by cadence/need)
-      String currentScore = score(jedis, 0L);
+      String currentScore = score(jedis, 0L, nowMsCached);
       // Gate diagnostics: only compute when debug is enabled, when warn cadence is due,
       // or when a periodic diagnostic cadence elapses. Period derives from scheduler interval.
       long schedulerIntervalMs = schedulerProperties.getIntervalMs();
@@ -758,7 +770,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         }
 
         // Refresh server time for fairness across chunks
-        currentScore = score(jedis, 0L);
+        currentScore = score(jedis, 0L, nowMsCached);
 
         // Use offset to skip already-tried agents when continuing after filtered chunks
         Set<String> readyChunk =
@@ -780,7 +792,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     runningAgents,
                     workersToSubmit,
                     attemptedThisCycle,
-                    registrySnapshot);
+                    registrySnapshot,
+                    nowMsCached);
             if (metrics != null) {
               metrics.recordAcquireTime("batch", System.currentTimeMillis() - chunkStartMs);
             }
@@ -798,7 +811,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     runningAgents,
                     workersToSubmit,
                     attemptedThisCycle,
-                    registrySnapshot);
+                    registrySnapshot,
+                    nowMsCached);
             if (metrics != null) {
               metrics.recordAcquireTime("fallback", System.currentTimeMillis() - chunkStartMs);
             }
@@ -812,7 +826,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                   runningAgents,
                   workersToSubmit,
                   attemptedThisCycle,
-                  registrySnapshot);
+                  registrySnapshot,
+                  nowMsCached);
           if (metrics != null) {
             metrics.recordAcquireTime("individual", System.currentTimeMillis() - chunkStartMs);
           }
@@ -1133,7 +1148,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       Semaphore runningAgents,
       Set<AgentWorker> workersToSubmit,
       java.util.Set<String> attemptedThisCycle,
-      java.util.Map<String, AgentWorker> registrySnapshot) {
+      java.util.Map<String, AgentWorker> registrySnapshot,
+      Long nowMsCached) {
 
     // Calculate batch size to prevent memory/Redis overload
     int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
@@ -1214,7 +1230,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
         // Generate completion deadline for this agent (current time + timeout)
         long agentTimeout = intervalProvider.getInterval(worker.getAgent()).getTimeout();
-        String acquireScore = score(jedis, agentTimeout);
+        String acquireScore = score(jedis, agentTimeout, nowMsCached);
 
         // Validate pair before adding: agent non-numeric, score numeric
         boolean scoreNumeric = acquireScore != null && acquireScore.matches("^\\d+$");
@@ -1396,7 +1412,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           runningAgents,
           workersToSubmit,
           attemptedThisCycle,
-          registrySnapshot);
+          registrySnapshot,
+          nowMsCached);
     }
   }
 
@@ -1418,7 +1435,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       Semaphore runningAgents,
       Set<AgentWorker> workersToSubmit,
       java.util.Set<String> attemptedThisCycle,
-      java.util.Map<String, AgentWorker> registrySnapshot) {
+      java.util.Map<String, AgentWorker> registrySnapshot,
+      Long nowMsCached) {
 
     log.debug(
         "Using individual agent acquisition for {} ready agents (max: {})",
@@ -1471,7 +1489,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
 
       // Try to acquire this agent from Redis
-      String agentAcquireScore = tryAcquireAgent(jedis, worker.getAgent());
+      String agentAcquireScore = tryAcquireAgent(jedis, worker.getAgent(), nowMsCached);
       if (agentAcquireScore != null) {
         // Successfully acquired agent, prepare for execution
         worker.acquireScore = agentAcquireScore;
@@ -2379,7 +2397,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * Process queued agent completions using the shared Redis connection. Processes agent completions
    * that were queued during previous execution cycles.
    */
-  private void processQueuedCompletions(Jedis jedis) {
+  private void processQueuedCompletions(Jedis jedis, Long nowMsCached) {
     List<AgentCompletion> completions = drainCompletionQueue();
     if (completions.isEmpty()) {
       return;
@@ -2398,9 +2416,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       List<AgentCompletion> group = entry.getValue();
 
       if (schedulerProperties.getBatchOperations().isEnabled()) {
-        totalProcessed += batchScheduleCompletions(jedis, group, offset);
+        totalProcessed += batchScheduleCompletions(jedis, group, offset, nowMsCached);
       } else {
-        totalProcessed += individualScheduleCompletions(jedis, group, offset);
+        totalProcessed += individualScheduleCompletions(jedis, group, offset, nowMsCached);
       }
     }
 
@@ -2651,12 +2669,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * @return Number of agents successfully scheduled
    */
   private int batchScheduleCompletions(
-      Jedis jedis, List<AgentCompletion> completions, long offset) {
+      Jedis jedis, List<AgentCompletion> completions, long offset, Long nowMsCached) {
     try {
       List<String> batchArgs = new ArrayList<>();
       for (AgentCompletion completion : completions) {
         String agentType = completion.agent.getAgentType();
-        String completionScore = score(jedis, offset);
+        String completionScore = score(jedis, offset, nowMsCached);
         if (!validateAgentScorePair(agentType, completionScore, "completion_batch")) {
           continue;
         }
@@ -2678,7 +2696,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
     } catch (Exception e) {
       log.warn("Batch completion scheduling failed, using individual mode", e);
-      return individualScheduleCompletions(jedis, completions, offset);
+      return individualScheduleCompletions(jedis, completions, offset, nowMsCached);
     }
   }
 
@@ -2693,9 +2711,10 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * @return Number of agents successfully scheduled
    */
   private int individualScheduleCompletions(
-      Jedis jedis, List<AgentCompletion> completions, long offset) {
+      Jedis jedis, List<AgentCompletion> completions, long offset, Long nowMsCached) {
     int scheduled = 0;
-    String offsetScore = score(jedis, offset); // Calculate once for all agents with same offset
+    String offsetScore =
+        score(jedis, offset, nowMsCached); // Calculate once for all agents with same offset
 
     for (AgentCompletion completion : completions) {
       try {
@@ -2779,12 +2798,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * @param agent The agent to acquire
    * @return The acquire score if successful, null otherwise
    */
-  private String tryAcquireAgent(Jedis jedis, Agent agent) {
+  private String tryAcquireAgent(Jedis jedis, Agent agent, Long nowMsCached) {
     try {
       String agentType = agent.getAgentType();
       // Generate completion deadline: current_time + agent_timeout
       long agentTimeout = intervalProvider.getInterval(agent).getTimeout();
-      String acquireScore = score(jedis, agentTimeout);
+      String acquireScore = score(jedis, agentTimeout, nowMsCached);
 
       // Atomically try to move agent from waiting → working using Lua script
       // Script ensures only one instance can successfully acquire each agent
@@ -2860,6 +2879,11 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     }
   }
 
+  // Backward-compatible overload used by tests via reflection
+  private String tryAcquireAgent(Jedis jedis, Agent agent) {
+    return tryAcquireAgent(jedis, agent, null);
+  }
+
   /**
    * Get the current score of an agent in the working or waiting set.
    *
@@ -2905,7 +2929,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
 
       // Only NEW agents (not in Redis) get immediate execution priority
-      String result = score(jedis, 0L);
+      String result = score(jedis, 0L, null);
       log.debug(
           "Agent {} is new - giving immediate execution priority: {}",
           agent.getAgentType(),
@@ -3032,7 +3056,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
     try {
       // Only NEW agents (not in Redis) get immediate execution priority
-      String result = score(jedis, 0L);
+      String result = score(jedis, 0L, null);
       log.debug("Agent {} new - immediate execution: {}", agent.getAgentType(), result);
       return result;
     } catch (Exception e) {
@@ -3080,6 +3104,15 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     }
 
     java.util.function.LongSupplier supplier = this::nowMsWithOffset;
+    return com.netflix.spinnaker.cats.redis.cluster.support.RedisTimeUtils.scoreFromMsDelay(
+        jedis, offsetMs != null ? offsetMs : 0L, supplier);
+  }
+
+  // Overload that prefers a per-cycle cached Redis TIME (ms) if provided; else falls back to offset
+  // cache
+  private String score(Jedis jedis, Long offsetMs, Long nowMsCached) {
+    java.util.function.LongSupplier supplier =
+        (nowMsCached != null && nowMsCached > 0) ? () -> nowMsCached : this::nowMsWithOffset;
     return com.netflix.spinnaker.cats.redis.cluster.support.RedisTimeUtils.scoreFromMsDelay(
         jedis, offsetMs != null ? offsetMs : 0L, supplier);
   }
@@ -3526,11 +3559,11 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               "Failed to calculate original ready time for agent {}, using immediate score",
               agentType,
               e);
-          requeueScore = score(jedis, 0L);
+          requeueScore = score(jedis, 0L, null);
         }
       } else {
         // No acquire score available, make it immediately eligible
-        requeueScore = score(jedis, 0L);
+        requeueScore = score(jedis, 0L, null);
         log.debug(
             "Requeueing rejected agent {} with score {} (immediate, no acquire score)",
             agentType,
