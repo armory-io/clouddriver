@@ -467,12 +467,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           int zombiesInFlightCount = zombiesInFlight.get();
           if (zombiesInFlightCount > cap) {
             int delta = cap - zombiesInFlightCount; // negative
-            zombiesInFlight.addAndGet(delta);
+            int newValue = zombiesInFlight.updateAndGet(current -> Math.max(0, current + delta));
             if (log.isDebugEnabled()) {
               log.debug(
                   "Reconciled zombiesInFlight from {} to {} (held={}, active={})",
                   zombiesInFlightCount,
-                  cap,
+                  newValue,
                   heldPermits,
                   currentlyRunning);
             }

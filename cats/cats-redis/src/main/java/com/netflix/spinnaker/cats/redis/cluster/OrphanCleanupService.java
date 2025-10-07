@@ -290,7 +290,7 @@ public class OrphanCleanupService {
             && schedulerProperties.getOrphanCleanup().isRemoveNumericOnlyAgents()) {
           for (Tuple tuple : new java.util.ArrayList<>(potentialOrphans)) {
             String name = tuple.getElement();
-            if (name != null && name.matches("^\\d+$")) {
+            if (name != null && name.matches("^\\d{9,11}$")) {
               try {
                 Object res =
                     scriptManager.evalshaWithSelfHeal(

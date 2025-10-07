@@ -335,6 +335,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
         java.util.concurrent.Semaphore runningAgentsSemaphore = config.getRunningAgents();
         int availablePermitsNow =
             runningAgentsSemaphore != null ? runningAgentsSemaphore.availablePermits() : -1;
+        // Read zombiesInFlight immediately after permits to reduce diagnostic skew
+        int zombiesInFlightCount = acquisitionService.getZombiesInFlight();
         int poolActive = 0;
         if (config.getAgentWorkPool() instanceof java.util.concurrent.ThreadPoolExecutor) {
           poolActive =
@@ -347,7 +349,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
                 : 0;
         int activeCount = acquisitionService.getActiveAgentCount();
         long ready = acquisitionService.getReadyCountSnapshot();
-        int zombiesInFlightCount = acquisitionService.getZombiesInFlight();
         // Allow zero capacity visibility (do not clamp to 1)
         int effectiveCapacity = Math.max(0, maxConcurrent - (activeCount + zombiesInFlightCount));
         double permitsFreePct =
@@ -392,7 +393,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
         // execution.
         try {
           int consecutive = permitStarvationConsecutive.get();
-          if (runningAgentsSemaphore != null && availablePermitsNow == 0 && poolActive == 0) {
+          // Consider starvation only when zombies are not consuming most capacity
+          boolean zombiesSmallFraction =
+              (maxConcurrent <= 0) || (zombiesInFlightCount < (maxConcurrent * 0.1));
+          if (runningAgentsSemaphore != null
+              && availablePermitsNow == 0
+              && poolActive == 0
+              && zombiesSmallFraction) {
             consecutive = permitStarvationConsecutive.incrementAndGet();
           } else {
             permitStarvationConsecutive.set(0);
