@@ -628,18 +628,9 @@ public class ZombieCleanupService {
         removed = false;
       }
 
-      if (!removed) {
-        try {
-          // Preserve waiting entries: remove only from WORKING as a conservative fallback
-          Long zrem = jedis.zrem(WORKING_SET, agentType);
-          removed = zrem != null && zrem.longValue() > 0L;
-          if (removed) {
-            log.debug("Fallback ZREM removed {} from working set (preserved waiting)", agentType);
-          }
-        } catch (Exception fbEx) {
-          log.warn("Fallback working-set removal failed for {}", agentType, fbEx);
-        }
-      }
+      // Do not perform an unconditional fallback ZREM here. If the conditional removal failed,
+      // ownership likely changed or the agent was already removed. Proceed with local cleanup
+      // regardless to avoid race conditions that could orphan a legitimately re-acquired agent.
 
       // ALWAYS clean local state and perform fairness, regardless of Redis outcome.
       // This prevents permit leaks and stuck 'running' counts when Redis removal races or fails.
