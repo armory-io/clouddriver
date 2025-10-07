@@ -1266,7 +1266,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           }
         }
 
-        List<String> acquiredAgentTypes = new ArrayList<>();
+        Set<String> acquiredAgentTypes = new HashSet<>();
         if (resultList.size() > 1) {
           Object list1 = resultList.get(1);
           if (list1 instanceof List) {
