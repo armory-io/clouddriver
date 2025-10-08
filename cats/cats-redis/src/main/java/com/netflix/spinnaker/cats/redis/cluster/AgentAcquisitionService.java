@@ -2442,24 +2442,29 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
     log.debug("Processing {} queued agent completions", completions.size());
 
-    // Group completions by scheduling offset for batch efficiency
-    Map<Long, List<AgentCompletion>> groupedCompletions =
-        completions.stream().collect(Collectors.groupingBy(this::getSchedulingOffset));
+    try {
+      // Group completions by scheduling offset for batch efficiency
+      Map<Long, List<AgentCompletion>> groupedCompletions =
+          completions.stream().collect(Collectors.groupingBy(this::getSchedulingOffset));
 
-    int totalProcessed = 0;
-    // Process each group with shared connection
-    for (Map.Entry<Long, List<AgentCompletion>> entry : groupedCompletions.entrySet()) {
-      long offset = entry.getKey();
-      List<AgentCompletion> group = entry.getValue();
+      int totalProcessed = 0;
+      // Process each group with shared connection
+      for (Map.Entry<Long, List<AgentCompletion>> entry : groupedCompletions.entrySet()) {
+        long offset = entry.getKey();
+        List<AgentCompletion> group = entry.getValue();
 
-      if (schedulerProperties.getBatchOperations().isEnabled()) {
-        totalProcessed += batchScheduleCompletions(jedis, group, offset, nowMsCached);
-      } else {
-        totalProcessed += individualScheduleCompletions(jedis, group, offset, nowMsCached);
+        if (schedulerProperties.getBatchOperations().isEnabled()) {
+          totalProcessed += batchScheduleCompletions(jedis, group, offset, nowMsCached);
+        } else {
+          totalProcessed += individualScheduleCompletions(jedis, group, offset, nowMsCached);
+        }
       }
-    }
 
-    log.debug("Processed {} agent completions with shared connection", totalProcessed);
+      log.debug("Processed {} agent completions with shared connection", totalProcessed);
+    } finally {
+      // Drop references to completion payloads early to allow GC before next drain
+      completions.clear();
+    }
   }
 
   /**
