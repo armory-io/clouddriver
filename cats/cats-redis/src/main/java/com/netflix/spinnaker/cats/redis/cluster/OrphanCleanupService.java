@@ -21,7 +21,6 @@ import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.*;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.redis.cluster.support.ScriptResults;
 import java.net.InetAddress;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -69,6 +68,16 @@ public class OrphanCleanupService {
   // Leadership tracking
   private volatile String currentLeadershipId = null;
   private volatile long lastOrphanCleanup = 0;
+
+  // Reusable ThreadLocal collections to reduce GC pressure in cleanup hot paths
+  private static final ThreadLocal<java.util.List<String>> REUSABLE_INVALID_ARGS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<String>> REUSABLE_ATTEMPTED_INVALID =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<redis.clients.jedis.Tuple>> REUSABLE_ORPHAN_LIST =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.Set<String>> REUSABLE_STRING_SET =
+      ThreadLocal.withInitial(java.util.HashSet::new);
 
   public OrphanCleanupService(
       JedisPool jedisPool,
@@ -323,9 +332,15 @@ public class OrphanCleanupService {
               thresholdForLogging);
         }
 
-        List<Tuple> orphanList = new ArrayList<>(potentialOrphans);
-        int cleanedThisPass =
-            processOrphanBatch(jedis, setName, orphanList, startEpochMs, budgetMs);
+        java.util.List<Tuple> orphanList = REUSABLE_ORPHAN_LIST.get();
+        int cleanedThisPass = 0;
+        try {
+          orphanList.clear();
+          orphanList.addAll(potentialOrphans);
+          cleanedThisPass = processOrphanBatch(jedis, setName, orphanList, startEpochMs, budgetMs);
+        } finally {
+          orphanList.clear();
+        }
         totalCleaned += cleanedThisPass;
 
         // Break when no progress was made to avoid infinite loops on valid-only candidates
@@ -375,141 +390,153 @@ public class OrphanCleanupService {
     if (WAITING_SET.equals(setName)) {
       // Critical: Never purge valid waiting by age. Batch-remove only invalid entries.
       if (batchOperationsEnabled) {
-        List<String> invalidArgs = new ArrayList<>();
-        // Also track which invalid agents we attempted to remove in this batch
-        List<String> attemptedInvalid = new ArrayList<>();
-        for (Tuple orphan : orphans) {
-          if (Thread.currentThread().isInterrupted()) {
-            log.warn("Aborting waiting-batch build due to interrupt");
-            break;
-          }
-          if (overBudget(startEpochMs, budgetMs)) {
-            log.warn("Aborting waiting-batch build due to budget deadline");
-            break;
-          }
-          String agentName = orphan.getElement();
-          if (!isAgentStillValid(agentName)) {
-            // Shard-aware gating: Only remove invalid entries owned by this shard
-            boolean belongsToThisShard;
-            if (acquisitionService == null) {
-              belongsToThisShard = true;
-            } else {
-              try {
-                belongsToThisShard = acquisitionService.belongsToThisShard(agentName);
-              } catch (Exception e) {
-                belongsToThisShard = false; // fail-safe preserve
+        java.util.List<String> invalidArgs = REUSABLE_INVALID_ARGS.get();
+        java.util.List<String> attemptedInvalid = REUSABLE_ATTEMPTED_INVALID.get();
+        try {
+          invalidArgs.clear();
+          attemptedInvalid.clear();
+          for (Tuple orphan : orphans) {
+            if (Thread.currentThread().isInterrupted()) {
+              log.warn("Aborting waiting-batch build due to interrupt");
+              break;
+            }
+            if (overBudget(startEpochMs, budgetMs)) {
+              log.warn("Aborting waiting-batch build due to budget deadline");
+              break;
+            }
+            String agentName = orphan.getElement();
+            if (!isAgentStillValid(agentName)) {
+              // Shard-aware gating: Only remove invalid entries owned by this shard
+              boolean belongsToThisShard;
+              if (acquisitionService == null) {
+                belongsToThisShard = true;
+              } else {
+                try {
+                  belongsToThisShard = acquisitionService.belongsToThisShard(agentName);
+                } catch (Exception e) {
+                  belongsToThisShard = false; // fail-safe preserve
+                }
+              }
+
+              if (belongsToThisShard) {
+                invalidArgs.add(agentName);
+                invalidArgs.add(String.valueOf((long) orphan.getScore()));
+                attemptedInvalid.add(agentName);
               }
             }
-
-            if (belongsToThisShard) {
-              invalidArgs.add(agentName);
-              invalidArgs.add(String.valueOf((long) orphan.getScore()));
-              attemptedInvalid.add(agentName);
-            }
           }
-        }
-        if (!invalidArgs.isEmpty()) {
-          try {
-            Object result =
-                scriptManager.evalshaWithSelfHeal(
-                    jedis,
-                    RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
-                    java.util.Collections.singletonList(WAITING_SET),
-                    invalidArgs);
-            ScriptResults.BatchRemovalResult parsed =
-                ScriptResults.parseRemoveAgentsConditional(result);
-            totalCleaned += parsed.getRemovedCount();
-            // Per-item fallback for any attempted invalid entries not removed by batch (partial
-            // success)
-            if (parsed.getRemovedCount() < attemptedInvalid.size()) {
-              java.util.Set<String> removedSet = new java.util.HashSet<>(parsed.getMembers());
-              for (String agentName : attemptedInvalid) {
+          if (!invalidArgs.isEmpty()) {
+            try {
+              Object result =
+                  scriptManager.evalshaWithSelfHeal(
+                      jedis,
+                      RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+                      java.util.Collections.singletonList(WAITING_SET),
+                      invalidArgs);
+              ScriptResults.BatchRemovalResult parsed =
+                  ScriptResults.parseRemoveAgentsConditional(result);
+              totalCleaned += parsed.getRemovedCount();
+              // Per-item fallback for any attempted invalid entries not removed by batch (partial
+              // success)
+              if (parsed.getRemovedCount() < attemptedInvalid.size()) {
+                java.util.Set<String> removedSet = REUSABLE_STRING_SET.get();
+                try {
+                  removedSet.clear();
+                  removedSet.addAll(parsed.getMembers());
+                  for (String agentName : attemptedInvalid) {
+                    if (Thread.currentThread().isInterrupted()) {
+                      log.warn("Stopping per-item fallback due to interrupt");
+                      break;
+                    }
+                    if (overBudget(startEpochMs, budgetMs)) {
+                      log.warn("Stopping per-item fallback due to budget deadline");
+                      break;
+                    }
+                    if (!removedSet.contains(agentName)) {
+                      String scoreStr;
+                      try {
+                        Double s = jedis.zscore(WAITING_SET, agentName);
+                        scoreStr = s != null ? String.valueOf(s.longValue()) : null;
+                      } catch (Exception ignore) {
+                        scoreStr = null;
+                      }
+                      try {
+                        if (scoreStr != null) {
+                          Object one =
+                              scriptManager.evalshaWithSelfHeal(
+                                  jedis,
+                                  RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+                                  java.util.Collections.singletonList(WAITING_SET),
+                                  java.util.Arrays.asList(agentName, scoreStr));
+                          ScriptResults.BatchRemovalResult oneParsed =
+                              ScriptResults.parseRemoveAgentsConditional(one);
+                          totalCleaned += oneParsed.getRemovedCount();
+                          if (oneParsed.getRemovedCount() == 0) {
+                            Object fallback =
+                                scriptManager.evalshaWithSelfHeal(
+                                    jedis,
+                                    RedisScriptManager.REMOVE_AGENT,
+                                    java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                                    java.util.Collections.singletonList(agentName));
+                            if (fallback != null && ((Long) fallback).intValue() == 1) {
+                              totalCleaned += 1;
+                            }
+                          }
+                        }
+                      } catch (Exception ex) {
+                        log.debug("Per-item fallback removal failed for {}: {}", agentName, ex);
+                      }
+                    }
+                  }
+                } finally {
+                  removedSet.clear();
+                }
+              }
+            } catch (Exception e) {
+              log.warn("Batch removal of invalid waiting agents failed, using individual path", e);
+              // Batch-first per-item: try conditional remove one-by-one, then fallback to
+              // REMOVE_AGENT
+              for (Tuple orphan : orphans) {
                 if (Thread.currentThread().isInterrupted()) {
-                  log.warn("Stopping per-item fallback due to interrupt");
+                  log.warn("Stopping individual conditional removal due to interrupt");
                   break;
                 }
                 if (overBudget(startEpochMs, budgetMs)) {
-                  log.warn("Stopping per-item fallback due to budget deadline");
+                  log.warn("Stopping individual conditional removal due to budget deadline");
                   break;
                 }
-                if (!removedSet.contains(agentName)) {
-                  String scoreStr;
-                  try {
-                    Double s = jedis.zscore(WAITING_SET, agentName);
-                    scoreStr = s != null ? String.valueOf(s.longValue()) : null;
-                  } catch (Exception ignore) {
-                    scoreStr = null;
-                  }
-                  try {
-                    if (scoreStr != null) {
-                      Object one =
-                          scriptManager.evalshaWithSelfHeal(
-                              jedis,
-                              RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
-                              java.util.Collections.singletonList(WAITING_SET),
-                              java.util.Arrays.asList(agentName, scoreStr));
-                      ScriptResults.BatchRemovalResult oneParsed =
-                          ScriptResults.parseRemoveAgentsConditional(one);
-                      totalCleaned += oneParsed.getRemovedCount();
-                      if (oneParsed.getRemovedCount() == 0) {
-                        Object fallback =
-                            scriptManager.evalshaWithSelfHeal(
-                                jedis,
-                                RedisScriptManager.REMOVE_AGENT,
-                                java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                                java.util.Collections.singletonList(agentName));
-                        if (fallback != null && ((Long) fallback).intValue() == 1) {
-                          totalCleaned += 1;
-                        }
-                      }
-                    }
-                  } catch (Exception ex) {
-                    log.debug("Per-item fallback removal failed for {}: {}", agentName, ex);
-                  }
-                }
-              }
-            }
-          } catch (Exception e) {
-            log.warn("Batch removal of invalid waiting agents failed, using individual path", e);
-            // Batch-first per-item: try conditional remove one-by-one, then fallback to
-            // REMOVE_AGENT
-            for (Tuple orphan : orphans) {
-              if (Thread.currentThread().isInterrupted()) {
-                log.warn("Stopping individual conditional removal due to interrupt");
-                break;
-              }
-              if (overBudget(startEpochMs, budgetMs)) {
-                log.warn("Stopping individual conditional removal due to budget deadline");
-                break;
-              }
-              String agentName = orphan.getElement();
-              String scoreStr = String.valueOf((long) orphan.getScore());
-              try {
-                Object one =
-                    scriptManager.evalshaWithSelfHeal(
-                        jedis,
-                        RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
-                        java.util.Collections.singletonList(WAITING_SET),
-                        java.util.Arrays.asList(agentName, scoreStr));
-                ScriptResults.BatchRemovalResult oneParsed =
-                    ScriptResults.parseRemoveAgentsConditional(one);
-                totalCleaned += oneParsed.getRemovedCount();
-                if (oneParsed.getRemovedCount() == 0) {
-                  Object fallback =
+                String agentName = orphan.getElement();
+                String scoreStr = String.valueOf((long) orphan.getScore());
+                try {
+                  Object one =
                       scriptManager.evalshaWithSelfHeal(
                           jedis,
-                          RedisScriptManager.REMOVE_AGENT,
-                          java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                          java.util.Collections.singletonList(agentName));
-                  if (fallback != null && ((Long) fallback).intValue() == 1) {
-                    totalCleaned += 1;
+                          RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+                          java.util.Collections.singletonList(WAITING_SET),
+                          java.util.Arrays.asList(agentName, scoreStr));
+                  ScriptResults.BatchRemovalResult oneParsed =
+                      ScriptResults.parseRemoveAgentsConditional(one);
+                  totalCleaned += oneParsed.getRemovedCount();
+                  if (oneParsed.getRemovedCount() == 0) {
+                    Object fallback =
+                        scriptManager.evalshaWithSelfHeal(
+                            jedis,
+                            RedisScriptManager.REMOVE_AGENT,
+                            java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                            java.util.Collections.singletonList(agentName));
+                    if (fallback != null && ((Long) fallback).intValue() == 1) {
+                      totalCleaned += 1;
+                    }
                   }
+                } catch (Exception ex) {
+                  log.debug("Individual conditional removal failed for {}: {}", agentName, ex);
                 }
-              } catch (Exception ex) {
-                log.debug("Individual conditional removal failed for {}: {}", agentName, ex);
               }
             }
           }
+        } finally {
+          attemptedInvalid.clear();
+          invalidArgs.clear();
         }
       } else {
         totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startEpochMs, budgetMs);

@@ -219,6 +219,18 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   private static final ThreadLocal<Set<AgentWorker>> REUSABLE_WORKERS_SET =
       ThreadLocal.withInitial(HashSet::new);
 
+  // Additional reusable containers for acquisition hot paths
+  private static final ThreadLocal<java.util.List<String>> REUSABLE_CANDIDATE_AGENTS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<AgentWorker>> REUSABLE_CANDIDATE_WORKERS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<String>> REUSABLE_ELIGIBLE_AGENTS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<String>> REUSABLE_AGENT_SCORE_PAIRS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<AgentCompletion>> REUSABLE_COMPLETIONS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+
   // Runtime configuration
   private volatile Pattern enabledAgentPattern;
   private volatile Pattern disabledAgentPattern;
@@ -447,12 +459,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
       // Prune completed futures (best-effort) to keep tracking map small
       try {
-        for (Map.Entry<String, Future<?>> entry : new ArrayList<>(activeAgentsFutures.entrySet())) {
-          Future<?> f = entry.getValue();
-          if (f != null && f.isDone()) {
-            activeAgentsFutures.remove(entry.getKey(), f);
-          }
-        }
+        activeAgentsFutures.forEach(
+            (key, future) -> {
+              if (future != null && future.isDone()) {
+                activeAgentsFutures.remove(key, future); // remove only if mapping unchanged
+              }
+            });
       } catch (Exception ignore) {
         // Best-effort only
       }
@@ -1163,13 +1175,16 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         effectiveBatchSize);
 
     int candidateCount = 0;
-    List<String> candidateAgents = new ArrayList<>();
-    List<AgentWorker> candidateWorkers = new ArrayList<>();
+    java.util.List<String> candidateAgents = REUSABLE_CANDIDATE_AGENTS.get();
+    java.util.List<AgentWorker> candidateWorkers = REUSABLE_CANDIDATE_WORKERS.get();
+    candidateAgents.clear();
+    candidateWorkers.clear();
 
     // PHASE 1: Pre-filter ready agents using local registry + enablement/sharding
     // This avoids acquiring permits for agents we will filter out anyway during candidate building,
     // reducing wasted work and permit churn under heavy filtering.
-    List<String> eligibleAgents = new ArrayList<>();
+    java.util.List<String> eligibleAgents = REUSABLE_ELIGIBLE_AGENTS.get();
+    eligibleAgents.clear();
     for (String agentType : readyAgents) {
       AgentWorker worker = registrySnapshot.get(agentType);
       if (worker == null) {
@@ -1239,7 +1254,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     try {
       // Prepare Redis Lua script arguments: [agent1, score1, agent2, score2, ...]
       // The Lua script expects alternating agent names and scores
-      List<String> agentScorePairs = new ArrayList<>();
+      java.util.List<String> agentScorePairs = REUSABLE_AGENT_SCORE_PAIRS.get();
+      agentScorePairs.clear();
 
       for (int i = 0; i < candidateAgents.size(); i++) {
         String agentType = candidateAgents.get(i);
@@ -1430,6 +1446,11 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           attemptedThisCycle,
           registrySnapshot,
           nowMsCached);
+    } finally {
+      REUSABLE_AGENT_SCORE_PAIRS.get().clear();
+      REUSABLE_ELIGIBLE_AGENTS.get().clear();
+      REUSABLE_CANDIDATE_WORKERS.get().clear();
+      REUSABLE_CANDIDATE_AGENTS.get().clear();
     }
   }
 
@@ -2450,7 +2471,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * @return List of all pending completions, or empty list if none.
    */
   private List<AgentCompletion> drainCompletionQueue() {
-    List<AgentCompletion> completions = new ArrayList<>();
+    java.util.List<AgentCompletion> completions = REUSABLE_COMPLETIONS.get();
+    completions.clear();
     int queueSize = completionQueue.size();
     log.debug("Draining completion queue, current size: {}", queueSize);
 
