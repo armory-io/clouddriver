@@ -50,7 +50,7 @@ public class LambdaClientProvider {
 
     ClientConfiguration clientConfiguration = new ClientConfiguration();
     clientConfiguration.setSocketTimeout(operationsConfig.getInvokeTimeoutMs());
-    clientConfiguration.setUseTcpKeepAlive(operationsConfig.getTcpKeepAlive());
+    clientConfiguration.setUseTcpKeepAlive(true);
     // only override if non-negative, and can't just set to the negative default :(
     if (operationsConfig.getRetry().getRetries() >= 0) {
       clientConfiguration.setRetryPolicy(

@@ -52,7 +52,6 @@ public class LambdaServiceConfig {
   private int invokeTimeoutMs = 50000;
 
   private Retry retry = new Retry();
-  private boolean tcpKeepAlive = false;
   /**
    * Duplicated by the {@link
    * com.netflix.spinnaker.clouddriver.aws.AwsConfigurationProperties.ClientConfig} class and the
