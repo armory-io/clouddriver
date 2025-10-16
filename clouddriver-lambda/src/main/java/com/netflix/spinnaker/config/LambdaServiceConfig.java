@@ -51,6 +51,12 @@ public class LambdaServiceConfig {
   @Value("#{'${aws.lambda.invokeTimeoutMs:${aws.lambda.ops.invokeTimeoutMs:50000}}'}")
   private int invokeTimeoutMs = 50000;
 
+  private boolean tcpKeepAlive = false;
+
+  public boolean getTcpKeepAlive() {
+    return tcpKeepAlive;
+  }
+
   private Retry retry = new Retry();
   /**
    * Duplicated by the {@link
