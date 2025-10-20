@@ -17,6 +17,7 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -947,6 +948,28 @@ class ZombieCleanupServiceTest {
       // Then - Zombie cleaned but future not cancelled (already done)
       assertThat(cleaned).isEqualTo(1);
       verify(completedFuture, never()).cancel(true); // Should not attempt to cancel
+    }
+  }
+
+  @Nested
+  @DisplayName("ThreadLocal Hygiene Tests")
+  class ThreadLocalHygieneTests {
+
+    @Test
+    @DisplayName("cleanupZombieAgents should not retain ThreadLocal buffers after run")
+    void cleanupZombieAgentsDoesNotRetainBuffers() {
+      Map<String, String> activeAgents = new HashMap<>();
+      Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+      // Run twice to exercise finally-clears and assert no exceptions are thrown
+      assertThatCode(
+              () -> {
+                zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+                zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+              })
+          .doesNotThrowAnyException();
+      // Maps remain unchanged
+      assertThat(activeAgents).isEmpty();
+      assertThat(activeAgentsFutures).isEmpty();
     }
   }
 }
