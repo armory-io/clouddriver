@@ -53,11 +53,8 @@ public class RedisScriptManager {
   public static final String ADD_AGENT = "addAgent"; // Single agent addition
   public static final String ADD_AGENTS = "addAgents"; // Batch agent addition
   public static final String REMOVE_AGENT = "removeAgent"; // Single agent removal
-  public static final String REMOVE_AGENTS =
-      "removeAgents"; // Batch agent unconditional removal from both sets
 
   // === STATE TRANSITIONS ===
-  public static final String MOVE_AGENT = "moveAgent"; // Single agent waiting→working movement
   public static final String MOVE_AGENTS =
       "moveAgents"; // Unconditional waiting→working for agent acquisition
   public static final String MOVE_AGENTS_CONDITIONAL =
@@ -65,8 +62,8 @@ public class RedisScriptManager {
 
   // === QUERIES ===
   public static final String SCORE_AGENTS = "scoreAgents"; // Batch score lookup for multiple agents
-  public static final String VALIDATE_OWNERSHIP =
-      "validateOwnership"; // Check agent ownership by score
+  public static final String ZMSCORE_AGENTS =
+      "zmscoreAgents"; // Atomic ZMSCORE for both sets; returns [1/0 per arg] ORed across sets
 
   // === ADVANCED OPERATIONS ===
   public static final String ACQUIRE_AGENTS =
@@ -191,6 +188,34 @@ public class RedisScriptManager {
       }
       metrics.incrementScriptError(scriptName, e.getClass().getSimpleName());
       throw e;
+    } catch (ClassCastException cce) {
+      // Defensive: result type mismatch (e.g., Redis/Jedis returns a different shape)
+      // Attempt one-time reload of scripts and retry this call
+      try {
+        metrics.incrementScriptResultTypeError(scriptName);
+      } catch (Exception ignoreMetric) {
+      }
+
+      try {
+        loadAllScripts(jedis);
+        metrics.incrementScriptsReload();
+        long retryStart = System.nanoTime();
+        Object result = jedis.evalsha(getScriptSha(scriptName), keys, args);
+        metrics.recordScriptEval(
+            scriptName, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - retryStart));
+        return result;
+      } catch (Exception retry) {
+        // Fall back to EVAL body
+        String body = getScriptBody(scriptName);
+        if (body != null) {
+          long evalStart = System.nanoTime();
+          Object result = jedis.eval(body, keys, args);
+          metrics.recordScriptEval(
+              scriptName, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - evalStart));
+          return result;
+        }
+        throw cce; // rethrow original CCE if we have no body
+      }
     }
   }
 
@@ -248,25 +273,6 @@ public class RedisScriptManager {
             + "redis.call('zrem', KEYS[2], ARGV[1])\n"
             + "return 1  -- Always successful: Redis ZREM is idempotent\n");
 
-    // MOVE_AGENT: Atomically move single agent from the waiting set to the working set.
-    // Invariants:
-    // - Transition is atomic: agent is removed from waiting and added to working with new score.
-    // - Returns 1 on success, 0 if agent was not waiting (no-op, safe under races).
-    // ARGS: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=newScore
-    // RETURNS: 1 if agent was moved successfully, 0 if agent was not in the waiting set
-    // USAGE: Individual agent acquisition, pipeline-friendly conditional move
-    bodies.put(
-        MOVE_AGENT,
-        "-- Attempt to remove agent from the waiting set\n"
-            + "local removed = redis.call('zrem', KEYS[2], ARGV[1])\n"
-            + "if removed == 1 then\n"
-            + "  -- Agent existed in waiting, move to working with new score\n"
-            + "  redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])\n"
-            + "  return 1  -- Success: agent moved waiting → working\n"
-            + "else\n"
-            + "  return 0  -- Failure: agent was not in the waiting set\n"
-            + "end\n");
-
     // --- BATCH OPERATIONS ---
 
     // ADD_AGENTS: Add single or multiple agents to the waiting set (consolidated from ADD_AGENT +
@@ -283,21 +289,17 @@ public class RedisScriptManager {
             + "for i=1,#ARGV,2 do\n"
             + "  local agent = ARGV[i]\n"
             + "  local score = ARGV[i+1]\n"
-            + "  local exists = redis.call('zscore', KEYS[1], agent) or redis.call('zscore', KEYS[2], agent)\n"
-            + "  if not exists then\n"
-            + "    redis.call('zadd', KEYS[2], score, agent)\n"
-            + "    table.insert(added, agent)\n"
-            + "    count = count + 1\n"
+            + "  -- Guards: score must be numeric and agent must not be numeric\n"
+            + "  if tonumber(score) ~= nil and tonumber(agent) == nil then\n"
+            + "    local exists = redis.call('zscore', KEYS[1], agent) or redis.call('zscore', KEYS[2], agent)\n"
+            + "    if not exists then\n"
+            + "      redis.call('zadd', KEYS[2], score, agent)\n"
+            + "      table.insert(added, agent)\n"
+            + "      count = count + 1\n"
+            + "    end\n"
             + "  end\n"
             + "end\n"
             + "return {count, added}\n");
-
-    // REMOVE_AGENTS: Unconditional removal (single-arg variant kept for compatibility).
-    bodies.put(
-        REMOVE_AGENTS,
-        "redis.call('zrem', KEYS[1], ARGV[1])\n"
-            + "redis.call('zrem', KEYS[2], ARGV[1])\n"
-            + "return 1\n");
 
     // --- AGENT STATE TRANSITION SCRIPTS ---
 
@@ -322,7 +324,7 @@ public class RedisScriptManager {
     // MOVE_AGENTS_CONDITIONAL: Conditionally move working → waiting with ownership verification.
     // Invariants:
     // - Score encodes lock ownership. Only the owning scorer may requeue.
-    // - Used by graceful shutdown and local zombie/orphan fixes.
+    // - Used by graceful shutdown and local zombie/orphan cleanup.
     // ARGS: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=expectedScore,
     // ARGV[3]=newScore
     // RETURNS: 'swapped' if agent moved successfully, nil if ownership verification failed
@@ -334,14 +336,6 @@ public class RedisScriptManager {
             + "  redis.call('zrem', KEYS[1], ARGV[1])\n"
             + "  redis.call('zadd', KEYS[2], ARGV[3], ARGV[1])\n"
             + "  return 'swapped'\n"
-            + "else return nil end\n");
-
-    // VALIDATE_OWNERSHIP: Check if we still own the agent lock (score validation).
-    bodies.put(
-        VALIDATE_OWNERSHIP,
-        "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
-            + "if score and tonumber(score) == tonumber(ARGV[2]) then\n"
-            + "  return score\n"
             + "else return nil end\n");
 
     // --- ADVANCED CLEANUP SCRIPTS ---
@@ -381,17 +375,44 @@ public class RedisScriptManager {
             + "for i=1,#ARGV,2 do\n"
             + "  local agent = ARGV[i]\n"
             + "  local newScore = ARGV[i+1]\n"
-            + "  local waitingScore = redis.call('zscore', KEYS[2], agent)\n"
-            + "  if waitingScore then\n"
-            + "    redis.call('zrem', KEYS[2], agent)\n"
-            + "    redis.call('zadd', KEYS[1], newScore, agent)\n"
-            + "    table.insert(acquired, agent)\n"
-            + "    count = count + 1\n"
+            + "  if tonumber(newScore) ~= nil then\n"
+            + "    local waitingScore = redis.call('zscore', KEYS[2], agent)\n"
+            + "    if waitingScore then\n"
+            + "      redis.call('zrem', KEYS[2], agent)\n"
+            + "      redis.call('zadd', KEYS[1], newScore, agent)\n"
+            + "      table.insert(acquired, agent)\n"
+            + "      count = count + 1\n"
+            + "    end\n"
             + "  end\n"
             + "end\n"
             + "return {count, acquired}\n");
 
     // --- QUERY SCRIPTS ---
+
+    // ZMSCORE_AGENTS: Batch presence check across working and waiting sets.
+    // Invariants:
+    // - Atomically evaluates both sets within one script execution per batch
+    // - Returns [1|0, 1|0, ...] aligned with ARGV order (1 if present in either set)
+    // - Read-only; no state is modified
+    bodies.put(
+        ZMSCORE_AGENTS,
+        "-- Input validation: ensure at least one agent name provided\n"
+            + "if #ARGV == 0 then\n"
+            + "  return {}\n"
+            + "end\n"
+            + "local workingScores = redis.call('zmscore', KEYS[1], unpack(ARGV))\n"
+            + "local waitingScores = redis.call('zmscore', KEYS[2], unpack(ARGV))\n"
+            + "local presence = {}\n"
+            + "for i=1,#ARGV do\n"
+            + "  local workingScore = workingScores[i]\n"
+            + "  local waitingScore = waitingScores[i]\n"
+            + "  if workingScore or waitingScore then\n"
+            + "    table.insert(presence, 1)\n"
+            + "  else\n"
+            + "    table.insert(presence, 0)\n"
+            + "  end\n"
+            + "end\n"
+            + "return presence\n");
 
     // SCORE_AGENTS: Batch score lookup for multiple agents.
     // Invariants:

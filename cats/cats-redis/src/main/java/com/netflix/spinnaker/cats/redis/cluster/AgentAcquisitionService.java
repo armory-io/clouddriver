@@ -17,13 +17,14 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static com.netflix.spinnaker.cats.agent.ExecutionInstrumentation.elapsedTimeMs;
-import static com.netflix.spinnaker.cats.redis.cluster.SchedulerUtils.*;
+import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.*;
 
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
 import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
+import com.netflix.spinnaker.cats.redis.cluster.support.ScriptResults;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -43,6 +44,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import javax.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.Jedis;
@@ -59,7 +61,7 @@ import redis.clients.jedis.Tuple;
  */
 @Component
 @Slf4j
-public class AgentAcquisitionService {
+public class AgentAcquisitionService implements PermitFairnessHandler {
 
   // Redis key names (injected via properties)
   private final String WAITING_SET;
@@ -98,9 +100,91 @@ public class AgentAcquisitionService {
   private final ConcurrentHashMap<String, RunState> runStates = new ConcurrentHashMap<>();
   private volatile Semaphore runningAgentsRef; // Provided by scheduler when calling saturatePool
 
+  // Dead-man timer scheduler for early cancellation at (deadline + threshold)
+  private final java.util.concurrent.ScheduledExecutorService deadmanScheduler;
+
+  // Compiled exceptional-agents pattern to mirror zombie cleanup semantics
+  private volatile java.util.regex.Pattern zombieExceptionalAgentsPattern;
+
   private static final class RunState {
     final java.util.concurrent.atomic.AtomicBoolean permitHeld =
         new java.util.concurrent.atomic.AtomicBoolean(true);
+    final java.util.concurrent.atomic.AtomicBoolean started =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    final java.util.concurrent.atomic.AtomicBoolean zifIncremented =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    volatile java.util.concurrent.ScheduledFuture<?> deadmanHandle;
+  }
+
+  /**
+   * Early release the semaphore permit for a running agent if still held, and increment
+   * zombies-in-flight compensation. This enables fairness when zombie cleanup cancels a task whose
+   * thread may linger.
+   *
+   * <p>Exactly-once semantics are enforced via the per-agent {@code RunState.permitHeld} flag.
+   *
+   * @param agentType the agent whose permit should be pre-released if still held
+   */
+  public void earlyReleasePermitIfHeld(String agentType) {
+    try {
+      RunState runStateForAgent = runStates.get(agentType);
+      if (runStateForAgent != null && runStateForAgent.permitHeld.compareAndSet(true, false)) {
+        if (runningAgentsRef != null) {
+          runningAgentsRef.release();
+        }
+        // Increment zIF only if the worker actually started running
+        if (runStateForAgent.started.get()) {
+          zombiesInFlight.incrementAndGet();
+          runStateForAgent.zifIncremented.set(true);
+        }
+      }
+    } catch (Exception e) {
+      // Best-effort; do not propagate exceptions to callers in cleanup paths
+      log.debug("earlyReleasePermitIfHeld failed for {}", agentType, e);
+    }
+  }
+
+  @Override
+  public void tryEarlyPermitReleaseAndMaybeIncrementZif(String agentType) {
+    earlyReleasePermitIfHeld(agentType);
+  }
+
+  /** Determine zombie threshold for the agent, honoring exceptional agents config. */
+  private long getZombieThresholdForAgent(String agentType) {
+    try {
+      if (zombieExceptionalAgentsPattern != null
+          && agentType != null
+          && zombieExceptionalAgentsPattern.matcher(agentType).matches()) {
+        return schedulerProperties.getZombieCleanup().getExceptionalAgents().getThresholdMs();
+      }
+      return schedulerProperties.getZombieCleanup().getThresholdMs();
+    } catch (Exception e) {
+      return schedulerProperties.getZombieCleanup().getThresholdMs();
+    }
+  }
+
+  /** Dead-man timeout action: interrupt and perform fairness early-release. */
+  private void onDeadmanTimeout(String agentType) {
+    try {
+      java.util.concurrent.Future<?> f = activeAgentsFutures.get(agentType);
+      if (f != null && !f.isDone()) {
+        boolean cancelled = f.cancel(true);
+        if (cancelled) {
+          tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
+          log.warn(
+              "Dead-man timeout fired for {}: future cancelled and permit released", agentType);
+        } else {
+          log.debug("Dead-man timeout fired for {}: cancel returned false", agentType);
+        }
+      }
+    } catch (Exception e) {
+      log.debug("Dead-man timeout handling failed for {}", agentType, e);
+    }
+  }
+
+  /** Current number of zombies whose permits were pre-released but threads still running. */
+  public int getZombiesInFlight() {
+    return zombiesInFlight.get();
   }
 
   // Backlog/health snapshots and rate-limiting
@@ -134,6 +218,18 @@ public class AgentAcquisitionService {
   // This avoids creating new HashSet instances on every scheduler cycle.
   private static final ThreadLocal<Set<AgentWorker>> REUSABLE_WORKERS_SET =
       ThreadLocal.withInitial(HashSet::new);
+
+  // Additional reusable containers for acquisition hot paths
+  private static final ThreadLocal<java.util.List<String>> REUSABLE_CANDIDATE_AGENTS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<AgentWorker>> REUSABLE_CANDIDATE_WORKERS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<String>> REUSABLE_ELIGIBLE_AGENTS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<String>> REUSABLE_AGENT_SCORE_PAIRS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
+  private static final ThreadLocal<java.util.List<AgentCompletion>> REUSABLE_COMPLETIONS =
+      ThreadLocal.withInitial(java.util.ArrayList::new);
 
   // Runtime configuration
   private volatile Pattern enabledAgentPattern;
@@ -179,7 +275,6 @@ public class AgentAcquisitionService {
     final Agent agent;
     final String acquireScore;
     final boolean success;
-    final long timestamp;
     final FailureClass failureClass; // null when success
     final String throwableClassName; // optional; may be null
 
@@ -187,7 +282,6 @@ public class AgentAcquisitionService {
       this.agent = agent;
       this.acquireScore = acquireScore;
       this.success = success;
-      this.timestamp = currentTimeMillis();
       this.failureClass = null;
       this.throwableClassName = null;
     }
@@ -201,7 +295,6 @@ public class AgentAcquisitionService {
       this.agent = agent;
       this.acquireScore = acquireScore;
       this.success = success;
-      this.timestamp = currentTimeMillis();
       this.failureClass = failureClass;
       this.throwableClassName = throwableClassName;
     }
@@ -283,6 +376,38 @@ public class AgentAcquisitionService {
     }
 
     this.redisRefreshPeriod = schedulerProperties.getRefreshPeriodSeconds();
+
+    // Compile exceptional-agents pattern to share semantics with ZombieCleanupService
+    try {
+      this.zombieExceptionalAgentsPattern =
+          schedulerProperties.getExceptionalAgentsPatternCompiled();
+    } catch (Exception e) {
+      log.error("Failed to compile exceptional agents pattern for dead-man timing", e);
+      this.zombieExceptionalAgentsPattern = null;
+    }
+
+    // Initialize dead-man scheduler (single thread, daemon, remove cancelled tasks)
+    java.util.concurrent.ScheduledThreadPoolExecutor dmExec =
+        new java.util.concurrent.ScheduledThreadPoolExecutor(
+            1,
+            r -> {
+              Thread t = new Thread(r, "DeadmanTimer-0");
+              t.setDaemon(true);
+              return t;
+            });
+    dmExec.setRemoveOnCancelPolicy(true);
+    this.deadmanScheduler = dmExec;
+  }
+
+  @PreDestroy
+  public void shutdownDeadmanScheduler() {
+    try {
+      if (deadmanScheduler != null) {
+        deadmanScheduler.shutdownNow();
+      }
+    } catch (Exception ignore) {
+      log.debug("Failed to shutdown deadman scheduler", ignore);
+    }
   }
 
   /**
@@ -321,16 +446,28 @@ public class AgentAcquisitionService {
     long acquireStartMs = System.currentTimeMillis();
 
     try (Jedis jedis = jedisPool.getResource()) {
+      // Fetch Redis TIME once for this cycle and reuse a cached nowMs across score() calls
+      Long nowMsCached = null;
+      try {
+        java.util.List<String> time = jedis.time();
+        if (time != null && time.size() >= 2) {
+          long sec = Long.parseLong(time.get(0));
+          long micros = Long.parseLong(time.get(1));
+          nowMsCached = (sec * 1000L) + (micros / 1000L);
+        }
+      } catch (Exception e) {
+        log.debug("Failed to fetch Redis TIME for this cycle; falling back to offset cache", e);
+      }
       // Prune completed futures (best-effort) to keep tracking map small
       try {
-        for (Map.Entry<String, Future<?>> entry : new ArrayList<>(activeAgentsFutures.entrySet())) {
-          Future<?> f = entry.getValue();
-          if (f != null && f.isDone()) {
-            activeAgentsFutures.remove(entry.getKey(), f);
-          }
-        }
+        activeAgentsFutures.forEach(
+            (key, future) -> {
+              if (future != null && future.isDone()) {
+                activeAgentsFutures.remove(key, future); // remove only if mapping unchanged
+              }
+            });
       } catch (Exception ignore) {
-        // Best-effort only
+        // Best-effort only – pruning failures are non-fatal and retried next cycle
       }
       // Check concurrent agent limits before processing
       int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
@@ -345,8 +482,34 @@ public class AgentAcquisitionService {
         return 0;
       }
 
+      // Defensive reconciliation: cap zombiesInFlight to real headroom so capacity accounting
+      // cannot be skewed by cancelled-but-never-started tasks.
+      if (!unbounded && runningAgents != null) {
+        try {
+          int availablePermits = runningAgents.availablePermits();
+          int heldPermits = Math.max(0, maxConcurrentAgents - availablePermits);
+          int cap = Math.max(0, heldPermits - currentlyRunning);
+          int zombiesInFlightCount = zombiesInFlight.get();
+          if (zombiesInFlightCount > cap) {
+            int delta = cap - zombiesInFlightCount; // negative
+            int newValue = zombiesInFlight.updateAndGet(current -> Math.max(0, current + delta));
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Reconciled zombiesInFlight from {} to {} (held={}, active={})",
+                  zombiesInFlightCount,
+                  newValue,
+                  heldPermits,
+                  currentlyRunning);
+            }
+          }
+        } catch (Exception e) {
+          log.debug(
+              "zombiesInFlight reconciliation skipped due to error; keeping previous values", e);
+        }
+      }
+
       // PHASE 1: Process queued agent completions
-      processQueuedCompletions(jedis);
+      processQueuedCompletions(jedis, nowMsCached);
 
       // PHASE 2: Agent Repopulation (Redis Recovery, periodic)
       long nowMsForRepop = System.currentTimeMillis();
@@ -366,101 +529,98 @@ public class AgentAcquisitionService {
       }
 
       // PHASE 3: Determine current readiness state for diagnostics (gated by cadence/need)
-      String currentScore = score(jedis, 0L);
+      String currentScore = score(jedis, 0L, nowMsCached);
       // Gate diagnostics: only compute when debug is enabled, when warn cadence is due,
       // or when a periodic diagnostic cadence elapses. Period derives from scheduler interval.
       long schedulerIntervalMs = schedulerProperties.getIntervalMs();
       final long DIAG_PERIOD_MS = Math.max(3L * Math.max(1L, schedulerIntervalMs), 10_000L);
       boolean emitDiag =
           log.isDebugEnabled()
-              || isPeriodElapsed(lastBacklogWarnEpochMs, 600_000L)
-              || isPeriodElapsed(lastStallWarnEpochMs, 300_000L)
-              || isPeriodElapsed(lastDiagEpochMs, DIAG_PERIOD_MS);
+              || isPeriodElapsed(lastBacklogWarnEpochMs.get(), 600_000L)
+              || isPeriodElapsed(lastStallWarnEpochMs.get(), 300_000L)
+              || isPeriodElapsed(lastDiagEpochMs.get(), DIAG_PERIOD_MS);
 
-      long readyCountForDiagnostics = -1L;
+      // Cycle-long registry snapshot: consistent view of registered agents for the entire cycle
+      final java.util.Map<String, AgentWorker> registrySnapshot = new java.util.HashMap<>(agents);
+
+      long readyCountForDiagnostics = 0L;
       boolean earlyEmptyReady = false;
+      Long earliestLocalWaitingScore = null;
       if (emitDiag) {
         try {
-          // Cheap readiness probe: ask for a single ready element; avoid full count scan
-          java.util.Set<String> oneReady =
-              jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, 0, 1);
-          earlyEmptyReady = (oneReady == null || oneReady.isEmpty());
-          readyCountForDiagnostics = earlyEmptyReady ? 0L : 1L;
-        } catch (Exception ignore) {
-          readyCountForDiagnostics = -1L; // unknown on failure
-        }
-
-        if (earlyEmptyReady) {
-          // Detect acquisition stall: waiting set has backlog but none are ready (e.g.,
-          // future-scored)
-          try {
-            long waitingBacklog = jedis.zcard(WAITING_SET);
-
-            if (waitingBacklog > 0) {
-              long nowSec;
-              try {
-                nowSec = Long.parseLong(currentScore);
-              } catch (NumberFormatException nfe) {
-                nowSec = System.currentTimeMillis() / 1000L;
-              }
-
-              final int window =
-                  Math.max(
-                      8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
-              Long earliestLocalWaitingScore = null;
-              try {
-                Set<Tuple> earliest =
-                    jedis.zrangeWithScores(WAITING_SET, 0, Math.max(0, window - 1));
-                for (Tuple t : earliest) {
-                  String agentType = t.getElement();
-                  AgentWorker local = agents.get(agentType);
-                  if (local != null && isAgentEnabled(local.getAgent())) {
-                    earliestLocalWaitingScore = (long) t.getScore();
-                    break;
-                  }
-                }
-              } catch (Exception ignore) {
-                // Best-effort; keep null on failure
-              }
-
-              long minIntervalSec = cachedMinEnabledIntervalSec.get();
-              if (earliestLocalWaitingScore != null
-                  && minIntervalSec > 0L
-                  && (earliestLocalWaitingScore - nowSec) > minIntervalSec
-                  && shouldWarnNow(lastStallWarnEpochMs, 300_000)) {
-                long nextReadyInSec = Math.max(0L, earliestLocalWaitingScore - nowSec);
-                log.warn(
-                    "Acquisition stall detected: ready=0, waiting_backlog={}, next_local_ready_in={}s > min_interval={}s, pool_active={}, pool_waiters={}",
-                    waitingBacklog,
-                    nextReadyInSec,
-                    minIntervalSec,
-                    jedisPool.getNumActive(),
-                    jedisPool.getNumWaiters());
-                if (metrics != null) {
-                  metrics.incrementStallDetected();
+          // Examine a small sorted-set window so we can count the oldest agents this pod could
+          // actually execute (restricted to locally registered + enabled agents).
+          final int window =
+              Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
+          Set<Tuple> earliest =
+              jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", currentScore, 0, window);
+          long eligibleReady = 0L;
+          if (earliest != null) {
+            for (Tuple t : earliest) {
+              String agentType = t.getElement();
+              AgentWorker local = registrySnapshot.get(agentType);
+              if (local != null && isAgentEnabled(local.getAgent())) {
+                eligibleReady++;
+                if (earliestLocalWaitingScore == null) {
+                  // First matching entry: use its score for stall diagnostics below.
+                  earliestLocalWaitingScore = (long) t.getScore();
                 }
               }
             }
-          } catch (Exception ignore) {
-            // Diagnostics only
           }
+          earlyEmptyReady = (eligibleReady == 0L);
+          readyCountForDiagnostics = eligibleReady;
+          if (earlyEmptyReady) {
+            // Waiting set has entries but none are runnable on this pod right now; check whether
+            // the next local candidate is still in the future and, if so, surface a stall warning
+            // on
+            // the same cadence as before.
+            try {
+              long waitingBacklog = jedis.zcard(WAITING_SET);
+              if (waitingBacklog > 0 && earliestLocalWaitingScore != null) {
+                long nowSec;
+                try {
+                  nowSec = Long.parseLong(currentScore);
+                } catch (NumberFormatException nfe) {
+                  nowSec = System.currentTimeMillis() / 1000L;
+                }
+                long minIntervalSec = cachedMinEnabledIntervalSec.get();
+                if (minIntervalSec > 0L
+                    && (earliestLocalWaitingScore - nowSec) > minIntervalSec
+                    && shouldWarnNow(lastStallWarnEpochMs, 300_000)) {
+                  long nextReadyInSec = Math.max(0L, earliestLocalWaitingScore - nowSec);
+                  log.warn(
+                      "Acquisition stall detected: ready=0, waiting_backlog={}, next_local_ready_in={}s > min_interval={}s, pool_active={}, pool_waiters={}",
+                      waitingBacklog,
+                      nextReadyInSec,
+                      minIntervalSec,
+                      jedisPool.getNumActive(),
+                      jedisPool.getNumWaiters());
+                  if (metrics != null) {
+                    metrics.incrementStallDetected();
+                  }
+                }
+              }
+            } catch (Exception ignore) {
+              // Diagnostics only – continue with acquisition attempt.
+            }
+          }
+        } catch (Exception ignore) {
+          // Any failure falls back to the safe "no ready agents" path.
+          readyCountForDiagnostics = 0L;
+          earliestLocalWaitingScore = null;
+          earlyEmptyReady = true;
+        }
+
+        if (earlyEmptyReady) {
           if (log.isDebugEnabled()) {
-            log.debug("No agents ready for execution");
+            log.debug("No locally eligible agents ready for execution");
           }
-          // Early return consistent with original behavior when we know none are ready
           return 0;
         }
       }
 
-      // Compute queue lag and health before acquisition; reuse Redis results when possible
-      long nowSec;
-      try {
-        nowSec = Long.parseLong(currentScore);
-      } catch (NumberFormatException nfe) {
-        nowSec = System.currentTimeMillis() / 1000L;
-      }
-
-      long readyCount = emitDiag ? Math.max(0L, readyCountForDiagnostics) : -1L;
+      long readyCount = emitDiag ? Math.max(0L, readyCountForDiagnostics) : 0L;
       long oldestOverdueSec = 0L;
       if (emitDiag) {
         try {
@@ -471,12 +631,18 @@ public class AgentAcquisitionService {
               Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
           Set<Tuple> oldestWindow =
               jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", currentScore, 0, window);
+          long nowSecForDiagnostics;
+          try {
+            nowSecForDiagnostics = Long.parseLong(currentScore);
+          } catch (NumberFormatException nfe) {
+            nowSecForDiagnostics = System.currentTimeMillis() / 1000L;
+          }
           for (Tuple t : oldestWindow) {
             String agentType = t.getElement();
-            AgentWorker local = agents.get(agentType);
+            AgentWorker local = registrySnapshot.get(agentType);
             if (local != null && isAgentEnabled(local.getAgent())) {
               long oldestScore = (long) t.getScore();
-              oldestOverdueSec = Math.max(0L, nowSec - oldestScore);
+              oldestOverdueSec = Math.max(0L, nowSecForDiagnostics - oldestScore);
               break;
             }
           }
@@ -509,11 +675,10 @@ public class AgentAcquisitionService {
         return 0;
       }
 
-      long readyLimit = (readyCount >= 0) ? readyCount : Long.MAX_VALUE;
-      int effectiveMaxToAcquire =
-          unbounded
-              ? (int) Math.min(Integer.MAX_VALUE, readyLimit)
-              : (int) Math.min(availableSlotsForNewAgents, Math.max(0L, readyLimit));
+      // Do NOT cap by diagnostic-ready count; we intentionally probed only a single element.
+      // Acquisition capacity should reflect concurrency slots when bounded, or be effectively
+      // unbounded when maxConcurrentAgents <= 0.
+      int effectiveMaxToAcquire = unbounded ? Integer.MAX_VALUE : availableSlotsForNewAgents;
 
       // Evaluate health/degradation and rate-limited WARNing.
       // Avoid false positives by excluding known-orphan/zombie cases: the decision is based purely
@@ -524,18 +689,8 @@ public class AgentAcquisitionService {
       boolean degraded = oldestOverdueSec > minIntervalSec && minIntervalSec > 0L;
       int capacityPerCycle = availableSlotsForNewAgents;
 
-      if (degraded && shouldWarnNow(lastBacklogWarnEpochMs, 600_000)) {
-        log.warn(
-            "PriorityScheduler degraded: oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
-            oldestOverdueSec,
-            minIntervalSec,
-            readyCount,
-            capacityPerCycle,
-            currentlyRunning,
-            maxConcurrentAgents);
-      } else if (degraded && log.isDebugEnabled()) {
-        log.debug(
-            "PriorityScheduler degraded (suppressed WARN): oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
+      if (degraded) {
+        logDegradedBacklog(
             oldestOverdueSec,
             minIntervalSec,
             readyCount,
@@ -554,12 +709,11 @@ public class AgentAcquisitionService {
               : "";
 
       // Persist initial snapshots (will be updated after slot filling check if needed)
-      if (emitDiag) {
-        lastOldestOverdueSeconds.set(oldestOverdueSec);
-        lastReadyCount.set(Math.max(0L, readyCount));
-        lastCapacityPerCycle.set(capacityPerCycle);
-        // Degradation status will be finalized after slot filling check
-      }
+      // Always keep snapshots up to date for health logging
+      lastOldestOverdueSeconds.set(oldestOverdueSec);
+      lastReadyCount.set(Math.max(0L, readyCount));
+      lastCapacityPerCycle.set(capacityPerCycle);
+      // Degradation status will be finalized after slot filling check
       int queueDepthDebug = -1;
       if (agentWorkPool instanceof java.util.concurrent.ThreadPoolExecutor) {
         queueDepthDebug =
@@ -574,19 +728,19 @@ public class AgentAcquisitionService {
           queueDepthDebug);
 
       // PHASE 5: Acquire up to available slots in chunks of batch-size
-      int remainingToAcquire = availableSlotsForNewAgents;
+      int remainingToAcquire = effectiveMaxToAcquire;
       int chunkOffset = 0; // Track offset for pagination through ready agents
 
-      // Calculate max chunk attempts based on actual need and filtering expectations
+      // Calculate max chunk attempts based on actual need and filtering expectations.
+      // batch-size <= 0 means "no per-chunk cap" so each attempt can try every remaining slot.
       int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
       if (configuredBatchSize <= 0) {
-        configuredBatchSize =
-            availableSlotsForNewAgents; // Use all slots if batch size not configured
+        configuredBatchSize = effectiveMaxToAcquire; // Default 0 = use all remaining slots
       }
 
       // Base calculation: how many chunks we need to fill available slots
       int baseAttempts =
-          (availableSlotsForNewAgents + configuredBatchSize - 1)
+          (effectiveMaxToAcquire + configuredBatchSize - 1)
               / configuredBatchSize; // ceiling division
 
       // Apply multiplier for filtering scenarios
@@ -607,7 +761,7 @@ public class AgentAcquisitionService {
         log.debug(
             "Calculated chunk attempts: {} (slots: {} / batch: {} = {} base × {} multiplier)",
             maxChunkAttempts,
-            availableSlotsForNewAgents,
+            effectiveMaxToAcquire,
             configuredBatchSize,
             baseAttempts,
             multiplier);
@@ -618,7 +772,9 @@ public class AgentAcquisitionService {
       while (remainingToAcquire > 0 && chunkAttempts < maxChunkAttempts) {
         chunkAttempts++;
 
-        // Use configured batch size when positive; otherwise treat as unlimited for this chunk
+        // Use configured batch size when positive; otherwise treat as unlimited for this chunk.
+        // With the default (0), we effectively make a single pass that can include every remaining
+        // slot.
         int configuredBatch = schedulerProperties.getBatchOperations().getBatchSize();
         int perChunkLimit = configuredBatch > 0 ? configuredBatch : remainingToAcquire;
         int chunkSize = Math.min(remainingToAcquire, perChunkLimit);
@@ -627,7 +783,7 @@ public class AgentAcquisitionService {
         }
 
         // Refresh server time for fairness across chunks
-        currentScore = score(jedis, 0L);
+        currentScore = score(jedis, 0L, nowMsCached);
 
         // Use offset to skip already-tried agents when continuing after filtered chunks
         Set<String> readyChunk =
@@ -638,7 +794,8 @@ public class AgentAcquisitionService {
         }
 
         int acquiredThisChunk = 0;
-        if (schedulerProperties.getBatchOperations().isEnabled() && readyChunk.size() > 1) {
+        long chunkStartMs = System.currentTimeMillis();
+        if (schedulerProperties.getBatchOperations().isEnabled() && !readyChunk.isEmpty()) {
           try {
             acquiredThisChunk =
                 saturatePoolBatch(
@@ -647,9 +804,17 @@ public class AgentAcquisitionService {
                     chunkSize,
                     runningAgents,
                     workersToSubmit,
-                    attemptedThisCycle);
+                    attemptedThisCycle,
+                    registrySnapshot,
+                    nowMsCached);
+            if (metrics != null) {
+              metrics.recordAcquireTime("batch", System.currentTimeMillis() - chunkStartMs);
+            }
           } catch (Exception e) {
             log.warn("Batch acquisition failed for chunk, falling back to individual", e);
+            if (metrics != null) {
+              metrics.incrementBatchFallback();
+            }
             workersToSubmit.clear();
             acquiredThisChunk =
                 saturatePoolIndividual(
@@ -658,12 +823,27 @@ public class AgentAcquisitionService {
                     chunkSize,
                     runningAgents,
                     workersToSubmit,
-                    attemptedThisCycle);
+                    attemptedThisCycle,
+                    registrySnapshot,
+                    nowMsCached);
+            if (metrics != null) {
+              metrics.recordAcquireTime("fallback", System.currentTimeMillis() - chunkStartMs);
+            }
           }
         } else {
           acquiredThisChunk =
               saturatePoolIndividual(
-                  jedis, readyChunk, chunkSize, runningAgents, workersToSubmit, attemptedThisCycle);
+                  jedis,
+                  readyChunk,
+                  chunkSize,
+                  runningAgents,
+                  workersToSubmit,
+                  attemptedThisCycle,
+                  registrySnapshot,
+                  nowMsCached);
+          if (metrics != null) {
+            metrics.recordAcquireTime("individual", System.currentTimeMillis() - chunkStartMs);
+          }
         }
 
         if (acquiredThisChunk <= 0) {
@@ -671,7 +851,8 @@ public class AgentAcquisitionService {
           // 1. All agents in chunk were acquired by other pods (normal contention)
           // 2. All agents were filtered out (sharding/disabled)
           // 3. Semaphore exhausted
-          // Continue to next chunk to avoid starvation of agents deeper in queue
+          // Continue to next chunk to maintain throughput - agents deeper in queue may still
+          // be eligible, and with high filter rates stopping here reduces effective capacity
           log.debug(
               "No agents acquired from chunk (size: {}) at offset {}, checking for more ready agents",
               readyChunk.size(),
@@ -701,7 +882,7 @@ public class AgentAcquisitionService {
 
       if (chunkAttempts >= maxChunkAttempts && remainingToAcquire > 0) {
         // Check if we have significant unfilled slots with evidence of filtering
-        double unfilledRatio = (double) remainingToAcquire / availableSlotsForNewAgents;
+        double unfilledRatio = (double) remainingToAcquire / effectiveMaxToAcquire;
         int scannedButNotAcquired = chunkOffset - agentsAcquiredThisCycle;
 
         if (unfilledRatio > 0.2 && scannedButNotAcquired > 0) {
@@ -753,7 +934,7 @@ public class AgentAcquisitionService {
       // PHASE 6: Submit all acquired agents for execution
       // Submit each agent individually to handle rejections properly
       for (AgentWorker worker : workersToSubmit) {
-        // CRITICAL: Set semaphore before execution so it can be released when done
+        // Critical: Set semaphore before execution so it can be released when done
         worker.setRunningAgents(runningAgents);
         // Initialize run-state for exactly-once permit release
         runStates.put(worker.getAgent().getAgentType(), new RunState());
@@ -763,7 +944,29 @@ public class AgentAcquisitionService {
             submitAgentWithRejectionHandling(worker, agentWorkPool, runningAgents);
 
         if (future != null) {
-          activeAgentsFutures.put(worker.getAgent().getAgentType(), future);
+          // Schedule dead-man cancellation exactly at (completion deadline + threshold)
+          try {
+            if (schedulerProperties.getZombieCleanup().isEnabled()) {
+              String agentType = worker.getAgent().getAgentType();
+              if (worker.acquireScore != null && worker.acquireScore.matches("^\\d+$")) {
+                long thresholdMs = getZombieThresholdForAgent(agentType);
+                // acquireScore encodes the completion deadline in epoch seconds
+                long completionDeadlineMs = Long.parseLong(worker.acquireScore) * 1000L;
+                long delayMs =
+                    Math.max(0L, (completionDeadlineMs + thresholdMs) - nowMsWithOffset());
+                RunState runState = runStates.get(agentType);
+                if (runState != null) {
+                  runState.deadmanHandle =
+                      deadmanScheduler.schedule(
+                          () -> onDeadmanTimeout(agentType),
+                          delayMs,
+                          java.util.concurrent.TimeUnit.MILLISECONDS);
+                }
+              }
+            }
+          } catch (Exception e) {
+            log.debug("Dead-man scheduling failed for {}", worker.getAgent().getAgentType(), e);
+          }
           log.debug("Submitted agent {} for execution", worker.getAgent().getAgentType());
         }
       }
@@ -796,11 +999,21 @@ public class AgentAcquisitionService {
         metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
       }
       return 0;
-    } catch (Exception e) {
+
+      // Design note: Catch Throwable as final safety net for acquisition cycle.
+      // - Most permit-related failures are handled by inner catch(Throwable) blocks in batch
+      //   acquisition and submission, but this ensures we handle Errors in other parts of the
+      //   acquisition flow (e.g., during diagnostics, metrics, submission loop setup).
+      // - While the scheduler's outer catch(Throwable) would eventually catch these, handling
+      //   them here allows proper circuit breaker recording and prevents Error propagation from
+      //   disrupting other scheduler services.
+    } catch (Throwable e) {
       log.error("Error during agent acquisition cycle", e);
 
-      // Record general failure to acquisition circuit breaker
-      acquisitionCircuitBreaker.recordFailure(e);
+      // Record general failure to acquisition circuit breaker (only for Exceptions)
+      if (e instanceof Exception) {
+        acquisitionCircuitBreaker.recordFailure((Exception) e);
+      }
 
       if (metrics != null) {
         metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
@@ -860,7 +1073,7 @@ public class AgentAcquisitionService {
    * for schedulers to decide whether to skip acquisition on the same tick.
    */
   public boolean repopulateIfDueNow() {
-    long now = SchedulerUtils.currentTimeMillis();
+    long now = nowMs();
     long refreshPeriodMs = Math.max(1L, schedulerProperties.getRefreshPeriodSeconds()) * 1000L;
     long last = lastRepopulateEpochMs.get();
     if (last == 0L) {
@@ -868,7 +1081,7 @@ public class AgentAcquisitionService {
       // on first run when required by tests/config.
       return false;
     }
-    if (!SchedulerUtils.isPeriodElapsed(last, refreshPeriodMs)) {
+    if (!isPeriodElapsed(last, refreshPeriodMs)) {
       return false;
     }
     if (!lastRepopulateEpochMs.compareAndSet(last, now)) {
@@ -901,10 +1114,32 @@ public class AgentAcquisitionService {
     return false;
   }
 
-  private static boolean isPeriodElapsed(AtomicLong lastEpochMs, long periodMs) {
-    long now = System.currentTimeMillis();
-    long last = lastEpochMs.get();
-    return now - last >= periodMs;
+  private void logDegradedBacklog(
+      long oldestOverdueSec,
+      long minIntervalSec,
+      long readyCount,
+      int capacityPerCycle,
+      int currentlyRunning,
+      int maxConcurrentAgents) {
+    if (shouldWarnNow(lastBacklogWarnEpochMs, 600_000)) {
+      log.warn(
+          "PriorityScheduler degraded: oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
+          oldestOverdueSec,
+          minIntervalSec,
+          readyCount,
+          capacityPerCycle,
+          currentlyRunning,
+          maxConcurrentAgents);
+    } else if (log.isDebugEnabled()) {
+      log.debug(
+          "PriorityScheduler degraded (suppressed WARN): oldest_overdue={}s > min_interval={}s; ready={} capacityPerCycle={} running={} maxConcurrent={}",
+          oldestOverdueSec,
+          minIntervalSec,
+          readyCount,
+          capacityPerCycle,
+          currentlyRunning,
+          maxConcurrentAgents);
+    }
   }
 
   /**
@@ -925,7 +1160,9 @@ public class AgentAcquisitionService {
       int maxToAcquire,
       Semaphore runningAgents,
       Set<AgentWorker> workersToSubmit,
-      java.util.Set<String> attemptedThisCycle) {
+      java.util.Set<String> attemptedThisCycle,
+      java.util.Map<String, AgentWorker> registrySnapshot,
+      Long nowMsCached) {
 
     // Calculate batch size to prevent memory/Redis overload
     int configuredBatchSize = schedulerProperties.getBatchOperations().getBatchSize();
@@ -939,16 +1176,32 @@ public class AgentAcquisitionService {
         effectiveBatchSize);
 
     int candidateCount = 0;
-    List<String> candidateAgents = new ArrayList<>();
-    List<AgentWorker> candidateWorkers = new ArrayList<>();
+    java.util.List<String> candidateAgents = REUSABLE_CANDIDATE_AGENTS.get();
+    java.util.List<AgentWorker> candidateWorkers = REUSABLE_CANDIDATE_WORKERS.get();
+    candidateAgents.clear();
+    candidateWorkers.clear();
 
-    // Snapshot agents to prevent concurrent modification during batch processing
-    // Critical for avoiding race conditions with dynamic account updates
-    Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
-
-    // PHASE 1: Build candidate list and acquire semaphore permits
-    // Note: We respect BOTH the concurrency limit (maxToAcquire) AND batch size limit
+    // PHASE 1: Pre-filter ready agents using local registry + enablement/sharding
+    // This avoids acquiring permits for agents we will filter out anyway during candidate building,
+    // reducing wasted work and permit churn under heavy filtering.
+    java.util.List<String> eligibleAgents = REUSABLE_ELIGIBLE_AGENTS.get();
+    eligibleAgents.clear();
     for (String agentType : readyAgents) {
+      AgentWorker worker = registrySnapshot.get(agentType);
+      if (worker == null) {
+        log.debug("Agent {} not in registry during pre-filter, skipping", agentType);
+        continue;
+      }
+      if (!isAgentEnabled(worker.getAgent())) {
+        log.debug("Agent {} filtered by enablement/sharding during pre-filter", agentType);
+        continue;
+      }
+      eligibleAgents.add(agentType);
+    }
+
+    // PHASE 2: Build candidate list and acquire semaphore permits
+    // Note: We respect both the concurrency limit (maxToAcquire) and batch size limit
+    for (String agentType : eligibleAgents) {
       if (attemptedThisCycle != null && attemptedThisCycle.contains(agentType)) {
         continue;
       }
@@ -963,7 +1216,7 @@ public class AgentAcquisitionService {
         break;
       }
 
-      AgentWorker worker = agentsSnapshot.get(agentType);
+      AgentWorker worker = registrySnapshot.get(agentType);
       if (worker == null) {
         log.warn(
             "Agent {} not found in local registry, skipping (may have been dynamically removed)",
@@ -998,11 +1251,12 @@ public class AgentAcquisitionService {
       return 0;
     }
 
-    // PHASE 2: Batch acquire agents using Redis Lua script
+    // PHASE 3: Batch acquire agents using Redis Lua script
     try {
       // Prepare Redis Lua script arguments: [agent1, score1, agent2, score2, ...]
       // The Lua script expects alternating agent names and scores
-      List<String> agentScorePairs = new ArrayList<>();
+      java.util.List<String> agentScorePairs = REUSABLE_AGENT_SCORE_PAIRS.get();
+      agentScorePairs.clear();
 
       for (int i = 0; i < candidateAgents.size(); i++) {
         String agentType = candidateAgents.get(i);
@@ -1010,7 +1264,21 @@ public class AgentAcquisitionService {
 
         // Generate completion deadline for this agent (current time + timeout)
         long agentTimeout = intervalProvider.getInterval(worker.getAgent()).getTimeout();
-        String acquireScore = score(jedis, agentTimeout);
+        String acquireScore = score(jedis, agentTimeout, nowMsCached);
+
+        // Validate pair before adding: agent non-numeric, score numeric
+        boolean scoreNumeric = acquireScore != null && acquireScore.matches("^\\d+$");
+        boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
+        if (!scoreNumeric || agentNumeric) {
+          if (metrics != null) {
+            metrics.incrementInvalidPair("acquire_batch");
+          }
+          // Skip invalid pair; release semaphore since we won't attempt this one
+          if (runningAgents != null) {
+            runningAgents.release();
+          }
+          continue;
+        }
 
         // Add to script arguments: agent name, then its score
         agentScorePairs.add(agentType); // Even index: agent name
@@ -1025,11 +1293,45 @@ public class AgentAcquisitionService {
               Arrays.asList(WORKING_SET, WAITING_SET),
               agentScorePairs);
 
-      // PHASE 3: Process batch acquisition results
+      // PHASE 4: Process batch acquisition results
       if (result instanceof List) {
-        List<Object> resultList = (List<Object>) result;
-        long successCount = (Long) resultList.get(0);
-        List<String> acquiredAgentTypes = (List<String>) resultList.get(1);
+        // ACQUIRE_AGENTS returns a Lua array: [count, [acquiredAgent1, acquiredAgent2, ...]]
+        // Jedis can surface elements as Long, String, or byte[] depending on codec/version.
+        // Coerce types defensively to avoid ClassCastException and keep the pod progressing.
+        List<?> resultList = (List<?>) result;
+        long successCount = 0L;
+        try {
+          Object c0 = resultList.size() > 0 ? resultList.get(0) : 0L;
+          if (c0 instanceof Long) {
+            successCount = (Long) c0;
+          } else if (c0 instanceof String) {
+            successCount = Long.parseLong((String) c0);
+          } else if (c0 instanceof byte[]) {
+            successCount =
+                Long.parseLong(new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
+          }
+        } catch (Exception ex) {
+          if (metrics != null) {
+            metrics.incrementAcquireValidationFailure("batch_result_count_parse");
+          }
+        }
+
+        Set<String> acquiredAgentTypes = new HashSet<>();
+        if (resultList.size() > 1) {
+          Object list1 = resultList.get(1);
+          if (list1 instanceof List) {
+            for (Object o : (List<?>) list1) {
+              if (o instanceof String) {
+                acquiredAgentTypes.add((String) o);
+              } else if (o instanceof byte[]) {
+                acquiredAgentTypes.add(
+                    new String((byte[]) o, java.nio.charset.StandardCharsets.UTF_8));
+              } else if (o != null) {
+                acquiredAgentTypes.add(String.valueOf(o));
+              }
+            }
+          }
+        }
 
         log.debug(
             "Batch acquisition completed: {} successes out of {} attempts",
@@ -1037,21 +1339,21 @@ public class AgentAcquisitionService {
             candidateAgents.size());
 
         // Process each candidate agent to see if it was successfully acquired
-        for (int i = 0; i < candidateAgents.size(); i++) {
-          String agentType = candidateAgents.get(i);
+        for (int candidateIndex = 0; candidateIndex < candidateAgents.size(); candidateIndex++) {
+          String agentType = candidateAgents.get(candidateIndex);
 
           if (acquiredAgentTypes.contains(agentType)) {
             // SUCCESS: This pod acquired the agent - set up for execution
-            AgentWorker worker = candidateWorkers.get(i);
+            AgentWorker worker = candidateWorkers.get(candidateIndex);
 
             // Extract the agent's score from agentScorePairs array
             // Array structure: [agent1, score1, agent2, score2, ...]
-            // For agent at index i: score is at position (i * 2 + 1)
+            // For agent at index candidateIndex: score is at position (candidateIndex * 2 + 1)
 
-            // CRITICAL: Validate index and score format to prevent corruption
-            // from dynamic account updates during batch acquisition
+            // Critical: Validate index and score format to prevent corruption
+            // from concurrent external modifications during batch acquisition
             String acquireScore = null;
-            int scoreIndex = i * 2 + 1;
+            int scoreIndex = candidateIndex * 2 + 1;
 
             if (scoreIndex < agentScorePairs.size()) {
               String scoreCandidate = agentScorePairs.get(scoreIndex);
@@ -1060,14 +1362,14 @@ public class AgentAcquisitionService {
                 acquireScore = scoreCandidate;
               } else {
                 log.error(
-                    "Invalid acquire score detected for agent {} at index {}: '{}' - likely corruption from dynamic account update",
+                    "Invalid acquire score detected for agent {} at index {}: '{}' - likely corruption from concurrent external modification",
                     agentType,
                     scoreIndex,
                     scoreCandidate);
               }
             } else {
               log.error(
-                  "Score index {} out of bounds for agent {} (agentScorePairs.size={}). Dynamic account modification likely occurred during batch acquisition.",
+                  "Score index {} out of bounds for agent {} (agentScorePairs.size={}). Concurrent external modification likely occurred during batch acquisition.",
                   scoreIndex,
                   agentType,
                   agentScorePairs.size());
@@ -1114,17 +1416,23 @@ public class AgentAcquisitionService {
       log.warn("Unexpected batch acquisition result: {}", result);
       // Release all semaphore permits on batch failure
       if (runningAgents != null) {
-        for (int i = 0; i < candidateAgents.size(); i++) {
+        for (int releaseIndex = 0; releaseIndex < candidateAgents.size(); releaseIndex++) {
           runningAgents.release();
         }
       }
       return 0;
 
-    } catch (Exception e) {
+      // Design note: Catch Throwable to ensure permit cleanup on all failure modes.
+      // - Critical: Phase 2 acquired permits for all candidates. If an Error (e.g.,
+      //   OutOfMemoryError) occurs during Phase 3 (Redis batch) or Phase 4 (result processing),
+      //   we must release all acquired permits to prevent permit leaks.
+      // - The scheduler's outer catch(Throwable) would eventually catch Errors, but by then permits
+      //   are already leaked, causing permanent capacity loss until pod restart.
+    } catch (Throwable e) {
       log.error("Batch agent acquisition failed, falling back to individual mode", e);
       // Release all semaphore permits on batch failure
       if (runningAgents != null) {
-        for (int i = 0; i < candidateAgents.size(); i++) {
+        for (int releaseIndex = 0; releaseIndex < candidateAgents.size(); releaseIndex++) {
           runningAgents.release();
         }
       }
@@ -1136,7 +1444,14 @@ public class AgentAcquisitionService {
           maxToAcquire,
           runningAgents,
           workersToSubmit,
-          attemptedThisCycle);
+          attemptedThisCycle,
+          registrySnapshot,
+          nowMsCached);
+    } finally {
+      REUSABLE_AGENT_SCORE_PAIRS.get().clear();
+      REUSABLE_ELIGIBLE_AGENTS.get().clear();
+      REUSABLE_CANDIDATE_WORKERS.get().clear();
+      REUSABLE_CANDIDATE_AGENTS.get().clear();
     }
   }
 
@@ -1157,7 +1472,9 @@ public class AgentAcquisitionService {
       int maxToAcquire,
       Semaphore runningAgents,
       Set<AgentWorker> workersToSubmit,
-      java.util.Set<String> attemptedThisCycle) {
+      java.util.Set<String> attemptedThisCycle,
+      java.util.Map<String, AgentWorker> registrySnapshot,
+      Long nowMsCached) {
 
     log.debug(
         "Using individual agent acquisition for {} ready agents (max: {})",
@@ -1185,11 +1502,9 @@ public class AgentAcquisitionService {
       }
 
       // Semaphore permit acquired
-      // Note: Individual acquisition is less prone to race conditions since it processes one agent
-      // at a time
-      // The dynamic account plugin race primarily affects batch acquisition where indices can be
-      // corrupted
-      AgentWorker worker = agents.get(agentType);
+      // Note: Individual acquisition processes agents sequentially, making it more resilient
+      // to concurrent external modifications that can corrupt batch operation indices
+      AgentWorker worker = registrySnapshot.get(agentType);
       if (worker == null) {
         log.warn(
             "Ready agent {} not found in local agents map, releasing semaphore permit and skipping.",
@@ -1212,7 +1527,7 @@ public class AgentAcquisitionService {
       }
 
       // Try to acquire this agent from Redis
-      String agentAcquireScore = tryAcquireAgent(jedis, worker.getAgent());
+      String agentAcquireScore = tryAcquireAgent(jedis, worker.getAgent(), nowMsCached);
       if (agentAcquireScore != null) {
         // Successfully acquired agent, prepare for execution
         worker.acquireScore = agentAcquireScore;
@@ -1245,11 +1560,13 @@ public class AgentAcquisitionService {
 
   /**
    * Determine if the provided agent type belongs to this shard according to the configured {@link
-   * ShardingFilter}. When the agent is not registered locally, a lightweight stub is used to
-   * evaluate sharding based on agentType alone (providerName defaults to "unknown").
+   * ShardingFilter}.
    *
-   * <p>Returns false if the shard ownership cannot be determined to avoid cross-shard deletions in
-   * cleanup flows.
+   * <p>Details: - Uses the registered {@link Agent} if available; otherwise uses a lightweight stub
+   * based on agentType only (providerName defaults to "unknown"). - When sharding is disabled, a
+   * {@link com.netflix.spinnaker.cats.cluster.NoopShardingFilter} is wired which always returns
+   * true, so ownership checks pass and cleanup proceeds. - Returns false on unexpected errors to
+   * avoid cross-shard deletions in cleanup flows.
    */
   public boolean belongsToThisShard(String agentType) {
     try {
@@ -1399,7 +1716,7 @@ public class AgentAcquisitionService {
    * @param agentType The type identifier of the agent to remove
    */
   public void removeActiveAgent(String agentType) {
-    // CRITICAL: Capture removed value to ensure atomic consistency between map and counter
+    // Critical: Capture removed value to ensure atomic consistency between map and counter
     String removedScore = activeAgents.remove(agentType);
     if (removedScore != null) {
       // Only decrement counter if we actually removed something
@@ -1407,7 +1724,7 @@ public class AgentAcquisitionService {
       // Remove future tracking - this cleanup is non-critical if it fails
       activeAgentsFutures.remove(agentType);
 
-      // CRITICAL: Remove from Redis sets - behavior depends on shutdown state
+      // Critical: Remove from Redis sets - behavior depends on shutdown state
       try (Jedis jedis = jedisPool.getResource()) {
         if (shuttingDown.get()) {
           // During shutdown: Only remove from working to preserve waiting entries
@@ -1535,6 +1852,37 @@ public class AgentAcquisitionService {
     return System.currentTimeMillis() + serverClientOffset.get();
   }
 
+  /**
+   * Compute the original ready time (in epoch seconds) for an agent currently in the working set.
+   *
+   * <p>Working score encodes the completion deadline: acquire_time + timeout. To preserve the
+   * agent's original position when re-queuing (e.g., during orphan cleanup), we subtract the
+   * provider-configured timeout to recover the original ready score used while in the waiting set.
+   *
+   * @param agentType The agent identifier
+   * @param workingScoreSeconds The score from the working set as a decimal string (epoch seconds)
+   * @return The original ready time in epoch seconds as a string, or null if unavailable
+   */
+  public String computeOriginalReadySecondsFromWorkingScore(
+      String agentType, String workingScoreSeconds) {
+    try {
+      if (agentType == null || workingScoreSeconds == null) {
+        return null;
+      }
+      Agent agent = getAgentByType(agentType);
+      if (agent == null) {
+        return null;
+      }
+      long timeoutMs = intervalProvider.getInterval(agent).getTimeout();
+      long timeoutSeconds = Math.max(0L, timeoutMs / 1000L);
+      long workingSeconds = Long.parseLong(workingScoreSeconds);
+      long originalReadySeconds = Math.max(0L, workingSeconds - timeoutSeconds);
+      return String.valueOf(originalReadySeconds);
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
   public boolean isDegraded() {
     return lastDegraded.get();
   }
@@ -1553,6 +1901,24 @@ public class AgentAcquisitionService {
     status.put("acquisition", acquisitionCircuitBreaker.getStatus());
     status.put("redis", redisCircuitBreaker.getStatus());
     return status;
+  }
+
+  /**
+   * Get the current Redis circuit breaker state for watchdog diagnostics.
+   *
+   * @return breaker state, or {@code null} if unavailable
+   */
+  public PrioritySchedulerCircuitBreaker.State getRedisCircuitBreakerState() {
+    return redisCircuitBreaker.getState();
+  }
+
+  /**
+   * Expose agent properties for scheduler diagnostics/watchdog decisions.
+   *
+   * @return current {@link PriorityAgentProperties}
+   */
+  public PriorityAgentProperties getAgentProperties() {
+    return agentProperties;
   }
 
   /** Reset circuit breakers (for recovery/testing). */
@@ -1593,15 +1959,15 @@ public class AgentAcquisitionService {
           expectedScore,
           nextScore);
       // Check current state in Redis before attempting swap
-      Double currentWorkzScore = jedis.zscore(WORKING_SET, agentType);
-      Double currentWaitzScore = jedis.zscore(WAITING_SET, agentType);
+      Double currentWorkingScore = jedis.zscore(WORKING_SET, agentType);
+      Double currentWaitingScore = jedis.zscore(WAITING_SET, agentType);
       log.debug(
           "Redis state before swap: {} {}={} {}={}",
           agentType,
           WORKING_SET,
-          currentWorkzScore,
+          currentWorkingScore,
           WAITING_SET,
-          currentWaitzScore);
+          currentWaitingScore);
 
       // Use MOVE_AGENTS_CONDITIONAL - only moves if agent is in working with expected score
       Object result =
@@ -1612,15 +1978,15 @@ public class AgentAcquisitionService {
               java.util.Arrays.asList(agentType, expectedScore, nextScore));
 
       // Check final state
-      Double finalWorkzScore = jedis.zscore(WORKING_SET, agentType);
-      Double finalWaitzScore = jedis.zscore(WAITING_SET, agentType);
+      Double finalWorkingScore = jedis.zscore(WORKING_SET, agentType);
+      Double finalWaitingScore = jedis.zscore(WAITING_SET, agentType);
       log.debug(
           "Redis state after swap: {} {}={} {}={} result={}",
           agentType,
           WORKING_SET,
-          finalWorkzScore,
+          finalWorkingScore,
           WAITING_SET,
-          finalWaitzScore,
+          finalWaitingScore,
           result);
 
       if (result != null && "swapped".equals(result)) {
@@ -1630,8 +1996,8 @@ public class AgentAcquisitionService {
             "Agent {} not re-queued (already completed or moved during shutdown) (expected_working={}, current_working={}, current_waiting={}, result={})",
             agentType,
             expectedScore,
-            currentWorkzScore,
-            currentWaitzScore,
+            currentWorkingScore,
+            currentWaitingScore,
             result);
       }
 
@@ -1776,37 +2142,76 @@ public class AgentAcquisitionService {
       return java.util.Collections.emptySet();
     }
 
+    // Primary: Use ZMSCORE batches to check presence in working/waiting with minimal Redis work
     try {
-      @SuppressWarnings("unchecked")
-      List<String> results =
-          (List<String>)
-              scriptManager.evalshaWithSelfHeal(
-                  jedis,
-                  RedisScriptManager.SCORE_AGENTS,
-                  Arrays.asList(WORKING_SET, WAITING_SET),
-                  agentNames);
-
-      // Results format: [agent, workScore|'null', waitScore|'null', ...]
+      int batchSize;
+      int configured = 0;
+      try {
+        configured = schedulerProperties.getBatchOperations().getBatchSize();
+      } catch (Exception ignore) {
+        // best effort
+      }
+      if (configured > 0) {
+        batchSize = configured;
+      } else {
+        batchSize = agentNames.size();
+      }
       Set<String> allAgents = new HashSet<>();
-      for (int i = 0; i < results.size(); i += 3) {
-        String agent = results.get(i);
-        String workScore = results.get(i + 1);
-        String waitScore = results.get(i + 2);
-        if (!"null".equals(workScore) || !"null".equals(waitScore)) {
-          allAgents.add(agent);
+      for (int start = 0; start < agentNames.size(); start += batchSize) {
+        int end = Math.min(start + batchSize, agentNames.size());
+        List<String> batch = agentNames.subList(start, end);
+
+        @SuppressWarnings("unchecked")
+        List<Long> presence =
+            (List<Long>)
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.ZMSCORE_AGENTS,
+                    Arrays.asList(WORKING_SET, WAITING_SET),
+                    batch);
+
+        for (int i = 0; i < batch.size(); i++) {
+          Long p = (presence != null && i < presence.size()) ? presence.get(i) : 0L;
+          if (p != null && p != 0L) {
+            allAgents.add(batch.get(i));
+          }
         }
       }
       return allAgents;
-    } catch (Exception e) {
-      // Fallback: full-set scan if script fails
-      log.warn("Repopulation presence check failed, falling back to full-set scan", e);
-      Pipeline pipeline = jedis.pipelined();
-      Response<Set<String>> waitingAgents = pipeline.zrange(WAITING_SET, 0, -1);
-      Response<Set<String>> workingAgents = pipeline.zrange(WORKING_SET, 0, -1);
-      pipeline.sync();
-      Set<String> allAgents = new HashSet<>(waitingAgents.get());
-      allAgents.addAll(workingAgents.get());
-      return allAgents;
+    } catch (Exception zmscoreEx) {
+      // Fallback 1: Use existing Lua script query to avoid full scans
+      log.warn("ZMSCORE presence check failed, falling back to Lua script", zmscoreEx);
+      try {
+        @SuppressWarnings("unchecked")
+        List<String> results =
+            (List<String>)
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.SCORE_AGENTS,
+                    Arrays.asList(WORKING_SET, WAITING_SET),
+                    agentNames);
+
+        Set<String> allAgents = new HashSet<>();
+        for (int resultIndex = 0; resultIndex < results.size(); resultIndex += 3) {
+          String agent = results.get(resultIndex);
+          String workScore = results.get(resultIndex + 1);
+          String waitScore = results.get(resultIndex + 2);
+          if (!"null".equals(workScore) || !"null".equals(waitScore)) {
+            allAgents.add(agent);
+          }
+        }
+        return allAgents;
+      } catch (Exception luaEx) {
+        // Fallback 2: Full-set scan
+        log.warn("Lua presence check failed, falling back to full-set scan", luaEx);
+        Pipeline pipeline = jedis.pipelined();
+        Response<Set<String>> waitingAgents = pipeline.zrange(WAITING_SET, 0, -1);
+        Response<Set<String>> workingAgents = pipeline.zrange(WORKING_SET, 0, -1);
+        pipeline.sync();
+        Set<String> allAgents = new HashSet<>(waitingAgents.get());
+        allAgents.addAll(workingAgents.get());
+        return allAgents;
+      }
     }
   }
 
@@ -1819,7 +2224,10 @@ public class AgentAcquisitionService {
    * @param agentsToAdd Set of agent types to add to Redis
    */
   private void addMissingAgents(Jedis jedis, Set<String> agentsToAdd) {
-    if (schedulerProperties.getBatchOperations().isEnabled() && agentsToAdd.size() > 1) {
+    if (agentsToAdd == null || agentsToAdd.isEmpty()) {
+      return;
+    }
+    if (schedulerProperties.getBatchOperations().isEnabled()) {
       addMissingAgentsBatch(jedis, agentsToAdd);
     } else {
       addMissingAgentsIndividual(jedis, agentsToAdd);
@@ -1831,23 +2239,26 @@ public class AgentAcquisitionService {
     for (String agentType : agentsToAdd) {
       AgentWorker worker = agents.get(agentType);
       if (worker != null) {
-        batchArgs.add(agentType);
         long jitterSec = computeInitialRegistrationJitterSeconds();
-        batchArgs.add(score(jedis, jitterSec * 1000L));
+        String registrationScore = score(jedis, jitterSec * 1000L);
+        if (!validateAgentScorePair(agentType, registrationScore, "repopulate_missing_batch")) {
+          continue;
+        }
+        batchArgs.add(agentType);
+        batchArgs.add(registrationScore);
       }
     }
 
     if (!batchArgs.isEmpty()) {
       try {
-        @SuppressWarnings("unchecked")
-        List<Object> result =
-            (List<Object>)
+        List<?> result =
+            (List<?>)
                 scriptManager.evalshaWithSelfHeal(
                     jedis,
                     RedisScriptManager.ADD_AGENTS,
                     Arrays.asList(WORKING_SET, WAITING_SET),
                     batchArgs);
-        int added = result.size() >= 1 ? ((Long) result.get(0)).intValue() : 0;
+        int added = parseAddAgentsCount(result);
         log.debug("Batch added {} missing agents to Redis", added);
         if (metrics != null && added > 0) {
           metrics.incrementRepopulateAdded(added);
@@ -1939,8 +2350,18 @@ public class AgentAcquisitionService {
 
       List<String> batchArgs = new ArrayList<>();
       for (Map.Entry<String, String> entry : agentScores.entrySet()) {
-        batchArgs.add(entry.getKey()); // agent name
-        batchArgs.add(entry.getValue()); // score
+        String agentType = entry.getKey();
+        String acquireScoreStr = entry.getValue();
+        boolean scoreNumeric = acquireScoreStr != null && acquireScoreStr.matches("^\\d+$");
+        boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
+        if (!scoreNumeric || agentNumeric) {
+          if (metrics != null) {
+            metrics.incrementInvalidPair("repopulate_fallback_batch");
+          }
+          continue;
+        }
+        batchArgs.add(agentType); // agent name
+        batchArgs.add(acquireScoreStr); // score
         processed++;
 
         // Process batch when we reach batch size or end of agents
@@ -1973,11 +2394,11 @@ public class AgentAcquisitionService {
 
             // Fallback: Use pipeline with individual ADD_AGENT script
             Pipeline pipeline = jedis.pipelined();
-            for (int i = 0; i < batchArgs.size(); i += 2) {
+            for (int argIndex = 0; argIndex < batchArgs.size(); argIndex += 2) {
               pipeline.evalsha(
                   scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT),
                   Arrays.asList(WORKING_SET, WAITING_SET),
-                  Arrays.asList(batchArgs.get(i), batchArgs.get(i + 1)));
+                  Arrays.asList(batchArgs.get(argIndex), batchArgs.get(argIndex + 1)));
             }
             List<Object> pipelineResults = pipeline.syncAndReturnAll();
 
@@ -2023,7 +2444,7 @@ public class AgentAcquisitionService {
    * Process queued agent completions using the shared Redis connection. Processes agent completions
    * that were queued during previous execution cycles.
    */
-  private void processQueuedCompletions(Jedis jedis) {
+  private void processQueuedCompletions(Jedis jedis, Long nowMsCached) {
     List<AgentCompletion> completions = drainCompletionQueue();
     if (completions.isEmpty()) {
       return;
@@ -2031,32 +2452,45 @@ public class AgentAcquisitionService {
 
     log.debug("Processing {} queued agent completions", completions.size());
 
-    // Group completions by scheduling offset for batch efficiency
-    Map<Long, List<AgentCompletion>> groupedCompletions =
-        completions.stream().collect(Collectors.groupingBy(this::getSchedulingOffset));
+    try {
+      // Group completions by scheduling offset for batch efficiency
+      Map<Long, List<AgentCompletion>> groupedCompletions =
+          completions.stream().collect(Collectors.groupingBy(this::getSchedulingOffset));
 
-    int totalProcessed = 0;
-    // Process each group with shared connection
-    for (Map.Entry<Long, List<AgentCompletion>> entry : groupedCompletions.entrySet()) {
-      long offset = entry.getKey();
-      List<AgentCompletion> group = entry.getValue();
+      int totalProcessed = 0;
+      // Process each group with shared connection
+      for (Map.Entry<Long, List<AgentCompletion>> entry : groupedCompletions.entrySet()) {
+        long offset = entry.getKey();
+        List<AgentCompletion> group = entry.getValue();
 
-      if (schedulerProperties.getBatchOperations().isEnabled() && group.size() > 1) {
-        totalProcessed += batchScheduleCompletions(jedis, group, offset);
-      } else {
-        totalProcessed += individualScheduleCompletions(jedis, group, offset);
+        if (schedulerProperties.getBatchOperations().isEnabled()) {
+          totalProcessed += batchScheduleCompletions(jedis, group, offset, nowMsCached);
+        } else {
+          totalProcessed += individualScheduleCompletions(jedis, group, offset, nowMsCached);
+        }
+      }
+
+      log.debug("Processed {} agent completions with shared connection", totalProcessed);
+    } finally {
+      // Drop references to completion payloads early to allow GC before next drain
+      completions.clear();
+      if (completions instanceof java.util.ArrayList) {
+        ((java.util.ArrayList<?>) completions).trimToSize();
       }
     }
-
-    log.debug("Processed {} agent completions with shared connection", totalProcessed);
   }
 
   /**
-   * Drain the completion queue in a thread-safe manner. Extracts all agent completions from the
-   * queue for processing.
+   * Drain all pending agent completions from the queue for processing.
+   *
+   * <p>Thread-safety: Only called from single-threaded scheduler executor, but queue accepts offers
+   * from agent work pool threads.
+   *
+   * @return List of all pending completions, or empty list if none.
    */
   private List<AgentCompletion> drainCompletionQueue() {
-    List<AgentCompletion> completions = new ArrayList<>();
+    java.util.List<AgentCompletion> completions = REUSABLE_COMPLETIONS.get();
+    completions.clear();
     int queueSize = completionQueue.size();
     log.debug("Draining completion queue, current size: {}", queueSize);
 
@@ -2240,9 +2674,10 @@ public class AgentAcquisitionService {
     if (jitterRatio <= 0.0) {
       return baseMs;
     }
-    double r = Math.max(0.0, Math.min(1.0, jitterRatio));
-    java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
-    double delta = (rnd.nextDouble() * 2.0 * r) - r; // [-r, +r]
+    double boundedRatio = Math.max(0.0, Math.min(1.0, jitterRatio));
+    java.util.concurrent.ThreadLocalRandom random =
+        java.util.concurrent.ThreadLocalRandom.current();
+    double delta = (random.nextDouble() * 2.0 * boundedRatio) - boundedRatio; // [-ratio, +ratio]
     double jittered = baseMs * (1.0 + delta);
     if (jittered < 0.0) {
       return 0L;
@@ -2290,30 +2725,34 @@ public class AgentAcquisitionService {
    * @return Number of agents successfully scheduled
    */
   private int batchScheduleCompletions(
-      Jedis jedis, List<AgentCompletion> completions, long offset) {
+      Jedis jedis, List<AgentCompletion> completions, long offset, Long nowMsCached) {
     try {
       List<String> batchArgs = new ArrayList<>();
       for (AgentCompletion completion : completions) {
-        batchArgs.add(completion.agent.getAgentType());
-        batchArgs.add(score(jedis, offset));
+        String agentType = completion.agent.getAgentType();
+        String completionScore = score(jedis, offset, nowMsCached);
+        if (!validateAgentScorePair(agentType, completionScore, "completion_batch")) {
+          continue;
+        }
+        batchArgs.add(agentType);
+        batchArgs.add(completionScore);
       }
 
-      @SuppressWarnings("unchecked")
-      List<Object> result =
-          (List<Object>)
+      List<?> result =
+          (List<?>)
               scriptManager.evalshaWithSelfHeal(
                   jedis,
                   RedisScriptManager.ADD_AGENTS,
                   Arrays.asList(WORKING_SET, WAITING_SET),
                   batchArgs);
 
-      int scheduled = result.size() >= 1 ? ((Long) result.get(0)).intValue() : 0;
+      int scheduled = ScriptResults.parseAddAgentsCount(result);
       log.debug("Batch scheduled {} completions with offset {}ms", scheduled, offset);
       return scheduled;
 
     } catch (Exception e) {
       log.warn("Batch completion scheduling failed, using individual mode", e);
-      return individualScheduleCompletions(jedis, completions, offset);
+      return individualScheduleCompletions(jedis, completions, offset, nowMsCached);
     }
   }
 
@@ -2328,12 +2767,17 @@ public class AgentAcquisitionService {
    * @return Number of agents successfully scheduled
    */
   private int individualScheduleCompletions(
-      Jedis jedis, List<AgentCompletion> completions, long offset) {
+      Jedis jedis, List<AgentCompletion> completions, long offset, Long nowMsCached) {
     int scheduled = 0;
-    String offsetScore = score(jedis, offset); // Calculate once for all agents with same offset
+    String offsetScore =
+        score(jedis, offset, nowMsCached); // Calculate once for all agents with same offset
 
     for (AgentCompletion completion : completions) {
       try {
+        if (!validateAgentScorePair(
+            completion.agent.getAgentType(), offsetScore, "completion_fallback")) {
+          continue;
+        }
         Object result =
             scriptManager.evalshaWithSelfHeal(
                 jedis,
@@ -2360,18 +2804,62 @@ public class AgentAcquisitionService {
   }
 
   /**
+   * Validate that an agent/score pair is safe to send to Redis scripts. Increments invalid-pair
+   * metrics with the given context on failure.
+   */
+  private boolean validateAgentScorePair(String agentType, String score, String context) {
+    boolean scoreNumeric = score != null && score.matches("^\\d+$");
+    boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
+    if (!scoreNumeric || agentNumeric) {
+      if (metrics != null) {
+        metrics.incrementInvalidPair(context);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /** Parse the count returned by ADD_AGENTS script which typically returns [count, ...]. */
+  private int parseAddAgentsCount(Object result) {
+    try {
+      if (result instanceof java.util.List) {
+        java.util.List<?> list = (java.util.List<?>) result;
+        if (!list.isEmpty()) {
+          Object c0 = list.get(0);
+          if (c0 instanceof Number) {
+            return ((Number) c0).intValue();
+          } else if (c0 instanceof String) {
+            try {
+              return Integer.parseInt((String) c0);
+            } catch (Exception ignore) {
+            }
+          } else if (c0 instanceof byte[]) {
+            try {
+              return Integer.parseInt(
+                  new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
+            } catch (Exception ignore) {
+            }
+          }
+        }
+      }
+    } catch (Exception ignore) {
+    }
+    return 0;
+  }
+
+  /**
    * Attempt to acquire an agent for execution.
    *
    * @param jedis Jedis connection to Redis
    * @param agent The agent to acquire
    * @return The acquire score if successful, null otherwise
    */
-  private String tryAcquireAgent(Jedis jedis, Agent agent) {
+  private String tryAcquireAgent(Jedis jedis, Agent agent, Long nowMsCached) {
     try {
       String agentType = agent.getAgentType();
       // Generate completion deadline: current_time + agent_timeout
       long agentTimeout = intervalProvider.getInterval(agent).getTimeout();
-      String acquireScore = score(jedis, agentTimeout);
+      String acquireScore = score(jedis, agentTimeout, nowMsCached);
 
       // Atomically try to move agent from waiting → working using Lua script
       // Script ensures only one instance can successfully acquire each agent
@@ -2415,8 +2903,8 @@ public class AgentAcquisitionService {
         }
 
         boolean numeric = true;
-        for (int i = 0; i < scoreStr.length(); i++) {
-          char ch = scoreStr.charAt(i);
+        for (int charIndex = 0; charIndex < scoreStr.length(); charIndex++) {
+          char ch = scoreStr.charAt(charIndex);
           if (ch < '0' || ch > '9') {
             numeric = false;
             break;
@@ -2445,6 +2933,11 @@ public class AgentAcquisitionService {
       log.warn("Failed to acquire agent {}", agent.getAgentType(), e);
       return null;
     }
+  }
+
+  // Backward-compatible overload used by tests via reflection
+  private String tryAcquireAgent(Jedis jedis, Agent agent) {
+    return tryAcquireAgent(jedis, agent, null);
   }
 
   /**
@@ -2492,7 +2985,7 @@ public class AgentAcquisitionService {
       }
 
       // Only NEW agents (not in Redis) get immediate execution priority
-      String result = score(jedis, 0L);
+      String result = score(jedis, 0L, null);
       log.debug(
           "Agent {} is new - giving immediate execution priority: {}",
           agent.getAgentType(),
@@ -2543,10 +3036,10 @@ public class AgentAcquisitionService {
                   Collectors.toMap(
                       worker -> worker.getAgent().getAgentType(), AgentWorker::getAgent));
 
-      for (int i = 0; i < results.size(); i += 3) {
-        String agentType = results.get(i);
-        String workingScoreStr = results.get(i + 1);
-        String waitingScoreStr = results.get(i + 2);
+      for (int resultIndex = 0; resultIndex < results.size(); resultIndex += 3) {
+        String agentType = results.get(resultIndex);
+        String workingScoreStr = results.get(resultIndex + 1);
+        String waitingScoreStr = results.get(resultIndex + 2);
 
         Agent agent = agentMap.get(agentType);
         if (agent == null) {
@@ -2619,7 +3112,7 @@ public class AgentAcquisitionService {
 
     try {
       // Only NEW agents (not in Redis) get immediate execution priority
-      String result = score(jedis, 0L);
+      String result = score(jedis, 0L, null);
       log.debug("Agent {} new - immediate execution: {}", agent.getAgentType(), result);
       return result;
     } catch (Exception e) {
@@ -2645,38 +3138,39 @@ public class AgentAcquisitionService {
    * @param offset Offset in milliseconds to add to current time
    * @return Score as seconds since epoch, synchronized with Redis server time
    */
-  private String score(Jedis jedis, Long offset) {
+  private String score(Jedis jedis, Long offsetMs) {
+    // Maintain and refresh the server-client offset cache when needed
     long now = System.currentTimeMillis();
     long lastCheck = lastTimeCheck.get();
-
-    // Get time cache duration from properties (default 10 seconds)
     long timeCacheDurationMs = schedulerProperties.getTimeCacheDurationMs();
-
-    // Refresh the server-client offset if needed
     if (now - lastCheck > timeCacheDurationMs) {
-      // Use Redis TIME command for server-side time coordination
       try {
         List<String> times = jedis.time();
         if (times != null && times.size() == 2) {
-          // Redis TIME returns seconds and microseconds
           long serverTimeSeconds = Long.parseLong(times.get(0));
-          long serverTimeMs = serverTimeSeconds * 1000;
-          // Update the offset (server time - client time)
+          long serverTimeMicros = Long.parseLong(times.get(1));
+          long serverTimeMs = (serverTimeSeconds * 1000L) + (serverTimeMicros / 1000L);
           serverClientOffset.set(serverTimeMs - now);
           lastTimeCheck.set(now);
           log.debug("Updated Redis TIME sync offset: {}ms", serverTimeMs - now);
         }
       } catch (Exception e) {
-        // In case of Redis TIME command failure, we'll use client time
         log.warn("Failed to get Redis server time, using client time", e);
       }
     }
 
-    // Get the current time accounting for server-client offset
-    long adjustedTimeMs = now + serverClientOffset.get() + offset;
-    long adjustedTimeSeconds = adjustedTimeMs / 1000;
+    java.util.function.LongSupplier supplier = this::nowMsWithOffset;
+    return com.netflix.spinnaker.cats.redis.cluster.support.RedisTimeUtils.scoreFromMsDelay(
+        jedis, offsetMs != null ? offsetMs : 0L, supplier);
+  }
 
-    return String.valueOf(adjustedTimeSeconds);
+  // Overload that prefers a per-cycle cached Redis TIME (ms) if provided; else falls back to offset
+  // cache
+  private String score(Jedis jedis, Long offsetMs, Long nowMsCached) {
+    java.util.function.LongSupplier supplier =
+        (nowMsCached != null && nowMsCached > 0) ? () -> nowMsCached : this::nowMsWithOffset;
+    return com.netflix.spinnaker.cats.redis.cluster.support.RedisTimeUtils.scoreFromMsDelay(
+        jedis, offsetMs != null ? offsetMs : 0L, supplier);
   }
 
   /**
@@ -2716,6 +3210,27 @@ public class AgentAcquisitionService {
 
       // Queue completion for batch processing in next scheduler cycle
       if (!success) {
+        // If failure is due to an OutOfMemoryError, emit additional diagnostics
+        if (cause instanceof java.lang.OutOfMemoryError) {
+          String msg = String.valueOf(cause.getMessage());
+          String oomType = "unknown";
+          if (msg != null) {
+            String lower = msg.toLowerCase(java.util.Locale.ROOT);
+            if (lower.contains("heap") || lower.contains("gc overhead")) {
+              oomType = "heap";
+            } else if (lower.contains("direct buffer")) {
+              oomType = "direct";
+            } else if (lower.contains("metaspace")) {
+              oomType = "metaspace";
+            } else if (lower.contains("unable to create new native thread")) {
+              oomType = "native-thread";
+            }
+          }
+          log.warn(
+              "Agent {} encountered OutOfMemoryError (type={}) — applying throttled backoff",
+              agentType,
+              oomType);
+        }
         completionQueue.offer(
             new AgentCompletion(
                 agent,
@@ -2787,8 +3302,8 @@ public class AgentAcquisitionService {
     if (windowSec <= 0) {
       return 0L;
     }
-    int s = java.util.concurrent.ThreadLocalRandom.current().nextInt(1, windowSec + 1);
-    return s * 1000L;
+    int seconds = java.util.concurrent.ThreadLocalRandom.current().nextInt(1, windowSec + 1);
+    return seconds * 1000L;
   }
 
   /**
@@ -2878,9 +3393,9 @@ public class AgentAcquisitionService {
 
     log.info("Processing {} queued agent completions during shutdown", queueSize);
 
+    // Process all queued completions with immediate scheduling (0ms offset)
+    List<AgentCompletion> completions = drainCompletionQueue();
     try (Jedis jedis = jedisPool.getResource()) {
-      // Process all queued completions with immediate scheduling (0ms offset)
-      List<AgentCompletion> completions = drainCompletionQueue();
       int processed = 0;
 
       // Process each completion with cadence-based or jittered offset to avoid restart bursts
@@ -2916,6 +3431,15 @@ public class AgentAcquisitionService {
           completions.size());
     } catch (Exception e) {
       log.error("Failed to process completion queue during shutdown", e);
+    } finally {
+      try {
+        completions.clear();
+        if (completions instanceof java.util.ArrayList) {
+          ((java.util.ArrayList<?>) completions).trimToSize();
+        }
+      } catch (Exception ignore) {
+        // Best-effort – trimming failure is harmless
+      }
     }
   }
 
@@ -2942,41 +3466,6 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Performs a startup consistency check to ensure all agents are properly registered in Redis.
-   * Verifies that all local agents are synchronized to the Redis state.
-   */
-  private void performStartupConsistencyCheck() {
-    log.info("Performing startup consistency check for agent reliability");
-
-    // Take snapshot to prevent concurrent modifications during startup check
-    Map<String, AgentWorker> agentsSnapshot = new ConcurrentHashMap<>(agents);
-
-    try (Jedis jedis = jedisPool.getResource()) {
-      // Get current Redis state from both sets
-      Set<String> localAgents = agentsSnapshot.keySet();
-      Set<String> redisAgents = getCurrentRedisAgents(jedis, localAgents);
-
-      // Calculate what needs to be added (missing agents)
-      Set<String> toAdd =
-          localAgents.stream()
-              .filter(agent -> !redisAgents.contains(agent))
-              .collect(Collectors.toSet());
-
-      if (toAdd.isEmpty()) {
-        log.info("Startup consistency check: All agents properly registered in Redis");
-      } else {
-        log.warn(
-            "Startup consistency check: Found {} agents missing from Redis, adding now",
-            toAdd.size());
-        // Add missing agents with immediate execution to ensure they run soon
-        addMissingAgents(jedis, toAdd);
-      }
-    } catch (Exception e) {
-      log.error("Error during startup consistency check", e);
-    }
-  }
-
-  /**
    * Checks if graceful shutdown is in progress. This flag affects agent handling during shutdown -
    * graceful shutdown attempts to re-queue in-progress agents back to Redis for pickup after
    * restart.
@@ -2988,24 +3477,33 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Simple data holder for Redis acquisition and release scores. This ensures atomic score
-   * management and prevents race conditions.
+   * Remove ThreadLocal buffers held by the current thread to release per-thread memory. Intended to
+   * be invoked on the owning executor thread during shutdown.
    */
-  private static class ScoreTuple {
-    private final String acquireScore;
-    private final String releaseScore;
-
-    public ScoreTuple(String acquireScore, String releaseScore) {
-      this.acquireScore = acquireScore;
-      this.releaseScore = releaseScore;
+  public void removeThreadLocals() {
+    try {
+      REUSABLE_WORKERS_SET.remove();
+    } catch (Exception ignore) {
     }
-
-    public String getAcquireScore() {
-      return acquireScore;
+    try {
+      REUSABLE_CANDIDATE_AGENTS.remove();
+    } catch (Exception ignore) {
     }
-
-    public String getReleaseScore() {
-      return releaseScore;
+    try {
+      REUSABLE_CANDIDATE_WORKERS.remove();
+    } catch (Exception ignore) {
+    }
+    try {
+      REUSABLE_ELIGIBLE_AGENTS.remove();
+    } catch (Exception ignore) {
+    }
+    try {
+      REUSABLE_AGENT_SCORE_PAIRS.remove();
+    } catch (Exception ignore) {
+    }
+    try {
+      REUSABLE_COMPLETIONS.remove();
+    } catch (Exception ignore) {
     }
   }
 
@@ -3023,9 +3521,39 @@ public class AgentAcquisitionService {
     String agentType = worker.getAgent().getAgentType();
 
     try {
-      // Submit worker directly to thread pool
-      java.util.concurrent.Future<?> future = agentWorkPool.submit(worker);
+      // Wrap the worker to attach a completion listener that guarantees exactly-once
+      // semaphore release even if cancelled before run() starts (pre-start cancellation).
+      java.util.concurrent.FutureTask<Void> futureTask =
+          new java.util.concurrent.FutureTask<Void>(worker, null) {
+            @Override
+            protected void done() {
+              try {
+                // Remove from tracking map when the task completes (best-effort)
+                activeAgentsFutures.remove(agentType, this);
 
+                // Exactly-once permit release fallback: if the worker's finally block did not
+                // run (e.g., cancelled before start), release the permit here.
+                RunState runStateForAgent = runStates.remove(agentType);
+                if (runStateForAgent != null
+                    && runStateForAgent.permitHeld.compareAndSet(true, false)) {
+                  Semaphore semaphoreToRelease =
+                      runningAgents != null ? runningAgents : runningAgentsRef;
+                  if (semaphoreToRelease != null) {
+                    semaphoreToRelease.release();
+                    log.debug(
+                        "Released semaphore permit for agent {} in completion listener", agentType);
+                  }
+                }
+              } catch (Exception e) {
+                // Never propagate from listener
+                log.debug("Completion listener failed for {}", agentType, e);
+              }
+            }
+          };
+
+      // Submit to pool; only track the future after a successful submit
+      java.util.concurrent.Future<?> future = agentWorkPool.submit(futureTask);
+      activeAgentsFutures.put(agentType, future);
       log.debug("Successfully submitted agent {} to thread pool", agentType);
       return future;
 
@@ -3034,10 +3562,14 @@ public class AgentAcquisitionService {
       log.warn(
           "Agent {} submission rejected by thread pool (queue full or pool shutdown)", agentType);
 
-      // CRITICAL: Release the semaphore permit since the agent won't be executed
-      if (runningAgents != null) {
-        runningAgents.release();
-        log.debug("Released semaphore permit for rejected agent {}", agentType);
+      // Critical: Release the semaphore permit since the agent won't be executed
+      try {
+        Semaphore semaphoreToRelease = runningAgents != null ? runningAgents : runningAgentsRef;
+        if (semaphoreToRelease != null) {
+          semaphoreToRelease.release();
+          log.debug("Released semaphore permit for rejected agent {}", agentType);
+        }
+      } catch (Exception ignore) {
       }
 
       // Track rejection metric
@@ -3050,20 +3582,31 @@ public class AgentAcquisitionService {
 
       return null;
 
-    } catch (Exception e) {
+      // Design note: Catch Throwable to handle all submission failure modes.
+      // - Critical: A permit was acquired before calling this method. If an Error occurs during
+      //   FutureTask creation or executor.submit(), we must release the permit to prevent leaks.
+      // - Examples: OutOfMemoryError creating FutureTask, ThreadDeath during submit, etc.
+    } catch (Throwable e) {
       // Handle other submission errors
       log.error("Failed to submit agent {} due to unexpected error", agentType, e);
 
-      // CRITICAL: Release the semaphore permit for any submission failure
-      if (runningAgents != null) {
-        runningAgents.release();
-        log.debug("Released semaphore permit for failed submission of agent {}", agentType);
+      // Critical: Release the semaphore permit for any submission failure
+      try {
+        Semaphore semaphoreToRelease = runningAgents != null ? runningAgents : runningAgentsRef;
+        if (semaphoreToRelease != null) {
+          semaphoreToRelease.release();
+          log.debug("Released semaphore permit for failed submission of agent {}", agentType);
+        }
+      } catch (Exception ignore) {
       }
 
       // Track generic submission failure
       if (metrics != null) {
         metrics.incrementSubmissionFailure(e.getClass().getSimpleName());
       }
+
+      // Requeue to avoid lingering working entries on submission errors
+      requeueRejectedAgent(worker);
 
       return null;
     }
@@ -3079,6 +3622,14 @@ public class AgentAcquisitionService {
     String agentType = worker.getAgent().getAgentType();
 
     try (Jedis jedis = jedisPool.getResource()) {
+      // Ensure we don't leak local run-state or active tracking on submission failure
+      runStates.remove(agentType);
+      String removedScore = activeAgents.remove(agentType);
+      if (removedScore != null) {
+        activeAgentMapSize.decrementAndGet();
+        activeAgentsFutures.remove(agentType);
+      }
+
       // Calculate the score to preserve queue position
       String requeueScore;
 
@@ -3104,23 +3655,87 @@ public class AgentAcquisitionService {
               "Failed to calculate original ready time for agent {}, using immediate score",
               agentType,
               e);
-          requeueScore = score(jedis, 0L);
+          requeueScore = score(jedis, 0L, null);
         }
       } else {
         // No acquire score available, make it immediately eligible
-        requeueScore = score(jedis, 0L);
+        requeueScore = score(jedis, 0L, null);
         log.debug(
             "Requeueing rejected agent {} with score {} (immediate, no acquire score)",
             agentType,
             requeueScore);
       }
 
-      // Add back to waiting set
-      jedis.zadd(WAITING_SET, Double.parseDouble(requeueScore), agentType);
-      log.info(
-          "Requeued rejected agent {} with score {} - preserving queue fairness",
-          agentType,
-          requeueScore);
+      // Prefer an atomic working -> waiting move with ownership verification
+      boolean requeued = false;
+      try {
+        if (worker.acquireScore != null) {
+          Object swapResult =
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.MOVE_AGENTS_CONDITIONAL,
+                  java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                  java.util.Arrays.asList(agentType, worker.acquireScore, requeueScore));
+          if (swapResult != null && "swapped".equals(swapResult)) {
+            requeued = true;
+            log.info(
+                "Requeued rejected agent {} from working -> waiting (score preserved: {})",
+                agentType,
+                requeueScore);
+          }
+        }
+      } catch (Exception e) {
+        log.warn("Conditional move failed while requeueing rejected agent {}", agentType, e);
+      }
+
+      if (!requeued) {
+        // Fallback: remove from working if still owned (score match), then add to waiting
+        boolean removedFromWorking = false;
+        try {
+          if (worker.acquireScore != null) {
+            @SuppressWarnings("unchecked")
+            java.util.List<Object> removeResult =
+                (java.util.List<Object>)
+                    scriptManager.evalshaWithSelfHeal(
+                        jedis,
+                        RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
+                        java.util.Collections.singletonList(WORKING_SET),
+                        java.util.Arrays.asList(agentType, worker.acquireScore));
+            int count =
+                removeResult != null && removeResult.size() >= 1
+                    ? ((Long) removeResult.get(0)).intValue()
+                    : 0;
+            removedFromWorking = count > 0;
+          }
+        } catch (Exception e) {
+          log.warn("Conditional remove-from-working failed for {}", agentType, e);
+        }
+
+        if (removedFromWorking || worker.acquireScore == null) {
+          // Safe to add back to waiting only if we removed from working (or have no score)
+          Object addResult =
+              scriptManager.evalshaWithSelfHeal(
+                  jedis,
+                  RedisScriptManager.ADD_AGENT,
+                  java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                  java.util.Arrays.asList(agentType, requeueScore));
+          boolean scheduled = addResult != null && ((Long) addResult).intValue() == 1;
+          if (scheduled) {
+            log.info(
+                "Requeued rejected agent {} into waiting with score {}", agentType, requeueScore);
+          } else {
+            log.debug(
+                "Agent {} already present during requeue attempt (addResult={})",
+                agentType,
+                addResult);
+          }
+        } else {
+          // Could not verify ownership to safely move; leave as-is for zombie/orphan cleanup
+          log.warn(
+              "Could not safely requeue rejected agent {} (ownership mismatch) - will rely on cleanup",
+              agentType);
+        }
+      }
 
     } catch (Exception e) {
       log.error(
@@ -3131,7 +3746,7 @@ public class AgentAcquisitionService {
   }
 
   /** Runnable wrapper for agent execution that handles resource management and monitoring. */
-  public static class AgentWorker implements Runnable {
+  static class AgentWorker implements Runnable {
     private final Agent agent;
     private final AgentExecution agentExecution;
     private final ExecutionInstrumentation executionInstrumentation;
@@ -3162,6 +3777,15 @@ public class AgentAcquisitionService {
       Throwable capturedCause = null;
 
       try {
+        // Mark as started for fairness accounting
+        try {
+          RunState runStateForAgent = acquisitionService.runStates.get(agentType);
+          if (runStateForAgent != null) {
+            runStateForAgent.started.set(true);
+          }
+        } catch (Exception e) {
+          log.debug("Failed to mark run-state started for {}", agentType, e);
+        }
         log.debug("Starting execution of agent {}", agentType);
         executionInstrumentation.executionStarted(agent);
         agentExecution.executeAgent(agent);
@@ -3169,14 +3793,29 @@ public class AgentAcquisitionService {
         success = true;
         acquisitionService.agentsExecuted.increment(); // Track successful executions
         log.debug("Agent {} execution completed successfully", agentType);
-      } catch (Throwable cause) {
-        long elapsedMs = System.currentTimeMillis() - startTimeMs;
 
+        // Design note: Catch Throwable (not just Exception) to handle all failure modes.
+        // - Purpose: Ensure cleanup and requeueing occur even for Errors (OutOfMemoryError,
+        //   StackOverflowError, etc.) that agents may encounter during cloud provider API calls
+        //   or data processing.
+        // - Critical: If we only caught Exception, Errors would bypass failure classification and
+        //   proper requeueing, leaving orphaned entries in the working set that orphan cleanup
+        //   would need to handle later.
+        // - Policy: The finally block guarantees permit release and Redis cleanup regardless of
+        //   failure type. This catch block ensures we properly classify the failure and requeue
+        //   with appropriate backoff (e.g., OutOfMemoryError → THROTTLED with exponential backoff).
+      } catch (Throwable cause) {
         if (cause instanceof InterruptedException) {
           log.warn(
               "Agent {} execution was interrupted (likely due to zombie cleanup or shutdown)",
               agentType);
           Thread.currentThread().interrupt(); // Restore interrupt status
+        } else if (cause instanceof Error) {
+          log.error(
+              "Agent {} execution failed with Error after {}ms - this may indicate serious JVM issues",
+              agentType,
+              elapsedTimeMs(startTimeMs),
+              cause);
         } else {
           log.error(
               "Agent {} execution failed after {}ms", agentType, elapsedTimeMs(startTimeMs), cause);
@@ -3191,27 +3830,48 @@ public class AgentAcquisitionService {
         // This removes the agent from activeAgents map and working Redis set
         acquisitionService.removeActiveAgent(agentType);
 
+        // Cancel any scheduled dead-man action
+        try {
+          RunState runState = acquisitionService.runStates.get(agentType);
+          if (runState != null && runState.deadmanHandle != null) {
+            try {
+              boolean cancelled = runState.deadmanHandle.cancel(false);
+              if (!cancelled && log.isDebugEnabled()) {
+                log.debug("Dead-man timer already fired for {}", agentType);
+              }
+            } catch (Exception cancelEx) {
+              log.debug("Dead-man handle cancel failed for {}", agentType, cancelEx);
+            }
+            runState.deadmanHandle = null;
+          }
+        } catch (Exception ex) {
+          log.debug("Dead-man cleanup failed for {}", agentType, ex);
+        }
+
         // Handle conditional agent release (re-queuing on failure/shutdown)
         acquisitionService.conditionalReleaseAgent(
             agent, acquireScore, success, failureClass, capturedCause);
 
-        // CRITICAL: Exactly-once permit release
-        RunState rs = acquisitionService.runStates.remove(agentType);
-        if (rs == null) {
+        // Critical: Exactly-once permit release
+        RunState runStateForAgent = acquisitionService.runStates.remove(agentType);
+        if (runStateForAgent == null) {
           // No run-state (e.g., tests calling AgentWorker directly) -> release as before
           if (runningAgents != null) {
             runningAgents.release();
             log.debug("Released semaphore permit for agent {} (no run-state)", agentType);
           }
-        } else if (rs.permitHeld.compareAndSet(true, false)) {
+        } else if (runStateForAgent.permitHeld.compareAndSet(true, false)) {
           // Normal path: release once
           if (runningAgents != null) {
             runningAgents.release();
             log.debug("Released semaphore permit for agent {}", agentType);
           }
         } else {
-          // Permit was pre-released by zombie cleanup; decrement in-flight compensation
-          acquisitionService.zombiesInFlight.decrementAndGet();
+          // Permit was pre-released by zombie cleanup. Decrement zIF only if we had incremented it
+          // earlier (worker actually started and early-release performed accounting).
+          if (runStateForAgent.zifIncremented.get()) {
+            acquisitionService.zombiesInFlight.decrementAndGet();
+          }
         }
 
         log.debug("Agent {} execution cleanup completed", agentType);
@@ -3264,11 +3924,41 @@ public class AgentAcquisitionService {
       return FailureClass.TRANSIENT;
     }
 
+    // Treat memory pressure as throttling to exponentially back off agent executions
+    if (cause instanceof java.lang.OutOfMemoryError) {
+      return FailureClass.THROTTLED;
+    }
+
     if (cause instanceof java.net.SocketTimeoutException
         || cause instanceof java.net.ConnectException
         || cause instanceof java.net.SocketException
         || cause instanceof java.io.IOException) {
       return FailureClass.TRANSIENT;
+    }
+
+    // Reflective checks to avoid hard dependencies on provider libraries
+    try {
+      Class<?> sceClass = Class.forName("com.amazonaws.SdkClientException");
+      if (sceClass.isAssignableFrom(cause.getClass())) {
+        return FailureClass.TRANSIENT;
+      }
+    } catch (ClassNotFoundException ignored) {
+    }
+
+    try {
+      Class<?> aceClass = Class.forName("com.amazonaws.AmazonClientException");
+      if (aceClass.isAssignableFrom(cause.getClass())) {
+        return FailureClass.TRANSIENT;
+      }
+    } catch (ClassNotFoundException ignored) {
+    }
+
+    try {
+      Class<?> jooqDae = Class.forName("org.jooq.exception.DataAccessException");
+      if (jooqDae.isAssignableFrom(cause.getClass())) {
+        return FailureClass.TRANSIENT;
+      }
+    } catch (ClassNotFoundException ignored) {
     }
 
     try {
@@ -3291,6 +3981,19 @@ public class AgentAcquisitionService {
             errorCode = (String) ec;
           }
         } catch (Exception ignored) {
+        }
+
+        // Some throttling variants are communicated via errorCode even with 400s
+        if (errorCode != null) {
+          String codeLower = errorCode.toLowerCase(java.util.Locale.ROOT);
+          if (codeLower.contains("throttl")
+              || codeLower.contains("toomanyrequests")
+              || codeLower.contains("requestlimitexceeded")
+              || codeLower.contains("slowdown")
+              || codeLower.contains("provisionedthroughputexceeded")
+              || codeLower.contains("requestthrottled")) {
+            return FailureClass.THROTTLED;
+          }
         }
 
         if (status != null) {
@@ -3330,7 +4033,7 @@ public class AgentAcquisitionService {
   /**
    * Try to manually acquire a lock on an agent.
    *
-   * <p>NOTE: Manual locking is not supported by this scheduler to maintain thread safety and proper
+   * <p>Note: Manual locking is not supported by this scheduler to maintain thread safety and proper
    * coordination between multiple scheduler instances. Manual locking would bypass the carefully
    * designed Redis-based coordination mechanisms.
    *

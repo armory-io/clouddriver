@@ -187,7 +187,10 @@ class BatchScoringIntegrationTest {
     @DisplayName("Individual agentScore should keep existing scores for overdue agents")
     void individualScoringKeepsOverdueScores() throws Exception {
       Agent overdueAgent = createMockAgent("overdue-agent", "test-provider");
-      long currentTimeSeconds = System.currentTimeMillis() / 1000;
+      long currentTimeSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        currentTimeSeconds = Long.parseLong(j.time().get(0));
+      }
       long overdueScore = currentTimeSeconds - 300;
 
       try (Jedis jedis = jedisPool.getResource()) {
@@ -206,7 +209,10 @@ class BatchScoringIntegrationTest {
     @Test
     @DisplayName("Batch scoring should match individual scoring for overdue agents")
     void batchScoringMatchesIndividualForOverdueAgents() throws Exception {
-      long currentTimeSeconds = System.currentTimeMillis() / 1000;
+      long currentTimeSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        currentTimeSeconds = Long.parseLong(j.time().get(0));
+      }
       long overdueScore = currentTimeSeconds - 300;
 
       Agent overdueAgent = createMockAgent("overdue-agent", "test-provider");
@@ -263,7 +269,10 @@ class BatchScoringIntegrationTest {
           AgentAcquisitionService.class.getDeclaredMethod("agentScore", Agent.class);
       agentScoreMethod.setAccessible(true);
 
-      long scoringTimeSeconds = System.currentTimeMillis() / 1000;
+      long scoringTimeSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        scoringTimeSeconds = Long.parseLong(j.time().get(0));
+      }
       String individualResult = (String) agentScoreMethod.invoke(acquisitionService, newAgent);
 
       AgentExecution execution = mock(AgentExecution.class);
@@ -423,8 +432,9 @@ class BatchScoringIntegrationTest {
       try (var jedis = jedisPool.getResource()) {
         jedis.del("waiting", "working");
 
-        jedis.zadd("working", System.currentTimeMillis() / 1000 + 3600, "WorkingAgent");
-        jedis.zadd("waiting", System.currentTimeMillis() / 1000 + 1800, "WaitingAgent");
+        long nowSec = Long.parseLong(jedis.time().get(0));
+        jedis.zadd("working", nowSec + 3600, "WorkingAgent");
+        jedis.zadd("waiting", nowSec + 1800, "WaitingAgent");
       }
 
       Semaphore runningAgents = new Semaphore(100);

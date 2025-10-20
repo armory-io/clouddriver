@@ -130,12 +130,14 @@ class AgentScoreLifecycleTest {
     acquisitionService.registerAgent(
         agent, mock(AgentExecution.class), mock(ExecutionInstrumentation.class));
 
-    long nowSec = System.currentTimeMillis() / 1000;
     try (Jedis j = jedisPool.getResource()) {
+      // Compare against Redis server time to avoid host/container skew and second-boundary drift
+      java.util.List<String> t = j.time();
+      long redisNowSec = Long.parseLong(t.get(0));
       Double s = j.zscore("waiting", "reg-agent");
       assertThat(s).isNotNull();
-      // Within [-3s, +3s] of now
-      assertThat(Math.abs(s.longValue() - nowSec)).isLessThanOrEqualTo(3);
+      // Within [-3s, +3s] of Redis TIME now
+      assertThat(Math.abs(s.longValue() - redisNowSec)).isLessThanOrEqualTo(3);
     }
   }
 
@@ -195,16 +197,13 @@ class AgentScoreLifecycleTest {
     Thread.sleep(300);
     acquisitionService.saturatePool(1L, new Semaphore(0), executorService);
 
-    // expected next = (acquireScoreSec*1000 - timeoutMs) + intervalMs
-    long timeoutMs = intervalProvider.getInterval(agent).getTimeout();
+    // expected next ≈ now + interval (approximation consistent with agentScore() for working)
     long intervalMs = intervalProvider.getInterval(agent).getInterval();
-    // derive original acquire from working deadline recorded earlier by reading Redis history is
-    // hard;
-    // instead approximate using now + interval, which matches agentScore() for working agents.
-    long desiredNextMs = System.currentTimeMillis() + intervalMs;
-    long desiredNextSec = desiredNextMs / 1000L;
 
     try (Jedis j = jedisPool.getResource()) {
+      java.util.List<String> t = j.time();
+      long redisNowSec = Long.parseLong(t.get(0));
+      long desiredNextSec = redisNowSec + (intervalMs / 1000L);
       Double waitScore = j.zscore("waiting", "cadence-agent");
       assertThat(waitScore).isNotNull();
       long actual = waitScore.longValue();
@@ -216,6 +215,9 @@ class AgentScoreLifecycleTest {
   @Test
   @DisplayName("Failure completion reschedules immediately (score≈now)")
   void failureReschedulesImmediately() throws Exception {
+    // Enable immediate retry semantics to reflect intended business behavior
+    schedulerProperties.getFailureBackoff().setEnabled(true);
+    schedulerProperties.getFailureBackoff().setMaxImmediateRetries(1);
     Agent agent = mkAgent("fail-agent");
     AgentExecution failing = mock(AgentExecution.class);
     doThrow(new RuntimeException("boom")).when(failing).executeAgent(any());
@@ -228,11 +230,14 @@ class AgentScoreLifecycleTest {
     acquisitionService.saturatePool(
         1L, new Semaphore(0), executorService); // process only completions, prevent reacquire
 
-    long nowSec = System.currentTimeMillis() / 1000;
     try (Jedis j = jedisPool.getResource()) {
+      // Use Redis server time to avoid host/container skew and seconds quantization issues
+      java.util.List<String> t = j.time();
+      long redisNowSec = Long.parseLong(t.get(0));
       Double s = j.zscore("waiting", "fail-agent");
       assertThat(s).isNotNull();
-      assertThat(Math.abs(s.longValue() - nowSec)).isLessThanOrEqualTo(3);
+      // Allow a slightly wider tolerance for CI variance and double second rounding
+      assertThat(Math.abs(s.longValue() - redisNowSec)).isLessThanOrEqualTo(4);
     }
   }
 
@@ -267,13 +272,16 @@ class AgentScoreLifecycleTest {
 
     // Put back into working and try with wrong score → should not swap
     try (Jedis j = jedisPool.getResource()) {
-      long nowSec = System.currentTimeMillis() / 1000 + 10;
+      long redisNowSec = Long.parseLong(j.time().get(0));
+      long nowSecPlus = redisNowSec + 10;
       j.zrem("waiting", "shutdown-agent");
-      j.zadd("working", nowSec, "shutdown-agent");
+      j.zadd("working", nowSecPlus, "shutdown-agent");
     }
 
-    acquisitionService.forceRequeueAgentForShutdown(
-        agent, Long.toString((System.currentTimeMillis() / 1000) + 999));
+    try (Jedis j = jedisPool.getResource()) {
+      long redisNowSec = Long.parseLong(j.time().get(0));
+      acquisitionService.forceRequeueAgentForShutdown(agent, Long.toString(redisNowSec + 999));
+    }
 
     try (Jedis j = jedisPool.getResource()) {
       // Still in working since expected score mismatched

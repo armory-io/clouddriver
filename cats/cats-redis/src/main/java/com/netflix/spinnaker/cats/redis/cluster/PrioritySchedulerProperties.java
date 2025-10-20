@@ -69,6 +69,15 @@ public class PrioritySchedulerProperties {
   private int refreshPeriodSeconds = 30;
 
   /**
+   * Period between health summary logs (seconds). Default: 600 (10 minutes).
+   *
+   * <p>If set to a value <= 0, the periodic health summary logging is disabled.
+   *
+   * <p>Config key: {@code redis.scheduler.health-summary-period-seconds}
+   */
+  private int healthSummaryPeriodSeconds = 600;
+
+  /**
    * How long to cache Redis server time to reduce TIME command calls (milliseconds). Higher values
    * reduce Redis calls but may drift from server time. Config key: {@code
    * redis.scheduler.time-cache-duration-ms}
@@ -165,7 +174,18 @@ public class PrioritySchedulerProperties {
     this.jitter = jitter != null ? jitter : new JitterProperties();
   }
 
-  /** Returns the configured Redis key naming and namespacing options. */
+  /**
+   * Returns the configured Redis key naming and namespacing options. Never returns null.
+   *
+   * @return key naming configuration
+   */
+  public Keys getKeys() {
+    if (keys == null) {
+      keys = new Keys();
+    }
+    return keys;
+  }
+
   /** Sets the Redis key naming and namespacing options. */
   public void setKeys(Keys keys) {
     this.keys = keys != null ? keys : new Keys();
@@ -186,10 +206,16 @@ public class PrioritySchedulerProperties {
   @Setter
   public static class BatchOperations {
     /** Enable batch operations globally (acquisition, cleanup, completion, repopulation). */
-    private boolean enabled = false;
+    private boolean enabled = true;
 
-    /** Maximum number of items to process in a single batch. Default: 50. */
-    private int batchSize = 50;
+    /**
+     * Maximum number of items to process in a single batch operation.
+     *
+     * <p>Applies to all batch operations: agent acquisition, completions, cleanup, repopulation.
+     *
+     * <p>Default: 0 (unbounded - process all available items)
+     */
+    private int batchSize = 0;
 
     /**
      * Multiplier for chunk attempts during acquisition to handle filtering. The base number of
@@ -231,6 +257,27 @@ public class PrioritySchedulerProperties {
     return zombieCleanup.getExceptionalAgents().getThresholdMs();
   }
 
+  // Lazily compiled exceptional-agents regex for reuse across services
+  private volatile java.util.regex.Pattern exceptionalAgentsPatternCache;
+
+  public java.util.regex.Pattern getExceptionalAgentsPatternCompiled() {
+    try {
+      String pattern = getExceptionalAgentsPattern();
+      if (pattern == null || pattern.trim().isEmpty()) {
+        exceptionalAgentsPatternCache = null;
+        return null;
+      }
+      java.util.regex.Pattern cached = exceptionalAgentsPatternCache;
+      if (cached == null || !pattern.equals(cached.pattern())) {
+        exceptionalAgentsPatternCache = java.util.regex.Pattern.compile(pattern);
+      }
+      return exceptionalAgentsPatternCache;
+    } catch (Exception e) {
+      exceptionalAgentsPatternCache = null;
+      return null;
+    }
+  }
+
   public boolean isOrphanCleanupEnabled() {
     return orphanCleanup.isEnabled();
   }
@@ -251,6 +298,76 @@ public class PrioritySchedulerProperties {
     return orphanCleanup.isForceAllPods();
   }
 
+  /**
+   * Whether numeric-only members in the waiting set should be removed during orphan cleanup.
+   *
+   * <p>Public proxy to avoid leaking package-private nested type.
+   */
+  public boolean isOrphanRemoveNumericOnlyAgents() {
+    return orphanCleanup.isRemoveNumericOnlyAgents();
+  }
+
+  // === JITTER (public proxies) ===
+
+  /** Initial registration jitter in whole seconds (0 disables). */
+  public int getJitterInitialRegistrationSeconds() {
+    JitterProperties j = getJitter();
+    return j != null ? j.getInitialRegistrationSeconds() : 0;
+  }
+
+  /** Shutdown smoothing jitter in whole seconds (0 disables). */
+  public int getJitterShutdownSeconds() {
+    JitterProperties j = getJitter();
+    return j != null ? j.getShutdownSeconds() : 0;
+  }
+
+  /** Ratio applied to non-zero failure backoff delays. Range [0.0, 1.0]. */
+  public double getJitterFailureBackoffRatio() {
+    JitterProperties j = getJitter();
+    return j != null ? j.getFailureBackoffRatio() : 0.0d;
+  }
+
+  // === FAILURE BACKOFF (public proxies) ===
+
+  /** Master switch for failure-aware backoff. */
+  public boolean isFailureBackoffEnabled() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    return fb != null && fb.isEnabled();
+  }
+
+  /** Immediate retry count before applying error interval for transient/server errors. */
+  public int getFailureBackoffMaxImmediateRetries() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    return fb != null ? fb.getMaxImmediateRetries() : 0;
+  }
+
+  /** Fixed backoff for permanent forbidden errors (e.g., 403/AccessDenied). */
+  public long getFailureBackoffPermanentForbiddenBackoffMs() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    return fb != null ? fb.getPermanentForbiddenBackoffMs() : 0L;
+  }
+
+  /** Starting backoff for throttled errors. */
+  public long getFailureBackoffThrottledBaseMs() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    FailureBackoffProperties.ThrottledPolicy tp = fb != null ? fb.getThrottled() : null;
+    return tp != null ? tp.getBaseMs() : 0L;
+  }
+
+  /** Exponential multiplier for throttled errors. */
+  public double getFailureBackoffThrottledMultiplier() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    FailureBackoffProperties.ThrottledPolicy tp = fb != null ? fb.getThrottled() : null;
+    return tp != null ? tp.getMultiplier() : 0.0d;
+  }
+
+  /** Upper cap for throttled exponential backoff. */
+  public long getFailureBackoffThrottledCapMs() {
+    FailureBackoffProperties fb = getFailureBackoff();
+    FailureBackoffProperties.ThrottledPolicy tp = fb != null ? fb.getThrottled() : null;
+    return tp != null ? tp.getCapMs() : 0L;
+  }
+
   // Public proxies to avoid leaking package-private types to other modules
   public long getZombieExecutorShutdownAwaitMs() {
     return zombieCleanup.getExecutorShutdownAwaitMs();
@@ -266,6 +383,26 @@ public class PrioritySchedulerProperties {
 
   public long getOrphanExecutorShutdownForceAwaitMs() {
     return orphanCleanup.getExecutorShutdownForceAwaitMs();
+  }
+
+  public long getZombieRunBudgetMs() {
+    return zombieCleanup.getRunBudgetMs();
+  }
+
+  public long getOrphanRunBudgetMs() {
+    return orphanCleanup.getRunBudgetMs();
+  }
+
+  public long getReconcileRunBudgetMs() {
+    return getReconcile().getRunBudgetMs();
+  }
+
+  public long getReconcileExecutorShutdownAwaitMs() {
+    return getReconcile().getExecutorShutdownAwaitMs();
+  }
+
+  public long getReconcileExecutorShutdownForceAwaitMs() {
+    return getReconcile().getExecutorShutdownForceAwaitMs();
   }
 
   public ReconcileProperties getReconcile() {
@@ -285,6 +422,13 @@ public class PrioritySchedulerProperties {
     validatePositive(refreshPeriodSeconds, "redis.scheduler.refresh-period-seconds");
     validateNonNegative(
         batchOperations.getBatchSize(), "redis.scheduler.batch-operations.batch-size");
+    double multiplier = batchOperations.getChunkAttemptMultiplier();
+    if (multiplier < 0 || !Double.isFinite(multiplier)) {
+      throw new IllegalArgumentException(
+          "redis.scheduler.batch-operations.chunk-attempt-multiplier must be >= 0 and finite (was "
+              + multiplier
+              + ")");
+    }
 
     // Keys validation: non-empty base names
     if (keys == null) {
@@ -328,11 +472,15 @@ public class PrioritySchedulerProperties {
       throw new IllegalArgumentException(
           "redis.scheduler.zombie-cleanup.* shutdown timeouts must be >= 0");
     }
+    validateNonNegative(
+        zombieCleanup.getRunBudgetMs(), "redis.scheduler.zombie-cleanup.run-budget-ms");
     if (orphanCleanup.getExecutorShutdownAwaitMs() < 0
         || orphanCleanup.getExecutorShutdownForceAwaitMs() < 0) {
       throw new IllegalArgumentException(
           "redis.scheduler.orphan-cleanup.* shutdown timeouts must be >= 0");
     }
+    validateNonNegative(
+        orphanCleanup.getRunBudgetMs(), "redis.scheduler.orphan-cleanup.run-budget-ms");
     if (reconcile == null) {
       reconcile = new ReconcileProperties();
     }
@@ -341,28 +489,35 @@ public class PrioritySchedulerProperties {
       throw new IllegalArgumentException(
           "redis.scheduler.reconcile.* shutdown timeouts must be >= 0");
     }
+    validateNonNegative(reconcile.getRunBudgetMs(), "redis.scheduler.reconcile.run-budget-ms");
   }
 
-  private static void validatePositive(long v, String name) {
-    if (v <= 0) {
-      throw new IllegalArgumentException(name + " must be > 0 (was " + v + ")");
+  private static void validatePositive(long value, String name) {
+    if (value <= 0) {
+      throw new IllegalArgumentException(name + " must be > 0 (was " + value + ")");
     }
   }
 
-  private static void validatePositive(int v, String name) {
-    if (v <= 0) {
-      throw new IllegalArgumentException(name + " must be > 0 (was " + v + ")");
+  private static void validatePositive(int value, String name) {
+    if (value <= 0) {
+      throw new IllegalArgumentException(name + " must be > 0 (was " + value + ")");
     }
   }
 
-  private static void validateNonNegative(int v, String name) {
-    if (v < 0) {
-      throw new IllegalArgumentException(name + " must be >= 0 (was " + v + ")");
+  private static void validateNonNegative(int value, String name) {
+    if (value < 0) {
+      throw new IllegalArgumentException(name + " must be >= 0 (was " + value + ")");
     }
   }
 
-  private static boolean isBlank(String s) {
-    return s == null || s.trim().isEmpty();
+  private static void validateNonNegative(long value, String name) {
+    if (value < 0) {
+      throw new IllegalArgumentException(name + " must be >= 0 (was " + value + ")");
+    }
+  }
+
+  private static boolean isBlank(String str) {
+    return str == null || str.trim().isEmpty();
   }
 
   /**
@@ -525,6 +680,8 @@ class ZombieCleanupProperties {
   private long executorShutdownAwaitMs = 10000L;
   /** Forced wait after zombie-cleanup shutdownNow (milliseconds). Default: 5000. */
   private long executorShutdownForceAwaitMs = 5000L;
+  /** Optional max runtime budget per cleanup pass (milliseconds). 0 disables. */
+  private long runBudgetMs = 0L;
 
   public ExceptionalAgentsProperties getExceptionalAgents() {
     if (exceptionalAgents == null) {
@@ -593,6 +750,11 @@ class OrphanCleanupProperties {
   private long executorShutdownAwaitMs = 10000L;
   /** Forced wait after orphan-cleanup shutdownNow (milliseconds). Default: 5000. */
   private long executorShutdownForceAwaitMs = 5000L;
+  /** Optional max runtime budget per cleanup pass (milliseconds). 0 disables. */
+  private long runBudgetMs = 0L;
+
+  /** When true, numeric-only members in the waiting set are removed during orphan cleanup. */
+  private boolean removeNumericOnlyAgents = true;
 }
 
 /** Reconcile executor shutdown tuning knobs. */
@@ -603,4 +765,6 @@ class ReconcileProperties {
   private long executorShutdownAwaitMs = 5000L;
   /** Forced wait after reconcile shutdownNow (milliseconds). Default: 2000. */
   private long executorShutdownForceAwaitMs = 2000L;
+  /** Optional max runtime budget per reconcile pass (milliseconds). 0 disables. */
+  private long runBudgetMs = 0L;
 }

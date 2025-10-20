@@ -38,7 +38,7 @@ class PrioritySchedulerMetricsUnitTest {
     Supplier<Number> s1 = () -> 1;
 
     // First registration
-    m.registerGauges(null, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0);
+    m.registerGauges(null, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0);
 
     // Reflect the internal flag
     Field f = PrioritySchedulerMetrics.class.getDeclaredField("gaugesRegistered");
@@ -47,7 +47,7 @@ class PrioritySchedulerMetricsUnitTest {
     assertThat(first).isTrue();
 
     // Second registration with different suppliers should be a no-op and not throw
-    m.registerGauges(null, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1);
+    m.registerGauges(null, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1);
     boolean second = (boolean) f.get(m);
     assertThat(second).isTrue();
   }

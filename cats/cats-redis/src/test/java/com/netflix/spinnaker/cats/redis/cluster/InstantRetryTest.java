@@ -218,26 +218,24 @@ public class InstantRetryTest {
       System.out.println("\n=== Instant Retry Test Results ===");
 
       if (newAgentsAdded.get() > 0) {
-        System.out.println("✓ Background thread successfully modified Redis state");
-        System.out.println("✓ Created race condition: original agents moved, new agents added");
+        System.out.println("Background thread successfully modified Redis state");
+        System.out.println("Created race condition: original agents moved, new agents added");
 
         // The key insight: If instant retry worked, the timing should be fast
         // Without retry: would wait for next cycle (~1000ms)
         // With retry: should complete quickly (~50-100ms)
         if (duration < 500) {
           System.out.println(
-              "✓ Acquisition completed quickly ("
-                  + duration
-                  + "ms) - suggests instant retry worked");
+              "Acquisition completed quickly (" + duration + "ms) - suggests instant retry worked");
         } else {
           System.out.println(
-              "⚠ Acquisition took " + duration + "ms - may not have used instant retry");
+              "WARNING: Acquisition took " + duration + "ms - may not have used instant retry");
         }
 
         // Check if Redis state reflects the scenario we created
         boolean scenarioCreated = finalWorking.size() >= 3 && (finalWaiting.size() >= 0);
         if (scenarioCreated) {
-          System.out.println("✓ Redis state confirms race condition scenario was created");
+          System.out.println("Redis state confirms race condition scenario was created");
         }
 
         assertThat(newAgentsAdded.get()).isEqualTo(2);

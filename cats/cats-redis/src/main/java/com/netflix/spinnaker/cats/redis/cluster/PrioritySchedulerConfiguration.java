@@ -16,7 +16,9 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import static com.netflix.spinnaker.cats.redis.cluster.support.ExecutorUtils.newNamedCachedThreadPool;
+import static com.netflix.spinnaker.cats.redis.cluster.support.ExecutorUtils.newNamedSingleThreadScheduledExecutor;
+
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
@@ -150,6 +152,15 @@ public class PrioritySchedulerConfiguration {
   }
 
   /**
+   * Health summary logging period in milliseconds. If configured as <= 0 seconds, returns 0 to
+   * indicate the feature is disabled.
+   */
+  public long getHealthSummaryPeriodMs() {
+    int sec = schedulerProperties.getHealthSummaryPeriodSeconds();
+    return sec <= 0 ? 0L : java.util.concurrent.TimeUnit.SECONDS.toMillis(sec);
+  }
+
+  /**
    * Get the maximum concurrent agents.
    *
    * @return max concurrent agents
@@ -276,11 +287,28 @@ public class PrioritySchedulerConfiguration {
   }
 
   public long getReconcileExecutorShutdownAwaitMs() {
-    return schedulerProperties.getReconcile().getExecutorShutdownAwaitMs();
+    return safeReconcile().getExecutorShutdownAwaitMs();
   }
 
   public long getReconcileExecutorShutdownForceAwaitMs() {
-    return schedulerProperties.getReconcile().getExecutorShutdownForceAwaitMs();
+    return safeReconcile().getExecutorShutdownForceAwaitMs();
+  }
+
+  public long getZombieRunBudgetMs() {
+    return schedulerProperties.getZombieCleanup().getRunBudgetMs();
+  }
+
+  public long getOrphanRunBudgetMs() {
+    return schedulerProperties.getOrphanCleanup().getRunBudgetMs();
+  }
+
+  public long getReconcileRunBudgetMs() {
+    return safeReconcile().getRunBudgetMs();
+  }
+
+  private ReconcileProperties safeReconcile() {
+    ReconcileProperties r = schedulerProperties.getReconcile();
+    return r != null ? r : new ReconcileProperties();
   }
 
   /** Shutdown all managed resources. */
@@ -316,17 +344,14 @@ public class PrioritySchedulerConfiguration {
 
   /** Creates the agent work pool. */
   private void createAgentWorkPool() {
-    this.agentWorkPool =
-        java.util.concurrent.Executors.newCachedThreadPool(
-            new ThreadFactoryBuilder().setNameFormat("PriorityAgentWorker-%d").build());
+    this.agentWorkPool = newNamedCachedThreadPool("PriorityAgentWorker-%d");
     log.info("Created agent work pool");
   }
 
   /** Creates the scheduler executor service. */
   private void createSchedulerExecutorService() {
     this.schedulerExecutorService =
-        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
-            new ThreadFactoryBuilder().setNameFormat("PriorityAgentScheduler-%d").build());
+        newNamedSingleThreadScheduledExecutor("PriorityAgentScheduler-%d");
 
     log.info("Created scheduler executor service");
   }
@@ -338,8 +363,9 @@ public class PrioritySchedulerConfiguration {
     int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
 
     if (maxConcurrentAgents <= 0) {
-      throw new IllegalArgumentException(
-          "redis.agent.max-concurrent-agents must be > 0 when using cached thread pool");
+      this.runningAgents = null; // unbounded mode; callers null-check
+      log.info("Concurrency semaphore disabled (unbounded mode)");
+      return;
     }
 
     this.runningAgents = new Semaphore(maxConcurrentAgents);

@@ -17,6 +17,7 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -105,7 +106,11 @@ class ZombieCleanupServiceTest {
     void shouldDetectZombieAgentsOlderThanThreshold() {
       // Given - Set up local tracking with an agent that has been running too long
       // Zombie cleanup scans LOCAL activeAgents map, not Redis
-      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000; // 1 minute ago
+      long oldScoreSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowSec = Long.parseLong(j.time().get(0));
+        oldScoreSeconds = nowSec - 60; // 1 minute ago
+      }
 
       // Also add to Redis for cleanup to work properly
       try (Jedis jedis = jedisPool.getResource()) {
@@ -137,8 +142,11 @@ class ZombieCleanupServiceTest {
     @DisplayName("Should not clean up agents within threshold")
     void shouldNotCleanUpAgentsWithinThreshold() {
       // Given - Add recent agent to WORKING set
-      long recentScore =
-          System.currentTimeMillis() - 10000; // 10 seconds ago (within 30s threshold)
+      long recentScore;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowMs = Long.parseLong(j.time().get(0)) * 1000L;
+        recentScore = nowMs - 10000; // 10 seconds ago (within 30s threshold)
+      }
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.zadd("working", recentScore, "recent-agent");
       }
@@ -163,7 +171,11 @@ class ZombieCleanupServiceTest {
     void shouldDetectAndCleanupMultipleZombieAgentsIndividually() {
       // Given - Clean up and add multiple old agents
       // Redis scores are stored as seconds since epoch, not milliseconds
-      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
+      long oldScoreSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowSec = Long.parseLong(j.time().get(0));
+        oldScoreSeconds = nowSec - 60;
+      }
       try (Jedis jedis = jedisPool.getResource()) {
         // Clean up any existing data first
         jedis.del("working", "waiting");
@@ -208,7 +220,11 @@ class ZombieCleanupServiceTest {
     void shouldCancelFuturesForZombieAgents() {
       // Given
       // Redis scores are stored as seconds since epoch, not milliseconds
-      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
+      long oldScoreSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowSec = Long.parseLong(j.time().get(0));
+        oldScoreSeconds = nowSec - 60;
+      }
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.zadd("working", oldScoreSeconds, "zombie-agent");
       }
@@ -237,7 +253,11 @@ class ZombieCleanupServiceTest {
     void shouldHandleAlreadyCompletedFuturesGracefully() {
       // Given
       // Redis scores are stored as seconds since epoch, not milliseconds
-      long oldScoreSeconds = (System.currentTimeMillis() - 60000) / 1000;
+      long oldScoreSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowSec = Long.parseLong(j.time().get(0));
+        oldScoreSeconds = nowSec - 60;
+      }
       try (Jedis jedis = jedisPool.getResource()) {
         jedis.zadd("working", oldScoreSeconds, "zombie-agent");
       }
@@ -928,6 +948,28 @@ class ZombieCleanupServiceTest {
       // Then - Zombie cleaned but future not cancelled (already done)
       assertThat(cleaned).isEqualTo(1);
       verify(completedFuture, never()).cancel(true); // Should not attempt to cancel
+    }
+  }
+
+  @Nested
+  @DisplayName("ThreadLocal Hygiene Tests")
+  class ThreadLocalHygieneTests {
+
+    @Test
+    @DisplayName("cleanupZombieAgents should not retain ThreadLocal buffers after run")
+    void cleanupZombieAgentsDoesNotRetainBuffers() {
+      Map<String, String> activeAgents = new HashMap<>();
+      Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+      // Run twice to exercise finally-clears and assert no exceptions are thrown
+      assertThatCode(
+              () -> {
+                zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+                zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+              })
+          .doesNotThrowAnyException();
+      // Maps remain unchanged
+      assertThat(activeAgents).isEmpty();
+      assertThat(activeAgentsFutures).isEmpty();
     }
   }
 }

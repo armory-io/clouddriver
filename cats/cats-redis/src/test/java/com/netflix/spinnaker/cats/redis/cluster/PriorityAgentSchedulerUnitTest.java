@@ -21,6 +21,10 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.netflix.spectator.api.DefaultRegistry;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
@@ -33,6 +37,7 @@ import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.provider.ProviderRegistry;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
@@ -60,14 +65,17 @@ class PriorityAgentSchedulerUnitTest {
     schedProps.getKeys().setWorkingSet("working");
     schedProps.getKeys().setCleanupLeaderKey("cleanup-leader");
 
-    return new PriorityAgentScheduler(
-        jedisPool,
-        nodeStatusProvider,
-        intervalProvider,
-        shardingFilter,
-        agentProps,
-        schedProps,
-        new PrioritySchedulerMetrics(new DefaultRegistry()));
+    PriorityAgentScheduler scheduler =
+        new PriorityAgentScheduler(
+            jedisPool,
+            nodeStatusProvider,
+            intervalProvider,
+            shardingFilter,
+            agentProps,
+            schedProps,
+            new PrioritySchedulerMetrics(new DefaultRegistry()));
+
+    return scheduler;
   }
 
   @Test
@@ -136,6 +144,103 @@ class PriorityAgentSchedulerUnitTest {
       String s = stats.toString();
       assertThat(s).contains("SchedulerStats{");
       assertThat(s).contains("health=");
+    } finally {
+      jedisPool.close();
+    }
+  }
+
+  @Test
+  @DisplayName("Watchdog records triggers without immediate WARN logging and surfaces in summary")
+  void watchdogRecordsTriggersWithoutImmediateWarns() {
+    JedisPool jedisPool = new JedisPool(new JedisPoolConfig(), "localhost");
+    try {
+      PriorityAgentScheduler scheduler = newScheduler(jedisPool);
+
+      Logger logger = (Logger) LoggerFactory.getLogger(PriorityAgentScheduler.class);
+      ListAppender<ILoggingEvent> appender = new ListAppender<>();
+      appender.start();
+      logger.addAppender(appender);
+
+      // Leak suspect streak
+      appender.list.clear();
+      for (int i = 0; i < 3; i++) {
+        scheduler.evaluateWatchdog(
+            0.0d, // permitsFreePct < 1%
+            0.0d, 1.0d, 5, 0, 1, false, 10, 0, 0, 10, 0);
+      }
+      long leakWarnings =
+          appender.list.stream()
+              .filter(
+                  e ->
+                      e.getLevel() == Level.WARN
+                          && e.getFormattedMessage().contains("PERMIT_LEAK_SUSPECT"))
+              .count();
+      assertThat(leakWarnings).isEqualTo(0);
+
+      // Reset streaks with a healthy sample
+      scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 0, 10, 10);
+
+      // Zero progress streak
+      appender.list.clear();
+      for (int i = 0; i < 3; i++) {
+        scheduler.evaluateWatchdog(0.5d, 0.0d, 0.0d, 5, 0, 0, false, 10, 0, 0, 10, 10);
+      }
+      long zeroProgressWarnings =
+          appender.list.stream()
+              .filter(
+                  e ->
+                      e.getLevel() == Level.WARN
+                          && e.getFormattedMessage().contains("ZERO_PROGRESS"))
+              .count();
+      assertThat(zeroProgressWarnings).isEqualTo(0);
+
+      // Reset
+      scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 0, 10, 10);
+
+      // Skew streak
+      appender.list.clear();
+      for (int i = 0; i < 3; i++) {
+        scheduler.evaluateWatchdog(0.95d, 0.0d, 0.05d, 5, 0, 1, false, 10, 0, 1, 10, 10);
+      }
+      long skewWarnings =
+          appender.list.stream()
+              .filter(
+                  e ->
+                      e.getLevel() == Level.WARN
+                          && e.getFormattedMessage().contains("CAPACITY_SKEW_ZIF"))
+              .count();
+      assertThat(skewWarnings).isEqualTo(0);
+
+      // Reset
+      scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 0, 10, 10);
+
+      // Redis stall streak
+      appender.list.clear();
+      for (int i = 0; i < 3; i++) {
+        scheduler.evaluateWatchdog(0.5d, 0.5d, 0.5d, 0, 0, 0, true, 10, 0, 0, 10, 10);
+      }
+      long stallWarnings =
+          appender.list.stream()
+              .filter(
+                  e ->
+                      e.getLevel() == Level.WARN && e.getFormattedMessage().contains("REDIS_STALL"))
+              .count();
+      assertThat(stallWarnings).isEqualTo(0);
+
+      // Force health summary emission and ensure watchdogs appear
+      scheduler.run();
+      String msg =
+          appender.list.stream()
+              .filter(
+                  e ->
+                      (e.getLevel() == Level.INFO || e.getLevel() == Level.WARN)
+                          && e.getFormattedMessage().contains("Scheduler health"))
+              .map(ILoggingEvent::getFormattedMessage)
+              .findFirst()
+              .orElse("");
+      assertThat(msg).contains("watchdogs=");
+
+      logger.detachAppender(appender);
     } finally {
       jedisPool.close();
     }
