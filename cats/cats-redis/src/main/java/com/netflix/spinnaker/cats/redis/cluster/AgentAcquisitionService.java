@@ -542,90 +542,84 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       // Cycle-long registry snapshot: consistent view of registered agents for the entire cycle
       final java.util.Map<String, AgentWorker> registrySnapshot = new java.util.HashMap<>(agents);
 
-      long readyCountForDiagnostics = -1L;
+      long readyCountForDiagnostics = 0L;
       boolean earlyEmptyReady = false;
+      Long earliestLocalWaitingScore = null;
       if (emitDiag) {
         try {
-          // Cheap readiness probe: ask for a single ready element; avoid full count scan
-          java.util.Set<String> oneReady =
-              jedis.zrangeByScore(WAITING_SET, "-inf", currentScore, 0, 1);
-          earlyEmptyReady = (oneReady == null || oneReady.isEmpty());
-          readyCountForDiagnostics = earlyEmptyReady ? 0L : 1L;
-        } catch (Exception ignore) {
-          readyCountForDiagnostics = -1L; // unknown on failure
-        }
-
-        if (earlyEmptyReady) {
-          // Detect acquisition stall: waiting set has backlog but none are ready (e.g.,
-          // future-scored)
-          try {
-            long waitingBacklog = jedis.zcard(WAITING_SET);
-
-            if (waitingBacklog > 0) {
-              long nowSec;
-              try {
-                nowSec = Long.parseLong(currentScore);
-              } catch (NumberFormatException nfe) {
-                nowSec = System.currentTimeMillis() / 1000L;
-              }
-
-              final int window =
-                  Math.max(
-                      8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
-              Long earliestLocalWaitingScore = null;
-              try {
-                Set<Tuple> earliest =
-                    jedis.zrangeWithScores(WAITING_SET, 0, Math.max(0, window - 1));
-                for (Tuple t : earliest) {
-                  String agentType = t.getElement();
-                  AgentWorker local = registrySnapshot.get(agentType);
-                  if (local != null && isAgentEnabled(local.getAgent())) {
-                    earliestLocalWaitingScore = (long) t.getScore();
-                    break;
-                  }
-                }
-              } catch (Exception ignore) {
-                // Best-effort; keep null on failure
-              }
-
-              long minIntervalSec = cachedMinEnabledIntervalSec.get();
-              if (earliestLocalWaitingScore != null
-                  && minIntervalSec > 0L
-                  && (earliestLocalWaitingScore - nowSec) > minIntervalSec
-                  && shouldWarnNow(lastStallWarnEpochMs, 300_000)) {
-                long nextReadyInSec = Math.max(0L, earliestLocalWaitingScore - nowSec);
-                log.warn(
-                    "Acquisition stall detected: ready=0, waiting_backlog={}, next_local_ready_in={}s > min_interval={}s, pool_active={}, pool_waiters={}",
-                    waitingBacklog,
-                    nextReadyInSec,
-                    minIntervalSec,
-                    jedisPool.getNumActive(),
-                    jedisPool.getNumWaiters());
-                if (metrics != null) {
-                  metrics.incrementStallDetected();
+          // Examine a small sorted-set window so we can count the oldest agents this pod could
+          // actually execute (restricted to locally registered + enabled agents).
+          final int window =
+              Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
+          Set<Tuple> earliest =
+              jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", currentScore, 0, window);
+          long eligibleReady = 0L;
+          if (earliest != null) {
+            for (Tuple t : earliest) {
+              String agentType = t.getElement();
+              AgentWorker local = registrySnapshot.get(agentType);
+              if (local != null && isAgentEnabled(local.getAgent())) {
+                eligibleReady++;
+                if (earliestLocalWaitingScore == null) {
+                  // First matching entry: use its score for stall diagnostics below.
+                  earliestLocalWaitingScore = (long) t.getScore();
                 }
               }
             }
-          } catch (Exception ignore) {
-            // Diagnostics only
           }
+          earlyEmptyReady = (eligibleReady == 0L);
+          readyCountForDiagnostics = eligibleReady;
+          if (earlyEmptyReady) {
+            // Waiting set has entries but none are runnable on this pod right now; check whether
+            // the next local candidate is still in the future and, if so, surface a stall warning
+            // on
+            // the same cadence as before.
+            try {
+              long waitingBacklog = jedis.zcard(WAITING_SET);
+              if (waitingBacklog > 0 && earliestLocalWaitingScore != null) {
+                long nowSec;
+                try {
+                  nowSec = Long.parseLong(currentScore);
+                } catch (NumberFormatException nfe) {
+                  nowSec = System.currentTimeMillis() / 1000L;
+                }
+                long minIntervalSec = cachedMinEnabledIntervalSec.get();
+                if (minIntervalSec > 0L
+                    && (earliestLocalWaitingScore - nowSec) > minIntervalSec
+                    && shouldWarnNow(lastStallWarnEpochMs, 300_000)) {
+                  long nextReadyInSec = Math.max(0L, earliestLocalWaitingScore - nowSec);
+                  log.warn(
+                      "Acquisition stall detected: ready=0, waiting_backlog={}, next_local_ready_in={}s > min_interval={}s, pool_active={}, pool_waiters={}",
+                      waitingBacklog,
+                      nextReadyInSec,
+                      minIntervalSec,
+                      jedisPool.getNumActive(),
+                      jedisPool.getNumWaiters());
+                  if (metrics != null) {
+                    metrics.incrementStallDetected();
+                  }
+                }
+              }
+            } catch (Exception ignore) {
+              // Diagnostics only – continue with acquisition attempt.
+            }
+          }
+        } catch (Exception ignore) {
+          // Any failure falls back to the safe "no ready agents" path.
+          readyCountForDiagnostics = 0L;
+          earliestLocalWaitingScore = null;
+          earlyEmptyReady = true;
+        }
+
+        if (earlyEmptyReady) {
           if (log.isDebugEnabled()) {
-            log.debug("No agents ready for execution");
+            log.debug("No locally eligible agents ready for execution");
           }
-          // Early return consistent with original behavior when we know none are ready
           return 0;
         }
       }
 
-      // Compute queue lag and health before acquisition; reuse Redis results when possible
-      long nowSec;
-      try {
-        nowSec = Long.parseLong(currentScore);
-      } catch (NumberFormatException nfe) {
-        nowSec = System.currentTimeMillis() / 1000L;
-      }
-
-      long readyCount = emitDiag ? Math.max(0L, readyCountForDiagnostics) : -1L;
+      long readyCount = emitDiag ? Math.max(0L, readyCountForDiagnostics) : 0L;
       long oldestOverdueSec = 0L;
       if (emitDiag) {
         try {
@@ -636,12 +630,18 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               Math.max(8, Math.min(64, schedulerProperties.getBatchOperations().getBatchSize()));
           Set<Tuple> oldestWindow =
               jedis.zrangeByScoreWithScores(WAITING_SET, "-inf", currentScore, 0, window);
+          long nowSecForDiagnostics;
+          try {
+            nowSecForDiagnostics = Long.parseLong(currentScore);
+          } catch (NumberFormatException nfe) {
+            nowSecForDiagnostics = System.currentTimeMillis() / 1000L;
+          }
           for (Tuple t : oldestWindow) {
             String agentType = t.getElement();
             AgentWorker local = registrySnapshot.get(agentType);
             if (local != null && isAgentEnabled(local.getAgent())) {
               long oldestScore = (long) t.getScore();
-              oldestOverdueSec = Math.max(0L, nowSec - oldestScore);
+              oldestOverdueSec = Math.max(0L, nowSecForDiagnostics - oldestScore);
               break;
             }
           }
@@ -1900,6 +1900,15 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     status.put("acquisition", acquisitionCircuitBreaker.getStatus());
     status.put("redis", redisCircuitBreaker.getStatus());
     return status;
+  }
+
+  /**
+   * Get the current Redis circuit breaker state for watchdog diagnostics.
+   *
+   * @return breaker state, or {@code null} if unavailable
+   */
+  public PrioritySchedulerCircuitBreaker.State getRedisCircuitBreakerState() {
+    return redisCircuitBreaker.getState();
   }
 
   /**
