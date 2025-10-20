@@ -98,24 +98,16 @@ class HealthSummaryUnitTest {
               .map(ILoggingEvent::getFormattedMessage)
               .findFirst()
               .orElse("");
-      // Content assertions adapted to the consolidated summary format
-      assertThat(msg).contains("Scheduler health:");
-      assertThat(msg).contains("degraded=");
-      assertThat(msg).contains("ready=");
+      // Content assertions aligned with current summary format
+      assertThat(msg).contains("Scheduler health | health=");
+      assertThat(msg).contains("[backlog ready=");
       assertThat(msg).contains("oldest_overdue=");
       assertThat(msg).contains("capacityPerCycle=");
-      assertThat(msg).contains("permitsFree=");
-      assertThat(msg).contains("activePct=");
-      assertThat(msg).contains("registered=");
-      assertThat(msg).contains("active=");
-      assertThat(msg).contains("futures=");
+      assertThat(msg).contains("[permits ");
+      assertThat(msg).contains("zombiesInFlight=");
+      assertThat(msg).contains("[agents registered=");
       assertThat(msg).contains("scripts=");
-      assertThat(msg).contains("zombies_cleaned=");
-      assertThat(msg).contains("orphans_cleaned=");
-      assertThat(msg).contains("running=");
-      assertThat(msg).contains("health=");
       assertThat(msg).contains("queueDepth=");
-      assertThat(msg).contains("permitsAvailable=");
 
       // Subsequent immediate call should not add another health log due to 10m cadence
       scheduler.run();

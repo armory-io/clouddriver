@@ -31,6 +31,7 @@ import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import com.netflix.spinnaker.cats.module.CatsModuleAware;
+import com.netflix.spinnaker.cats.redis.cluster.PrioritySchedulerCircuitBreaker.State;
 import java.util.Map;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -366,9 +367,10 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
         boolean redisStall = false;
         try {
-          String redisState =
-              String.valueOf(acquisitionService.getCircuitBreakerStatus().get("redis"));
-          redisStall = (redisState != null && !"CLOSED".equalsIgnoreCase(redisState));
+          // Prefer the exact breaker state over formatted status text so CLOSED variants like
+          // "CLOSED (failures=0/5)" do not trigger false stall alerts.
+          State redisState = acquisitionService.getRedisCircuitBreakerState();
+          redisStall = redisState != null && redisState != State.CLOSED;
         } catch (Exception e) {
           log.debug("Watchdog: unable to read redis breaker state; assuming CLOSED", e);
         }
@@ -566,9 +568,21 @@ public class PriorityAgentScheduler extends CatsModuleAware
   /**
    * Emit a periodic health summary at most once every 10 minutes, regardless of scheduler interval.
    *
-   * <p>Includes: registered/active counts, scripts loaded, zombies/orphans cleaned, health state
-   * (HEALTHY/DEGRADED + reason), oldest overdue (seconds), executor queue depth, and available
-   * semaphore permits when enabled.
+   * <p>The log is human-scannable groupings that match operational concerns:
+   *
+   * <ul>
+   *   <li>Leading segment: overall scheduler health (`health=HEALTHY|DEGRADED`) with optional
+   *       reasons such as `permit_mismatch` or degraded backlog cause tokens.
+   *   <li>`[agents ...]`: registered agents plus active/futures counts, collapsing to
+   *       `active=futures=<n>` when they match.
+   *   <li>`[backlog ...]`: queued work snapshot (ready count, oldest overdue seconds, and
+   *       `capacityPerCycle`).
+   *   <li>`[permits ...]`: semaphore availability rendered as `available/max (percent)` when the
+   *       semaphore is enabled, or `n/a` when disabled, along with `zombiesInFlight`.
+   *   <li>`[cleanup ...]`: zombie/orphan cleanup totals to track maintenance work.
+   *   <li>Tail segments contain queue depth, active watchdog triggers, and optional starvation
+   *       annotations.
+   * </ul>
    */
   private void maybeLogHealthSummary() {
     long now = nowMs();
@@ -600,14 +614,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
     long readySnapshot = acquisitionService.getReadyCountSnapshot();
     long oldestOverdueSecondsNow = acquisitionService.getOldestOverdueSeconds();
     double capacityPerCycle = acquisitionService.getCapacityPerCycleSnapshot();
-    double permitsFreePct =
-        maxConcurrent > 0
-            ? Math.max(0d, Math.min(1d, (double) availablePermits / (double) maxConcurrent))
-            : 0d;
-    double activePct =
-        maxConcurrent > 0
-            ? Math.max(0d, Math.min(1d, (double) activeCount / (double) maxConcurrent))
-            : 0d;
 
     // Permit reconciliation: warn and mark degraded if heldPermits > active + zombiesInFlight
     boolean permitMismatch = false;
@@ -638,57 +644,103 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogs.add("redis_stall");
     }
 
-    String watchdogSegment =
-        watchdogs.isEmpty() ? "watchdogs=none" : ("watchdogs=" + String.join(",", watchdogs));
-
     boolean warnLevel = (stats.isDegraded() || permitMismatch);
-    String reason = "";
+    String healthLabel = warnLevel ? "DEGRADED" : "HEALTHY";
+
+    java.util.List<String> reasonTokens = new java.util.ArrayList<>();
+    if (permitMismatch) {
+      reasonTokens.add("permit_mismatch");
+    }
     if (warnLevel) {
-      java.util.List<String> reasonTokens = new java.util.ArrayList<>();
-      if (permitMismatch) {
-        reasonTokens.add("permit_mismatch");
-      }
       String degradedReason = stats.getDegradedReason();
       if (degradedReason != null && !degradedReason.isEmpty()) {
         reasonTokens.add(degradedReason);
       }
-      reason = reasonTokens.isEmpty() ? "" : (" reason=" + String.join("; ", reasonTokens));
     }
 
-    // Retain operationally useful fields from legacy summary
-    String msg =
-        String.format(
-            "Scheduler health: degraded=%s ready=%d oldest_overdue=%ds capacityPerCycle=%.2f permitsFree=%.2f activePct=%.2f registered=%d active=%d futures=%d scripts=%d zombies_cleaned=%d orphans_cleaned=%d running=%s health=%s queueDepth=%d permitsAvailable=%d zombiesInFlight=%d %s%s%s",
-            warnLevel ? 1 : 0,
-            readySnapshot,
-            oldestOverdueSecondsNow,
-            capacityPerCycle,
-            permitsFreePct,
-            activePct,
-            stats.getRegisteredAgents(),
-            stats.getActiveAgents(),
-            acquisitionService.getFuturesMapSize(),
-            scriptManager.getScriptCount(),
-            stats.getZombiesCleanedUp(),
-            stats.getOrphansCleanedUp(),
-            stats.isRunning(),
-            (stats.isDegraded() || permitMismatch) ? "DEGRADED" : "HEALTHY",
-            queueDepth,
-            availablePermits,
-            zombiesInFlight,
-            watchdogSegment,
-            lastStarvationSuspected.get()
-                ? String.format(
-                    " [starvation suspected: degradedForMs=%d ticks=%d]",
-                    lastStarvationDegradedMs.get(), lastStarvationTicks.get())
-                : "",
-            warnLevel ? reason : "");
+    StringBuilder msg = new StringBuilder("Scheduler health | health=").append(healthLabel);
+    if (!reasonTokens.isEmpty()) {
+      msg.append(" reason=").append(String.join("; ", reasonTokens));
+    }
 
-    if (warnLevel) {
-      log.warn(msg);
+    int registeredAgents = stats.getRegisteredAgents();
+    int activeAgents = stats.getActiveAgents();
+    int futuresCount = acquisitionService.getFuturesMapSize();
+    int scriptsCount = scriptManager.getScriptCount();
+
+    if (activeAgents == futuresCount) {
+      msg.append(
+          String.format(
+              " | [agents registered=%d active=futures=%d scripts=%d]",
+              registeredAgents, activeAgents, scriptsCount));
     } else {
-      log.info(msg);
+      msg.append(
+          String.format(
+              " | [agents registered=%d active=%d futures=%d scripts=%d]",
+              registeredAgents, activeAgents, futuresCount, scriptsCount));
     }
+
+    msg.append(
+        String.format(
+            " [backlog ready=%s oldest_overdue=%ss capacityPerCycle=%s]",
+            formatLong(readySnapshot),
+            formatLong(oldestOverdueSecondsNow),
+            formatDouble(capacityPerCycle)));
+
+    if (runningAgentsSemaphore == null || maxConcurrent <= 0) {
+      msg.append(String.format(" [permits n/a zombiesInFlight=%s]", formatLong(zombiesInFlight)));
+    } else {
+      double freePct =
+          Math.max(0d, Math.min(1d, (double) availablePermits / (double) maxConcurrent));
+      msg.append(
+          String.format(
+              " [permits %s/%s (%.1f%%) zombiesInFlight=%s]",
+              formatLong(availablePermits),
+              formatLong(maxConcurrent),
+              freePct * 100d,
+              formatLong(zombiesInFlight)));
+    }
+
+    msg.append(
+        String.format(
+            " [cleanup zombies_cleaned=%s orphans_cleaned=%s]",
+            formatLong(stats.getZombiesCleanedUp()), formatLong(stats.getOrphansCleanedUp())));
+
+    msg.append(" queueDepth=" + formatLong(queueDepth));
+
+    if (!watchdogs.isEmpty()) {
+      msg.append(" watchdogs=").append(String.join(",", watchdogs));
+    }
+
+    if (lastStarvationSuspected.get()) {
+      msg.append(
+          String.format(
+              " [starvation suspected: degradedForMs=%d ticks=%d]",
+              lastStarvationDegradedMs.get(), lastStarvationTicks.get()));
+    }
+
+    String message = msg.toString();
+    if (warnLevel) {
+      log.warn(message);
+    } else {
+      log.info(message);
+    }
+  }
+
+  /** Format a long value for log output without locale-specific separators. */
+  private static String formatLong(long value) {
+    return Long.toString(value);
+  }
+
+  /** Format a double with either zero or two fractional digits, depending on precision. */
+  private static String formatDouble(double value) {
+    if (Double.isFinite(value)) {
+      if (value == Math.rint(value)) {
+        return String.format("%.0f", value);
+      }
+      return String.format("%.2f", value);
+    }
+    return "NaN";
   }
 
   /**

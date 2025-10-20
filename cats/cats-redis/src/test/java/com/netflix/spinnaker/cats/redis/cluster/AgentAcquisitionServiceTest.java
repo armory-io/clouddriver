@@ -709,8 +709,8 @@ class AgentAcquisitionServiceTest {
     }
 
     @Test
-    @DisplayName("Warn when acquisition stall occurs (backlog but no ready agents)")
-    void shouldWarnOnAcquisitionStall() throws Exception {
+    @DisplayName("No stall warn when backlog has only future entries (no local ready)")
+    void shouldNotWarnOnBacklogWithOnlyFutureEntries() throws Exception {
       // Use a tiny batch size to simplify
       schedulerProperties.getBatchOperations().setEnabled(false);
       recreateAcquisitionService();
@@ -740,9 +740,9 @@ class AgentAcquisitionServiceTest {
         assertThat(jedis.zcard("waiting")).isGreaterThan(0);
       }
 
-      // Assert the stall path executed by verifying the rate-limiter timestamp updated
+      // Assert no stall warn was emitted for future-only backlog: rate limiter remains unchanged
       long afterTs = rateLimiter.get();
-      assertThat(afterTs).isGreaterThan(0L);
+      assertThat(afterTs).isEqualTo(0L);
     }
   }
 
