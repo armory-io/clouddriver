@@ -858,6 +858,23 @@ public class PriorityAgentScheduler extends CatsModuleAware
       gracefullyReleaseActiveAgents();
 
       // Step 2: Stop the scheduler executor
+      // Best-effort ThreadLocal cleanup on the scheduler thread before shutdown
+      try {
+        config
+            .getSchedulerExecutorService()
+            .submit(
+                () -> {
+                  try {
+                    if (acquisitionService != null) {
+                      acquisitionService.removeThreadLocals();
+                    }
+                  } catch (Exception ignore) {
+                    log.debug("Failed to run ThreadLocal cleanup on scheduler executor", ignore);
+                  }
+                });
+      } catch (Exception ignore) {
+        log.debug("Failed to schedule ThreadLocal cleanup on scheduler executor", ignore);
+      }
       config.getSchedulerExecutorService().shutdown();
       // Intentional: reuse orphan cleanup timeouts so executor shutdown behavior stays consistent
       // across scheduler/orphan flows.
@@ -878,6 +895,23 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Stop zombie cleanup executor
       zombieCleanupExecutor.shutdown();
+      // Best-effort ThreadLocal cleanup on owning thread before await
+      try {
+        zombieCleanupExecutor.submit(
+            () -> {
+              try {
+                if (zombieService != null) {
+                  zombieService.removeThreadLocals();
+                }
+                if (acquisitionService != null) {
+                  acquisitionService.removeThreadLocals();
+                }
+              } catch (Exception ignore) {
+              }
+            });
+      } catch (Exception ignore) {
+        log.debug("Failed to schedule ThreadLocal cleanup on zombie executor", ignore);
+      }
       long zombieAwait = config.getZombieExecutorShutdownAwaitMs();
       long zombieForceAwait = config.getZombieExecutorShutdownForceAwaitMs();
       if (!zombieCleanupExecutor.awaitTermination(zombieAwait, TimeUnit.MILLISECONDS)) {
@@ -890,6 +924,23 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Stop orphan cleanup executor
       orphanCleanupExecutor.shutdown();
+      // Best-effort ThreadLocal cleanup on owning thread before await
+      try {
+        orphanCleanupExecutor.submit(
+            () -> {
+              try {
+                if (orphanService != null) {
+                  orphanService.removeThreadLocals();
+                }
+                if (acquisitionService != null) {
+                  acquisitionService.removeThreadLocals();
+                }
+              } catch (Exception ignore) {
+              }
+            });
+      } catch (Exception ignore) {
+        log.debug("Failed to schedule ThreadLocal cleanup on orphan executor", ignore);
+      }
       long orphanAwait = config.getOrphanExecutorShutdownAwaitMs();
       long orphanForceAwait = config.getOrphanExecutorShutdownForceAwaitMs();
       if (!orphanCleanupExecutor.awaitTermination(orphanAwait, TimeUnit.MILLISECONDS)) {
@@ -902,6 +953,20 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Stop reconcile executor (best-effort)
       reconcileExecutor.shutdown();
+      // Best-effort ThreadLocal cleanup on owning thread before await
+      try {
+        reconcileExecutor.submit(
+            () -> {
+              try {
+                if (acquisitionService != null) {
+                  acquisitionService.removeThreadLocals();
+                }
+              } catch (Exception ignore) {
+              }
+            });
+      } catch (Exception ignore) {
+        log.debug("Failed to schedule ThreadLocal cleanup on reconcile executor", ignore);
+      }
       long reconcileAwait = config.getReconcileExecutorShutdownAwaitMs();
       long reconcileForceAwait = config.getReconcileExecutorShutdownForceAwaitMs();
       if (!reconcileExecutor.awaitTermination(reconcileAwait, TimeUnit.MILLISECONDS)) {

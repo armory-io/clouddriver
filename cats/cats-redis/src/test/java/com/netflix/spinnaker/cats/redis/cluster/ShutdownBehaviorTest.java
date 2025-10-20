@@ -201,6 +201,46 @@ class ShutdownBehaviorTest {
   }
 
   @Nested
+  @DisplayName("Shutdown Completion List Hygiene")
+  class CompletionHygieneTests {
+
+    @Test
+    @DisplayName("Shutdown completion processing should drain queue without retaining references")
+    void shutdownProcessingClearsCompletions() throws Exception {
+      Agent agent = createMockAgent("complete-agent");
+      AgentExecution exec = mock(AgentExecution.class);
+      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      acquisitionService.registerAgent(agent, exec, instr);
+
+      // Ensure not in shutdown to enqueue into the completion queue
+      acquisitionService.setShuttingDown(false);
+      long nowSec = System.currentTimeMillis() / 1000L;
+      acquisitionService.conditionalReleaseAgent(agent, String.valueOf(nowSec), false, null, null);
+
+      // Queue should have 1 item before shutdown
+      assertThat(acquisitionService.getCompletionQueueSize()).isEqualTo(1);
+
+      // Trigger shutdown, which processes and drains the completion queue with finally-clear/trim
+      acquisitionService.setShuttingDown(true);
+      assertThat(acquisitionService.getCompletionQueueSize()).isEqualTo(0);
+
+      // Capture waiting size after first processing
+      long afterFirst;
+      try (Jedis jedis = jedisPool.getResource()) {
+        afterFirst = jedis.zcard("waiting");
+        assertThat(afterFirst).isGreaterThanOrEqualTo(1);
+      }
+
+      // Call shutdown processing again; no additional completions should be reprocessed
+      acquisitionService.setShuttingDown(true);
+      try (Jedis jedis = jedisPool.getResource()) {
+        long afterSecond = jedis.zcard("waiting");
+        assertThat(afterSecond).isEqualTo(afterFirst);
+      }
+    }
+  }
+
+  @Nested
   @DisplayName("Scheduling Score Correctness")
   class SchedulingScoreTests {
 

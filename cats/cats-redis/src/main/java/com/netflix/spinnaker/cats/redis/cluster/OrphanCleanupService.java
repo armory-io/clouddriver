@@ -106,6 +106,33 @@ public class OrphanCleanupService {
     this.acquisitionService = acquisitionService;
   }
 
+  /**
+   * Remove ThreadLocal buffers held by the current thread to release per-thread memory. Intended to
+   * be invoked on the owning executor thread during shutdown.
+   */
+  void removeThreadLocals() {
+    try {
+      REUSABLE_INVALID_ARGS.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+    try {
+      REUSABLE_ATTEMPTED_INVALID.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+    try {
+      REUSABLE_ORPHAN_LIST.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+    try {
+      REUSABLE_STRING_SET.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+  }
+
   /** Cleanup orphaned agents if needed, with configurable intervals and leadership coordination. */
   public void cleanupOrphanedAgentsIfNeeded() {
     long start = nowMs();
@@ -129,6 +156,7 @@ public class OrphanCleanupService {
         try {
           releaseCleanupLeadership();
         } catch (Exception ignore) {
+          // Best-effort leadership release – lock may already be gone or expired
         }
         // Bump the timestamp to avoid log spam; next cycle will attempt again
         lastOrphanCleanup = nowMs();
@@ -315,6 +343,7 @@ public class OrphanCleanupService {
                   }
                 }
               } catch (Exception ignore) {
+                // Parsing/lookup best-effort – continue with fallback
               }
             }
           }
@@ -340,6 +369,9 @@ public class OrphanCleanupService {
           cleanedThisPass = processOrphanBatch(jedis, setName, orphanList, startEpochMs, budgetMs);
         } finally {
           orphanList.clear();
+          if (orphanList instanceof java.util.ArrayList) {
+            ((java.util.ArrayList<?>) orphanList).trimToSize();
+          }
         }
         totalCleaned += cleanedThisPass;
 
@@ -537,6 +569,12 @@ public class OrphanCleanupService {
         } finally {
           attemptedInvalid.clear();
           invalidArgs.clear();
+          if (attemptedInvalid instanceof java.util.ArrayList) {
+            ((java.util.ArrayList<?>) attemptedInvalid).trimToSize();
+          }
+          if (invalidArgs instanceof java.util.ArrayList) {
+            ((java.util.ArrayList<?>) invalidArgs).trimToSize();
+          }
         }
       } else {
         totalCleaned += cleanupIndividualOrphans(jedis, setName, orphans, startEpochMs, budgetMs);

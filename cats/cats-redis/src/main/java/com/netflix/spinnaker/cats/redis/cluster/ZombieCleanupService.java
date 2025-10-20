@@ -125,6 +125,48 @@ public class ZombieCleanupService {
   }
 
   /**
+   * Remove ThreadLocal buffers held by the current thread to release per-thread memory. Intended to
+   * be invoked on the owning executor thread during shutdown.
+   */
+  void removeThreadLocals() {
+    try {
+      REUSABLE_ZOMBIE_TYPES.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+    try {
+      REUSABLE_ZOMBIE_BATCH.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+    try {
+      REUSABLE_BATCH_ARGS.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+    try {
+      REUSABLE_ATTEMPTED.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+    try {
+      REUSABLE_INPUT_CANDIDATES.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+    try {
+      REUSABLE_STRING_SET.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+    try {
+      REUSABLE_REMAINING.remove();
+    } catch (Exception ignore) {
+      // Best-effort – buffers may already be cleared/GC'd
+    }
+  }
+
+  /**
    * Compiles the exceptional agents pattern for efficient matching. This method is called during
    * initialization and can be called again if configuration changes.
    */
@@ -388,6 +430,9 @@ public class ZombieCleanupService {
       }
     } finally {
       zombieAgentTypes.clear();
+      if (zombieAgentTypes instanceof java.util.ArrayList) {
+        ((java.util.ArrayList<?>) zombieAgentTypes).trimToSize();
+      }
     }
   }
 
@@ -606,6 +651,18 @@ public class ZombieCleanupService {
       inputCandidates.clear();
       attemptedCandidates.clear();
       batchArgs.clear();
+      if (remainingForFallback instanceof java.util.ArrayList) {
+        ((java.util.ArrayList<?>) remainingForFallback).trimToSize();
+      }
+      if (inputCandidates instanceof java.util.ArrayList) {
+        ((java.util.ArrayList<?>) inputCandidates).trimToSize();
+      }
+      if (attemptedCandidates instanceof java.util.ArrayList) {
+        ((java.util.ArrayList<?>) attemptedCandidates).trimToSize();
+      }
+      if (batchArgs instanceof java.util.ArrayList) {
+        ((java.util.ArrayList<?>) batchArgs).trimToSize();
+      }
     }
   }
 

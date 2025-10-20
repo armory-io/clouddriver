@@ -406,6 +406,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         deadmanScheduler.shutdownNow();
       }
     } catch (Exception ignore) {
+      log.debug("Failed to shutdown deadman scheduler", ignore);
     }
   }
 
@@ -466,7 +467,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               }
             });
       } catch (Exception ignore) {
-        // Best-effort only
+        // Best-effort only – pruning failures are non-fatal and retried next cycle
       }
       // Check concurrent agent limits before processing
       int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
@@ -2473,6 +2474,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     } finally {
       // Drop references to completion payloads early to allow GC before next drain
       completions.clear();
+      if (completions instanceof java.util.ArrayList) {
+        ((java.util.ArrayList<?>) completions).trimToSize();
+      }
     }
   }
 
@@ -3389,9 +3393,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
     log.info("Processing {} queued agent completions during shutdown", queueSize);
 
+    // Process all queued completions with immediate scheduling (0ms offset)
+    List<AgentCompletion> completions = drainCompletionQueue();
     try (Jedis jedis = jedisPool.getResource()) {
-      // Process all queued completions with immediate scheduling (0ms offset)
-      List<AgentCompletion> completions = drainCompletionQueue();
       int processed = 0;
 
       // Process each completion with cadence-based or jittered offset to avoid restart bursts
@@ -3427,6 +3431,15 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           completions.size());
     } catch (Exception e) {
       log.error("Failed to process completion queue during shutdown", e);
+    } finally {
+      try {
+        completions.clear();
+        if (completions instanceof java.util.ArrayList) {
+          ((java.util.ArrayList<?>) completions).trimToSize();
+        }
+      } catch (Exception ignore) {
+        // Best-effort – trimming failure is harmless
+      }
     }
   }
 
@@ -3461,6 +3474,37 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    */
   public boolean isGracefulShutdown() {
     return gracefulShutdown.get();
+  }
+
+  /**
+   * Remove ThreadLocal buffers held by the current thread to release per-thread memory. Intended to
+   * be invoked on the owning executor thread during shutdown.
+   */
+  public void removeThreadLocals() {
+    try {
+      REUSABLE_WORKERS_SET.remove();
+    } catch (Exception ignore) {
+    }
+    try {
+      REUSABLE_CANDIDATE_AGENTS.remove();
+    } catch (Exception ignore) {
+    }
+    try {
+      REUSABLE_CANDIDATE_WORKERS.remove();
+    } catch (Exception ignore) {
+    }
+    try {
+      REUSABLE_ELIGIBLE_AGENTS.remove();
+    } catch (Exception ignore) {
+    }
+    try {
+      REUSABLE_AGENT_SCORE_PAIRS.remove();
+    } catch (Exception ignore) {
+    }
+    try {
+      REUSABLE_COMPLETIONS.remove();
+    } catch (Exception ignore) {
+    }
   }
 
   /**
