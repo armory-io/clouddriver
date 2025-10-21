@@ -661,7 +661,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       java.util.Set<String> attemptedThisCycle = new java.util.HashSet<>();
 
       // Calculate how many new agents this pod can try to acquire
-      int effectiveRunning = currentlyRunning + zombiesInFlight.get();
+      int effectiveRunning = currentlyRunning + Math.max(0, zombiesInFlight.get());
       int availableSlotsForNewAgents =
           unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - effectiveRunning);
 
@@ -3870,7 +3870,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           // Permit was pre-released by zombie cleanup. Decrement zIF only if we had incremented it
           // earlier (worker actually started and early-release performed accounting).
           if (runStateForAgent.zifIncremented.get()) {
-            acquisitionService.zombiesInFlight.decrementAndGet();
+            acquisitionService.zombiesInFlight.updateAndGet(current -> Math.max(0, current - 1));
           }
         }
 

@@ -610,7 +610,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         runningAgentsSemaphore != null ? runningAgentsSemaphore.availablePermits() : -1;
     int maxConcurrent = acquisitionService.getAgentProperties().getMaxConcurrentAgents();
     int activeCount = acquisitionService.getActiveAgentCount();
-    int zombiesInFlight = acquisitionService.getZombiesInFlight();
+    int zombiesInFlight = Math.max(0, acquisitionService.getZombiesInFlight());
     long readySnapshot = acquisitionService.getReadyCountSnapshot();
     long oldestOverdueSecondsNow = acquisitionService.getOldestOverdueSeconds();
     double capacityPerCycle = acquisitionService.getCapacityPerCycleSnapshot();
