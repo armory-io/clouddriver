@@ -610,7 +610,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         runningAgentsSemaphore != null ? runningAgentsSemaphore.availablePermits() : -1;
     int maxConcurrent = acquisitionService.getAgentProperties().getMaxConcurrentAgents();
     int activeCount = acquisitionService.getActiveAgentCount();
-    int zombiesInFlight = acquisitionService.getZombiesInFlight();
+    int zombiesInFlight = Math.max(0, acquisitionService.getZombiesInFlight());
     long readySnapshot = acquisitionService.getReadyCountSnapshot();
     long oldestOverdueSecondsNow = acquisitionService.getOldestOverdueSeconds();
     double capacityPerCycle = acquisitionService.getCapacityPerCycleSnapshot();
@@ -782,9 +782,44 @@ public class PriorityAgentScheduler extends CatsModuleAware
    */
   @Override
   public void unschedule(Agent agent) {
+    // Scheduler-scoped safeguard: avoid unscheduling shared regional instance-type agent
+    String agentType = agent != null ? agent.getAgentType() : null;
+    if (agentType != null && isSharedRegionalClassRegionPattern(agent, agentType)) {
+      log.info("Ignoring unschedule for shared regional agent {}", agentType);
+      return;
+    }
     acquisitionService.unregisterAgent(agent);
-    log.debug("Unregistered agent {} from scheduling", agent.getAgentType());
-    knownAgents.remove(agent.getAgentType());
+    log.debug("Unregistered agent {} from scheduling", agentType);
+    knownAgents.remove(agentType);
+  }
+
+  /**
+   * Detects the AWS instance-type agent that is intentionally shared per-region across accounts and
+   * uses the pattern "AmazonInstanceTypeCachingAgent/<region>" (no account prefix).
+   */
+  private boolean isSharedRegionalClassRegionPattern(Agent agent, String agentType) {
+    try {
+      // Only gate for AWS providers; other providers include account in agentType
+      String provider = agent != null ? agent.getProviderName() : null;
+      if (provider == null || !provider.toLowerCase().contains("aws")) {
+        return false;
+      }
+      int first = agentType.indexOf('/');
+      int last = agentType.lastIndexOf('/');
+      if (!(first > 0 && first == last && first < agentType.length() - 1)) {
+        return false;
+      }
+      // parts[0] should look like a ClassName ending with CachingAgent
+      String classPart = agentType.substring(0, first);
+      if (!classPart.matches("[A-Z][A-Za-z0-9]*CachingAgent")) {
+        return false;
+      }
+      // parts[1] should look like an AWS region
+      String regionPart = agentType.substring(first + 1);
+      return regionPart.matches("[a-z]{2}-[a-z]+-\\d");
+    } catch (Exception ignore) {
+      return false;
+    }
   }
 
   /**
