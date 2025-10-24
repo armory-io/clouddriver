@@ -140,29 +140,6 @@ public class OrphanCleanupService {
       return;
     }
 
-    // Guard against long-running loops: if previous pass is still considered running for too long
-    // (e.g., due to a bug), skip starting another pass to avoid monopolizing cleanup leadership.
-    long maxPassDurationMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
-    if (maxPassDurationMs > 0 && lastOrphanCleanup > 0) {
-      long sinceLast = nowMs() - lastOrphanCleanup;
-      // If we haven't updated lastOrphanCleanup for > runBudgetMs, assume the previous pass hung
-      long threshold = maxPassDurationMs;
-      if (sinceLast > threshold) {
-        log.warn(
-            "Skipping orphan cleanup: previous pass appears hung ({}ms since last update > budget {}ms). Releasing leadership defensively.",
-            sinceLast,
-            maxPassDurationMs);
-        try {
-          releaseCleanupLeadership();
-        } catch (Exception ignore) {
-          // Best-effort leadership release – lock may already be gone or expired
-        }
-        // Bump the timestamp to avoid log spam; next cycle will attempt again
-        lastOrphanCleanup = nowMs();
-        return;
-      }
-    }
-
     // Check if enough time has passed since last cleanup
     long intervalMs = schedulerProperties.getOrphanCleanup().getIntervalMs();
     if (!isPeriodElapsed(lastOrphanCleanup, intervalMs)) {

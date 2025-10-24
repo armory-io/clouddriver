@@ -546,6 +546,14 @@ public class ZombieCleanupService {
                     log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
                   }
                 }
+                // Early permit release first to minimize transient permit/accounting skew
+                if (fairnessHandler != null) {
+                  try {
+                    fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
+                  } catch (Exception e) {
+                    log.debug("Fairness handshake during zombie cleanup failed; continuing", e);
+                  }
+                }
                 if (acquisitionService != null) {
                   try {
                     acquisitionService.removeActiveAgent(agentType);
@@ -557,13 +565,6 @@ public class ZombieCleanupService {
                   }
                 } else {
                   activeAgents.remove(agentType);
-                }
-                if (fairnessHandler != null) {
-                  try {
-                    fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
-                  } catch (Exception e) {
-                    log.debug("Fairness handshake during zombie cleanup failed; continuing", e);
-                  }
                 }
                 if (log.isDebugEnabled()) {
                   log.debug("Cleaned up zombie agent: {}", agentType);
@@ -729,14 +730,7 @@ public class ZombieCleanupService {
       // ownership likely changed or the agent was already removed. Proceed with local cleanup
       // regardless to avoid race conditions that could orphan a legitimately re-acquired agent.
 
-      // ALWAYS clean local state and perform fairness, regardless of Redis outcome.
-      // This prevents permit leaks and stuck 'running' counts when Redis removal races or fails.
-      if (acquisitionService != null) {
-        acquisitionService.removeActiveAgent(agentType);
-      } else {
-        activeAgents.remove(agentType);
-      }
-
+      // Perform fairness early release first to minimize transient permit mismatch windows
       if (fairnessHandler != null) {
         try {
           fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
@@ -744,6 +738,13 @@ public class ZombieCleanupService {
           log.debug(
               "Failed early-permit release during individual zombie cleanup for {}", agentType, e);
         }
+      }
+
+      // ALWAYS clean local state regardless of Redis outcome to prevent leaks
+      if (acquisitionService != null) {
+        acquisitionService.removeActiveAgent(agentType);
+      } else {
+        activeAgents.remove(agentType);
       }
 
       if (removed) {

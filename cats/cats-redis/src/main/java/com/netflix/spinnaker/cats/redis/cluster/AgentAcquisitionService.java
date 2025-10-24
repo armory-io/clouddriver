@@ -128,14 +128,26 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   public void earlyReleasePermitIfHeld(String agentType) {
     try {
       RunState runStateForAgent = runStates.get(agentType);
-      if (runStateForAgent != null && runStateForAgent.permitHeld.compareAndSet(true, false)) {
+      if (runStateForAgent == null) {
+        return;
+      }
+
+      if (runStateForAgent.permitHeld.compareAndSet(true, false)) {
         if (runningAgentsRef != null) {
           runningAgentsRef.release();
         }
-        // Increment zIF only if the worker actually started running
+
         if (runStateForAgent.started.get()) {
           zombiesInFlight.incrementAndGet();
           runStateForAgent.zifIncremented.set(true);
+          log.debug(
+              "Early permit release for {}: started={}, zombiesInFlight={}",
+              agentType,
+              true,
+              zombiesInFlight.get());
+        } else {
+          log.debug(
+              "Early permit release for {}: started={}, skipping zIF increment", agentType, false);
         }
       }
     } catch (Exception e) {
@@ -3319,10 +3331,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
     while (retryCount < maxRetries) {
       try (Jedis jedis = jedisPool.getResource()) {
-        String nextScore;
-
-        // Use standard score calculation for all cases
-        nextScore = score(jedis, offsetMs);
+        String nextScore = score(jedis, offsetMs);
 
         log.debug(
             "Scheduling agent {} in Redis with score: {} (attempt {})",
@@ -3330,6 +3339,33 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             nextScore,
             retryCount + 1);
 
+        // During shutdown, attempt to move agent from working to waiting if present.
+        // If move fails (agent was concurrently removed), fall through to add operation.
+        if (shuttingDown.get()) {
+          Double workingScore = jedis.zscore(WORKING_SET, agentType);
+          if (workingScore != null) {
+            String expectedScore = String.valueOf(workingScore.longValue());
+            log.debug(
+                "Agent {} in working during shutdown, attempting conditional move", agentType);
+            Object moveResult =
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.MOVE_AGENTS_CONDITIONAL,
+                    java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                    java.util.Arrays.asList(agentType, expectedScore, nextScore));
+
+            boolean moved = moveResult != null && "swapped".equals(moveResult);
+            if (moved) {
+              log.debug("Agent {} moved from working to waiting", agentType);
+              return;
+            } else {
+              log.debug(
+                  "Agent {} move failed (concurrent modification), falling back to add", agentType);
+            }
+          }
+        }
+
+        // Add agent to waiting set if not already present in either set
         Object result =
             scriptManager.evalshaWithSelfHeal(
                 jedis,
@@ -3357,7 +3393,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               retryCount,
               e.getMessage());
           try {
-            Thread.sleep(100 * retryCount); // Exponential backoff
+            Thread.sleep(100 * retryCount); // Backoff for next attempt
           } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             log.warn("Interrupted during Redis retry backoff for agent {}", agentType);
@@ -3826,11 +3862,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         capturedCause = cause;
         failureClass = acquisitionService.classifyFailure(cause);
       } finally {
-        // Always clean up agent tracking when execution completes (success or failure)
-        // This removes the agent from activeAgents map and working Redis set
-        acquisitionService.removeActiveAgent(agentType);
-
-        // Cancel any scheduled dead-man action
+        // Cancel any scheduled dead-man action FIRST
         try {
           RunState runState = acquisitionService.runStates.get(agentType);
           if (runState != null && runState.deadmanHandle != null) {
@@ -3848,29 +3880,37 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           log.debug("Dead-man cleanup failed for {}", agentType, ex);
         }
 
-        // Handle conditional agent release (re-queuing on failure/shutdown)
+        // Queue completion BEFORE removing from tracking to avoid race with cleanup services
         acquisitionService.conditionalReleaseAgent(
             agent, acquireScore, success, failureClass, capturedCause);
+
+        // Now remove from active tracking and Redis
+        acquisitionService.removeActiveAgent(agentType);
 
         // Critical: Exactly-once permit release
         RunState runStateForAgent = acquisitionService.runStates.remove(agentType);
         if (runStateForAgent == null) {
-          // No run-state (e.g., tests calling AgentWorker directly) -> release as before
           if (runningAgents != null) {
             runningAgents.release();
-            log.debug("Released semaphore permit for agent {} (no run-state)", agentType);
-          }
-        } else if (runStateForAgent.permitHeld.compareAndSet(true, false)) {
-          // Normal path: release once
-          if (runningAgents != null) {
-            runningAgents.release();
-            log.debug("Released semaphore permit for agent {}", agentType);
+            log.debug("Released permit for {} (no run-state)", agentType);
           }
         } else {
-          // Permit was pre-released by zombie cleanup. Decrement zIF only if we had incremented it
-          // earlier (worker actually started and early-release performed accounting).
-          if (runStateForAgent.zifIncremented.get()) {
-            acquisitionService.zombiesInFlight.updateAndGet(current -> Math.max(0, current - 1));
+          if (runStateForAgent.permitHeld.compareAndSet(true, false)) {
+            if (runningAgents != null) {
+              runningAgents.release();
+              log.debug("Released permit for {}", agentType);
+            }
+          } else {
+            // Permit was pre-released by cleanup. Decrement zIF if it was incremented.
+            if (runStateForAgent.zifIncremented.get()) {
+              int newZif =
+                  acquisitionService.zombiesInFlight.updateAndGet(
+                      current -> Math.max(0, current - 1));
+              log.debug(
+                  "Permit for {} was pre-released by cleanup, decremented zombiesInFlight to {}",
+                  agentType,
+                  newZif);
+            }
           }
         }
 

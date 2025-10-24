@@ -30,7 +30,7 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
-@DisplayName("Orphan cleanup hung-pass releases leadership and defers next run")
+@DisplayName("Orphan cleanup defers when leadership held by another instance")
 @Testcontainers
 class OrphanCleanupHungLeadershipReleaseTest {
 
@@ -53,8 +53,8 @@ class OrphanCleanupHungLeadershipReleaseTest {
   }
 
   @Test
-  @DisplayName("If previous pass appears hung, service releases leadership and updates timestamp")
-  void previousPassHung_releasesLeadership_and_updatesTimestamp() throws Exception {
+  @DisplayName("When leadership is held elsewhere, cleanup skips and leaves state unchanged")
+  void leadershipHeld_skips_and_keepsTimestampAndKey() throws Exception {
     PrioritySchedulerProperties props = new PrioritySchedulerProperties();
     props.getKeys().setWaitingSet("waiting");
     props.getKeys().setWorkingSet("working");
@@ -88,15 +88,16 @@ class OrphanCleanupHungLeadershipReleaseTest {
       j.set(props.getKeys().getCleanupLeaderKey(), "node-1");
     }
 
+    // Since leadership key exists and we didn't acquire it, the service should skip
     svc.cleanupOrphanedAgentsIfNeeded();
 
     long after = lastField.getLong(svc);
-    assertThat(after).isGreaterThan(before);
+    assertThat(after).isEqualTo(before);
 
-    // Assert leadership key was released
+    // Leadership key should remain (no release since we didn't acquire)
     try (Jedis j = jedisPool.getResource()) {
       String v = j.get(props.getKeys().getCleanupLeaderKey());
-      assertThat(v).isNull();
+      assertThat(v).isEqualTo("node-1");
     }
   }
 }

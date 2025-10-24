@@ -32,7 +32,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -138,65 +137,126 @@ class ShutdownBehaviorTest {
   class RaceConditionTests {
 
     @Test
-    @DisplayName("Should always re-queue agents during shutdown for reliability")
+    @DisplayName("Should preserve agents in waiting when they complete during shutdown")
     void shouldAlwaysReQueueDuringShutdown() throws Exception {
-      // Given - Agent that will take time to execute
+      /*
+       * CRITICAL SAFETY INVARIANT:
+       * When an agent completes during shutdown, it MUST be added to the waiting set
+       * to ensure it will be picked up by other pods after restart.
+       *
+       * This test verifies the interaction between:
+       * 1. conditionalReleaseAgent (called first in finally block after Bug #2 fix)
+       * 2. removeActiveAgent (called second)
+       * 3. Shutdown flag affecting behavior of both
+       */
+
+      // Given - Agent that will complete during shutdown
       Agent slowAgent = createMockAgent("slow-agent");
       CountDownLatch executionStarted = new CountDownLatch(1);
       CountDownLatch allowCompletion = new CountDownLatch(1);
-      AtomicInteger redisAddAttempts = new AtomicInteger(0);
 
       AgentExecution slowExecution = mock(AgentExecution.class);
       doAnswer(
               invocation -> {
                 executionStarted.countDown();
-                allowCompletion.await(5, TimeUnit.SECONDS); // Wait for shutdown signal
-                return null;
+                allowCompletion.await(5, TimeUnit.SECONDS);
+                return null; // Successful execution
               })
           .when(slowExecution)
           .executeAgent(any());
 
       ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
 
-      // Register and start agent execution
+      // Register agent
       acquisitionService.registerAgent(slowAgent, slowExecution, instrumentation);
 
-      // Start agent execution
+      // Clear any auto-added entries from registration to start clean
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.del("waiting");
+        jedis.del("working");
+      }
+
+      // Start agent execution - this should add it to working set
       int acquired = acquisitionService.saturatePool(0L, null, testExecutor);
       assertThat(acquired).isEqualTo(1);
-
-      // Wait for execution to start
       assertThat(executionStarted.await(2, TimeUnit.SECONDS)).isTrue();
+
+      // Verify agent is in working set and tracked as active
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("working"))
+            .describedAs("Agent should be in working set after acquisition")
+            .isEqualTo(1);
+        assertThat(jedis.zscore("working", "slow-agent")).isNotNull();
+      }
       assertThat(acquisitionService.getActiveAgentCount()).isEqualTo(1);
 
-      // When - Trigger shutdown while agent is running
+      // When - Trigger shutdown while agent is still running
       acquisitionService.setShuttingDown(true);
-      acquisitionService.setGracefulShutdown(true);
 
-      // Count Redis ADD script calls before graceful shutdown
+      // Allow agent to complete during shutdown
+      // The finally block will execute:
+      // 1. conditionalReleaseAgent -> checks shuttingDown=true -> immediately calls
+      // scheduleAgentInRedis
+      // 2. removeActiveAgent -> checks shuttingDown=true -> only removes from WORKZ, preserves
+      // WAITZ
+      allowCompletion.countDown();
+
+      // Give enough time for:
+      // - Agent execution to complete
+      // - Finally block to execute both methods
+      // - Redis operations to complete
+      Thread.sleep(1000);
+
+      // Then - CRITICAL INVARIANT: Agent MUST be in waiting set for restart
       try (Jedis jedis = jedisPool.getResource()) {
-        long beforeWaitzSize = jedis.zcard("waiting");
-
-        // Simulate graceful shutdown re-queuing
-        acquisitionService.conditionalReleaseAgent(slowAgent, "test-score", false, null, null);
-
-        // Allow agent to complete normally (this would also try to re-queue)
-        allowCompletion.countDown();
-        Thread.sleep(100); // Give time for normal completion flow
-
-        long afterWaitzSize = jedis.zcard("waiting");
-
-        // Then - we always re-queue during shutdown
-        System.out.println("waiting before: " + beforeWaitzSize + ", after: " + afterWaitzSize);
-        assertThat(afterWaitzSize - beforeWaitzSize)
-            .isEqualTo(1); // Agent re-queued during shutdown
-
-        // Verify the agent is successfully preserved for restart
         Set<String> waitingAgents = jedis.zrange("waiting", 0, -1);
-        boolean slowAgentFound = waitingAgents.contains("slow-agent");
-        System.out.println("Agents in waiting: " + waitingAgents);
-        assertThat(slowAgentFound).isTrue(); // Agent preserved for restart
+        Set<String> workingAgents = jedis.zrange("working", 0, -1);
+        long waitingSize = jedis.zcard("waiting");
+        long workingSize = jedis.zcard("working");
+
+        // Invariant 1: Agent must be in waiting for restart
+        assertThat(waitingSize)
+            .describedAs(
+                "Agent MUST be in waiting after shutdown completion to prevent data loss. "
+                    + "waiting=%s, working=%s, activeCount=%d, shuttingDown=%s",
+                waitingAgents,
+                workingAgents,
+                acquisitionService.getActiveAgentCount(),
+                acquisitionService.isShuttingDown())
+            .isGreaterThanOrEqualTo(1);
+
+        boolean slowAgentInWaiting = waitingAgents.contains("slow-agent");
+        assertThat(slowAgentInWaiting)
+            .describedAs(
+                "slow-agent MUST be in waiting set after shutdown. "
+                    + "waiting=%s, working=%s. "
+                    + "If this fails, agents may be lost during pod restart!",
+                waitingAgents, workingAgents)
+            .isTrue();
+
+        // Invariant 2: Agent should NOT be in working (removeActiveAgent removes from WORKZ)
+        assertThat(workingSize)
+            .describedAs(
+                "Agent should not be in working after completion. working=%s", workingAgents)
+            .isEqualTo(0);
+
+        // Invariant 3: Score should be reasonable (not far-future due to TIME sync issues)
+        Double score = jedis.zscore("waiting", "slow-agent");
+        assertThat(score).isNotNull();
+        long scoreSeconds = score.longValue();
+        long currentSeconds = System.currentTimeMillis() / 1000;
+        assertThat(scoreSeconds)
+            .describedAs(
+                "Score should be near current time. Got %d, current %d. "
+                    + "Far-future scores indicate Redis TIME sync bug.",
+                scoreSeconds, currentSeconds)
+            .isBetween(currentSeconds - 10, currentSeconds + 300); // Allow up to 5min future
       }
+
+      // Verify agent is no longer tracked as active (removeActiveAgent cleared it)
+      assertThat(acquisitionService.getActiveAgentCount())
+          .describedAs("Agent should not be in activeAgents after completion")
+          .isEqualTo(0);
     }
   }
 
