@@ -85,6 +85,10 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   // have not yet exited. This prevents the scheduler from oversubscribing when we release early.
   private final AtomicInteger zombiesInFlight = new AtomicInteger(0);
 
+  // Raw zombies-in-flight value for diagnostics (may be negative if mis-accounting occurs).
+  // Behavior must use the effective/clamped counter above; logs and debug tools can use this.
+  private final AtomicInteger zombiesInFlightRaw = new AtomicInteger(0);
+
   // Redis TIME synchronization for multi-instance coordination
   private static final AtomicLong lastTimeCheck = new AtomicLong(0);
   private static final AtomicLong serverClientOffset = new AtomicLong(0);
@@ -138,13 +142,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         }
 
         if (runStateForAgent.started.get()) {
-          zombiesInFlight.incrementAndGet();
+          int raw = zombiesInFlightRaw.incrementAndGet();
           runStateForAgent.zifIncremented.set(true);
           log.debug(
-              "Early permit release for {}: started={}, zombiesInFlight={}",
+              "Early permit release for {}: started={}, zIF_raw={} zIF_effective={}",
               agentType,
               true,
-              zombiesInFlight.get());
+              raw,
+              Math.max(0, zombiesInFlightRaw.get()));
         } else {
           log.debug(
               "Early permit release for {}: started={}, skipping zIF increment", agentType, false);
@@ -196,7 +201,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
   /** Current number of zombies whose permits were pre-released but threads still running. */
   public int getZombiesInFlight() {
-    return zombiesInFlight.get();
+    return zombiesInFlightRaw.get();
+  }
+
+  /** Raw zIF value for diagnostics (may be negative). */
+  int getZombiesInFlightRaw() {
+    return zombiesInFlightRaw.get();
   }
 
   // Backlog/health snapshots and rate-limiting
@@ -501,15 +511,25 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           int availablePermits = runningAgents.availablePermits();
           int heldPermits = Math.max(0, maxConcurrentAgents - availablePermits);
           int cap = Math.max(0, heldPermits - currentlyRunning);
-          int zombiesInFlightCount = zombiesInFlight.get();
-          if (zombiesInFlightCount > cap) {
-            int delta = cap - zombiesInFlightCount; // negative
-            int newValue = zombiesInFlight.updateAndGet(current -> Math.max(0, current + delta));
+          int rawBefore = zombiesInFlightRaw.get();
+          if (rawBefore > cap) {
+            int delta = cap - rawBefore; // negative
+            int rawAfter = zombiesInFlightRaw.addAndGet(delta);
+            if (rawAfter < 0) {
+              log.warn(
+                  "zIF raw negative after reconciliation: raw={} delta={} held={} active={}",
+                  rawAfter,
+                  delta,
+                  heldPermits,
+                  currentlyRunning);
+            }
+            zombiesInFlight.set(Math.max(0, rawAfter));
             if (log.isDebugEnabled()) {
               log.debug(
-                  "Reconciled zombiesInFlight from {} to {} (held={}, active={})",
-                  zombiesInFlightCount,
-                  newValue,
+                  "Reconciled zombiesInFlight raw from {} to {} (effective={} held={} active={})",
+                  rawBefore,
+                  rawAfter,
+                  Math.max(0, zombiesInFlightRaw.get()),
                   heldPermits,
                   currentlyRunning);
             }
@@ -673,7 +693,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       java.util.Set<String> attemptedThisCycle = new java.util.HashSet<>();
 
       // Calculate how many new agents this pod can try to acquire
-      int effectiveRunning = currentlyRunning + Math.max(0, zombiesInFlight.get());
+      int effectiveRunning = currentlyRunning + Math.max(0, zombiesInFlightRaw.get());
       int availableSlotsForNewAgents =
           unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - effectiveRunning);
 
@@ -3901,15 +3921,18 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               log.debug("Released permit for {}", agentType);
             }
           } else {
-            // Permit was pre-released by cleanup. Decrement zIF if it was incremented.
+            // Permit was pre-released by cleanup. Decrement raw zIF if it was incremented.
             if (runStateForAgent.zifIncremented.get()) {
-              int newZif =
-                  acquisitionService.zombiesInFlight.updateAndGet(
-                      current -> Math.max(0, current - 1));
+              int raw = acquisitionService.zombiesInFlightRaw.decrementAndGet();
+              if (raw < 0) {
+                log.warn("zIF raw went negative during worker finally: raw={}", raw);
+              }
+              // Do not set the separate effective counter; clamp only at behavior read sites.
               log.debug(
-                  "Permit for {} was pre-released by cleanup, decremented zombiesInFlight to {}",
+                  "Permit for {} was pre-released by cleanup, zIF_raw={} zIF_effective={}",
                   agentType,
-                  newZif);
+                  raw,
+                  acquisitionService.zombiesInFlight.get());
             }
           }
         }

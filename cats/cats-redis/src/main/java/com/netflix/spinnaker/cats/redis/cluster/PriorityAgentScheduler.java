@@ -238,7 +238,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
             double ready = acquisitionService.getReadyCountSnapshot();
             return cap > 0 ? (ready / cap) : 0;
           },
-          () -> (double) acquisitionService.getZombiesInFlight());
+          () -> (double) Math.max(0, acquisitionService.getZombiesInFlight()));
     } catch (Exception e) {
       log.debug("Failed to register scheduler gauges", e);
     }
@@ -337,7 +337,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         int availablePermitsNow =
             runningAgentsSemaphore != null ? runningAgentsSemaphore.availablePermits() : -1;
         // Read zombiesInFlight immediately after permits to reduce diagnostic skew
-        int zombiesInFlightCount = acquisitionService.getZombiesInFlight();
+        int zombiesInFlightCount = Math.max(0, acquisitionService.getZombiesInFlight());
         int poolActive = 0;
         if (config.getAgentWorkPool() instanceof java.util.concurrent.ThreadPoolExecutor) {
           poolActive =
