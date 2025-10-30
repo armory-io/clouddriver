@@ -141,18 +141,20 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           runningAgentsRef.release();
         }
 
-        if (runStateForAgent.started.get()) {
+        boolean started = runStateForAgent.started.get();
+        if (started) {
           int raw = zombiesInFlightRaw.incrementAndGet();
+          zombiesInFlight.incrementAndGet();
           runStateForAgent.zifIncremented.set(true);
           log.debug(
-              "Early permit release for {}: started={}, zIF_raw={} zIF_effective={}",
+              "Early permit release for {}: started={} zIF_raw={} zIF_eff={}",
               agentType,
               true,
               raw,
-              Math.max(0, zombiesInFlightRaw.get()));
+              zombiesInFlight.get());
         } else {
           log.debug(
-              "Early permit release for {}: started={}, skipping zIF increment", agentType, false);
+              "Early permit release for {}: started=false, skipping zIF increment", agentType);
         }
       }
     } catch (Exception e) {
@@ -201,7 +203,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
   /** Current number of zombies whose permits were pre-released but threads still running. */
   public int getZombiesInFlight() {
-    return zombiesInFlightRaw.get();
+    return Math.max(0, zombiesInFlight.get());
   }
 
   /** Raw zIF value for diagnostics (may be negative). */
@@ -3904,10 +3906,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         acquisitionService.conditionalReleaseAgent(
             agent, acquireScore, success, failureClass, capturedCause);
 
-        // Now remove from active tracking and Redis
-        acquisitionService.removeActiveAgent(agentType);
-
-        // Critical: Exactly-once permit release
+        // Critical: Exactly-once permit release (perform BEFORE Redis cleanup)
         RunState runStateForAgent = acquisitionService.runStates.remove(agentType);
         if (runStateForAgent == null) {
           if (runningAgents != null) {
@@ -3924,6 +3923,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             // Permit was pre-released by cleanup. Decrement raw zIF if it was incremented.
             if (runStateForAgent.zifIncremented.get()) {
               int raw = acquisitionService.zombiesInFlightRaw.decrementAndGet();
+              acquisitionService.zombiesInFlight.updateAndGet(v -> Math.max(0, v - 1));
               if (raw < 0) {
                 log.warn("zIF raw went negative during worker finally: raw={}", raw);
               }
@@ -3936,6 +3936,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             }
           }
         }
+
+        // Now remove from active tracking and Redis
+        acquisitionService.removeActiveAgent(agentType);
 
         log.debug("Agent {} execution cleanup completed", agentType);
       }

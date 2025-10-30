@@ -111,7 +111,7 @@ class ZombiesInFlightGaugeIntegrationTest {
 
     // Early release should increment zIF (and release a semaphore permit)
     acq.earlyReleasePermitIfHeld("agent/zif-test");
-    assertThat(acq.getZombiesInFlight()).isEqualTo(1);
+    assertThat(Math.max(0, acq.getZombiesInFlight())).isEqualTo(1);
     assertThat(sem.availablePermits()).isEqualTo(1);
     assertThat(gaugeValue(registry, "cats.redisPriority.zombiesInFlight")).isEqualTo(1.0d);
 
@@ -120,7 +120,7 @@ class ZombiesInFlightGaugeIntegrationTest {
     zifField.setAccessible(true);
     ((java.util.concurrent.atomic.AtomicInteger) zifField.get(acq)).decrementAndGet();
 
-    assertThat(acq.getZombiesInFlight()).isEqualTo(0);
+    assertThat(Math.max(0, acq.getZombiesInFlight())).isEqualTo(0);
     assertThat(gaugeValue(registry, "cats.redisPriority.zombiesInFlight")).isEqualTo(0.0d);
   }
 }
