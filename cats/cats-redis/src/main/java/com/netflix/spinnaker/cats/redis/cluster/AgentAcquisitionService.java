@@ -1762,19 +1762,32 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       try (Jedis jedis = jedisPool.getResource()) {
         if (shuttingDown.get()) {
           // During shutdown: Only remove from working to preserve waiting entries
-          // Agents in waiting were put there by graceful shutdown for restart
           jedis.zrem(WORKING_SET, agentType);
           log.debug(
               "Removed agent {} from active tracking and working (preserving waiting during shutdown)",
               agentType);
         } else {
-          // Normal operation: Remove from both sets
-          scriptManager.evalshaWithSelfHeal(
-              jedis,
-              RedisScriptManager.REMOVE_AGENT,
-              java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-              java.util.Collections.singletonList(agentType));
-          log.debug("Removed agent {} from active tracking and Redis sets", agentType);
+          // Normal operation: Preserve waiting entry if present (e.g., completion or orphan move)
+          boolean inWaiting = false;
+          try {
+            Double w = jedis.zscore(WAITING_SET, agentType);
+            inWaiting = (w != null);
+          } catch (Exception ignore) {
+            inWaiting = false;
+          }
+          if (inWaiting) {
+            // Remove only from working to avoid deleting the re-queued waiting entry
+            jedis.zrem(WORKING_SET, agentType);
+            log.debug("Removed agent {} from working only (waiting entry preserved)", agentType);
+          } else {
+            // Remove from both when not present in waiting
+            scriptManager.evalshaWithSelfHeal(
+                jedis,
+                RedisScriptManager.REMOVE_AGENT,
+                java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                java.util.Collections.singletonList(agentType));
+            log.debug("Removed agent {} from active tracking and Redis sets", agentType);
+          }
         }
       } catch (Exception e) {
         log.error("Failed to remove agent {} from Redis", agentType, e);

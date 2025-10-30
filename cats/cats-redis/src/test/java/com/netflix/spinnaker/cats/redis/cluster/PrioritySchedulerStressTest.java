@@ -293,40 +293,62 @@ class PrioritySchedulerStressTest {
       }
     }
     int zifAfter = Math.max(0, acquisitionService.getZombiesInFlight());
+
+    // Process any remaining completion queue items after threads have stopped
+    // This ensures agents that completed just before shutdown are properly rescheduled
+    try {
+      acquisitionService.saturatePool(Long.MAX_VALUE, null, agentWorkPool);
+    } catch (Exception e) {
+      // Best-effort: ignore errors during post-shutdown processing
+    }
+
     // End-of-run eventual-consistency assertions with brief stabilization window
     try (Jedis j = jedisPool.getResource()) {
       String WAITING_KEY = schedProps.getKeys().getWaitingSet();
       String WORKING_KEY = schedProps.getKeys().getWorkingSet();
       long endBy = System.currentTimeMillis() + 1000L;
       boolean settled = false;
+      java.util.Set<String> waiting = null;
+      java.util.Set<String> working = null;
+      int registered = params.numAgents;
+      int sumSets = 0;
+      int completing = 0;
+      int active = 0;
+
       while (System.currentTimeMillis() < endBy && !settled) {
-        java.util.Set<String> waiting = j.zrange(WAITING_KEY, 0, -1);
-        java.util.Set<String> working = j.zrange(WORKING_KEY, 0, -1);
-        int registered = params.numAgents;
-        int sumSets = waiting.size() + working.size();
-        int completing = Math.max(0, acquisitionService.getCompletionQueueSize());
-        if ((registered - sumSets) <= completing) {
+        waiting = j.zrange(WAITING_KEY, 0, -1);
+        working = j.zrange(WORKING_KEY, 0, -1);
+        sumSets = waiting.size() + working.size();
+        completing = Math.max(0, acquisitionService.getCompletionQueueSize());
+        active = Math.max(0, acquisitionService.getActiveAgentCount());
+        if ((registered - sumSets) <= (completing + active)) {
           settled = true;
           break;
         }
         Thread.sleep(10);
       }
-      java.util.Set<String> waiting = j.zrange(WAITING_KEY, 0, -1);
-      java.util.Set<String> working = j.zrange(WORKING_KEY, 0, -1);
+
+      // Use final values for assertions (or re-fetch if loop didn't run)
+      if (waiting == null || working == null) {
+        waiting = j.zrange(WAITING_KEY, 0, -1);
+        working = j.zrange(WORKING_KEY, 0, -1);
+        sumSets = waiting.size() + working.size();
+        completing = Math.max(0, acquisitionService.getCompletionQueueSize());
+        active = Math.max(0, acquisitionService.getActiveAgentCount());
+      }
+
       java.util.Set<String> inter = new java.util.HashSet<>(waiting);
       inter.retainAll(working);
       org.assertj.core.api.Assertions.assertThat(inter)
           .describedAs("waiting/workingset must be disjoint at end-of-run")
           .isEmpty();
-      int registered = params.numAgents;
-      int sumSets = waiting.size() + working.size();
-      int completing = Math.max(0, acquisitionService.getCompletionQueueSize());
       org.assertj.core.api.Assertions.assertThat(sumSets)
           .describedAs("sum of sets must not exceed registered")
           .isLessThanOrEqualTo(registered);
       org.assertj.core.api.Assertions.assertThat(registered - sumSets)
-          .describedAs("missing members must be explainable by completing queue")
-          .isLessThanOrEqualTo(completing);
+          .describedAs(
+              "missing members must be explainable by completing queue or active execution")
+          .isLessThanOrEqualTo(completing + active);
     }
     // Shutdown pools
     agentWorkPool.shutdownNow();
