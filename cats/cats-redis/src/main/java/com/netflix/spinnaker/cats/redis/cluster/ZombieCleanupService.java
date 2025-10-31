@@ -220,11 +220,20 @@ public class ZombieCleanupService {
     long zombieCleanupInterval = schedulerProperties.getZombieCleanup().getIntervalMs();
 
     if (isPeriodElapsed(lastZombieCleanup, zombieCleanupInterval)) {
+      if (log.isDebugEnabled()) {
+        log.debug(
+            "Starting zombie cleanup cycle (interval={}ms, activeAgents={})",
+            zombieCleanupInterval,
+            activeAgents.size());
+      }
       int cleaned = cleanupZombieAgents(activeAgents, activeAgentsFutures);
       lastZombieCleanup = now;
 
-      if (cleaned > 0) {
-        log.info("Zombie cleanup completed: {} agents cleaned up", cleaned);
+      // Note: Detailed completion log is emitted by cleanupZombieAgents() itself
+    } else {
+      long remaining = zombieCleanupInterval - (now - lastZombieCleanup);
+      if (log.isDebugEnabled()) {
+        log.debug("Skipping zombie cleanup - interval not elapsed ({}ms remaining)", remaining);
       }
     }
   }
@@ -260,14 +269,23 @@ public class ZombieCleanupService {
 
       for (Map.Entry<String, String> entry : activeAgents.entrySet()) {
         if (Thread.currentThread().isInterrupted()) {
-          log.warn("Stopping zombie scan early due to interrupt");
-          break;
-        }
-        if (overBudget(start, budgetMs)) {
-          log.warn("Stopping zombie scan early due to budget deadline");
+          log.warn(
+              "Stopping zombie scan early due to interrupt (scanned={}, zombies={})",
+              validAgentsScanned,
+              zombieAgentTypes.size());
           break;
         }
         currentTime = nowMs();
+        long elapsedMs = currentTime - start;
+        if (overBudget(start, budgetMs)) {
+          log.info(
+              "Zombie scan stopping due to budget deadline (scanned={}, zombies={}, elapsed={}ms, budget={}ms)",
+              validAgentsScanned,
+              zombieAgentTypes.size(),
+              elapsedMs,
+              budgetMs);
+          break;
+        }
         String agentType = entry.getKey();
         String acquireScore = entry.getValue();
 
@@ -309,19 +327,23 @@ public class ZombieCleanupService {
       }
 
       // Log scanning summary
+      long scanElapsedMs = nowMs() - start;
       if (zombieAgentTypes.isEmpty()) {
         if (log.isDebugEnabled()) {
           log.debug(
-              "Zombie scan completed: {} agents analyzed, 0 zombies found", validAgentsScanned);
+              "Zombie scan completed: {} agents analyzed, 0 zombies found (elapsed={}ms)",
+              validAgentsScanned,
+              scanElapsedMs);
         }
         return 0;
       }
 
-      log.warn(
-          "Zombie scan completed: {} agents analyzed, {} zombies found - cleaning up: {}",
+      log.info(
+          "Zombie scan completed: {} agents analyzed, {} zombies found - cleaning up: {} (elapsed={}ms)",
           validAgentsScanned,
           zombieAgentTypes.size(),
-          zombieAgentTypes.stream().limit(5).collect(java.util.stream.Collectors.toList()));
+          zombieAgentTypes.stream().limit(5).collect(java.util.stream.Collectors.toList()),
+          scanElapsedMs);
 
       // Check if batch operations are enabled (disabled by default for safety)
       boolean batchOperationsEnabled = schedulerProperties.getBatchOperations().isEnabled();
@@ -337,11 +359,20 @@ public class ZombieCleanupService {
 
           for (String agentType : zombieAgentTypes) {
             if (Thread.currentThread().isInterrupted()) {
-              log.warn("Stopping zombie individual cleanup due to interrupt");
+              log.warn(
+                  "Stopping zombie individual cleanup due to interrupt (cleaned={}, remaining={})",
+                  totalCleaned,
+                  zombieAgentTypes.size() - totalCleaned);
               break;
             }
+            long elapsedMs = nowMs() - start;
             if (overBudget(start, budgetMs)) {
-              log.warn("Stopping zombie individual cleanup due to budget deadline");
+              log.info(
+                  "Zombie individual cleanup stopping due to budget deadline (cleaned={}, remaining={}, elapsed={}ms, budget={}ms)",
+                  totalCleaned,
+                  zombieAgentTypes.size() - totalCleaned,
+                  elapsedMs,
+                  budgetMs);
               break;
             }
             try {
@@ -373,22 +404,40 @@ public class ZombieCleanupService {
 
             for (String agentType : zombieAgentTypes) {
               if (Thread.currentThread().isInterrupted()) {
-                log.warn("Stopping zombie batch preparation due to interrupt");
+                log.warn(
+                    "Stopping zombie batch preparation due to interrupt (prepared={}, cleaned={})",
+                    zombieBatch.size(),
+                    totalCleaned);
                 break;
               }
+              long elapsedMs = nowMs() - start;
               if (overBudget(start, budgetMs)) {
-                log.warn("Stopping zombie batch preparation due to budget deadline");
+                log.info(
+                    "Zombie batch preparation stopping due to budget deadline (prepared={}, cleaned={}, elapsed={}ms, budget={}ms)",
+                    zombieBatch.size(),
+                    totalCleaned,
+                    elapsedMs,
+                    budgetMs);
                 break;
               }
               zombieBatch.add(agentType);
 
               if (zombieBatch.size() >= batchSize) {
                 if (Thread.currentThread().isInterrupted()) {
-                  log.warn("Skipping zombie batch execution due to interrupt");
+                  log.warn(
+                      "Skipping zombie batch execution due to interrupt (batchSize={}, cleaned={})",
+                      zombieBatch.size(),
+                      totalCleaned);
                   break;
                 }
+                long batchElapsedMs = nowMs() - start;
                 if (overBudget(start, budgetMs)) {
-                  log.warn("Skipping zombie batch execution due to budget deadline");
+                  log.info(
+                      "Skipping zombie batch execution due to budget deadline (batchSize={}, cleaned={}, elapsed={}ms, budget={}ms)",
+                      zombieBatch.size(),
+                      totalCleaned,
+                      batchElapsedMs,
+                      budgetMs);
                   break;
                 }
                 totalCleaned +=
@@ -412,12 +461,25 @@ public class ZombieCleanupService {
         }
 
         zombiesCleanedUp.add(totalCleaned);
+        long totalElapsedMs = nowMs() - start;
         if (metrics != null) {
-          metrics.recordCleanupTime("zombie", nowMs() - start);
+          metrics.recordCleanupTime("zombie", totalElapsedMs);
           metrics.incrementCleanupCleaned("zombie", totalCleaned);
         }
-        if (log.isDebugEnabled()) {
-          log.debug("Zombie cleanup completed: {} agents cleaned up", totalCleaned);
+        if (totalCleaned > 0) {
+          log.info(
+              "Zombie cleanup cycle completed: {} agents cleaned (scanned={}, zombies={}, elapsed={}ms, budget={}ms)",
+              totalCleaned,
+              validAgentsScanned,
+              zombieAgentTypes.size(),
+              totalElapsedMs,
+              budgetMs);
+        } else if (log.isDebugEnabled()) {
+          log.debug(
+              "Zombie cleanup cycle completed: 0 agents cleaned (scanned={}, elapsed={}ms, budget={}ms)",
+              validAgentsScanned,
+              totalElapsedMs,
+              budgetMs);
         }
         return totalCleaned;
 
@@ -587,11 +649,20 @@ public class ZombieCleanupService {
               int fallbackCleaned = 0;
               for (String agentType : remainingForFallback) {
                 if (Thread.currentThread().isInterrupted()) {
-                  log.warn("Stopping zombie individual fallback due to interrupt");
+                  log.warn(
+                      "Stopping zombie individual fallback due to interrupt (fallbackCleaned={}, remaining={})",
+                      fallbackCleaned,
+                      remainingForFallback.size() - fallbackCleaned);
                   break;
                 }
+                long elapsedMs = nowMs() - startEpochMs;
                 if (overBudget(startEpochMs, budgetMs)) {
-                  log.warn("Stopping zombie individual fallback due to budget deadline");
+                  log.info(
+                      "Zombie individual fallback stopping due to budget deadline (fallbackCleaned={}, remaining={}, elapsed={}ms, budget={}ms)",
+                      fallbackCleaned,
+                      remainingForFallback.size() - fallbackCleaned,
+                      elapsedMs,
+                      budgetMs);
                   break;
                 }
                 try {
@@ -628,11 +699,20 @@ public class ZombieCleanupService {
       int totalCleaned = 0;
       for (String agentType : zombieAgentTypes) {
         if (Thread.currentThread().isInterrupted()) {
-          log.warn("Stopping zombie individual fallback due to interrupt");
+          log.warn(
+              "Stopping zombie individual fallback due to interrupt (cleaned={}, remaining={})",
+              totalCleaned,
+              zombieAgentTypes.size() - totalCleaned);
           break;
         }
+        long elapsedMs = nowMs() - startEpochMs;
         if (overBudget(startEpochMs, budgetMs)) {
-          log.warn("Stopping zombie individual fallback due to budget deadline");
+          log.info(
+              "Zombie individual fallback stopping due to budget deadline (cleaned={}, remaining={}, elapsed={}ms, budget={}ms)",
+              totalCleaned,
+              zombieAgentTypes.size() - totalCleaned,
+              elapsedMs,
+              budgetMs);
           break;
         }
         try {

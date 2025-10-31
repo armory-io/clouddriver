@@ -144,7 +144,12 @@ public class OrphanCleanupService {
     long intervalMs = schedulerProperties.getOrphanCleanup().getIntervalMs();
     if (!isPeriodElapsed(lastOrphanCleanup, intervalMs)) {
       long remaining = intervalMs - (nowMs() - lastOrphanCleanup);
-      log.debug("Skipping orphan cleanup - interval not elapsed ({}ms remaining)", remaining);
+      if (log.isDebugEnabled()) {
+        log.debug(
+            "Skipping orphan cleanup - interval not elapsed ({}ms remaining, interval={}ms)",
+            remaining,
+            intervalMs);
+      }
       return;
     }
 
@@ -152,38 +157,60 @@ public class OrphanCleanupService {
     // Use leadership election to prevent multiple instances from running cleanup simultaneously
     boolean forceCleanup = schedulerProperties.getOrphanCleanup().isForceAllPods();
     if (!forceCleanup && !tryAcquireCleanupLeadership()) {
-      log.debug("Skipping orphan cleanup - leadership held by another instance");
+      if (log.isDebugEnabled()) {
+        log.debug("Skipping orphan cleanup - leadership held by another instance");
+      }
       return;
     }
 
     // Update timestamp immediately after acquiring leadership (or confirming forced run)
     lastOrphanCleanup = nowMs();
 
+    if (log.isDebugEnabled()) {
+      log.debug(
+          "Starting orphan cleanup cycle (forced={}, budget={}ms)",
+          forceCleanup,
+          schedulerProperties.getOrphanCleanup().getRunBudgetMs());
+    }
+
     try (Jedis jedis = jedisPool.getResource()) {
       final long budgetMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
 
       int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start, budgetMs);
+      long workingElapsedMs = nowMs() - start;
       if (overBudget(start, budgetMs)) {
-        log.warn("Orphan cleanup budget exceeded after working set; skipping waiting set");
+        log.info(
+            "Orphan cleanup exceeded budget {}ms (elapsed={}ms); skipping waiting set (cleaned={})",
+            budgetMs,
+            workingElapsedMs,
+            workingCleaned);
         return;
       }
       int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, start, budgetMs);
       int totalCleaned = workingCleaned + waitingCleaned;
+      long totalElapsedMs = nowMs() - start;
 
       if (totalCleaned > 0) {
         orphansCleanedUp.add(totalCleaned);
         log.info(
-            "Orphan cleanup completed: {} agents cleaned ({} from working, {} from waiting)",
+            "Orphan cleanup cycle completed: {} agents cleaned ({} from working, {} from waiting, elapsed={}ms, budget={}ms)",
             totalCleaned,
             workingCleaned,
-            waitingCleaned);
+            waitingCleaned,
+            totalElapsedMs,
+            budgetMs);
+      } else if (log.isDebugEnabled()) {
+        log.debug(
+            "Orphan cleanup cycle completed: 0 agents cleaned (elapsed={}ms, budget={}ms)",
+            totalElapsedMs,
+            budgetMs);
       }
       if (metrics != null) {
         metrics.recordCleanupTime("orphan", nowMs() - start);
         metrics.incrementCleanupCleaned("orphan", totalCleaned);
       }
     } catch (Exception e) {
-      log.error("Failed to cleanup orphaned agents", e);
+      log.error("Error during orphan cleanup", e);
     } finally {
       // Release leadership if we acquired it (but not if forced cleanup)
       if (!forceCleanup) {
@@ -217,12 +244,14 @@ public class OrphanCleanupService {
             totalCleaned,
             workingCleaned,
             waitingCleaned);
+      } else if (log.isDebugEnabled()) {
+        log.debug("Forced orphan cleanup completed: 0 agents cleaned");
       }
       // Update the last cleanup timestamp
       lastOrphanCleanup = nowMs();
       return totalCleaned;
     } catch (Exception e) {
-      log.error("Failed to force cleanup orphaned agents", e);
+      log.error("Error during forced orphan cleanup", e);
       return 0;
     }
   }
@@ -273,6 +302,7 @@ public class OrphanCleanupService {
 
     try {
       int totalCleaned = 0;
+      int totalScanned = 0;
 
       final int configuredBatch = schedulerProperties.getBatchOperations().getBatchSize();
 
@@ -280,23 +310,44 @@ public class OrphanCleanupService {
         // Unbounded mode: retain legacy behavior for small environments.
         // We fetch the full eligible range and process it. This maximizes simplicity and
         // avoids pagination overhead when the candidate set is small.
+        int passNumber = 0;
         while (true) {
           if (Thread.currentThread().isInterrupted()) {
-            log.warn("Stopping {} orphan scan due to interrupt", setName);
+            log.warn(
+                "Stopping {} orphan scan due to interrupt (pass={}, cleaned={}, scanned={})",
+                setName,
+                passNumber,
+                totalCleaned,
+                totalScanned);
             break;
           }
+          long elapsedMs = nowMs() - startEpochMs;
           if (overBudget(startEpochMs, budgetMs)) {
-            log.warn("Stopping {} orphan scan due to budget deadline", setName);
+            log.info(
+                "Stopping {} orphan scan due to budget deadline (pass={}, cleaned={}, scanned={}, elapsed={}ms, budget={}ms)",
+                setName,
+                passNumber,
+                totalCleaned,
+                totalScanned,
+                elapsedMs,
+                budgetMs);
             break;
           }
 
           Set<Tuple> all = jedis.zrangeByScoreWithScores(setName, 0, cutoffScore);
           if (all == null || all.isEmpty()) {
             if (log.isDebugEnabled()) {
-              log.debug("Orphan scan: {} set analyzed, 0 candidates found", setName);
+              log.debug(
+                  "Orphan scan ({}/{}): {} set analyzed, 0 candidates found (totalScanned={}, totalCleaned={})",
+                  setName,
+                  passNumber,
+                  totalScanned,
+                  totalCleaned);
             }
             break;
           }
+          totalScanned += all.size();
+          passNumber++;
 
           java.util.List<Tuple> orphanList = REUSABLE_ORPHAN_LIST.get();
           int cleanedThisPass = 0;
@@ -314,13 +365,19 @@ public class OrphanCleanupService {
 
           totalCleaned += cleanedThisPass;
           if (cleanedThisPass == 0) {
-            log.warn(
-                "Orphan scan: {} set made no progress this pass; exiting early before budget is exhausted",
-                setName);
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Orphan scan ({}/{}): {} set made no progress this pass; exiting early before budget is exhausted (totalScanned={}, totalCleaned={})",
+                  setName,
+                  passNumber,
+                  totalScanned,
+                  totalCleaned);
+            }
             break;
           }
         }
 
+        // Per-set completion log removed - final summary below provides breakdown by set
         return totalCleaned;
       }
 
@@ -332,23 +389,45 @@ public class OrphanCleanupService {
         // WORKING: head-advancing paging.
         // Safe to mutate as we go because we always read from the head (LIMIT 0,pageSize).
         // Moving/removing entries advances the head naturally; we won't skip eligible items.
+        int pageNumber = 0;
         while (true) {
           if (Thread.currentThread().isInterrupted()) {
-            log.warn("Stopping {} orphan scan due to interrupt", setName);
+            log.warn(
+                "Stopping {} orphan scan due to interrupt (page={}, cleaned={}, scanned={})",
+                setName,
+                pageNumber,
+                totalCleaned,
+                totalScanned);
             break;
           }
+          long elapsedMs = nowMs() - startEpochMs;
           if (overBudget(startEpochMs, budgetMs)) {
-            log.warn("Stopping {} orphan scan due to budget deadline", setName);
+            log.info(
+                "Stopping {} orphan scan due to budget deadline (page={}, cleaned={}, scanned={}, elapsed={}ms, budget={}ms)",
+                setName,
+                pageNumber,
+                totalCleaned,
+                totalScanned,
+                elapsedMs,
+                budgetMs);
             break;
           }
 
           Set<Tuple> page = jedis.zrangeByScoreWithScores(setName, 0, cutoffScore, 0, pageSize);
           if (page == null || page.isEmpty()) {
             if (log.isDebugEnabled()) {
-              log.debug("Orphan scan: {} page empty (head), stopping", setName);
+              log.debug(
+                  "Orphan scan ({}/{}): {} page empty (head), stopping (totalScanned={}, totalCleaned={})",
+                  setName,
+                  pageNumber,
+                  setName,
+                  totalScanned,
+                  totalCleaned);
             }
             break;
           }
+          totalScanned += page.size();
+          pageNumber++;
 
           java.util.List<Tuple> orphanList = REUSABLE_ORPHAN_LIST.get();
           int cleanedThisPass = 0;
@@ -367,12 +446,19 @@ public class OrphanCleanupService {
 
           // If no progress, do not spin – deeper pages will have >= scores; exit early
           if (cleanedThisPass == 0) {
-            log.warn(
-                "Orphan scan: {} set made no progress this pass; exiting early before budget is exhausted",
-                setName);
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Orphan scan ({}/{}): {} set made no progress this pass; exiting early before budget is exhausted (totalScanned={}, totalCleaned={})",
+                  setName,
+                  pageNumber,
+                  totalScanned,
+                  totalCleaned);
+            }
             break;
           }
         }
+        // Per-set completion log removed - final summary provides breakdown by set
+        return totalCleaned;
       } else {
         // WAITING: two-phase per page.
         // 1) Enumerate a page with OFFSET/COUNT without mutating the set, collecting invalid
@@ -381,13 +467,29 @@ public class OrphanCleanupService {
         //    (pageCount - removedInWindow). If we removed everything, keep OFFSET to re-check
         //    the new head (prevents skipping deeper candidates behind a run of valid ones).
         int offset = 0;
+        int pageNumber = 0;
         while (true) {
           if (Thread.currentThread().isInterrupted()) {
-            log.warn("Stopping {} orphan scan due to interrupt", setName);
+            log.warn(
+                "Stopping {} orphan scan due to interrupt (page={}, offset={}, cleaned={}, scanned={})",
+                setName,
+                pageNumber,
+                offset,
+                totalCleaned,
+                totalScanned);
             break;
           }
+          long elapsedMs = nowMs() - startEpochMs;
           if (overBudget(startEpochMs, budgetMs)) {
-            log.warn("Stopping {} orphan scan due to budget deadline", setName);
+            log.info(
+                "Stopping {} orphan scan due to budget deadline (page={}, offset={}, cleaned={}, scanned={}, elapsed={}ms, budget={}ms)",
+                setName,
+                pageNumber,
+                offset,
+                totalCleaned,
+                totalScanned,
+                elapsedMs,
+                budgetMs);
             break;
           }
 
@@ -395,10 +497,18 @@ public class OrphanCleanupService {
               jedis.zrangeByScoreWithScores(setName, 0, cutoffScore, offset, pageSize);
           if (page == null || page.isEmpty()) {
             if (log.isDebugEnabled()) {
-              log.debug("Orphan scan: {} page empty at offset {}", setName, offset);
+              log.debug(
+                  "Orphan scan ({}/{}): {} page empty at offset {} (totalScanned={}, totalCleaned={})",
+                  setName,
+                  pageNumber,
+                  offset,
+                  totalScanned,
+                  totalCleaned);
             }
             break;
           }
+          totalScanned += page.size();
+          pageNumber++;
 
           java.util.List<Tuple> orphanList = REUSABLE_ORPHAN_LIST.get();
           int cleanedThisWindow = 0;
@@ -428,9 +538,9 @@ public class OrphanCleanupService {
             offset += advance;
           }
         }
+        // Per-set completion log removed - final summary provides breakdown by set
+        return totalCleaned;
       }
-
-      return totalCleaned;
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
       log.warn("Redis connection error while scanning {} for orphans", setName, e);
@@ -473,13 +583,24 @@ public class OrphanCleanupService {
         try {
           invalidArgs.clear();
           attemptedInvalid.clear();
+          int scannedCount = 0;
           for (Tuple orphan : orphans) {
+            scannedCount++;
             if (Thread.currentThread().isInterrupted()) {
-              log.warn("Aborting waiting-batch build due to interrupt");
+              log.warn(
+                  "Stopping waiting-batch build due to interrupt (invalid={}, scanned={})",
+                  attemptedInvalid.size(),
+                  scannedCount);
               break;
             }
+            long elapsedMs = nowMs() - startEpochMs;
             if (overBudget(startEpochMs, budgetMs)) {
-              log.warn("Aborting waiting-batch build due to budget deadline");
+              log.info(
+                  "Stopping waiting-batch build due to budget deadline (invalid={}, scanned={}, elapsed={}ms, budget={}ms)",
+                  attemptedInvalid.size(),
+                  scannedCount,
+                  elapsedMs,
+                  budgetMs);
               break;
             }
             String agentName = orphan.getElement();
@@ -529,11 +650,20 @@ public class OrphanCleanupService {
                   removedSet.addAll(parsed.getMembers());
                   for (String agentName : attemptedInvalid) {
                     if (Thread.currentThread().isInterrupted()) {
-                      log.warn("Stopping per-item fallback due to interrupt");
+                      log.warn(
+                          "Stopping per-item fallback due to interrupt (processed={}, remaining={})",
+                          attemptedInvalid.size() - attemptedInvalid.indexOf(agentName),
+                          attemptedInvalid.indexOf(agentName));
                       break;
                     }
+                    long elapsedMs = nowMs() - startEpochMs;
                     if (overBudget(startEpochMs, budgetMs)) {
-                      log.warn("Stopping per-item fallback due to budget deadline");
+                      log.info(
+                          "Stopping per-item fallback due to budget deadline (processed={}, remaining={}, elapsed={}ms, budget={}ms)",
+                          attemptedInvalid.size() - attemptedInvalid.indexOf(agentName),
+                          attemptedInvalid.indexOf(agentName),
+                          elapsedMs,
+                          budgetMs);
                       break;
                     }
                     if (!removedSet.contains(agentName)) {
@@ -583,11 +713,20 @@ public class OrphanCleanupService {
               // Guarded per-item fallback: only act on invalid candidates we positively identify
               for (Tuple orphan : orphans) {
                 if (Thread.currentThread().isInterrupted()) {
-                  log.warn("Stopping individual conditional removal due to interrupt");
+                  log.warn(
+                      "Stopping individual conditional removal due to interrupt (processed={}, remaining={})",
+                      orphans.indexOf(orphan),
+                      orphans.size() - orphans.indexOf(orphan));
                   break;
                 }
+                long elapsedMs = nowMs() - startEpochMs;
                 if (overBudget(startEpochMs, budgetMs)) {
-                  log.warn("Stopping individual conditional removal due to budget deadline");
+                  log.info(
+                      "Stopping individual conditional removal due to budget deadline (processed={}, remaining={}, elapsed={}ms, budget={}ms)",
+                      orphans.indexOf(orphan),
+                      orphans.size() - orphans.indexOf(orphan),
+                      elapsedMs,
+                      budgetMs);
                   break;
                 }
 
@@ -661,11 +800,20 @@ public class OrphanCleanupService {
       // skip locally active work.
       for (int i = 0; i < orphans.size(); i += batchSize) {
         if (Thread.currentThread().isInterrupted()) {
-          log.warn("Aborting working-batch processing due to interrupt");
+          log.warn(
+              "Stopping working-batch processing due to interrupt (processed={}, remaining={})",
+              i,
+              orphans.size() - i);
           break;
         }
+        long elapsedMs = nowMs() - startEpochMs;
         if (overBudget(startEpochMs, budgetMs)) {
-          log.warn("Aborting working-batch processing due to budget deadline");
+          log.info(
+              "Stopping working-batch processing due to budget deadline (processed={}, remaining={}, elapsed={}ms, budget={}ms)",
+              i,
+              orphans.size() - i,
+              elapsedMs,
+              budgetMs);
           break;
         }
         int endIndex = Math.min(i + batchSize, orphans.size());
@@ -763,11 +911,22 @@ public class OrphanCleanupService {
 
     for (Tuple orphan : orphans) {
       if (Thread.currentThread().isInterrupted()) {
-        log.warn("Stopping individual orphan cleanup early due to interrupt");
+        log.warn(
+            "Stopping individual orphan cleanup early due to interrupt (cleaned={}, processed={}, remaining={})",
+            cleaned,
+            orphans.indexOf(orphan),
+            orphans.size() - orphans.indexOf(orphan));
         break;
       }
+      long elapsedMs = nowMs() - startEpochMs;
       if (overBudget(startEpochMs, budgetMs)) {
-        log.warn("Stopping individual orphan cleanup early due to budget deadline");
+        log.info(
+            "Stopping individual orphan cleanup early due to budget deadline (cleaned={}, processed={}, remaining={}, elapsed={}ms, budget={}ms)",
+            cleaned,
+            orphans.indexOf(orphan),
+            orphans.size() - orphans.indexOf(orphan),
+            elapsedMs,
+            budgetMs);
         break;
       }
       try {

@@ -463,9 +463,10 @@ public class PriorityAgentScheduler extends CatsModuleAware
                   long budgetMs = config.getZombieRunBudgetMs();
                   zombieService.cleanupZombieAgentsIfNeeded(activeAgentsSnapshot, futuresSnapshot);
                   if (budgetMs > 0 && nowMs() - startTs > budgetMs) {
-                    log.warn(
-                        "Zombie cleanup exceeded budget {}ms; subsequent work will be deferred",
-                        budgetMs);
+                    log.info(
+                        "Zombie cleanup exceeded budget {}ms (elapsed={}ms); subsequent work will be deferred",
+                        budgetMs,
+                        nowMs() - startTs);
                     // Cooperative hard stop: interrupt to signal budget breach
                     Thread.currentThread().interrupt();
                   }
@@ -509,9 +510,10 @@ public class PriorityAgentScheduler extends CatsModuleAware
                   long budgetMs = config.getOrphanRunBudgetMs();
                   orphanService.cleanupOrphanedAgentsIfNeeded();
                   if (budgetMs > 0 && nowMs() - startTs > budgetMs) {
-                    log.warn(
-                        "Orphan cleanup exceeded budget {}ms; subsequent work will be deferred",
-                        budgetMs);
+                    log.info(
+                        "Orphan cleanup exceeded budget {}ms (elapsed={}ms); subsequent work will be deferred",
+                        budgetMs,
+                        nowMs() - startTs);
                     Thread.currentThread().interrupt();
                     return;
                   }
@@ -785,7 +787,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
     // Scheduler-scoped safeguard: avoid unscheduling shared regional instance-type agent
     String agentType = agent != null ? agent.getAgentType() : null;
     if (agentType != null && isSharedRegionalClassRegionPattern(agent, agentType)) {
-      log.info("Ignoring unschedule for shared regional agent {}", agentType);
+      if (log.isDebugEnabled()) {
+        log.debug("Ignoring unschedule for shared regional agent {}", agentType);
+      }
       return;
     }
     acquisitionService.unregisterAgent(agent);
@@ -1128,11 +1132,16 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       for (KnownAgent ka : knownAgents.values()) {
         if (Thread.currentThread().isInterrupted()) {
-          log.warn("Reconcile pass stopping early due to interrupt");
+          if (log.isDebugEnabled()) {
+            log.debug("Reconcile pass stopping early due to interrupt");
+          }
           break;
         }
         if (overBudget(start, budgetMs)) {
-          log.warn("Reconcile pass stopping early due to budget deadline");
+          log.info(
+              "Reconcile pass stopping early due to budget deadline (elapsed={}ms, budget={}ms)",
+              nowMs() - start,
+              budgetMs);
           break;
         }
         Agent agent = ka.agent;
@@ -1153,11 +1162,16 @@ public class PriorityAgentScheduler extends CatsModuleAware
         java.util.Map<String, String> active = acquisitionService.getActiveAgentsMap();
         for (java.util.Map.Entry<String, String> e : active.entrySet()) {
           if (Thread.currentThread().isInterrupted()) {
-            log.warn("Reconcile validation stopping early due to interrupt");
+            if (log.isDebugEnabled()) {
+              log.debug("Reconcile validation stopping early due to interrupt");
+            }
             break;
           }
           if (overBudget(start, budgetMs)) {
-            log.warn("Reconcile validation stopping early due to budget deadline");
+            log.info(
+                "Reconcile validation stopping early due to budget deadline (elapsed={}ms, budget={}ms)",
+                nowMs() - start,
+                budgetMs);
             break;
           }
           String agentType = e.getKey();

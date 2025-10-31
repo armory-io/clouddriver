@@ -215,6 +215,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   private final AtomicLong lastBacklogWarnEpochMs = new AtomicLong(0);
   private final AtomicLong lastStallWarnEpochMs = new AtomicLong(0);
   private final AtomicLong lastBatchParsingMismatchWarnEpochMs = new AtomicLong(0);
+  private final AtomicLong lastZifNegativeErrorEpochMs = new AtomicLong(0);
   private final AtomicLong lastDiagEpochMs = new AtomicLong(0);
   private final AtomicLong lastOldestOverdueSeconds = new AtomicLong(0);
   private final AtomicLong lastReadyCount = new AtomicLong(0);
@@ -1473,7 +1474,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           }
         }
 
-        log.info(
+        log.debug(
             "Batch acquisition completed: {}/{} agents acquired",
             successCount,
             candidateAgents.size());
@@ -4007,16 +4008,41 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             // Permit was pre-released by cleanup. Decrement raw zIF if it was incremented.
             if (runStateForAgent.zifIncremented.get()) {
               int raw = acquisitionService.zombiesInFlightRaw.decrementAndGet();
-              acquisitionService.zombiesInFlight.updateAndGet(v -> Math.max(0, v - 1));
+              int effectiveBefore = acquisitionService.zombiesInFlight.get();
+              int effectiveAfter =
+                  acquisitionService.zombiesInFlight.updateAndGet(
+                      current -> {
+                        int result = current - 1;
+                        if (result < 0) {
+                          // Log ERROR for accounting bug detection (rate-limited to avoid flooding)
+                          if (shouldWarnNow(
+                              acquisitionService.lastZifNegativeErrorEpochMs, 60_000)) {
+                            log.error(
+                                "zIF effective counter went negative: current={}, would be={}. "
+                                    + "This indicates an accounting bug in permit/zIF tracking. "
+                                    + "Permit accounting may be incorrect, allowing over-subscription.",
+                                current,
+                                result);
+                          } else if (log.isDebugEnabled()) {
+                            log.debug(
+                                "zIF effective counter went negative (suppressed ERROR): current={}, would be={}",
+                                current,
+                                result);
+                          }
+                          return 0; // Clamp to 0 (defensive)
+                        }
+                        return result;
+                      });
               if (raw < 0) {
                 log.warn("zIF raw went negative during worker finally: raw={}", raw);
               }
               // Do not set the separate effective counter; clamp only at behavior read sites.
               log.debug(
-                  "Permit for {} was pre-released by cleanup, zIF_raw={} zIF_effective={}",
+                  "Permit for {} was pre-released by cleanup, zIF_raw={} zIF_effective={}->{}",
                   agentType,
                   raw,
-                  acquisitionService.zombiesInFlight.get());
+                  effectiveBefore,
+                  effectiveAfter);
             }
           }
         }
