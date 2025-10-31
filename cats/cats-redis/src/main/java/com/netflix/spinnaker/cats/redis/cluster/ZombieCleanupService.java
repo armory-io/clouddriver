@@ -749,24 +749,10 @@ public class ZombieCleanupService {
 
       if (removed) {
         log.debug("Removed zombie agent {} from Redis working set", agentType);
-        // Optional: targeted repair. If a duplicate exists in WAITING, remove it now.
-        try {
-          Double waitScore = jedis.zscore(WAITING_SET, agentType);
-          if (waitScore != null) {
-            Object remRes =
-                scriptManager.evalshaWithSelfHeal(
-                    jedis,
-                    RedisScriptManager.REMOVE_AGENT,
-                    java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                    java.util.Collections.singletonList(agentType));
-            if (remRes != null && ((Long) remRes).intValue() == 1) {
-              log.warn(
-                  "Removed duplicate waiting entry for zombie agent {} during cleanup", agentType);
-            }
-          }
-        } catch (Exception ignore) {
-          // Best-effort duplicate repair; ignore failures
-        }
+        // Note: Zombie cleanup only removes from WORKING set. If a duplicate exists in WAITING,
+        // that's corruption which should be handled by orphan cleanup (not zombie cleanup).
+        // A legitimate WAITING entry would have been added AFTER zombie cleanup by completion
+        // processing, so zombie cleanup should never touch WAITING.
       } else {
         log.debug(
             "Zombie agent {} not found in Redis working set during cleanup (result={})",
