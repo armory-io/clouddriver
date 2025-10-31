@@ -214,6 +214,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   // Backlog/health snapshots and rate-limiting
   private final AtomicLong lastBacklogWarnEpochMs = new AtomicLong(0);
   private final AtomicLong lastStallWarnEpochMs = new AtomicLong(0);
+  private final AtomicLong lastBatchParsingMismatchWarnEpochMs = new AtomicLong(0);
   private final AtomicLong lastDiagEpochMs = new AtomicLong(0);
   private final AtomicLong lastOldestOverdueSeconds = new AtomicLong(0);
   private final AtomicLong lastReadyCount = new AtomicLong(0);
@@ -1369,6 +1370,34 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               }
             }
           }
+        }
+
+        // Validate parsing consistency: ensure parsed agent list matches Redis-reported count
+        // This prevents silent permit leaks if parsing fails or Redis returns unexpected format
+        if (acquiredAgentTypes.size() != successCount) {
+          if (shouldWarnNow(lastBatchParsingMismatchWarnEpochMs, 600_000)) {
+            log.warn(
+                "Batch acquisition parsing mismatch: Redis returned count={}, parsed agents={}. "
+                    + "This may indicate parsing failure or unexpected Redis response format. "
+                    + "Parsed agents will be processed normally; unparsed agents will have permits "
+                    + "released in the processing loop below.",
+                successCount,
+                acquiredAgentTypes.size());
+          } else if (log.isDebugEnabled()) {
+            log.debug(
+                "Batch acquisition parsing mismatch (suppressed WARN): Redis returned count={}, parsed agents={}",
+                successCount,
+                acquiredAgentTypes.size());
+          }
+          if (metrics != null) {
+            metrics.incrementAcquireValidationFailure("batch_result_count_mismatch");
+          }
+          // Note: Permits for candidates not in acquiredAgentTypes will be released in another
+          // processing loop. If successCount > acquiredAgentTypes.size(),
+          // there are unparsed agents that Redis says were acquired, but we couldn't parse them.
+          // These will be treated as failed acquisitions and their permits will be released.
+          // This prevents permit leaks at the cost of potentially retrying agents that were
+          // actually acquired but couldn't be parsed.
         }
 
         log.debug(
