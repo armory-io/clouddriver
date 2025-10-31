@@ -932,18 +932,42 @@ public class OrphanCleanupService {
   /**
    * Determine shard ownership for the given agent in a fail-safe way.
    *
-   * <p>Behavior:
+   * <p>This method implements a fail-safe design to prevent cross-shard deletions during orphan
+   * cleanup. When shard ownership cannot be determined, the method preserves entries by returning
+   * {@code false}, preventing cleanup actions on entries that may belong to other shards.
+   *
+   * <p><b>Fail-Safe Rationale:</b>
+   *
+   * <ul>
+   *   <li><b>Prevents data corruption:</b> Returning {@code false} on errors prevents this pod from
+   *       deleting entries that belong to other shards, which could cause agent loss across the
+   *       cluster.
+   *   <li><b>Safe during scale events:</b> When pods are added/removed, shard configuration changes
+   *       via {@code CachingPodsObserver.refreshHeartbeat()}. Transient exceptions during
+   *       reconfiguration (e.g., {@code NullPointerException} if shard state is being updated) are
+   *       handled safely by preserving entries.
+   *   <li><b>Accumulation trade-off:</b> The fail-safe design may cause orphaned entries to
+   *       accumulate over time if exceptions occur frequently, but this is preferable to the risk
+   *       of cross-shard deletions causing agent loss.
+   * </ul>
+   *
+   * <p><b>Behavior:</b>
    *
    * <ul>
    *   <li>Uses {@code acquisitionService.belongsToThisShard(agentName)} when available.
    *   <li>Returns {@code false} on any unexpected error to preserve entries (avoid cross-shard
-   *       delete).
+   *       delete). This is the fail-safe behavior.
    *   <li>Returns {@code true} when {@code acquisitionService} is not wired (e.g., in tests) to
    *       maintain consistent behavior without blocking cleanup flows.
    * </ul>
    *
+   * <p><b>Observability:</b> Logs exceptions for observability during scale events when shard
+   * configuration changes. Transient exceptions are logged at debug level; other exceptions are
+   * logged at warn level to help diagnose accumulation issues.
+   *
    * @param agentName agent identifier used for shard ownership check
-   * @return true if this shard should act on the agent, false otherwise
+   * @return true if this shard should act on the agent, false otherwise (fail-safe preserve on
+   *     errors)
    */
   private boolean safeBelongsToShard(String agentName) {
     if (acquisitionService == null) {
@@ -953,7 +977,16 @@ public class OrphanCleanupService {
     }
     try {
       return acquisitionService.belongsToThisShard(agentName);
+    } catch (NullPointerException | IllegalStateException e) {
+      // Transient exceptions - log for observability (may be due to shard reconfiguration during
+      // scale events)
+      if (log.isDebugEnabled()) {
+        log.debug("Shard check failed for {}: {}", agentName, e.getMessage(), e);
+      }
+      return false; // Still fail-safe preserve
     } catch (Exception e) {
+      // Other exceptions - log but preserve
+      log.warn("Shard check exception for {}: {}", agentName, e.getMessage(), e);
       return false;
     }
   }
