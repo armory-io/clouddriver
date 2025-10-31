@@ -136,7 +136,16 @@ public class AgentAcquisitionSemaphoreTest {
 
   @Test
   void shouldAcquireSemaphorePermitWhenAgentIsScheduled() throws Exception {
-    // Given: Add agent to Redis WAITING set (ready for acquisition)
+    // Given: Setup agent execution with delay to prevent immediate completion
+    doAnswer(
+            invocation -> {
+              Thread.sleep(100); // Delay to keep agent executing during assertion
+              return null;
+            })
+        .when(agentExecution)
+        .executeAgent(any());
+
+    // Add agent to Redis WAITING set (ready for acquisition)
     try (Jedis jedis = jedisPool.getResource()) {
       jedis.zadd("waiting", System.currentTimeMillis() / 1000 - 10, "test-agent"); // Ready now
     }
@@ -147,8 +156,9 @@ public class AgentAcquisitionSemaphoreTest {
     // When: Saturate pool with semaphore (runCount=0 forces Redis scan)
     int acquired = service.saturatePool(0L, testSemaphore, testExecutor);
 
-    // Then: Semaphore permit should be acquired
+    // Then: Semaphore permit should be acquired and still held (agent executing)
     assertThat(acquired).isEqualTo(1);
+    // Check immediately - agent should still be executing (permit held)
     assertThat(testSemaphore.availablePermits()).isEqualTo(1);
   }
 

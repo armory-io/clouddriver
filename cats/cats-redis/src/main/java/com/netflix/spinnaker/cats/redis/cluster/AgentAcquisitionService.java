@@ -1767,26 +1767,64 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               "Removed agent {} from active tracking and working (preserving waiting during shutdown)",
               agentType);
         } else {
-          // Normal operation: Preserve waiting entry if present (e.g., completion or orphan move)
-          boolean inWaiting = false;
+          // Normal operation: Use atomic script to preserve waiting entry if present
+          //
+          // RACE CONDITION CONTEXT:
+          // The agent is NOT in both sets simultaneously. The race occurs during the transition:
+          //
+          // Timeline:
+          // 1. Agent completes execution → Worker thread calls removeActiveAgent()
+          // 2. Worker: conditionalReleaseAgent() queues completion (in-memory queue, not Redis yet)
+          // 3. Worker: removeActiveAgent() reads WAITING_SET → finds null (agent not rescheduled
+          // yet)
+          // 4. [RACE WINDOW] Scheduler thread: processQueuedCompletions() adds agent to WAITING_SET
+          // 5. Worker: removeActiveAgent() calls REMOVE_AGENT script → removes from both sets
+          //    → This removes the just-added WAITING entry, causing agent loss!
+          //
+          // REMOVE_AGENT_COMPLETION atomically checks-and-removes in a single Redis
+          // operation. If completion processing added the agent to WAITING between the check and
+          // removal, the waiting entry is preserved, preventing agent loss.
           try {
-            Double w = jedis.zscore(WAITING_SET, agentType);
-            inWaiting = (w != null);
-          } catch (Exception ignore) {
-            inWaiting = false;
-          }
-          if (inWaiting) {
-            // Remove only from working to avoid deleting the re-queued waiting entry
-            jedis.zrem(WORKING_SET, agentType);
-            log.debug("Removed agent {} from working only (waiting entry preserved)", agentType);
-          } else {
-            // Remove from both when not present in waiting
-            scriptManager.evalshaWithSelfHeal(
-                jedis,
-                RedisScriptManager.REMOVE_AGENT,
-                java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                java.util.Collections.singletonList(agentType));
-            log.debug("Removed agent {} from active tracking and Redis sets", agentType);
+            Object result =
+                scriptManager.evalshaWithSelfHeal(
+                    jedis,
+                    RedisScriptManager.REMOVE_AGENT_COMPLETION,
+                    java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                    java.util.Collections.singletonList(agentType));
+
+            // Parse result: {removedFromWorking, preservedWaiting}
+            boolean preservedWaiting = false;
+            if (result instanceof java.util.List) {
+              java.util.List<?> resultList = (java.util.List<?>) result;
+              if (resultList.size() >= 2
+                  && resultList.get(1) instanceof Number
+                  && ((Number) resultList.get(1)).intValue() == 1) {
+                preservedWaiting = true;
+              }
+            }
+
+            log.debug(
+                "Removed agent {} from active tracking and Redis (preservedWaiting={})",
+                agentType,
+                preservedWaiting);
+          } catch (Exception scriptEx) {
+            // Fallback to non-atomic removal if script fails (should be rare)
+            log.warn(
+                "Atomic removal script failed for {}, falling back to non-atomic removal",
+                agentType,
+                scriptEx);
+            try {
+              jedis.zrem(WORKING_SET, agentType);
+              // Best-effort: check if in waiting before removing
+              // This is still a race, but better than removing blindly
+              Double w = jedis.zscore(WAITING_SET, agentType);
+              if (w == null) {
+                jedis.zrem(WAITING_SET, agentType);
+              }
+            } catch (Exception fallbackEx) {
+              log.error(
+                  "Fallback removal also failed for agent {} from Redis", agentType, fallbackEx);
+            }
           }
         }
       } catch (Exception e) {
