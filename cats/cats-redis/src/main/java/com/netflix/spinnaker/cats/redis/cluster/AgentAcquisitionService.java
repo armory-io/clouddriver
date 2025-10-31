@@ -986,8 +986,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                 long thresholdMs = getZombieThresholdForAgent(agentType);
                 // acquireScore encodes the completion deadline in epoch seconds
                 long completionDeadlineMs = Long.parseLong(worker.acquireScore) * 1000L;
-                long delayMs =
-                    Math.max(0L, (completionDeadlineMs + thresholdMs) - nowMsWithOffset());
+                // Use nowMsCached if available (from cycle start) for consistency with acquisition
+                // timing. This prevents premature cancellation during long scheduler cycles (>1s)
+                // where nowMsWithOffset() would be later than nowMsCached, causing the timer to
+                // fire earlier than intended.
+                long nowMsForTimer = nowMsCached != null ? nowMsCached : nowMsWithOffset();
+                long delayMs = Math.max(0L, (completionDeadlineMs + thresholdMs) - nowMsForTimer);
                 RunState runState = runStates.get(agentType);
                 if (runState != null) {
                   runState.deadmanHandle =
