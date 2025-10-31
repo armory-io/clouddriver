@@ -289,7 +289,8 @@ public class RedisScriptManager {
     // 5. Worker: removeActiveAgent() calls REMOVE_AGENT script → removes from both sets
     //    → This removes the just-added WAITING entry, causing agent loss!
     //
-    // This script fixes the race by atomically checking-and-removing in a single Redis operation.
+    // This script prevents the race by atomically checking-and-removing in a single Redis
+    // operation.
     // If completion processing added the agent to WAITING between the check and removal, the
     // waiting entry is preserved, preventing agent loss.
     //

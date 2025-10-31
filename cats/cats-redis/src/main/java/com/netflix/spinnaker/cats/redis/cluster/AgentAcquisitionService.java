@@ -4014,12 +4014,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                       current -> {
                         int result = current - 1;
                         if (result < 0) {
-                          // Log ERROR for accounting bug detection (rate-limited to avoid flooding)
+                          // Log ERROR when negative value detected (rate-limited to avoid flooding)
                           if (shouldWarnNow(
                               acquisitionService.lastZifNegativeErrorEpochMs, 60_000)) {
                             log.error(
                                 "zIF effective counter went negative: current={}, would be={}. "
-                                    + "This indicates an accounting bug in permit/zIF tracking. "
+                                    + "This indicates incorrect accounting in permit/zIF tracking. "
                                     + "Permit accounting may be incorrect, allowing over-subscription.",
                                 current,
                                 result);
