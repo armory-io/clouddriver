@@ -42,6 +42,7 @@ import redis.clients.jedis.JedisPoolConfig;
  *   <li>Performance characteristics
  *   <li>All script constants and operations
  * </ul>
+ *
  */
 @Testcontainers
 @DisplayName("RedisScriptManager Tests")
@@ -830,6 +831,122 @@ class RedisScriptManagerTest {
         System.out.println(
             "\u26a0\ufe0f  Mixed format detected - this demonstrates the bug we're preventing");
       }
+    }
+  }
+
+  @Nested
+  @DisplayName("Unit Tests")
+  class UnitTests {
+
+    private static class FakePool extends JedisPool {
+      private final Jedis jedis;
+
+      FakePool(Jedis j) {
+        this.jedis = j;
+      }
+
+      @Override
+      public Jedis getResource() {
+        return jedis;
+      }
+    }
+
+    @Test
+    @DisplayName(
+        "evalshaWithSelfHeal records reloads and eval metrics on NOSCRIPT, falls back to EVAL")
+    void evalshaSelfHealAndEvalFallback() {
+      // Fake Jedis: scriptLoad loads; evalsha throws NOSCRIPT; eval succeeds
+      class FakeJedis extends Jedis {
+        @Override
+        public String scriptLoad(String script) {
+          return "sha";
+        }
+
+        @Override
+        public Object evalsha(
+            String sha1, java.util.List<String> keys, java.util.List<String> args) {
+          throw new redis.clients.jedis.exceptions.JedisDataException(
+              "NOSCRIPT No matching script");
+        }
+
+        @Override
+        public Object eval(
+            String script, java.util.List<String> keys, java.util.List<String> args) {
+          return 1L;
+        }
+      }
+
+      FakeJedis j = new FakeJedis();
+      com.netflix.spectator.api.Registry registry = new com.netflix.spectator.api.DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+      RedisScriptManager mgr = new RedisScriptManager(new FakePool(j), metrics);
+
+      // Ensure initialized so getScriptSha works after loadAllScripts
+      mgr.initializeScripts();
+
+      Object r =
+          mgr.evalshaWithSelfHeal(
+              j,
+              RedisScriptManager.ADD_AGENT,
+              java.util.Arrays.asList("working", "waiting"),
+              java.util.Arrays.asList("a", "1"));
+      assertThat(r).isEqualTo(1L);
+
+      // Verify at least latency timer recorded (sum across tags)
+      long timerSum = 0L;
+      for (com.netflix.spectator.api.Meter m : registry) {
+        if (m.id().name().equals("cats.redisPriority.scripts.latency")) {
+          for (com.netflix.spectator.api.Measurement ms : m.measure()) {
+            timerSum += (long) ms.value();
+          }
+        }
+      }
+      assertThat(timerSum).isGreaterThanOrEqualTo(1L);
+    }
+  }
+
+  @Nested
+  @DisplayName("Integration Tests")
+  class IntegrationTests {
+
+    // Converted from Pattern B (@BeforeAll/@AfterAll) to Pattern A (uses shared container)
+    @Test
+    void recordsEvalAndReloadMetrics() {
+      String host = redis.getHost();
+      int port = redis.getMappedPort(6379);
+      JedisPoolConfig config = new JedisPoolConfig();
+      JedisPool pool = new JedisPool(config, host, port, 2000, "testpass");
+      com.netflix.spectator.api.Registry registry = new com.netflix.spectator.api.DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+      RedisScriptManager manager = new RedisScriptManager(pool, metrics);
+
+      try (Jedis j = pool.getResource()) {
+        manager.initializeScripts();
+        // Call a small script to record eval
+        manager.evalshaWithSelfHeal(
+            j,
+            RedisScriptManager.SCORE_AGENTS,
+            java.util.Arrays.asList("working", "waiting"),
+            java.util.Arrays.asList("agentA"));
+        // Force flush to drive reload
+        j.scriptFlush();
+        manager.evalshaWithSelfHeal(
+            j,
+            RedisScriptManager.SCORE_AGENTS,
+            java.util.Arrays.asList("working", "waiting"),
+            java.util.Arrays.asList("agentB"));
+      }
+
+      long evalCount =
+          registry
+              .counter(
+                  registry
+                      .createId("cats.redisPriority.scripts.eval")
+                      .withTag("script", RedisScriptManager.SCORE_AGENTS))
+              .count();
+      assertThat(evalCount).isGreaterThanOrEqualTo(1);
+      assertThat(registry.counter("cats.redisPriority.scripts.reloads").count())
+          .isGreaterThanOrEqualTo(1);
     }
   }
 }

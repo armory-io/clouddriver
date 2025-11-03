@@ -347,13 +347,37 @@ public final class PrioritySchedulerMetrics {
       Object waitersAnchor = new Object();
       PolledMeter.using(registry)
           .withId(registry.createId("cats.redisPriority.redisPool.active"))
-          .monitorValue(activeAnchor, o -> jedisPool.getNumActive());
+          .monitorValue(
+              activeAnchor,
+              o -> {
+                try {
+                  return jedisPool.getNumActive();
+                } catch (Exception e) {
+                  return 0;
+                }
+              });
       PolledMeter.using(registry)
           .withId(registry.createId("cats.redisPriority.redisPool.idle"))
-          .monitorValue(idleAnchor, o -> jedisPool.getNumIdle());
+          .monitorValue(
+              idleAnchor,
+              o -> {
+                try {
+                  return jedisPool.getNumIdle();
+                } catch (Exception e) {
+                  return 0;
+                }
+              });
       PolledMeter.using(registry)
           .withId(registry.createId("cats.redisPriority.redisPool.waiters"))
-          .monitorValue(waitersAnchor, o -> jedisPool.getNumWaiters());
+          .monitorValue(
+              waitersAnchor,
+              o -> {
+                try {
+                  return jedisPool.getNumWaiters();
+                } catch (Exception e) {
+                  return 0;
+                }
+              });
     }
 
     gaugesRegistered = true;

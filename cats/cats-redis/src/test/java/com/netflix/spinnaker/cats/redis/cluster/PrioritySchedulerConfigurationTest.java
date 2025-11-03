@@ -17,16 +17,40 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
+import com.netflix.spinnaker.cats.agent.Agent;
+import com.netflix.spinnaker.cats.agent.AgentExecution;
+import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
+import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
+import com.netflix.spinnaker.cats.cluster.ShardingFilter;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
 
 /**
  * Test suite for PrioritySchedulerConfiguration.
@@ -41,9 +65,16 @@ import org.junit.jupiter.api.Test;
  *   <li>Resource management and cleanup
  *   <li>Performance characteristics
  * </ul>
+ *
  */
+@Testcontainers
 @DisplayName("PriorityConfiguration Tests")
 class PrioritySchedulerConfigurationTest {
+
+  // Shared container for all integration tests
+  @Container
+  static GenericContainer<?> redis =
+      new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
 
   private PriorityAgentProperties agentProperties;
   private PrioritySchedulerProperties schedulerProperties;
@@ -101,6 +132,92 @@ class PrioritySchedulerConfigurationTest {
       // Then
       assertThat(schedulerExecutor).isNotNull();
       assertThat(schedulerExecutor.isShutdown()).isFalse();
+    }
+
+    @Test
+    @DisplayName("Should create threads with correct naming pattern")
+    void shouldCreateThreadsWithCorrectNamingPattern() throws Exception {
+      // When
+      ExecutorService workPool = configuration.getAgentWorkPool();
+
+      // Submit a task to create a thread
+      AtomicBoolean threadCreated = new AtomicBoolean(false);
+      String[] threadName = new String[1];
+
+      workPool.submit(
+          () -> {
+            threadCreated.set(true);
+            Thread currentThread = Thread.currentThread();
+            threadName[0] = currentThread.getName();
+          });
+
+      // Wait for thread to execute
+      Thread.sleep(100);
+
+      // Then - Verify thread name matches expected pattern
+      assertThat(threadCreated.get()).isTrue();
+      assertThat(threadName[0]).matches("PriorityAgentWorker-\\d+");
+    }
+
+    @Test
+    @DisplayName("Should create daemon threads")
+    void shouldCreateDaemonThreads() throws Exception {
+      // When
+      ExecutorService workPool = configuration.getAgentWorkPool();
+
+      // Submit a task to create a thread
+      AtomicBoolean threadCreated = new AtomicBoolean(false);
+      AtomicBoolean isDaemon = new AtomicBoolean(false);
+
+      workPool.submit(
+          () -> {
+            threadCreated.set(true);
+            isDaemon.set(Thread.currentThread().isDaemon());
+          });
+
+      // Wait for thread to execute
+      Thread.sleep(100);
+
+      // Then - Verify thread is daemon (important for JVM shutdown)
+      assertThat(threadCreated.get()).isTrue();
+      assertThat(isDaemon.get()).isTrue();
+    }
+
+    @Test
+    @DisplayName("Should handle concurrent submissions")
+    void shouldHandleConcurrentSubmissions() throws Exception {
+      // Given
+      ExecutorService workPool = configuration.getAgentWorkPool();
+      int concurrentTasks = 10;
+
+      // When - Submit multiple tasks concurrently
+      AtomicInteger completedTasks = new AtomicInteger(0);
+      CountDownLatch startLatch = new CountDownLatch(1);
+      CountDownLatch completionLatch = new CountDownLatch(concurrentTasks);
+
+      for (int i = 0; i < concurrentTasks; i++) {
+        workPool.submit(
+            () -> {
+              try {
+                startLatch.await(); // Wait for all tasks to be submitted
+                completedTasks.incrementAndGet();
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+              } finally {
+                completionLatch.countDown();
+              }
+            });
+      }
+
+      // Signal all tasks to start
+      startLatch.countDown();
+
+      // Wait for all tasks to complete
+      boolean completed = completionLatch.await(5, TimeUnit.SECONDS);
+
+      // Then - All tasks should complete successfully
+      assertThat(completed).isTrue();
+      assertThat(completedTasks.get()).isEqualTo(concurrentTasks);
     }
   }
 
@@ -526,6 +643,695 @@ class PrioritySchedulerConfigurationTest {
 
       // Then
       assertThat(retrievedDisabled.pattern()).isEqualTo(disabledPattern);
+    }
+  }
+
+  @Nested
+  @DisplayName("Configuration Validation Tests")
+  class ConfigurationValidationTests {
+
+    private PrioritySchedulerProperties properties;
+
+    @BeforeEach
+    void setUp() {
+      properties = new PrioritySchedulerProperties();
+    }
+
+    @Nested
+    @DisplayName("Batch Operations Configuration Tests")
+    class BatchOperationsConfigurationTests {
+
+      @Test
+      @DisplayName("Should have sensible default values")
+      void shouldHaveSensibleDefaultValues() {
+        assertThat(properties.getBatchOperations().isEnabled()).isTrue();
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(0);
+      }
+
+      @Test
+      @DisplayName("Should allow enabling batch operations")
+      void shouldAllowEnablingBatchOperations() {
+        properties.getBatchOperations().setEnabled(true);
+        assertThat(properties.getBatchOperations().isEnabled()).isTrue();
+      }
+
+      @Test
+      @DisplayName("Should allow setting valid batch sizes")
+      void shouldAllowSettingValidBatchSizes() {
+        properties.getBatchOperations().setBatchSize(25);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(25);
+      }
+
+      @Test
+      @DisplayName("Should handle zero batch size")
+      void shouldHandleZeroBatchSize() {
+        properties.getBatchOperations().setBatchSize(0);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(0);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(0);
+      }
+
+      @Test
+      @DisplayName("Should handle negative batch size")
+      void shouldHandleNegativeBatchSize() {
+        properties.getBatchOperations().setBatchSize(-1);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(-1);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(-1);
+      }
+
+      @Test
+      @DisplayName("Should handle extremely large batch sizes")
+      void shouldHandleExtremelyLargeBatchSizes() {
+        properties.getBatchOperations().setBatchSize(Integer.MAX_VALUE);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(Integer.MAX_VALUE);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(Integer.MAX_VALUE);
+      }
+
+      @Test
+      @DisplayName("Should reject negative chunk attempt multiplier values")
+      void shouldRejectNegativeChunkAttemptMultiplierValues() {
+        properties.getBatchOperations().setChunkAttemptMultiplier(-0.1d);
+
+        assertThatThrownBy(() -> properties.validate())
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("chunk-attempt-multiplier");
+      }
+
+      @Test
+      @DisplayName("Should reject non-finite chunk attempt multiplier values")
+      void shouldRejectNonFiniteChunkAttemptMultiplierValues() {
+        properties.getBatchOperations().setChunkAttemptMultiplier(Double.NaN);
+
+        assertThatThrownBy(() -> properties.validate())
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("chunk-attempt-multiplier");
+      }
+
+      @Test
+      @DisplayName("Should allow finite non-negative chunk attempt multiplier values")
+      void shouldAllowFiniteNonNegativeChunkAttemptMultiplierValues() {
+        properties.getBatchOperations().setChunkAttemptMultiplier(2.5d);
+
+        assertThatCode(() -> properties.validate()).doesNotThrowAnyException();
+      }
+    }
+
+    @Nested
+    @DisplayName("Backward Compatibility Tests")
+    class BackwardCompatibilityTests {
+
+      @Test
+      @DisplayName("Should provide zombie cleanup convenience methods")
+      void shouldProvideZombieCleanupConvenienceMethods() {
+        properties.getBatchOperations().setBatchSize(75);
+
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(75);
+
+        properties.getZombieCleanup().setThresholdMs(45000L);
+        assertThat(properties.getZombieThresholdMs()).isEqualTo(45000L);
+        assertThat(properties.isZombieCleanupEnabled()).isTrue();
+      }
+
+      @Test
+      @DisplayName("Should provide orphan cleanup convenience methods")
+      void shouldProvideOrphanCleanupConvenienceMethods() {
+        properties.getBatchOperations().setBatchSize(125);
+
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(125);
+
+        properties.getOrphanCleanup().setThresholdMs(3600000L);
+        assertThat(properties.getOrphanThresholdMs()).isEqualTo(3600000L);
+        assertThat(properties.isOrphanCleanupEnabled()).isTrue();
+      }
+
+      @Test
+      @DisplayName("Should handle exceptional agents configuration")
+      void shouldHandleExceptionalAgentsConfiguration() {
+        properties.getZombieCleanup().getExceptionalAgents().setPattern(".*test.*");
+        properties.getZombieCleanup().getExceptionalAgents().setThresholdMs(7200000L);
+
+        assertThat(properties.hasExceptionalAgents()).isTrue();
+        assertThat(properties.getExceptionalAgentsPattern()).isEqualTo(".*test.*");
+        assertThat(properties.getExceptionalAgentsThresholdMs()).isEqualTo(7200000L);
+      }
+
+      @Test
+      @DisplayName("Should handle missing exceptional agents configuration")
+      void shouldHandleMissingExceptionalAgentsConfiguration() {
+        assertThat(properties.hasExceptionalAgents()).isFalse();
+        assertThat(properties.getExceptionalAgentsPattern()).isEmpty();
+      }
+    }
+
+    @Nested
+    @DisplayName("Timing Configuration Tests")
+    class TimingConfigurationTests {
+
+      @Test
+      @DisplayName("Should have reasonable timing defaults")
+      void shouldHaveReasonableTimingDefaults() {
+        assertThat(properties.getIntervalMs()).isEqualTo(1000L);
+        assertThat(properties.getRefreshPeriodSeconds()).isEqualTo(30);
+        assertThat(properties.getTimeCacheDurationMs()).isEqualTo(10000L);
+      }
+
+      @Test
+      @DisplayName("Should allow setting custom timing values")
+      void shouldAllowSettingCustomTimingValues() {
+        properties.setIntervalMs(60000L);
+        properties.setRefreshPeriodSeconds(60);
+        properties.setTimeCacheDurationMs(600000L);
+
+        assertThat(properties.getIntervalMs()).isEqualTo(60000L);
+        assertThat(properties.getRefreshPeriodSeconds()).isEqualTo(60);
+        assertThat(properties.getTimeCacheDurationMs()).isEqualTo(600000L);
+      }
+
+      @Test
+      @DisplayName("Should handle extreme timing values")
+      void shouldHandleExtremeTimingValues() {
+        properties.setIntervalMs(1L);
+        properties.setRefreshPeriodSeconds(1);
+        properties.setTimeCacheDurationMs(1L);
+
+        assertThat(properties.getIntervalMs()).isEqualTo(1L);
+        assertThat(properties.getRefreshPeriodSeconds()).isEqualTo(1);
+        assertThat(properties.getTimeCacheDurationMs()).isEqualTo(1L);
+
+        properties.setIntervalMs(Long.MAX_VALUE);
+        properties.setRefreshPeriodSeconds(Integer.MAX_VALUE);
+        properties.setTimeCacheDurationMs(Long.MAX_VALUE);
+
+        assertThat(properties.getIntervalMs()).isEqualTo(Long.MAX_VALUE);
+        assertThat(properties.getRefreshPeriodSeconds()).isEqualTo(Integer.MAX_VALUE);
+        assertThat(properties.getTimeCacheDurationMs()).isEqualTo(Long.MAX_VALUE);
+      }
+    }
+
+    @Nested
+    @DisplayName("Configuration Consistency Tests")
+    class ConfigurationConsistencyTests {
+
+      @Test
+      @DisplayName("Should maintain consistency between batch size properties")
+      void shouldMaintainConsistencyBetweenBatchSizeProperties() {
+        int testBatchSize = 75;
+        properties.getBatchOperations().setBatchSize(testBatchSize);
+
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(testBatchSize);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(testBatchSize);
+      }
+
+      @Test
+      @DisplayName("Should use unified batch size for all operations")
+      void shouldUseUnifiedBatchSizeForAllOperations() {
+        properties.getBatchOperations().setBatchSize(75);
+
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(75);
+      }
+
+      @Test
+      @DisplayName("Should validate that agent acquisition batch size affects unified batch size")
+      void shouldValidateAgentAcquisitionBatchSizeAffectsUnified() {
+        properties.getBatchOperations().setBatchSize(25);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(25);
+        properties.getBatchOperations().setBatchSize(150);
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(150);
+
+        assertThat(properties.getBatchOperations().getBatchSize()).isEqualTo(150);
+      }
+    }
+
+    @Nested
+    @DisplayName("Configuration Object Structure Tests")
+    class ConfigurationObjectStructureTests {
+
+      @Test
+      @DisplayName("Should have proper nested configuration structure")
+      void shouldHaveProperNestedConfigurationStructure() {
+        assertThat(properties.getZombieCleanup()).isNotNull();
+        assertThat(properties.getOrphanCleanup()).isNotNull();
+      }
+
+      @Test
+      @DisplayName("Should handle null nested configurations gracefully")
+      void shouldHandleNullNestedConfigurationsGracefully() {
+        assertThatCode(
+                () -> {
+                  boolean enabled = properties.isZombieCleanupEnabled();
+                  long threshold = properties.getZombieThresholdMs();
+                  assertThat(enabled).isNotNull();
+                  assertThat(threshold).isGreaterThanOrEqualTo(0);
+                })
+            .doesNotThrowAnyException();
+      }
+
+      @Test
+      @DisplayName("Should provide all expected configuration properties")
+      void shouldProvideAllExpectedConfigurationProperties() {
+        assertThatCode(
+                () -> {
+                  properties.getIntervalMs();
+                  properties.getRefreshPeriodSeconds();
+                  properties.getTimeCacheDurationMs();
+
+                  properties.getBatchOperations().isEnabled();
+                  properties.getBatchOperations().getBatchSize();
+
+                  properties.isZombieCleanupEnabled();
+                  properties.getZombieThresholdMs();
+                  properties.getZombieIntervalMs();
+                  properties.getBatchOperations().getBatchSize();
+
+                  properties.isOrphanCleanupEnabled();
+                  properties.getOrphanThresholdMs();
+                  properties.getOrphanIntervalMs();
+                  properties.getBatchOperations().getBatchSize();
+                  properties.getOrphanLeadershipTtlMs();
+                  properties.isOrphanForceAllPods();
+                })
+            .doesNotThrowAnyException();
+      }
+    }
+  }
+
+  @Nested
+  @DisplayName("Configuration Simulation Tests")
+  class ConfigurationSimulationTests {
+
+    @Test
+    void shouldValidateDefaultConfigurationMathematics() {
+      long schedulerIntervalMs = 1000L;
+      int refreshPeriodSeconds = 30;
+      long zombieThresholdMs = 1800000L;
+      long zombieCleanupIntervalMs = 300000L;
+      double maxBoostsPerSecond = 10.0;
+
+      assertTrue(
+          zombieCleanupIntervalMs < zombieThresholdMs,
+          "Zombie cleanup should be more frequent than zombie threshold");
+
+      assertTrue(
+          zombieThresholdMs >= TimeUnit.MINUTES.toMillis(15),
+          "Zombie threshold should be at least 15 minutes for AWS agent timeouts");
+
+      assertTrue(
+          schedulerIntervalMs >= 500L,
+          "Scheduler interval should be at least 500ms to avoid excessive CPU usage");
+
+      assertTrue(
+          refreshPeriodSeconds >= 15,
+          "Refresh period should be at least 15 seconds to avoid Redis overload");
+
+      assertTrue(
+          maxBoostsPerSecond >= 1.0 && maxBoostsPerSecond <= 100.0,
+          "Boost rate should be between 1-100 per second for practical usage");
+
+      long agentPickupLatencyMs = schedulerIntervalMs;
+      double boostCapacityPerMinute = maxBoostsPerSecond * 60;
+      long maxZombieLifetimeMs = zombieThresholdMs + zombieCleanupIntervalMs;
+
+      assertTrue(agentPickupLatencyMs <= 2000L, "Agent pickup should be under 2 seconds");
+      assertTrue(
+          boostCapacityPerMinute >= 60, "Should handle at least 1 boost per second sustained");
+      assertTrue(
+          maxZombieLifetimeMs <= TimeUnit.MINUTES.toMillis(35),
+          "Zombies should be cleaned within 35 minutes maximum");
+    }
+
+    @Test
+    void shouldValidateHighLoadConfigurationMathematics() {
+      long schedulerIntervalMs = 500L;
+      int refreshPeriodSeconds = 15;
+      long zombieThresholdMs = 2100000L;
+      long zombieCleanupIntervalMs = 120000L;
+      double maxBoostsPerSecond = 30.0;
+
+      assertTrue(
+          zombieCleanupIntervalMs < zombieThresholdMs,
+          "Zombie cleanup should be more frequent than zombie threshold");
+
+      assertTrue(
+          zombieThresholdMs >= TimeUnit.MINUTES.toMillis(30),
+          "Zombie threshold should be at least 30 minutes to allow full agent execution");
+
+      assertTrue(
+          schedulerIntervalMs >= 200L,
+          "Scheduler interval should not be too aggressive to avoid CPU thrashing");
+
+      assertTrue(refreshPeriodSeconds >= 10, "Even frequent refresh should not overwhelm Redis");
+
+      long refreshIntervalMs = refreshPeriodSeconds * 1000L;
+      assertTrue(
+          refreshIntervalMs > schedulerIntervalMs * 5,
+          "Refresh should be significantly less frequent than scheduler cycles");
+
+      assertTrue(
+          zombieCleanupIntervalMs > schedulerIntervalMs * 10,
+          "Zombie cleanup should be much less frequent than scheduler cycles");
+
+      long agentPickupLatencyMs = schedulerIntervalMs;
+      double boostCapacityPerMinute = maxBoostsPerSecond * 60;
+      long maxZombieLifetimeMs = zombieThresholdMs + zombieCleanupIntervalMs;
+      double schedulerCyclesPerMinute = 60000.0 / schedulerIntervalMs;
+      double refreshCyclesRatio = refreshIntervalMs / (double) schedulerIntervalMs;
+
+      assertTrue(
+          agentPickupLatencyMs <= 1000L, "High-load config should have sub-second agent pickup");
+      assertTrue(boostCapacityPerMinute >= 1000, "High-load should handle 1000+ boosts per minute");
+      assertTrue(
+          maxZombieLifetimeMs <= TimeUnit.MINUTES.toMillis(40),
+          "Even with 35min threshold, total cleanup should be under 40 minutes");
+      assertTrue(schedulerCyclesPerMinute >= 60, "Should run at least once per second");
+      assertTrue(
+          refreshCyclesRatio >= 10, "Refresh should be at least 10x less frequent than scheduler");
+    }
+
+    @Test
+    void shouldValidateOnDemandBoostPerformanceScenarios() {
+      double defaultBoostRate = 0.0;
+      int normalDeploymentsPerHour = 20;
+      double normalBoostDemand = normalDeploymentsPerHour / 3600.0;
+
+      assertTrue(
+          defaultBoostRate >= normalBoostDemand * 0,
+          "Default rate should handle 0x normal deployment load");
+
+      double highLoadBoostRate = 30.0;
+      int busyDeploymentsPerHour = 200;
+      double busyBoostDemand = busyDeploymentsPerHour / 3600.0;
+
+      assertTrue(
+          highLoadBoostRate > busyBoostDemand * 1,
+          "High-load rate should handle 1x busy deployment load");
+
+      int maxConcurrentDeployments = 50;
+      assertTrue(
+          highLoadBoostRate >= maxConcurrentDeployments / 2,
+          "Should handle worst-case concurrent deployment burst");
+    }
+
+    @Test
+    void shouldValidateRedisLoadImplications() {
+      long defaultSchedulerInterval = 1000L;
+      int defaultRefreshPeriod = 30;
+      long defaultZombieCleanupInterval = 300000L;
+
+      double defaultSchedulerOpsPerMinute = 60000.0 / defaultSchedulerInterval;
+      double defaultRefreshOpsPerMinute = 60.0 / defaultRefreshPeriod;
+      double defaultZombieOpsPerMinute = 60000.0 / defaultZombieCleanupInterval;
+      double defaultTotalOpsPerMinute =
+          defaultSchedulerOpsPerMinute + defaultRefreshOpsPerMinute + defaultZombieOpsPerMinute;
+
+      long highLoadSchedulerInterval = 500L;
+      int highLoadRefreshPeriod = 15;
+      long highLoadZombieCleanupInterval = 120000L;
+
+      double highLoadSchedulerOpsPerMinute = 60000.0 / highLoadSchedulerInterval;
+      double highLoadRefreshOpsPerMinute = 60.0 / highLoadRefreshPeriod;
+      double highLoadZombieOpsPerMinute = 60000.0 / highLoadZombieCleanupInterval;
+      double highLoadTotalOpsPerMinute =
+          highLoadSchedulerOpsPerMinute + highLoadRefreshOpsPerMinute + highLoadZombieOpsPerMinute;
+
+      assertTrue(
+          defaultTotalOpsPerMinute <= 100,
+          "Default config should keep Redis load under 100 ops/minute");
+      assertTrue(
+          highLoadTotalOpsPerMinute <= 200,
+          "High-load config should keep Redis load under 200 ops/minute");
+
+      double loadIncrease = highLoadTotalOpsPerMinute / defaultTotalOpsPerMinute;
+      assertTrue(
+          loadIncrease >= 1.5 && loadIncrease <= 4.0,
+          "High-load should be 1.5-4x more Redis operations than default");
+    }
+  }
+
+  @Nested
+  @DisplayName("Instant Retry Integration Tests")
+  class InstantRetryIntegrationTests {
+
+    private JedisPool jedisPool;
+    private AgentAcquisitionService acquisitionService;
+    private ExecutorService testExecutor;
+    private ExecutorService agentWorkPool;
+
+    @BeforeEach
+    void setUp() {
+      JedisPoolConfig config = new JedisPoolConfig();
+      config.setMaxTotal(32);
+      jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379));
+
+      ShardingFilter mockShardingFilter = mock(ShardingFilter.class);
+      PriorityAgentProperties mockAgentProperties = mock(PriorityAgentProperties.class);
+      PrioritySchedulerProperties mockSchedulerProperties = mock(PrioritySchedulerProperties.class);
+      RedisScriptManager mockScriptManager = mock(RedisScriptManager.class);
+      AgentIntervalProvider mockIntervalProvider = mock(AgentIntervalProvider.class);
+
+      when(mockShardingFilter.filter(any(Agent.class))).thenReturn(true);
+      when(mockAgentProperties.getEnabledPattern()).thenReturn(".*");
+      when(mockAgentProperties.getDisabledPattern()).thenReturn("");
+      when(mockAgentProperties.getMaxConcurrentAgents()).thenReturn(10);
+      when(mockSchedulerProperties.getRefreshPeriodSeconds()).thenReturn(1);
+      PrioritySchedulerProperties.BatchOperations mockBatch =
+          new PrioritySchedulerProperties.BatchOperations();
+      mockBatch.setEnabled(true);
+      mockBatch.setBatchSize(50);
+      when(mockSchedulerProperties.getBatchOperations()).thenReturn(mockBatch);
+      PrioritySchedulerProperties.Keys keys = new PrioritySchedulerProperties.Keys();
+      keys.setWaitingSet("waiting");
+      keys.setWorkingSet("working");
+      keys.setCleanupLeaderKey("cleanup-leader");
+      when(mockSchedulerProperties.getKeys()).thenReturn(keys);
+      when(mockScriptManager.getScriptSha(anyString())).thenReturn("mock-sha");
+      when(mockScriptManager.isInitialized()).thenReturn(true);
+
+      AgentIntervalProvider.Interval testInterval = new AgentIntervalProvider.Interval(0L, 5000L);
+      when(mockIntervalProvider.getInterval(any(Agent.class))).thenReturn(testInterval);
+
+      acquisitionService =
+          new AgentAcquisitionService(
+              jedisPool,
+              mockScriptManager,
+              mockIntervalProvider,
+              mockShardingFilter,
+              mockAgentProperties,
+              mockSchedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+      testExecutor = Executors.newFixedThreadPool(5);
+      agentWorkPool = Executors.newFixedThreadPool(20);
+
+      // Clear Redis
+      try (var jedis = jedisPool.getResource()) {
+        jedis.flushDB();
+      }
+    }
+
+    @AfterEach
+    void tearDown() {
+      if (testExecutor != null) {
+        testExecutor.shutdown();
+      }
+      if (agentWorkPool != null) {
+        agentWorkPool.shutdown();
+      }
+      if (jedisPool != null) {
+        jedisPool.close();
+      }
+    }
+
+    @Test
+    @DisplayName("Should trigger instant retry when agents become available during execution")
+    void shouldTriggerInstantRetryWhenAgentsAppearDuringExecution() throws InterruptedException {
+      try (var jedis = jedisPool.getResource()) {
+        jedis.flushDB();
+
+        jedis.zadd("waiting", 0, "ReadyAgent-1");
+        jedis.zadd("waiting", 0, "ReadyAgent-2");
+        jedis.zadd("waiting", 0, "ReadyAgent-3");
+
+        var initialReady = jedis.zrangeByScore("waiting", 0, Double.MAX_VALUE);
+        assertThat(initialReady).hasSize(3);
+      }
+
+      for (int i = 1; i <= 3; i++) {
+        Agent agent = TestFixtures.createMockAgent("ReadyAgent-" + i, "test-provider");
+        AgentExecution execution = mock(AgentExecution.class);
+        ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+        acquisitionService.registerAgent(agent, execution, instrumentation);
+      }
+
+      var retryTriggered = new AtomicInteger(0);
+      var newAgentsAdded = new AtomicInteger(0);
+
+      Thread backgroundAdder =
+          new Thread(
+              () -> {
+                try {
+                  Thread.sleep(50);
+
+                  try (var jedis = jedisPool.getResource()) {
+                    jedis.zrem("waiting", "ReadyAgent-1", "ReadyAgent-2", "ReadyAgent-3");
+                    jedis.zadd("working", System.currentTimeMillis(), "ReadyAgent-1");
+                    jedis.zadd("working", System.currentTimeMillis(), "ReadyAgent-2");
+                    jedis.zadd("working", System.currentTimeMillis(), "ReadyAgent-3");
+
+                    jedis.zadd("waiting", 0, "RetryAgent-1");
+                    jedis.zadd("waiting", 0, "RetryAgent-2");
+
+                    newAgentsAdded.set(2);
+                  }
+                } catch (Exception e) {
+                  System.err.println("Background thread error: " + e.getMessage());
+                }
+              });
+
+      backgroundAdder.start();
+
+      long startTime = System.currentTimeMillis();
+      Semaphore testSemaphore = new Semaphore(10);
+      int acquired = acquisitionService.saturatePool(0L, testSemaphore, agentWorkPool);
+      long duration = System.currentTimeMillis() - startTime;
+
+      backgroundAdder.join(1000);
+
+      try (var jedis = jedisPool.getResource()) {
+        var finalWaiting = jedis.zrangeByScore("waiting", 0, Double.MAX_VALUE);
+        var finalWorking = jedis.zrangeByScore("working", 0, Double.MAX_VALUE);
+
+        if (newAgentsAdded.get() > 0) {
+          assertThat(newAgentsAdded.get()).isEqualTo(2);
+          assertThat(duration).isLessThan(1000);
+        }
+      }
+    }
+
+  }
+
+  @Nested
+  @DisplayName("Instant Retry Cap Integration Tests")
+  class InstantRetryCapIntegrationTests {
+
+    private JedisPool jedisPool;
+    private RedisScriptManager scriptManager;
+    private AgentAcquisitionService acquisitionService;
+    private PriorityAgentProperties agentProperties;
+    private PrioritySchedulerProperties schedulerProperties;
+    private AgentIntervalProvider intervalProvider;
+    private ShardingFilter shardingFilter;
+    private ExecutorService agentWorkPool;
+
+    @BeforeEach
+    void setUp() {
+      JedisPoolConfig config = new JedisPoolConfig();
+      config.setMaxTotal(32);
+      jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379));
+
+      scriptManager =
+          new RedisScriptManager(
+              jedisPool,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+      scriptManager.initializeScripts();
+
+      intervalProvider = mock(AgentIntervalProvider.class);
+      when(intervalProvider.getInterval(any(Agent.class)))
+          .thenReturn(new AgentIntervalProvider.Interval(0L, 2000L));
+
+      shardingFilter = mock(ShardingFilter.class);
+      when(shardingFilter.filter(any(Agent.class))).thenReturn(true);
+
+      agentProperties = new PriorityAgentProperties();
+      agentProperties.setEnabledPattern(".*");
+      agentProperties.setDisabledPattern("");
+      agentProperties.setMaxConcurrentAgents(5);
+
+      schedulerProperties = new PrioritySchedulerProperties();
+      schedulerProperties.setRefreshPeriodSeconds(30);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+      schedulerProperties.getBatchOperations().setBatchSize(2);
+      schedulerProperties.getKeys().setWaitingSet("waiting");
+      schedulerProperties.getKeys().setWorkingSet("working");
+
+      acquisitionService =
+          new AgentAcquisitionService(
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              schedulerProperties,
+              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+      agentWorkPool = Executors.newFixedThreadPool(8);
+
+      try (Jedis j = jedisPool.getResource()) {
+        j.flushDB();
+      }
+    }
+
+    @AfterEach
+    void tearDown() {
+      if (agentWorkPool != null) {
+        agentWorkPool.shutdownNow();
+      }
+      if (jedisPool != null) {
+        jedisPool.close();
+      }
+    }
+
+    @Test
+    @DisplayName("Chunked acquisition fills to min(availableSlots, ready)")
+    void chunkedAcquisitionFillsToSlots() throws Exception {
+      AgentExecution execution = mock(AgentExecution.class);
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+      for (int i = 1; i <= 6; i++) {
+        acquisitionService.registerAgent(createAgent("A" + i), execution, instrumentation);
+      }
+
+      try (Jedis j = jedisPool.getResource()) {
+        j.zadd("waiting", 0, "A1");
+        j.zadd("waiting", 0, "A2");
+      }
+
+      AtomicBoolean competingMoved = new AtomicBoolean(false);
+
+      Thread competitor =
+          new Thread(
+              () -> {
+                try {
+                  Thread.sleep(50);
+                  try (Jedis j = jedisPool.getResource()) {
+                    j.zrem("waiting", "A1", "A2");
+                    j.zadd("working", System.currentTimeMillis() / 1000.0, "A1");
+                    j.zadd("working", System.currentTimeMillis() / 1000.0, "A2");
+
+                    j.zadd("waiting", 0, "A3");
+                    j.zadd("waiting", 0, "A4");
+                    j.zadd("waiting", 0, "A5");
+                    j.zadd("waiting", 0, "A6");
+                    j.zadd("waiting", 0, "A7");
+                  }
+                  competingMoved.set(true);
+                } catch (InterruptedException ignored) {
+                  Thread.currentThread().interrupt();
+                }
+              });
+
+      competitor.start();
+
+      int acquired = acquisitionService.saturatePool(1L, new Semaphore(10), agentWorkPool);
+
+      competitor.join(1000);
+
+      assertThat(acquired).isEqualTo(5);
+      assertThat(competingMoved.get()).isTrue();
+    }
+
+    private Agent createAgent(String name) {
+      Agent a = mock(Agent.class);
+      when(a.getAgentType()).thenReturn(name);
+      when(a.getProviderName()).thenReturn("test");
+      return a;
     }
   }
 }

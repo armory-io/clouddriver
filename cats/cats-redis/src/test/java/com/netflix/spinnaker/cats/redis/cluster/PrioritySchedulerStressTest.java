@@ -40,6 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.testcontainers.containers.GenericContainer;
@@ -79,10 +80,6 @@ class PrioritySchedulerStressTest {
   @AfterEach
   void tearDown() {
     if (jedisPool != null) {
-      try (Jedis j = jedisPool.getResource()) {
-        j.flushAll();
-      } catch (Exception ignore) {
-      }
       jedisPool.close();
     }
   }

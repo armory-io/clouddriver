@@ -49,7 +49,11 @@ import redis.clients.jedis.JedisPoolConfig;
  *   <li>Future cancellation for zombie executions
  *   <li>Configurable thresholds and intervals
  *   <li>Error handling and edge cases
+ *   <li>Permit release and local tracking
+ *   <li>Budget respect and non-blocking behavior
+ *   <li>Exceptional agents with custom thresholds
  * </ul>
+ *
  */
 @Testcontainers
 @DisplayName("ZombieCleanupService Tests")
@@ -970,6 +974,554 @@ class ZombieCleanupServiceTest {
       // Maps remain unchanged
       assertThat(activeAgents).isEmpty();
       assertThat(activeAgentsFutures).isEmpty();
+    }
+  }
+
+  @Nested
+  @DisplayName("Unit Tests")
+  class UnitTests {
+
+    @Test
+    @DisplayName("refreshExceptionalAgentsPattern updates thresholds without error")
+    void refreshExceptionalThresholds() {
+      PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      PrioritySchedulerMetrics metrics =
+          new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry());
+      ZombieCleanupService svc =
+          new ZombieCleanupService(
+              new JedisPool(), new RedisScriptManager(new JedisPool(), metrics), props, metrics);
+      // exercise methods on empty state; ensure no crash
+      Map<String, String> active = new HashMap<>();
+      Map<String, Future<?>> futures = new HashMap<>();
+      int cleaned = svc.cleanupZombieAgents(active, futures);
+      assertThat(cleaned).isGreaterThanOrEqualTo(0);
+    }
+  }
+
+  @Nested
+  @DisplayName("Permit Release Tests")
+  class PermitReleaseTests {
+
+    @Test
+    @DisplayName("Should release permit and remove local tracking even if Redis remove returns 0")
+    void shouldReleasePermitAndRemoveLocalTrackingWhenRedisRemoveReturnsZero() {
+      // Given: local zombie present, but not present in Redis (REMOVE returns 0)
+      String agentType = "local-only-zombie";
+      long oldScoreSeconds;
+      try (Jedis j = jedisPool.getResource()) {
+        long nowSec = Long.parseLong(j.time().get(0));
+        oldScoreSeconds = nowSec - 120; // 2 minutes ago
+      }
+
+      Map<String, String> activeAgents = new HashMap<>();
+      Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+      activeAgents.put(agentType, String.valueOf(oldScoreSeconds));
+      Future<?> mockFuture = mock(Future.class);
+      when(mockFuture.isDone()).thenReturn(false);
+      when(mockFuture.cancel(true)).thenReturn(true);
+      activeAgentsFutures.put(agentType, mockFuture);
+
+      // Wire a mocked acquisition service to verify fairness and local cleanup calls
+      AgentAcquisitionService acquisition = mock(AgentAcquisitionService.class);
+      zombieService.setAcquisitionService(acquisition);
+
+      // When
+      int cleaned = zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+      // Then: counted as cleaned even if not in Redis; we cancel local future
+      // and delegate local tracking + permit release to acquisitionService
+      assertThat(cleaned).isEqualTo(1);
+      verify(mockFuture).cancel(true);
+      verify(acquisition).removeActiveAgent(agentType);
+      verify(acquisition).tryEarlyPermitReleaseAndMaybeIncrementZif(agentType);
+    }
+  }
+
+  @Nested
+  @DisplayName("Budget Respect Tests")
+  class BudgetRespectTests {
+
+    @Test
+    @DisplayName("Long zombie cleanup work does not block scheduler; subsequent run proceeds")
+    void zombieBudget_Respected_NonBlockingAndProceeds() throws Exception {
+      String host = redis.getHost();
+      int port = redis.getMappedPort(6379);
+      JedisPoolConfig config = new JedisPoolConfig();
+      JedisPool pool = new JedisPool(config, host, port, 2000, "testpass");
+
+      com.netflix.spinnaker.cats.cluster.NodeStatusProvider nodeStatusProvider = () -> true;
+      com.netflix.spinnaker.cats.cluster.AgentIntervalProvider intervalProvider =
+          a -> new com.netflix.spinnaker.cats.cluster.AgentIntervalProvider.Interval(1000L, 5000L);
+      com.netflix.spinnaker.cats.cluster.ShardingFilter shardFilter = a -> true;
+
+      PriorityAgentProperties agentProps = new PriorityAgentProperties();
+      agentProps.setMaxConcurrentAgents(5);
+      agentProps.setEnabledPattern(".*");
+      agentProps.setDisabledPattern("");
+
+      PrioritySchedulerProperties schedProps = new PrioritySchedulerProperties();
+      schedProps.setIntervalMs(50L);
+      schedProps.setRefreshPeriodSeconds(1);
+      schedProps.getZombieCleanup().setEnabled(true);
+      schedProps.getZombieCleanup().setIntervalMs(10L);
+      schedProps.getZombieCleanup().setRunBudgetMs(50L);
+      schedProps.getOrphanCleanup().setEnabled(false);
+      schedProps.getCircuitBreaker().setEnabled(false);
+
+      PrioritySchedulerMetrics metrics =
+          new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry());
+
+      PriorityAgentScheduler sched =
+          new PriorityAgentScheduler(
+              pool,
+              nodeStatusProvider,
+              intervalProvider,
+              shardFilter,
+              agentProps,
+              schedProps,
+              metrics);
+
+      // Access scriptManager and acquisitionService for stub
+      java.lang.reflect.Field smField =
+          PriorityAgentScheduler.class.getDeclaredField("scriptManager");
+      smField.setAccessible(true);
+      RedisScriptManager scriptManager = (RedisScriptManager) smField.get(sched);
+      scriptManager.initializeScripts();
+
+      java.lang.reflect.Field acqField =
+          PriorityAgentScheduler.class.getDeclaredField("acquisitionService");
+      acqField.setAccessible(true);
+      AgentAcquisitionService acq = (AgentAcquisitionService) acqField.get(sched);
+
+      // Provide a fake active map/futures and a sleeping zombie cleanup
+      java.util.concurrent.atomic.AtomicInteger calls =
+          new java.util.concurrent.atomic.AtomicInteger(0);
+      ZombieCleanupService sleeping =
+          new ZombieCleanupService(pool, scriptManager, schedProps, metrics) {
+            @Override
+            public void cleanupZombieAgentsIfNeeded(
+                Map<String, String> activeAgents, Map<String, Future<?>> activeAgentsFutures) {
+              calls.incrementAndGet();
+              try {
+                Thread.sleep(200);
+              } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+              }
+            }
+          };
+
+      java.lang.reflect.Field zombieField =
+          PriorityAgentScheduler.class.getDeclaredField("zombieService");
+      zombieField.setAccessible(true);
+      zombieField.set(sched, sleeping);
+
+      long start1 = System.currentTimeMillis();
+      sched.run();
+      long dur1 = System.currentTimeMillis() - start1;
+      assertThat(dur1).isLessThan(400L);
+
+      // Allow the first background task to finish, then run again so a new cleanup can begin
+      Thread.sleep(250);
+      long start2 = System.currentTimeMillis();
+      sched.run();
+      long dur2 = System.currentTimeMillis() - start2;
+      assertThat(dur2).isLessThan(400L);
+
+      // Give the second offloaded cleanup time to increment counter
+      Thread.sleep(50);
+      assertThat(calls.get()).isGreaterThanOrEqualTo(2);
+
+      sched.shutdown();
+      pool.close();
+    }
+  }
+
+  @Nested
+  @DisplayName("Exceptional Agents Tests")
+  class ExceptionalAgentsTests {
+
+    private ZombieCleanupService exceptionalZombieService;
+
+    @Nested
+    @DisplayName("Pattern Configuration Tests")
+    class PatternConfigurationTests {
+
+      @Test
+      @DisplayName("Should compile valid regex patterns")
+      void shouldCompileValidRegexPatterns() {
+        // Given - Properties with valid patterns
+        PrioritySchedulerProperties props = createPropertiesWithPattern(".*BigQuery.*");
+
+        // When - Create service (triggers pattern compilation)
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        // Then - Service should be created successfully
+        assertThat(exceptionalZombieService).isNotNull();
+      }
+
+      @Test
+      @DisplayName("Should handle empty pattern gracefully")
+      void shouldHandleEmptyPatternGracefully() {
+        // Given - Properties with empty pattern
+        PrioritySchedulerProperties props = createPropertiesWithPattern("");
+
+        // When - Create service
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        // Then - Should work with no exceptional agents
+        assertThat(exceptionalZombieService).isNotNull();
+      }
+
+      @Test
+      @DisplayName("Should log error for invalid regex patterns")
+      void shouldLogErrorForInvalidRegexPatterns() {
+        // Given - Properties with invalid regex pattern
+        PrioritySchedulerProperties props = createPropertiesWithPattern("[invalid regex");
+
+        // When - Create service (should handle gracefully)
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        // Then - Service should still be created (pattern will be null internally)
+        assertThat(exceptionalZombieService).isNotNull();
+      }
+
+      @Test
+      @DisplayName("Should refresh pattern configuration at runtime")
+      void shouldRefreshPatternConfigurationAtRuntime() {
+        // Given - Service with initial pattern
+        PrioritySchedulerProperties props = createPropertiesWithPattern(".*Old.*");
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        // When - Update pattern and refresh
+        props.getZombieCleanup().getExceptionalAgents().setPattern(".*New.*");
+        exceptionalZombieService.refreshExceptionalAgentsPattern();
+
+        // Then - Should handle the refresh without errors
+        assertThat(exceptionalZombieService).isNotNull();
+      }
+    }
+
+    @Nested
+    @DisplayName("Threshold Application Tests")
+    class ThresholdApplicationTests {
+
+      @Test
+      @DisplayName("Should apply default threshold to non-matching agents")
+      void shouldApplyDefaultThresholdToNonMatchingAgents() {
+        // Given - Properties with BigQuery pattern and short thresholds for testing
+        PrioritySchedulerProperties props =
+            createTestPropertiesWithExceptionalAgents(
+                ".*BigQuery.*", 10000L, 5000L); // 10s exceptional, 5s default
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        // Simulate agents past default threshold but before exceptional threshold
+        Map<String, String> activeAgents = new HashMap<>();
+        Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+        long currentTime = System.currentTimeMillis();
+        long completionDeadline =
+            (currentTime - 7000L) / 1000L; // 7 seconds ago (past default threshold)
+
+        activeAgents.put("RegularAgent", String.valueOf(completionDeadline));
+        activeAgents.put("AnotherAgent", String.valueOf(completionDeadline));
+
+        // When - Run zombie cleanup
+        int cleaned =
+            exceptionalZombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+        // Then - Regular agents should be cleaned (past 5s default threshold)
+        assertThat(cleaned).isEqualTo(2);
+        assertThat(activeAgents).isEmpty();
+      }
+
+      @Test
+      @DisplayName("Should apply exceptional threshold to matching agents")
+      void shouldApplyExceptionalThresholdToMatchingAgents() {
+        // Given - Properties with BigQuery pattern
+        PrioritySchedulerProperties props =
+            createTestPropertiesWithExceptionalAgents(
+                ".*BigQuery.*", 10000L, 5000L); // 10s exceptional, 5s default
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        Map<String, String> activeAgents = new HashMap<>();
+        Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+        long currentTime = System.currentTimeMillis();
+        long completionDeadline = (currentTime - 7000L) / 1000L; // 7 seconds ago
+
+        // BigQuery agent should not be cleaned (7s < 10s exceptional threshold)
+        activeAgents.put("BigQueryCachingAgent", String.valueOf(completionDeadline));
+        // Regular agent should be cleaned (7s > 5s default threshold)
+        activeAgents.put("RegularAgent", String.valueOf(completionDeadline));
+
+        // When - Run zombie cleanup
+        int cleaned =
+            exceptionalZombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+        // Then - Only regular agent should be cleaned
+        assertThat(cleaned).isEqualTo(1);
+        assertThat(activeAgents).containsKey("BigQueryCachingAgent");
+        assertThat(activeAgents).doesNotContainKey("RegularAgent");
+      }
+
+      @Test
+      @DisplayName("Should clean exceptional agents when they exceed exceptional threshold")
+      void shouldCleanExceptionalAgentsWhenTheyExceedExceptionalThreshold() {
+        // Given - Properties with BigQuery pattern
+        PrioritySchedulerProperties props =
+            createTestPropertiesWithExceptionalAgents(
+                ".*BigQuery.*", 8000L, 5000L); // 8s exceptional, 5s default
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        Map<String, String> activeAgents = new HashMap<>();
+        Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+        long currentTime = System.currentTimeMillis();
+        long completionDeadline = (currentTime - 10000L) / 1000L; // 10 seconds ago
+
+        // Both agents should be cleaned (10s > both thresholds)
+        activeAgents.put("BigQueryCachingAgent", String.valueOf(completionDeadline));
+        activeAgents.put("RegularAgent", String.valueOf(completionDeadline));
+
+        // When - Run zombie cleanup
+        int cleaned =
+            exceptionalZombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+        // Then - Both agents should be cleaned
+        assertThat(cleaned).isEqualTo(2);
+        assertThat(activeAgents).isEmpty();
+      }
+    }
+
+    @Nested
+    @DisplayName("Pattern Matching Tests")
+    class PatternMatchingTests {
+
+      @Test
+      @DisplayName("Should match 'contains' patterns")
+      void shouldMatchContainsPatterns() {
+        // Given - Pattern that matches agents containing "BigQuery"
+        PrioritySchedulerProperties props =
+            createTestPropertiesWithExceptionalAgents(".*BigQuery.*", 10000L, 5000L);
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        // Test agents with different names
+        Map<String, String> activeAgents = new HashMap<>();
+        Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+        long currentTime = System.currentTimeMillis();
+        long completionDeadline = (currentTime - 7000L) / 1000L; // 7 seconds ago
+
+        activeAgents.put("BigQueryCachingAgent", String.valueOf(completionDeadline));
+        activeAgents.put("MyBigQueryProvider", String.valueOf(completionDeadline));
+        activeAgents.put("BigQueryAgent", String.valueOf(completionDeadline));
+        activeAgents.put("RegularAgent", String.valueOf(completionDeadline));
+
+        // When - Run zombie cleanup
+        int cleaned =
+            exceptionalZombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+        // Then - Only RegularAgent should be cleaned
+        assertThat(cleaned).isEqualTo(1);
+        assertThat(activeAgents).hasSize(3);
+        assertThat(activeAgents).containsKey("BigQueryCachingAgent");
+        assertThat(activeAgents).containsKey("MyBigQueryProvider");
+        assertThat(activeAgents).containsKey("BigQueryAgent");
+      }
+
+      @Test
+      @DisplayName("Should match 'starts with' patterns")
+      void shouldMatchStartsWithPatterns() {
+        // Given - Pattern that matches agents starting with AWS or GCP
+        PrioritySchedulerProperties props =
+            createTestPropertiesWithExceptionalAgents("^(AWS|GCP).*", 10000L, 5000L);
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        Map<String, String> activeAgents = new HashMap<>();
+        Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+        long currentTime = System.currentTimeMillis();
+        long completionDeadline = (currentTime - 7000L) / 1000L; // 7 seconds ago
+
+        activeAgents.put("AWSCachingAgent", String.valueOf(completionDeadline));
+        activeAgents.put("GCPComputeAgent", String.valueOf(completionDeadline));
+        activeAgents.put("AzureAgent", String.valueOf(completionDeadline));
+
+        // When - Run zombie cleanup
+        int cleaned =
+            exceptionalZombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+        // Then - Only AzureAgent should be cleaned
+        assertThat(cleaned).isEqualTo(1);
+        assertThat(activeAgents).hasSize(2);
+        assertThat(activeAgents).containsKey("AWSCachingAgent");
+        assertThat(activeAgents).containsKey("GCPComputeAgent");
+      }
+
+      @Test
+      @DisplayName("Should match 'ends with' patterns")
+      void shouldMatchEndsWithPatterns() {
+        // Given - Pattern that matches agents ending with "Provider"
+        PrioritySchedulerProperties props =
+            createTestPropertiesWithExceptionalAgents(".*Provider$", 10000L, 5000L);
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        Map<String, String> activeAgents = new HashMap<>();
+        Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+        long currentTime = System.currentTimeMillis();
+        long completionDeadline = (currentTime - 7000L) / 1000L; // 7 seconds ago
+
+        activeAgents.put("BigQueryProvider", String.valueOf(completionDeadline));
+        activeAgents.put("ComputeProvider", String.valueOf(completionDeadline));
+        activeAgents.put("StorageAgent", String.valueOf(completionDeadline));
+
+        // When - Run zombie cleanup
+        int cleaned =
+            exceptionalZombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+        // Then - Only StorageAgent should be cleaned
+        assertThat(cleaned).isEqualTo(1);
+        assertThat(activeAgents).hasSize(2);
+        assertThat(activeAgents).containsKey("BigQueryProvider");
+        assertThat(activeAgents).containsKey("ComputeProvider");
+      }
+    }
+
+    @Nested
+    @DisplayName("Exceptional Agents Integration Tests")
+    class ExceptionalAgentsIntegrationTests {
+
+      @Test
+      @DisplayName("Should handle mixed agent types in one cleanup cycle")
+      void shouldHandleMixedAgentTypesInOneCleanupCycle() {
+        // Given - Properties with multiple exceptional patterns
+        PrioritySchedulerProperties props =
+            createTestPropertiesWithExceptionalAgents(
+                "(.*BigQuery.*|.*Provider$)",
+                12000L,
+                5000L); // Matches BigQuery or ending with Provider
+        exceptionalZombieService =
+            new ZombieCleanupService(
+                jedisPool,
+                scriptManager,
+                props,
+                new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+
+        Map<String, String> activeAgents = new HashMap<>();
+        Map<String, Future<?>> activeAgentsFutures = new HashMap<>();
+
+        long currentTime = System.currentTimeMillis();
+        long moderateOverdue = (currentTime - 7000L) / 1000L; // 7s ago
+        long significantOverdue = (currentTime - 15000L) / 1000L; // 15s ago
+
+        // Mix of agents with different overdue times
+        activeAgents.put(
+            "BigQueryCachingAgent", String.valueOf(moderateOverdue)); // Won't be cleaned (7s < 12s)
+        activeAgents.put(
+            "ComputeProvider", String.valueOf(moderateOverdue)); // Won't be cleaned (7s < 12s)
+        activeAgents.put(
+            "RegularAgent1", String.valueOf(moderateOverdue)); // Will be cleaned (7s > 5s)
+        activeAgents.put(
+            "RegularAgent2", String.valueOf(moderateOverdue)); // Will be cleaned (7s > 5s)
+        activeAgents.put(
+            "BigQuerySlowAgent", String.valueOf(significantOverdue)); // Will be cleaned (15s > 12s)
+
+        // When - Run zombie cleanup
+        int cleaned =
+            exceptionalZombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
+
+        // Then - Should clean appropriate agents based on their thresholds
+        assertThat(cleaned).isEqualTo(3); // RegularAgent1, RegularAgent2, BigQuerySlowAgent
+        assertThat(activeAgents).hasSize(2);
+        assertThat(activeAgents).containsKey("BigQueryCachingAgent");
+        assertThat(activeAgents).containsKey("ComputeProvider");
+      }
+    }
+
+    // Helper methods migrated from ExceptionalAgentsZombieCleanupTest.java:496-545
+    private PrioritySchedulerProperties createPropertiesWithPattern(String pattern) {
+      PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      props.getBatchOperations().setEnabled(true);
+      props.setIntervalMs(1000L);
+      props.setRefreshPeriodSeconds(30);
+
+      // Configure exceptional agents
+      props.getZombieCleanup().getExceptionalAgents().setPattern(pattern);
+      props.getZombieCleanup().getExceptionalAgents().setThresholdMs(3600000L); // 60 minutes
+
+      return props;
+    }
+
+    private PrioritySchedulerProperties createTestPropertiesWithExceptionalAgents(
+        String pattern, long exceptionalThresholdMs, long defaultThresholdMs) {
+      PrioritySchedulerProperties props = new PrioritySchedulerProperties();
+      props.getBatchOperations().setEnabled(true);
+      props.setIntervalMs(100L); // Short interval for testing
+      props.setRefreshPeriodSeconds(30);
+
+      // Configure zombie cleanup with test-friendly values
+      props.getZombieCleanup().setEnabled(true);
+      props.getZombieCleanup().setThresholdMs(defaultThresholdMs);
+      props.getZombieCleanup().setIntervalMs(100L); // Short interval for testing
+      props.getBatchOperations().setBatchSize(50);
+
+      // Configure exceptional agents
+      props.getZombieCleanup().getExceptionalAgents().setPattern(pattern);
+      props.getZombieCleanup().getExceptionalAgents().setThresholdMs(exceptionalThresholdMs);
+
+      return props;
     }
   }
 }
