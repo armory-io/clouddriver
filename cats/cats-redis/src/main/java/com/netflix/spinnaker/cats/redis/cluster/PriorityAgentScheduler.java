@@ -88,6 +88,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
   private final AtomicBoolean orphanCleanupRunning = new AtomicBoolean(false);
   private final AtomicBoolean reconcileRunning = new AtomicBoolean(false);
 
+  // Timeout tracking for cleanup tasks - allows detection of hung cleanup without blocking
+  // scheduler
+  private final AtomicLong zombieCleanupStartMs = new AtomicLong(0);
+  private final AtomicLong orphanCleanupStartMs = new AtomicLong(0);
+  private volatile java.util.concurrent.Future<?> zombieCleanupFuture;
+  private volatile java.util.concurrent.Future<?> orphanCleanupFuture;
+
   // Simple starvation counter: increments when permits==0 and pool activeCount==0. Resets
   // otherwise.
   private final java.util.concurrent.atomic.AtomicInteger permitStarvationConsecutive =
@@ -99,7 +106,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
       new java.util.concurrent.atomic.AtomicInteger(0);
   private final java.util.concurrent.atomic.AtomicLong lastStarvationDegradedMs =
       new java.util.concurrent.atomic.AtomicLong(0L);
-  // Removed per-WARN cadence fields; consolidated into periodic health summary
 
   // Track all agents provided via schedule(), regardless of current sharding gating
   private final java.util.concurrent.ConcurrentMap<String, KnownAgent> knownAgents =
@@ -112,13 +118,27 @@ public class PriorityAgentScheduler extends CatsModuleAware
   // Local submission gate for zombie cleanup to avoid per-second submits
   private final AtomicLong lastZombieSubmitEpochMs = new AtomicLong(0);
 
-  // Watchdog streak counters (single-threaded scheduler loop)
+  // Watchdog monitoring: detects operational anomalies via ratio-based heuristics.
+  //
+  // Four anomaly types are tracked, each with a streak counter and last-trigger timestamp:
+  // - Leak: Available permits are low but pool is idle (possible permit leak)
+  // - Skew: Active agents don't match held permits (capacity accounting mismatch)
+  // - ZeroProgress: Ready agents exist but none acquired (acquisition stall)
+  // - RedisStall: Redis circuit breaker is open (connectivity issues)
+  //
+  // Streak counters increment on consecutive anomaly detections and reset on recovery.
+  // When a streak exceeds a threshold (typically 3 consecutive cycles), a warning is
+  // recorded and surfaced in the periodic health summary. This avoids log spam from
+  // transient conditions while still alerting on sustained issues.
+  //
+  // These counters are single-threaded (updated only in the scheduler loop) so they
+  // do not require synchronization. The timestamps are atomic for safe reads during
+  // health summary logging.
   private int watchdogLeakStreak = 0;
   private int watchdogSkewStreak = 0;
   private int watchdogZeroProgressStreak = 0;
   private int watchdogRedisStallStreak = 0;
 
-  // Watchdog last-trigger timestamps (folded into periodic health summary)
   private final java.util.concurrent.atomic.AtomicLong watchdogLeakLastEpochMs =
       new java.util.concurrent.atomic.AtomicLong(0L);
   private final java.util.concurrent.atomic.AtomicLong watchdogSkewLastEpochMs =
@@ -230,7 +250,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
             return -1d;
           },
           () ->
-              config.getRunningAgents() != null ? config.getRunningAgents().availablePermits() : -1,
+              config.getMaxConcurrentSemaphore() != null
+                  ? config.getMaxConcurrentSemaphore().availablePermits()
+                  : -1,
           () -> (double) acquisitionService.getCompletionQueueSize(),
           () -> (double) acquisitionService.getServerClientOffsetMs(),
           () -> {
@@ -324,7 +346,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       if (!repopulatedThisCycle) {
         agentsAcquired =
             acquisitionService.saturatePool(
-                currentRun, config.getRunningAgents(), config.getAgentWorkPool());
+                currentRun, config.getMaxConcurrentSemaphore(), config.getAgentWorkPool());
       } else {
         log.debug(
             "Skipping acquisition on repopulation cycle {} to allow jitter distribution",
@@ -333,9 +355,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Watchdog: detect possible permit starvation and related stalls via ratio-based heuristics
       try {
-        java.util.concurrent.Semaphore runningAgentsSemaphore = config.getRunningAgents();
+        java.util.concurrent.Semaphore maxConcurrentSemaphore = config.getMaxConcurrentSemaphore();
         int availablePermitsNow =
-            runningAgentsSemaphore != null ? runningAgentsSemaphore.availablePermits() : -1;
+            maxConcurrentSemaphore != null ? maxConcurrentSemaphore.availablePermits() : -1;
         // Read zombiesInFlight immediately after permits to reduce diagnostic skew
         int zombiesInFlightCount = Math.max(0, acquisitionService.getZombiesInFlight());
         int poolActive = 0;
@@ -352,15 +374,15 @@ public class PriorityAgentScheduler extends CatsModuleAware
         long ready = acquisitionService.getReadyCountSnapshot();
         // Allow zero capacity visibility (do not clamp to 1)
         int effectiveCapacity = Math.max(0, maxConcurrent - (activeCount + zombiesInFlightCount));
-        double permitsFreePct =
+        double permitsFreeRatio =
             maxConcurrent > 0
                 ? Math.max(0d, Math.min(1d, (double) availablePermitsNow / (double) maxConcurrent))
                 : 0d;
-        double activePct =
+        double activeRatio =
             maxConcurrent > 0
                 ? Math.max(0d, Math.min(1d, (double) activeCount / (double) maxConcurrent))
                 : 0d;
-        double acquiredFillPct =
+        double acquiredFillRatio =
             effectiveCapacity > 0
                 ? Math.max(0d, Math.min(1d, (double) agentsAcquired / (double) effectiveCapacity))
                 : 0d;
@@ -376,9 +398,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
         }
 
         evaluateWatchdog(
-            permitsFreePct,
-            activePct,
-            acquiredFillPct,
+            permitsFreeRatio,
+            activeRatio,
+            acquiredFillRatio,
             ready,
             poolActive,
             agentsAcquired,
@@ -398,7 +420,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
           // Consider starvation only when zombies are not consuming most capacity
           boolean zombiesSmallFraction =
               (maxConcurrent <= 0) || (zombiesInFlightCount < (maxConcurrent * 0.1));
-          if (runningAgentsSemaphore != null
+          if (maxConcurrentSemaphore != null
               && availablePermitsNow == 0
               && poolActive == 0
               && zombiesSmallFraction) {
@@ -445,51 +467,97 @@ public class PriorityAgentScheduler extends CatsModuleAware
         log.debug("Watchdog check failed; continuing", e);
       }
 
-      // Offload zombie cleanup (non-blocking) — pre-gated by cadence to avoid per-second submits
+      // Offload zombie cleanup (non-blocking) — pre-gated by enabled check and cadence
       try {
-        long zombieIntervalMs = config.getZombieIntervalMs();
-        long lastZombieSubmit = lastZombieSubmitEpochMs.get();
-        boolean zombieDueToSubmit = isPeriodElapsed(lastZombieSubmit, zombieIntervalMs);
-        if (zombieDueToSubmit && zombieCleanupRunning.compareAndSet(false, true)) {
-          lastZombieSubmitEpochMs.set(nowMs());
-          zombieCleanupExecutor.submit(
-              () -> {
-                try {
-                  java.util.Map<String, String> activeAgentsSnapshot =
-                      new java.util.HashMap<>(acquisitionService.getActiveAgentsMap());
-                  java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
-                      new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
-                  long startTs = nowMs();
-                  long budgetMs = config.getZombieRunBudgetMs();
-                  zombieService.cleanupZombieAgentsIfNeeded(activeAgentsSnapshot, futuresSnapshot);
-                  if (budgetMs > 0 && nowMs() - startTs > budgetMs) {
-                    log.info(
-                        "Zombie cleanup exceeded budget {}ms (elapsed={}ms); subsequent work will be deferred",
-                        budgetMs,
-                        nowMs() - startTs);
-                    // Cooperative hard stop: interrupt to signal budget breach
-                    Thread.currentThread().interrupt();
-                  }
-                } catch (Exception e) {
-                  if (e instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                    return;
-                  }
-                  log.warn("Zombie cleanup failed", e);
-                  try {
-                    metrics.incrementRunFailure(e.getClass().getSimpleName());
-                  } catch (Exception me) {
-                    log.debug("Failed to record zombie cleanup failure metric", me);
-                  }
-                } finally {
-                  zombieCleanupRunning.set(false);
+        // Skip zombie cleanup entirely if disabled - avoids snapshot creation overhead
+        if (!config.isZombieCleanupEnabled()) {
+          if (log.isDebugEnabled()) {
+            log.debug("Skipping zombie cleanup: disabled via configuration");
+          }
+        } else {
+          // Check for hung cleanup: if running too long, forcibly cancel to prevent permanent
+          // failure
+          long zombieStartMs = zombieCleanupStartMs.get();
+          if (zombieStartMs > 0 && zombieCleanupRunning.get()) {
+            long budgetMs = config.getZombieRunBudgetMs();
+            // External timeout = budget + 30s margin (or 60s if no budget configured)
+            long externalTimeoutMs = budgetMs > 0 ? budgetMs + 30000L : 60000L;
+            long elapsedMs = nowMs() - zombieStartMs;
+            if (elapsedMs > externalTimeoutMs) {
+              log.error(
+                  "Zombie cleanup hung for {}ms (timeout={}ms), forcibly cancelling to recover",
+                  elapsedMs,
+                  externalTimeoutMs);
+              try {
+                java.util.concurrent.Future<?> f = zombieCleanupFuture;
+                if (f != null) {
+                  f.cancel(true);
                 }
-              });
-        } else if (log.isDebugEnabled()) {
-          if (!zombieDueToSubmit) {
-            log.debug("Skipping zombie cleanup submission: interval not elapsed");
+                metrics.incrementCleanupTimeout("zombie");
+              } catch (Exception ce) {
+                log.debug("Failed to cancel hung zombie cleanup", ce);
+              }
+              resetZombieCleanupState();
+            }
+          }
+
+          long zombieIntervalMs = config.getZombieIntervalMs();
+          long lastZombieSubmit = lastZombieSubmitEpochMs.get();
+          boolean zombieDueToSubmit = isPeriodElapsed(lastZombieSubmit, zombieIntervalMs);
+          if (zombieDueToSubmit && zombieCleanupRunning.compareAndSet(false, true)) {
+            lastZombieSubmitEpochMs.set(nowMs());
+            zombieCleanupStartMs.set(nowMs());
+            zombieCleanupFuture =
+                zombieCleanupExecutor.submit(
+                    () -> {
+                      try {
+                        java.util.Map<String, String> activeAgentsSnapshot =
+                            new java.util.HashMap<>(acquisitionService.getActiveAgentsMap());
+                        java.util.Map<String, java.util.concurrent.Future<?>> futuresSnapshot =
+                            new java.util.HashMap<>(acquisitionService.getActiveAgentsFutures());
+                        long startTs = nowMs();
+                        long budgetMs = config.getZombieRunBudgetMs();
+                        zombieService.cleanupZombieAgentsIfNeeded(
+                            activeAgentsSnapshot, futuresSnapshot);
+                        if (budgetMs > 0 && nowMs() - startTs > budgetMs) {
+                          log.info(
+                              "Zombie cleanup exceeded budget {}ms (elapsed={}ms); subsequent work will be deferred",
+                              budgetMs,
+                              nowMs() - startTs);
+                          // Cooperative hard stop: interrupt to signal budget breach
+                          Thread.currentThread().interrupt();
+                        }
+                      } catch (Exception e) {
+                        if (e instanceof InterruptedException) {
+                          Thread.currentThread().interrupt();
+                          return;
+                        }
+                        log.warn("Zombie cleanup failed", e);
+                        try {
+                          metrics.incrementRunFailure(e.getClass().getSimpleName());
+                        } catch (Exception me) {
+                          log.debug("Failed to record zombie cleanup failure metric", me);
+                        }
+                      } finally {
+                        resetZombieCleanupState();
+                      }
+                    });
           } else {
-            log.debug("Skipping zombie cleanup: previous run still in progress");
+            if (!zombieDueToSubmit) {
+              if (log.isDebugEnabled()) {
+                log.debug("Skipping zombie cleanup submission: interval not elapsed");
+              }
+            } else {
+              // Cleanup skipped because previous run still in progress - track for monitoring
+              if (log.isDebugEnabled()) {
+                log.debug("Skipping zombie cleanup: previous run still in progress");
+              }
+              try {
+                metrics.incrementCleanupSkipped("zombie");
+              } catch (Exception me) {
+                log.debug("Failed to record cleanup skipped metric", me);
+              }
+            }
           }
         }
       } catch (Exception e) {
@@ -498,45 +566,82 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
       // Offload orphan cleanup (non-blocking) — pre-gated by cadence to avoid per-second submits
       try {
+        // Check for hung cleanup: if running too long, forcibly cancel to prevent permanent failure
+        long orphanStartMs = orphanCleanupStartMs.get();
+        if (orphanStartMs > 0 && orphanCleanupRunning.get()) {
+          long budgetMs = config.getOrphanRunBudgetMs();
+          // External timeout = budget + 30s margin (or 60s if no budget configured)
+          long externalTimeoutMs = budgetMs > 0 ? budgetMs + 30000L : 60000L;
+          long elapsedMs = nowMs() - orphanStartMs;
+          if (elapsedMs > externalTimeoutMs) {
+            log.error(
+                "Orphan cleanup hung for {}ms (timeout={}ms), forcibly cancelling to recover",
+                elapsedMs,
+                externalTimeoutMs);
+            try {
+              java.util.concurrent.Future<?> f = orphanCleanupFuture;
+              if (f != null) {
+                f.cancel(true);
+              }
+              metrics.incrementCleanupTimeout("orphan");
+            } catch (Exception ce) {
+              log.debug("Failed to cancel hung orphan cleanup", ce);
+            }
+            resetOrphanCleanupState();
+          }
+        }
+
         long intervalMs = config.getOrphanIntervalMs();
         long lastSubmit = lastOrphanSubmitEpochMs.get();
         boolean dueToSubmit = isPeriodElapsed(lastSubmit, intervalMs);
         if (dueToSubmit && orphanCleanupRunning.compareAndSet(false, true)) {
           lastOrphanSubmitEpochMs.set(nowMs());
-          orphanCleanupExecutor.submit(
-              () -> {
-                try {
-                  long startTs = nowMs();
-                  long budgetMs = config.getOrphanRunBudgetMs();
-                  orphanService.cleanupOrphanedAgentsIfNeeded();
-                  if (budgetMs > 0 && nowMs() - startTs > budgetMs) {
-                    log.info(
-                        "Orphan cleanup exceeded budget {}ms (elapsed={}ms); subsequent work will be deferred",
-                        budgetMs,
-                        nowMs() - startTs);
-                    Thread.currentThread().interrupt();
-                    return;
-                  }
-                } catch (Exception e) {
-                  if (e instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                    return;
-                  }
-                  log.warn("Orphan cleanup failed", e);
-                  try {
-                    metrics.incrementRunFailure(e.getClass().getSimpleName());
-                  } catch (Exception me) {
-                    log.debug("Failed to record orphan cleanup failure metric", me);
-                  }
-                } finally {
-                  orphanCleanupRunning.set(false);
-                }
-              });
-        } else if (log.isDebugEnabled()) {
+          orphanCleanupStartMs.set(nowMs());
+          orphanCleanupFuture =
+              orphanCleanupExecutor.submit(
+                  () -> {
+                    try {
+                      long startTs = nowMs();
+                      long budgetMs = config.getOrphanRunBudgetMs();
+                      orphanService.cleanupOrphanedAgentsIfNeeded();
+                      if (budgetMs > 0 && nowMs() - startTs > budgetMs) {
+                        log.info(
+                            "Orphan cleanup exceeded budget {}ms (elapsed={}ms); subsequent work will be deferred",
+                            budgetMs,
+                            nowMs() - startTs);
+                        Thread.currentThread().interrupt();
+                        return;
+                      }
+                    } catch (Exception e) {
+                      if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                        return;
+                      }
+                      log.warn("Orphan cleanup failed", e);
+                      try {
+                        metrics.incrementRunFailure(e.getClass().getSimpleName());
+                      } catch (Exception me) {
+                        log.debug("Failed to record orphan cleanup failure metric", me);
+                      }
+                    } finally {
+                      resetOrphanCleanupState();
+                    }
+                  });
+        } else {
           if (!dueToSubmit) {
-            log.debug("Skipping orphan cleanup submission: interval not elapsed");
+            if (log.isDebugEnabled()) {
+              log.debug("Skipping orphan cleanup submission: interval not elapsed");
+            }
           } else {
-            log.debug("Skipping orphan cleanup: previous run still in progress");
+            // Cleanup skipped because previous run still in progress - track for monitoring
+            if (log.isDebugEnabled()) {
+              log.debug("Skipping orphan cleanup: previous run still in progress");
+            }
+            try {
+              metrics.incrementCleanupSkipped("orphan");
+            } catch (Exception me) {
+              log.debug("Failed to record cleanup skipped metric", me);
+            }
           }
         }
       } catch (Exception e) {
@@ -568,7 +673,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
   }
 
   /**
-   * Emit a periodic health summary at most once every 10 minutes, regardless of scheduler interval.
+   * Emit a periodic health summary at most once per configured period (default: 10 minutes).
    *
    * <p>The log is human-scannable groupings that match operational concerns:
    *
@@ -607,9 +712,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
       queueDepth =
           ((java.util.concurrent.ThreadPoolExecutor) config.getAgentWorkPool()).getQueue().size();
     }
-    java.util.concurrent.Semaphore runningAgentsSemaphore = config.getRunningAgents();
+    java.util.concurrent.Semaphore maxConcurrentSemaphore = config.getMaxConcurrentSemaphore();
     int availablePermits =
-        runningAgentsSemaphore != null ? runningAgentsSemaphore.availablePermits() : -1;
+        maxConcurrentSemaphore != null ? maxConcurrentSemaphore.availablePermits() : -1;
     int maxConcurrent = acquisitionService.getAgentProperties().getMaxConcurrentAgents();
     int activeCount = acquisitionService.getActiveAgentCount();
     int zombiesInFlight = Math.max(0, acquisitionService.getZombiesInFlight());
@@ -619,7 +724,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     // Permit reconciliation: warn and mark degraded if heldPermits > active + zombiesInFlight
     boolean permitMismatch = false;
-    if (runningAgentsSemaphore != null && maxConcurrent > 0) {
+    if (maxConcurrentSemaphore != null && maxConcurrent > 0) {
       int heldPermits = Math.max(0, maxConcurrent - availablePermits);
       int accounted = activeCount + zombiesInFlight;
       if (heldPermits > accounted) {
@@ -627,6 +732,11 @@ public class PriorityAgentScheduler extends CatsModuleAware
         // Do not emit immediate WARN; include in periodic summary instead
       }
     }
+
+    // Set consistency check: verify no agent exists in both waiting and working sets
+    AgentAcquisitionService.ConsistencyCheckResult consistencyResult =
+        acquisitionService.checkSetConsistency(50);
+    boolean setOverlap = consistencyResult.hasViolations();
 
     // Consolidate watchdog triggers in the last 10 minutes
     java.util.List<String> watchdogs = new java.util.ArrayList<>();
@@ -646,14 +756,17 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogs.add("redis_stall");
     }
 
-    boolean warnLevel = (stats.isDegraded() || permitMismatch);
+    boolean warnLevel = (stats.isDegraded() || permitMismatch || setOverlap);
     String healthLabel = warnLevel ? "DEGRADED" : "HEALTHY";
 
     java.util.List<String> reasonTokens = new java.util.ArrayList<>();
     if (permitMismatch) {
       reasonTokens.add("permit_mismatch");
     }
-    if (warnLevel) {
+    if (setOverlap) {
+      reasonTokens.add("set_overlap");
+    }
+    if (stats.isDegraded()) {
       String degradedReason = stats.getDegradedReason();
       if (degradedReason != null && !degradedReason.isEmpty()) {
         reasonTokens.add(degradedReason);
@@ -684,22 +797,22 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     msg.append(
         String.format(
-            " [backlog ready=%s oldest_overdue=%ss capacityPerCycle=%s]",
+            " [backlog ready=%s oldest_overdue=%ss capacity_per_cycle=%s]",
             formatLong(readySnapshot),
             formatLong(oldestOverdueSecondsNow),
             formatDouble(capacityPerCycle)));
 
-    if (runningAgentsSemaphore == null || maxConcurrent <= 0) {
-      msg.append(String.format(" [permits n/a zombiesInFlight=%s]", formatLong(zombiesInFlight)));
+    if (maxConcurrentSemaphore == null || maxConcurrent <= 0) {
+      msg.append(String.format(" [permits n/a zombies_in_flight=%s]", formatLong(zombiesInFlight)));
     } else {
-      double freePct =
+      double freeRatio =
           Math.max(0d, Math.min(1d, (double) availablePermits / (double) maxConcurrent));
       msg.append(
           String.format(
-              " [permits %s/%s (%.1f%%) zombiesInFlight=%s]",
+              " [permits %s/%s (%.1f%%) zombies_in_flight=%s]",
               formatLong(availablePermits),
               formatLong(maxConcurrent),
-              freePct * 100d,
+              freeRatio * 100d,
               formatLong(zombiesInFlight)));
     }
 
@@ -708,7 +821,15 @@ public class PriorityAgentScheduler extends CatsModuleAware
             " [cleanup zombies_cleaned=%s orphans_cleaned=%s]",
             formatLong(stats.getZombiesCleanedUp()), formatLong(stats.getOrphansCleanedUp())));
 
-    msg.append(" queueDepth=" + formatLong(queueDepth));
+    // Append consistency check results
+    if (consistencyResult.getSampled() > 0) {
+      msg.append(
+          String.format(
+              " [consistency violations=%d sampled=%d]",
+              consistencyResult.getViolations(), consistencyResult.getSampled()));
+    }
+
+    msg.append(" queue_depth=" + formatLong(queueDepth));
 
     if (!watchdogs.isEmpty()) {
       msg.append(" watchdogs=").append(String.join(",", watchdogs));
@@ -717,7 +838,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
     if (lastStarvationSuspected.get()) {
       msg.append(
           String.format(
-              " [starvation suspected: degradedForMs=%d ticks=%d]",
+              " [starvation suspected: degraded_for_ms=%d ticks=%d]",
               lastStarvationDegradedMs.get(), lastStarvationTicks.get()));
     }
 
@@ -1043,7 +1164,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // Set graceful shutdown flag (coordination marker for shutdown sequence)
       acquisitionService.setGracefulShutdown(true);
 
-      // PHASE 1: Interrupt any running futures
+      // Phase 1: Interrupt any running futures
       Map<String, Future<?>> activeAgentsFutures =
           acquisitionService.getActiveAgentsFuturesSnapshot();
       int interrupted = 0;
@@ -1079,7 +1200,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         Thread.sleep(100);
       }
 
-      // PHASE 2: Re-queue ONLY agents this instance was actively working on
+      // Phase 2: Re-queue only agents this instance was actively working on
       // This prevents duplicate re-queuing in non-sharded multi-instance environments
       Map<String, String> activeAgentsSnapshot = acquisitionService.getActiveAgentsMap();
       int released = 0;
@@ -1160,7 +1281,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // Lightweight local state validation: ensure activeAgents keys belong to registered agents
       try {
         java.util.Map<String, String> active = acquisitionService.getActiveAgentsMap();
-        for (java.util.Map.Entry<String, String> e : active.entrySet()) {
+        for (java.util.Map.Entry<String, String> entry : active.entrySet()) {
           if (Thread.currentThread().isInterrupted()) {
             if (log.isDebugEnabled()) {
               log.debug("Reconcile validation stopping early due to interrupt");
@@ -1174,9 +1295,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
                 budgetMs);
             break;
           }
-          String agentType = e.getKey();
-          String scoreStr = e.getValue();
-          boolean numeric = scoreStr != null && scoreStr.matches("^\\d+$");
+          String agentType = entry.getKey();
+          String scoreString = entry.getValue();
+          boolean numeric = scoreString != null && scoreString.matches("^\\d+$");
           if (acquisitionService.getRegisteredAgent(agentType) == null || !numeric) {
             // Inconsistent local tracking; clean it up to avoid leaks
             acquisitionService.removeActiveAgent(agentType);
@@ -1212,6 +1333,16 @@ public class PriorityAgentScheduler extends CatsModuleAware
   void reconcileKnownAgentsNow() {
     lastReconcileEpochMs.set(0);
     reconcileKnownAgentsIfNeeded(runCount.get());
+  }
+
+  /**
+   * Test hook that forces orphan cleanup without waiting for interval checks.
+   *
+   * <p>Package-private for test access. Allows tests to trigger cleanup directly without
+   * reflection.
+   */
+  void forceOrphanCleanup() {
+    orphanService.forceCleanupOrphanedAgents();
   }
 
   /**
@@ -1286,9 +1417,9 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
   /** Evaluate watchdog heuristics and emit warnings for consecutive trigger conditions. */
   public void evaluateWatchdog(
-      double permitsFreePct,
-      double activePct,
-      double acquiredFillPct,
+      double permitsFreeRatio,
+      double activeRatio,
+      double acquiredFillRatio,
       long ready,
       int poolActive,
       int agentsAcquired,
@@ -1301,7 +1432,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     // Consecutive-tick streaks to avoid flapping
     // Leak suspect: almost no free permits AND pool idle AND ready backlog
-    if (maxConcurrent > 0 && permitsFreePct < 0.01 && poolActive == 0 && ready > 0) {
+    if (maxConcurrent > 0 && permitsFreeRatio < 0.01 && poolActive == 0 && ready > 0) {
       watchdogLeakStreak++;
     } else {
       watchdogLeakStreak = 0;
@@ -1312,8 +1443,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogLeakStreak = 0;
     }
 
-    // Capacity skew (zIF): lots of free permits but we barely acquired anything
-    if (ready > 0 && permitsFreePct > 0.90 && acquiredFillPct < 0.10) {
+    // Capacity skew (zombiesInFlight): lots of free permits but we barely acquired anything
+    if (ready > 0 && permitsFreeRatio > 0.90 && acquiredFillRatio < 0.10) {
       watchdogSkewStreak++;
     } else {
       watchdogSkewStreak = 0;
@@ -1402,5 +1533,19 @@ public class PriorityAgentScheduler extends CatsModuleAware
               ? ", reason=" + degradedReason
               : "");
     }
+  }
+
+  /** Resets zombie cleanup tracking state after completion or forced cancellation. */
+  private void resetZombieCleanupState() {
+    zombieCleanupRunning.set(false);
+    zombieCleanupStartMs.set(0);
+    zombieCleanupFuture = null;
+  }
+
+  /** Resets orphan cleanup tracking state after completion or forced cancellation. */
+  private void resetOrphanCleanupState() {
+    orphanCleanupRunning.set(false);
+    orphanCleanupStartMs.set(0);
+    orphanCleanupFuture = null;
   }
 }

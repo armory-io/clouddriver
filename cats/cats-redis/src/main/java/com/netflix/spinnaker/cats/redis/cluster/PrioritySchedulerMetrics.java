@@ -21,6 +21,8 @@ import com.netflix.spectator.api.Registry;
 import com.netflix.spectator.api.patterns.PolledMeter;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import redis.clients.jedis.JedisPool;
 
@@ -31,6 +33,8 @@ import redis.clients.jedis.JedisPool;
  */
 @Component
 public final class PrioritySchedulerMetrics {
+
+  private static final Logger log = LoggerFactory.getLogger(PrioritySchedulerMetrics.class);
 
   private final Registry registry;
 
@@ -65,6 +69,16 @@ public final class PrioritySchedulerMetrics {
   private final Id invalidPairId;
   private final Id scriptResultTypeErrorId;
   private final Id stateInconsistentActiveId;
+
+  // Redis pool health metrics
+  private final Id redisPoolErrorsId;
+
+  // Agent removal metrics
+  private final Id removeAgentFallbackId;
+
+  // Cleanup metrics
+  private final Id cleanupSkippedId;
+  private final Id cleanupTimeoutId;
 
   // Guard against duplicate PolledMeter registrations
   private volatile boolean gaugesRegistered = false;
@@ -114,6 +128,16 @@ public final class PrioritySchedulerMetrics {
     this.scriptResultTypeErrorId = registry.createId("cats.redisPriority.scripts.resultTypeError");
     this.stateInconsistentActiveId =
         registry.createId("cats.redisPriority.state.inconsistentActive");
+
+    // Redis pool health
+    this.redisPoolErrorsId = registry.createId("cats.redisPriority.redisPool.errors");
+
+    // Agent removal
+    this.removeAgentFallbackId = registry.createId("cats.redisPriority.removeAgent.fallbackUsed");
+
+    // Cleanup
+    this.cleanupSkippedId = registry.createId("cats.redisPriority.cleanup.skipped");
+    this.cleanupTimeoutId = registry.createId("cats.redisPriority.cleanup.timeout");
   }
 
   /**
@@ -196,12 +220,20 @@ public final class PrioritySchedulerMetrics {
         .increment();
   }
 
-  /** Records a circuit breaker recovery event. */
+  /**
+   * Records a circuit breaker recovery event.
+   *
+   * @param name breaker name
+   */
   public void recordCircuitBreakerRecovery(String name) {
     registry.counter(circuitBreakerRecoveryId.withTag("name", safe(name))).increment();
   }
 
-  /** Records a circuit breaker blocked event. */
+  /**
+   * Records a circuit breaker blocked event.
+   *
+   * @param name breaker name
+   */
   public void recordCircuitBreakerBlocked(String name) {
     registry.counter(circuitBreakerBlockedId.withTag("name", safe(name))).increment();
   }
@@ -215,7 +247,11 @@ public final class PrioritySchedulerMetrics {
     registry.counter(acquireValidationFailureId.withTag("reason", safe(reason))).increment();
   }
 
-  /** Records repopulation duration. */
+  /**
+   * Records repopulation duration.
+   *
+   * @param elapsedMs elapsed time in milliseconds
+   */
   public void recordRepopulateTime(long elapsedMs) {
     registry.timer(repopulateTimeId).record(elapsedMs, TimeUnit.MILLISECONDS);
   }
@@ -231,7 +267,11 @@ public final class PrioritySchedulerMetrics {
     }
   }
 
-  /** Increments repopulation error counter with reason. */
+  /**
+   * Increments repopulation error counter with reason.
+   *
+   * @param reason error category
+   */
   public void incrementRepopulateError(String reason) {
     registry.counter(repopulateErrorsId.withTag("reason", safe(reason))).increment();
   }
@@ -273,7 +313,12 @@ public final class PrioritySchedulerMetrics {
         .record(elapsedMs, TimeUnit.MILLISECONDS);
   }
 
-  /** Increments script error counter tagged by script and reason. */
+  /**
+   * Increments script error counter tagged by script and reason.
+   *
+   * @param script script name
+   * @param reason error category
+   */
   public void incrementScriptError(String script, String reason) {
     registry
         .counter(scriptsErrorsId.withTag("script", safe(script)).withTag("reason", safe(reason)))
@@ -285,17 +330,29 @@ public final class PrioritySchedulerMetrics {
     registry.counter(scriptsReloadsId).increment();
   }
 
-  /** Increments invalid Redis member counter with location tag. */
+  /**
+   * Increments invalid Redis member counter with location tag.
+   *
+   * @param where location where invalid member was detected
+   */
   public void incrementInvalidMember(String where) {
     registry.counter(invalidMemberId.withTag("where", safe(where))).increment();
   }
 
-  /** Increments invalid pair counter with phase tag. */
+  /**
+   * Increments invalid pair counter with phase tag.
+   *
+   * @param phase processing phase where invalid pair was detected
+   */
   public void incrementInvalidPair(String phase) {
     registry.counter(invalidPairId.withTag("phase", safe(phase))).increment();
   }
 
-  /** Increments type error counter for script results. */
+  /**
+   * Increments type error counter for script results.
+   *
+   * @param script script name that returned unexpected type
+   */
   public void incrementScriptResultTypeError(String script) {
     registry.counter(scriptResultTypeErrorId.withTag("script", safe(script))).increment();
   }
@@ -305,7 +362,62 @@ public final class PrioritySchedulerMetrics {
     registry.counter(stateInconsistentActiveId).increment();
   }
 
-  /** Register gauges that are shared across scheduler services. Safe to call multiple times. */
+  /**
+   * Increments counter when Redis pool gauge collection fails due to pool exceptions. This provides
+   * visibility into Redis connectivity issues that would otherwise be masked by returning 0.
+   *
+   * @param metric the metric name that failed (e.g., "active", "idle", "waiters")
+   */
+  public void incrementRedisPoolError(String metric) {
+    registry.counter(redisPoolErrorsId.withTag("metric", safe(metric))).increment();
+  }
+
+  /**
+   * Increments counter when atomic removeAgent script fails and fallback path is used. This
+   * indicates potential race conditions in agent removal that could lead to agent loss.
+   */
+  public void incrementRemoveAgentFallback() {
+    registry.counter(removeAgentFallbackId).increment();
+  }
+
+  /**
+   * Increments counter when cleanup is skipped because a previous run is still in progress. A
+   * sustained high rate indicates cleanup is falling behind and zombies/orphans may accumulate.
+   *
+   * @param type cleanup type ("zombie" or "orphan")
+   */
+  public void incrementCleanupSkipped(String type) {
+    registry.counter(cleanupSkippedId.withTag("type", safe(type))).increment();
+  }
+
+  /**
+   * Increments counter when cleanup is cancelled due to exceeding the external timeout. This
+   * indicates the cleanup task hung on a Redis operation or future.cancel() and was forcibly
+   * cancelled to prevent permanent cleanup failure on this pod.
+   *
+   * @param type cleanup type ("zombie" or "orphan")
+   */
+  public void incrementCleanupTimeout(String type) {
+    registry.counter(cleanupTimeoutId.withTag("type", safe(type))).increment();
+  }
+
+  /**
+   * Registers gauges that are shared across scheduler services. Safe to call multiple times.
+   *
+   * @param jedisPool Redis connection pool for pool metrics (may be null)
+   * @param registeredAgents supplier for registered agent count
+   * @param activeAgents supplier for active agent count
+   * @param readyCount supplier for ready-to-run agent count
+   * @param oldestOverdueSeconds supplier for oldest overdue agent age in seconds
+   * @param degraded supplier for degraded state indicator (1=degraded, 0=healthy)
+   * @param capacityPerCycle supplier for capacity per scheduling cycle
+   * @param queueDepth supplier for executor queue depth
+   * @param semaphoreAvailable supplier for available semaphore permits
+   * @param completionQueueSize supplier for completion queue size
+   * @param timeOffsetMs supplier for Redis/local clock offset in milliseconds
+   * @param readyToCapacityRatio supplier for ready-to-capacity ratio
+   * @param zombiesInFlight supplier for zombies-in-flight count
+   */
   public synchronized void registerGauges(
       JedisPool jedisPool,
       Supplier<Number> registeredAgents,
@@ -353,6 +465,11 @@ public final class PrioritySchedulerMetrics {
                 try {
                   return jedisPool.getNumActive();
                 } catch (Exception e) {
+                  // Use DEBUG to avoid log spam during transient pool issues
+                  log.debug(
+                      "Failed to get Redis pool active connections count for metric cats.redisPriority.redisPool.active",
+                      e);
+                  incrementRedisPoolError("active");
                   return 0;
                 }
               });
@@ -364,6 +481,11 @@ public final class PrioritySchedulerMetrics {
                 try {
                   return jedisPool.getNumIdle();
                 } catch (Exception e) {
+                  // Use DEBUG to avoid log spam during transient pool issues
+                  log.debug(
+                      "Failed to get Redis pool idle connections count for metric cats.redisPriority.redisPool.idle",
+                      e);
+                  incrementRedisPoolError("idle");
                   return 0;
                 }
               });
@@ -375,6 +497,11 @@ public final class PrioritySchedulerMetrics {
                 try {
                   return jedisPool.getNumWaiters();
                 } catch (Exception e) {
+                  // Use DEBUG to avoid log spam during transient pool issues
+                  log.debug(
+                      "Failed to get Redis pool waiters count for metric cats.redisPriority.redisPool.waiters",
+                      e);
+                  incrementRedisPoolError("waiters");
                   return 0;
                 }
               });
