@@ -18,6 +18,7 @@ package com.netflix.spinnaker.cats.redis.cluster;
 
 import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.*;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.redis.cluster.support.ScriptResults;
 import java.net.InetAddress;
@@ -39,13 +40,12 @@ import redis.clients.jedis.params.SetParams;
  * agents), orphans have no running instance. The service uses leader election to coordinate cleanup
  * across pods, preventing duplicate work.
  *
- * <p>Key rules:
+ * <p>Key rules: preserve valid waiting agents; skip locally active agents (zombie cleaner handles
+ * those); move valid working orphans back to waiting.
  *
- * <ul>
- *   <li>Preserve valid waiting agents - only remove positively invalid ones
- *   <li>Skip locally active agents - zombie cleaner handles those
- *   <li>Move valid working orphans back to waiting, remove invalid ones
- * </ul>
+ * <p><b>Scope:</b> Agents from other pods only (no local RunState). Manipulates Redis and
+ * activeAgents map; <b>never</b> touches permits or zIF. See {@link ZombieCleanupService} for
+ * locally stuck agents.
  */
 @Component
 @Slf4j
@@ -69,7 +69,10 @@ public class OrphanCleanupService {
   private volatile String currentLeadershipId = null;
   private volatile long lastOrphanCleanup = 0;
 
-  // Reusable ThreadLocal collections to reduce GC pressure in cleanup hot paths
+  // Design decision: ThreadLocal proliferation (intentional performance optimization)
+  // Reusable containers reduce GC pressure in cleanup hot paths. Safe because cleanup runs in a
+  // single-threaded executor with proper finally-block clearing. See AgentAcquisitionService for
+  // detailed rationale.
   private static final ThreadLocal<java.util.List<String>> REUSABLE_INVALID_ARGS =
       ThreadLocal.withInitial(java.util.ArrayList::new);
   private static final ThreadLocal<java.util.List<String>> REUSABLE_ATTEMPTED_INVALID =
@@ -79,6 +82,14 @@ public class OrphanCleanupService {
   private static final ThreadLocal<java.util.Set<String>> REUSABLE_STRING_SET =
       ThreadLocal.withInitial(java.util.HashSet::new);
 
+  /**
+   * Constructs a new OrphanCleanupService.
+   *
+   * @param jedisPool Redis connection pool for cleanup operations
+   * @param scriptManager Lua script manager for atomic Redis operations
+   * @param schedulerProperties Configuration for cleanup behavior
+   * @param metrics Metrics collector for tracking cleanup operations
+   */
   public OrphanCleanupService(
       JedisPool jedisPool,
       RedisScriptManager scriptManager,
@@ -101,6 +112,8 @@ public class OrphanCleanupService {
   /**
    * Set reference to AgentAcquisitionService for advanced orphan processing. This provides access
    * to agent registry and active agent cleanup.
+   *
+   * @param acquisitionService the acquisition service for agent state coordination
    */
   public void setAcquisitionService(AgentAcquisitionService acquisitionService) {
     this.acquisitionService = acquisitionService;
@@ -110,6 +123,7 @@ public class OrphanCleanupService {
    * Remove ThreadLocal buffers held by the current thread to release per-thread memory. Intended to
    * be invoked on the owning executor thread during shutdown.
    */
+  @VisibleForTesting
   void removeThreadLocals() {
     try {
       REUSABLE_INVALID_ARGS.remove();
@@ -249,6 +263,11 @@ public class OrphanCleanupService {
       }
       // Update the last cleanup timestamp
       lastOrphanCleanup = nowMs();
+      // Record metrics (consistent with cleanupOrphanedAgentsIfNeeded)
+      if (metrics != null) {
+        metrics.recordCleanupTime("orphan", nowMs() - start);
+        metrics.incrementCleanupCleaned("orphan", totalCleaned);
+      }
       return totalCleaned;
     } catch (Exception e) {
       log.error("Error during forced orphan cleanup", e);
@@ -261,7 +280,8 @@ public class OrphanCleanupService {
    *
    * @return total orphans cleaned up
    */
-  public long getOrphansCleanedUp() {
+  @VisibleForTesting
+  long getOrphansCleanedUp() {
     return orphansCleanedUp.sum();
   }
 
@@ -270,7 +290,8 @@ public class OrphanCleanupService {
    *
    * @return last cleanup timestamp in milliseconds
    */
-  public long getLastOrphanCleanup() {
+  @VisibleForTesting
+  long getLastOrphanCleanup() {
     return lastOrphanCleanup;
   }
 
@@ -338,7 +359,7 @@ public class OrphanCleanupService {
           if (all == null || all.isEmpty()) {
             if (log.isDebugEnabled()) {
               log.debug(
-                  "Orphan scan ({}/{}): {} set analyzed, 0 candidates found (totalScanned={}, totalCleaned={})",
+                  "Orphan scan ({}/{}): {} set analyzed, 0 candidates found (total_scanned={}, total_cleaned={})",
                   setName,
                   passNumber,
                   totalScanned,
@@ -367,7 +388,7 @@ public class OrphanCleanupService {
           if (cleanedThisPass == 0) {
             if (log.isDebugEnabled()) {
               log.debug(
-                  "Orphan scan ({}/{}): {} set made no progress this pass; exiting early before budget is exhausted (totalScanned={}, totalCleaned={})",
+                  "Orphan scan ({}/{}): {} set made no progress this pass; exiting early before budget is exhausted (total_scanned={}, total_cleaned={})",
                   setName,
                   passNumber,
                   totalScanned,
@@ -386,7 +407,7 @@ public class OrphanCleanupService {
       final int pageSize = configuredBatch; // > 0 by guard above
 
       if (WORKING_SET.equals(setName)) {
-        // WORKING: head-advancing paging.
+        // Working set: head-advancing paging.
         // Safe to mutate as we go because we always read from the head (LIMIT 0,pageSize).
         // Moving/removing entries advances the head naturally; we won't skip eligible items.
         int pageNumber = 0;
@@ -417,7 +438,7 @@ public class OrphanCleanupService {
           if (page == null || page.isEmpty()) {
             if (log.isDebugEnabled()) {
               log.debug(
-                  "Orphan scan ({}/{}): {} page empty (head), stopping (totalScanned={}, totalCleaned={})",
+                  "Orphan scan ({}/{}): {} page empty (head), stopping (total_scanned={}, total_cleaned={})",
                   setName,
                   pageNumber,
                   setName,
@@ -448,7 +469,7 @@ public class OrphanCleanupService {
           if (cleanedThisPass == 0) {
             if (log.isDebugEnabled()) {
               log.debug(
-                  "Orphan scan ({}/{}): {} set made no progress this pass; exiting early before budget is exhausted (totalScanned={}, totalCleaned={})",
+                  "Orphan scan ({}/{}): {} set made no progress this pass; exiting early before budget is exhausted (total_scanned={}, total_cleaned={})",
                   setName,
                   pageNumber,
                   totalScanned,
@@ -460,7 +481,7 @@ public class OrphanCleanupService {
         // Per-set completion log removed - final summary provides breakdown by set
         return totalCleaned;
       } else {
-        // WAITING: two-phase per page.
+        // Waiting set: two-phase per page.
         // 1) Enumerate a page with OFFSET/COUNT without mutating the set, collecting invalid
         //    candidates. This keeps OFFSET stable within the window despite concurrent writers.
         // 2) Mutate (batch remove) only after enumeration; then advance OFFSET by
@@ -498,7 +519,7 @@ public class OrphanCleanupService {
           if (page == null || page.isEmpty()) {
             if (log.isDebugEnabled()) {
               log.debug(
-                  "Orphan scan ({}/{}): {} page empty at offset {} (totalScanned={}, totalCleaned={})",
+                  "Orphan scan ({}/{}): {} page empty at offset {} (total_scanned={}, total_cleaned={})",
                   setName,
                   pageNumber,
                   offset,
@@ -667,21 +688,21 @@ public class OrphanCleanupService {
                       break;
                     }
                     if (!removedSet.contains(agentName)) {
-                      String scoreStr;
+                      String scoreString;
                       try {
-                        Double s = jedis.zscore(WAITING_SET, agentName);
-                        scoreStr = s != null ? String.valueOf(s.longValue()) : null;
+                        Double score = jedis.zscore(WAITING_SET, agentName);
+                        scoreString = score != null ? String.valueOf(score.longValue()) : null;
                       } catch (Exception ignore) {
-                        scoreStr = null;
+                        scoreString = null;
                       }
                       try {
-                        if (scoreStr != null) {
+                        if (scoreString != null) {
                           Object one =
                               scriptManager.evalshaWithSelfHeal(
                                   jedis,
                                   RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
                                   java.util.Collections.singletonList(WAITING_SET),
-                                  java.util.Arrays.asList(agentName, scoreStr));
+                                  java.util.Arrays.asList(agentName, scoreString));
                           ScriptResults.BatchRemovalResult oneParsed =
                               ScriptResults.parseRemoveAgentsConditional(one);
                           totalCleaned += oneParsed.getRemovedCount();
@@ -753,14 +774,14 @@ public class OrphanCleanupService {
                   continue; // preserve valid waiting entries and non-owned shard entries
                 }
 
-                String scoreStr = String.valueOf((long) orphan.getScore());
+                String scoreString = String.valueOf((long) orphan.getScore());
                 try {
                   Object one =
                       scriptManager.evalshaWithSelfHeal(
                           jedis,
                           RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
                           java.util.Collections.singletonList(WAITING_SET),
-                          java.util.Arrays.asList(agentName, scoreStr));
+                          java.util.Arrays.asList(agentName, scoreString));
                   ScriptResults.BatchRemovalResult oneParsed =
                       ScriptResults.parseRemoveAgentsConditional(one);
                   totalCleaned += oneParsed.getRemovedCount();
@@ -841,7 +862,9 @@ public class OrphanCleanupService {
       // Use Redis SET with NX and EX options for atomic lock acquisition with built-in expiry
       String result =
           jedis.set(
-              CLEANUP_LEADER_KEY, instanceId, SetParams.setParams().nx().ex(leadershipTtlSeconds));
+              CLEANUP_LEADER_KEY,
+              instanceId,
+              SetParams.setParams().nx().ex((long) leadershipTtlSeconds));
 
       boolean acquired = "OK".equals(result);
       if (acquired) {
@@ -895,8 +918,8 @@ public class OrphanCleanupService {
 
   /**
    * Fallback method to clean up orphaned agents individually when batch operations fail or are
-   * disabled. Implements dual-processing logic: - Valid agents (still configured) → Move to waiting
-   * for rescheduling - Invalid agents (removed accounts) → Remove completely from Redis
+   * disabled. Implements dual-processing logic: - Valid agents (still configured) -> Move to
+   * waiting for rescheduling - Invalid agents (removed accounts) -> Remove completely from Redis
    *
    * @param jedis Redis connection
    * @param setName Redis set name (working or waiting)
@@ -982,7 +1005,7 @@ public class OrphanCleanupService {
             if (result != null && "swapped".equals(result)) {
               cleaned++;
               log.info(
-                  "Successfully moved orphaned agent {} (original score: {}, new score: {}) from working to waiting set (preserveReady={}).",
+                  "Successfully moved orphaned agent {} (original score: {}, new score: {}) from working to waiting set (preserve_ready={}).",
                   agentName,
                   (long) score,
                   Long.valueOf(newScore),
@@ -1007,7 +1030,7 @@ public class OrphanCleanupService {
                       java.util.Arrays.asList(WORKING_SET, WAITING_SET),
                       java.util.Collections.singletonList(agentName));
 
-              // REMOVE_AGENT returns 1 for success
+              // removeAgent returns 1 for success
               boolean removed = result != null && ((Long) result).intValue() == 1;
               if (removed) {
                 cleaned++;
@@ -1036,7 +1059,7 @@ public class OrphanCleanupService {
               }
             } else {
               log.debug(
-                  "Preserving invalid working agent {} due to shard gating (belongsToThisShard=false)",
+                  "Preserving invalid working agent {} due to shard gating (belongs_to_this_shard=false)",
                   agentName);
             }
           }
