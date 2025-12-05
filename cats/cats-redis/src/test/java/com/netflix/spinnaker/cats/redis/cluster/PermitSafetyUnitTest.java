@@ -20,7 +20,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 import com.netflix.spectator.api.DefaultRegistry;
 import com.netflix.spinnaker.cats.agent.Agent;
@@ -36,25 +35,37 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisPoolConfig;
 
+/**
+ * Unit tests for permit safety on submission rejection.
+ *
+ * <p>Verifies that semaphore permits are properly released when executor submission fails,
+ * preventing permit leaks and ensuring agents are requeued for retry.
+ */
 @Testcontainers
 @DisplayName("Permit safety on submission rejection")
+@SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
 class PermitSafetyUnitTest {
 
   @Container
   static GenericContainer<?> redis =
-      new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
+      new GenericContainer<>("redis:7-alpine")
+          .withExposedPorts(6379)
+          .withCommand("redis-server", "--requirepass", "testpass");
 
+  /**
+   * Tests that submission rejection releases permit, increments metric, and requeues agent.
+   *
+   * <p>When the executor rejects agent submission (RejectedExecutionException), verifies: 1) permit
+   * is released to prevent leaks, 2) submission failure metric is incremented with "rejected" tag,
+   * 3) agent is requeued to waiting set, and 4) no orphaned state in working set.
+   */
   @Test
   @DisplayName("Submission failure increments metric and does not throw")
   void submissionFailureIncrementsMetric() {
-    JedisPool pool =
-        new JedisPool(new JedisPoolConfig(), redis.getHost(), redis.getFirstMappedPort());
+    JedisPool pool = TestFixtures.createTestJedisPool(redis);
     try {
-      RedisScriptManager scripts =
-          new RedisScriptManager(pool, new PrioritySchedulerMetrics(new DefaultRegistry()));
-      scripts.initializeScripts();
+      RedisScriptManager scripts = TestFixtures.createTestScriptManager(pool);
 
       PriorityAgentProperties agentProps = new PriorityAgentProperties();
       agentProps.setEnabledPattern(".*");
@@ -67,7 +78,8 @@ class PermitSafetyUnitTest {
       schedProps.getKeys().setCleanupLeaderKey("cleanup-leader");
       schedProps.getBatchOperations().setEnabled(false);
 
-      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(new DefaultRegistry());
+      DefaultRegistry registry = new DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
 
       AgentAcquisitionService acq =
           new AgentAcquisitionService(
@@ -79,21 +91,8 @@ class PermitSafetyUnitTest {
               schedProps,
               metrics);
 
-      Agent agent = mock(Agent.class);
-      when(agent.getAgentType()).thenReturn("rejected-agent");
-      when(agent.getProviderName()).thenReturn("test");
-
-      ExecutionInstrumentation instr =
-          new ExecutionInstrumentation() {
-            @Override
-            public void executionStarted(Agent a) {}
-
-            @Override
-            public void executionCompleted(Agent a, long ms) {}
-
-            @Override
-            public void executionFailed(Agent a, Throwable t, long ms) {}
-          };
+      Agent agent = TestFixtures.createMockAgent("rejected-agent", "test");
+      ExecutionInstrumentation instr = TestFixtures.createNoOpInstrumentation();
 
       acq.registerAgent(
           agent,
@@ -112,9 +111,45 @@ class PermitSafetyUnitTest {
       doThrow(new RejectedExecutionException("full")).when(rejecting).submit(any(Runnable.class));
 
       Semaphore sem = new Semaphore(1);
+      int initialPermits = sem.availablePermits();
 
       int acquired = acq.saturatePool(1L, sem, rejecting);
       assertThat(acquired).isGreaterThanOrEqualTo(0);
+
+      // Verify permit released (critical for permit safety)
+      assertThat(sem.availablePermits())
+          .describedAs("Permit should be released after submission failure (permit safety)")
+          .isEqualTo(initialPermits);
+
+      // Verify submission failure metric incremented
+      assertThat(
+              registry
+                  .counter("cats.redisPriority.acquire.submissionFailures", "reason", "rejected")
+                  .count())
+          .describedAs("Submission failure metric should be incremented with reason='rejected'")
+          .isGreaterThanOrEqualTo(1);
+
+      // Verify agent requeued (agent should be back in waiting set)
+      try (var j = pool.getResource()) {
+        Double waitingScore = j.zscore("waiting", "rejected-agent");
+        assertThat(waitingScore)
+            .describedAs("Agent should be requeued to waiting set after submission failure")
+            .isNotNull();
+      }
+
+      // Verify no orphaned state (agent should not be in working set)
+      try (var j = pool.getResource()) {
+        Double workingScore = j.zscore("working", "rejected-agent");
+        assertThat(workingScore)
+            .describedAs(
+                "Agent should not be in working set after submission failure (no orphaned state)")
+            .isNull();
+      }
+
+      // Verify acquisition metrics were recorded
+      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+          .describedAs("Acquisition attempts metric should be incremented")
+          .isGreaterThanOrEqualTo(1);
     } finally {
       pool.close();
     }

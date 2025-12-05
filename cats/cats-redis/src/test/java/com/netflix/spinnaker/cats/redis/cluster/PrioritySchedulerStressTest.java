@@ -17,9 +17,9 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
 
 import com.netflix.spectator.api.DefaultRegistry;
+import com.netflix.spectator.api.Registry;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
@@ -48,10 +48,27 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisPoolConfig;
 
+/**
+ * Stress tests for Priority Scheduler under concurrent load.
+ *
+ * <p>Tests verify system correctness under stress conditions including permit accounting, agent
+ * uniqueness, cleanup coordination, and shutdown preservation. Each test runs concurrent operations
+ * (acquisition, zombie cleanup, orphan cleanup, shutdown toggles) for extended durations with
+ * randomized timing to expose race conditions.
+ *
+ * <p><b>Thread.sleep() Usage:</b> This suite intentionally uses {@code Thread.sleep()} for pacing
+ * worker threads, not for synchronization. Random delays (10-1500ms) create realistic timing
+ * windows that help expose timing-dependent bugs.
+ *
+ * <p><b>Verification Approach:</b> Tests verify invariants (disjoint sets, permit accounting) and
+ * eventual consistency (zombiesInFlight settles to 0) rather than deterministic outcomes. Metrics
+ * verification confirms code paths were exercised.
+ */
 @Testcontainers
 @DisplayName("Priority Scheduler Stress Tests")
+@Tag("stress")
+@SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
 class PrioritySchedulerStressTest {
 
   @Container
@@ -63,16 +80,16 @@ class PrioritySchedulerStressTest {
   private JedisPool jedisPool;
   private RedisScriptManager scriptManager;
   private PrioritySchedulerMetrics metrics;
+  private Registry registry;
 
   @BeforeEach
   void setUp() {
-    JedisPoolConfig config = new JedisPoolConfig();
-    config.setMaxTotal(32);
-    jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
+    jedisPool = TestFixtures.createTestJedisPool(redis, "testpass", 32);
     try (Jedis j = jedisPool.getResource()) {
       j.flushAll();
     }
-    metrics = new PrioritySchedulerMetrics(new DefaultRegistry());
+    registry = new DefaultRegistry();
+    metrics = new PrioritySchedulerMetrics(registry);
     scriptManager = new RedisScriptManager(jedisPool, metrics);
     scriptManager.initializeScripts();
   }
@@ -84,78 +101,133 @@ class PrioritySchedulerStressTest {
     }
   }
 
+  /**
+   * Tests that permit accounting remains correct under concurrent stress with randomized timing.
+   *
+   * <p>Runs 20 agents with 5 max concurrent for 10 seconds. Exercises concurrent acquisition,
+   * zombie cleanup, orphan cleanup, and shutdown toggles with randomized execution timing.
+   *
+   * <p>Verifies: zombiesInFlight settles to 0 after stress (eventual consistency), no thread
+   * exceptions, end-of-run invariants (disjoint sets, sum <= registered).
+   */
   @Test
   @Timeout(180)
-  @DisplayName("Test 1: Permit accounting with randomized timing (10s)")
+  @DisplayName("Permit accounting with randomized timing (10s)")
   void permitAccountingUnderRandomizedTiming() throws Exception {
     StressParams params = new StressParams(20, 5, Duration.ofSeconds(10));
     StressResult result = runStress(params);
 
-    // Exit criterion: zombiesInFlight returns to 0 within 2s
+    // Verify invariants
     assertThat(Math.max(0, result.zifAfterSettling))
         .describedAs("zombiesInFlight must settle back to 0 within 2s")
         .isEqualTo(0);
-
     assertThat(result.violations).as("No thread exceptions").isEmpty();
+
+    // Verify metrics were recorded during stress
+    verifyMetricsRecorded();
   }
 
+  /**
+   * Tests that agent uniqueness is maintained under concurrent operations.
+   *
+   * <p>Runs 50 agents with 10 max concurrent for 10 seconds. Higher agent count exercises
+   * concurrent acquisition, zombie cleanup, orphan cleanup, and shutdown toggles.
+   *
+   * <p>Verifies: zombiesInFlight settles to 0 or <= 1 (small tolerance for concurrent transitions),
+   * no thread exceptions.
+   */
   @Test
   @Timeout(180)
-  @DisplayName("Test 2: Agent execution under concurrent ops (10s)")
+  @DisplayName("Agent uniqueness under concurrent operations (10s)")
   void agentUniquenessUnderConcurrentOps() throws Exception {
     StressParams params = new StressParams(50, 10, Duration.ofSeconds(10));
     StressResult result = runStress(params);
 
-    // zombiesInFlight should settle to 0; allow small tolerance for concurrent state transitions
+    // Verify invariants (small tolerance for concurrent state transitions)
     assertThat(Math.max(0, result.zifAfterSettling))
         .describedAs("zombiesInFlight must settle back to 0")
         .isLessThanOrEqualTo(1);
-
     assertThat(result.violations).as("No thread exceptions").isEmpty();
+
+    // Verify metrics were recorded during stress
+    verifyMetricsRecorded();
   }
 
+  /**
+   * Tests that cleanup coordination and invariants hold under extended stress.
+   *
+   * <p>Runs 80 agents with 10 max concurrent for 30 seconds. Extended duration exercises zombie and
+   * orphan cleanup coordination under sustained concurrent operations.
+   *
+   * <p>Verifies: zombiesInFlight settles to 0 or <= 1 (small tolerance), no invariant violations or
+   * exceptions.
+   */
   @Test
   @Timeout(300)
-  @DisplayName("Test 3: Cleanup coordination under invariants (30s)")
+  @DisplayName("Cleanup coordination with invariants (30s)")
   void cleanupCoordinationWithInvariants() throws Exception {
     StressParams params = new StressParams(80, 10, Duration.ofSeconds(30));
     StressResult result = runStress(params);
 
-    // zombiesInFlight should settle to 0; allow small tolerance for concurrent state transitions
+    // Verify invariants (small tolerance for concurrent state transitions)
     assertThat(Math.max(0, result.zifAfterSettling))
         .describedAs("zombiesInFlight must settle back to 0")
         .isLessThanOrEqualTo(1);
-
     assertThat(result.violations).as("No invariant violations or exceptions").isEmpty();
+
+    // Verify metrics were recorded during stress
+    verifyMetricsRecorded();
   }
 
+  /**
+   * Tests that state is preserved correctly under shutdown toggle stress.
+   *
+   * <p>Runs 40 agents with 8 max concurrent for 8 seconds with 20 shutdown toggles. Includes
+   * invariant checker thread monitoring permit accounting throughout.
+   *
+   * <p>Verifies: zombiesInFlight settles to 0 after stress, no invariant violations or exceptions.
+   */
   @Test
   @Timeout(300)
-  @DisplayName("Test 4: Shutdown preservation with 20 toggles")
+  @DisplayName("Shutdown preservation with repeated toggles (8s)")
   void shutdownPreservationTwentyToggles() throws Exception {
     StressParams params = new StressParams(40, 8, Duration.ofSeconds(8));
     StressResult result = runShutdownPreservation(params, 20);
 
+    // Verify invariants
     assertThat(Math.max(0, result.zifAfterSettling))
         .describedAs("zombiesInFlight must settle back to 0 within 2s")
         .isEqualTo(0);
-
     assertThat(result.violations).as("No invariant violations or exceptions").isEmpty();
+
+    // Verify metrics were recorded during stress
+    verifyMetricsRecorded();
   }
 
+  /**
+   * Tests that correctness is maintained under combined stress scenarios.
+   *
+   * <p>Runs 60 agents with 12 max concurrent for 60 seconds. Combines acquisition, zombie cleanup,
+   * orphan cleanup, shutdown toggles, and invariant checking under extended stress.
+   *
+   * <p>Verifies: zombiesInFlight settles to 0 or <= 1 (small tolerance), no invariant violations or
+   * exceptions.
+   */
   @Test
   @Timeout(180)
-  @DisplayName("Test 5: Combined scenarios (60s with shutdown toggles and moderate agent count)")
+  @DisplayName("Combined scenarios under extended stress (60s)")
   void combinedScenariosSixtySeconds() throws Exception {
     StressParams params = new StressParams(60, 12, Duration.ofSeconds(60));
     StressResult result = runCombinedStress(params);
 
-    // zombiesInFlight should settle to 0; allow small tolerance for concurrent state transitions
+    // Verify invariants (small tolerance for concurrent state transitions)
     assertThat(Math.max(0, result.zifAfterSettling))
         .describedAs("zombiesInFlight must settle back to 0")
         .isLessThanOrEqualTo(1);
-
     assertThat(result.violations).as("No invariant violations or exceptions").isEmpty();
+
+    // Verify metrics were recorded during stress
+    verifyMetricsRecorded();
   }
 
   private StressResult runStress(StressParams params) throws Exception {
@@ -204,7 +276,7 @@ class PrioritySchedulerStressTest {
     for (int i = 0; i < params.numAgents; i++) {
       Agent a = mockAgent("stress-agent-" + i, "stress");
       AgentExecution exec = RandomExecutionFactory.randomized(10, 500);
-      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      ExecutionInstrumentation instr = TestFixtures.createMockInstrumentation();
       acquisitionService.registerAgent(a, exec, instr);
     }
 
@@ -294,8 +366,18 @@ class PrioritySchedulerStressTest {
     shutdownToggler.get(10, TimeUnit.SECONDS);
     // no invariant checker to join
 
-    // Allow workers to finish; poll for zIF to converge to 0 (eventual consistency window)
-    long zifDeadline = System.currentTimeMillis() + 5000L;
+    // Wait for all active agent futures to complete (ensures finally blocks have run)
+    java.util.Map<String, Future<?>> futures = acquisitionService.getActiveAgentsFutures();
+    for (Future<?> future : futures.values()) {
+      try {
+        future.get(5, TimeUnit.SECONDS);
+      } catch (Exception ignored) {
+        // Future may be cancelled or failed - that's fine
+      }
+    }
+
+    // Poll for zombiesInFlight to settle (should be quick now that all workers finished)
+    long zifDeadline = System.currentTimeMillis() + 2000L;
     while (System.currentTimeMillis() < zifDeadline
         && Math.max(0, acquisitionService.getZombiesInFlight()) > 0) {
       try {
@@ -416,7 +498,7 @@ class PrioritySchedulerStressTest {
     for (int i = 0; i < params.numAgents; i++) {
       Agent a = mockAgent("shutdown-agent-" + i, "shutdown");
       AgentExecution exec = RandomExecutionFactory.randomized(10, 500);
-      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      ExecutionInstrumentation instr = TestFixtures.createMockInstrumentation();
       acquisitionService.registerAgent(a, exec, instr);
     }
 
@@ -503,7 +585,8 @@ class PrioritySchedulerStressTest {
                     // Intentionally skip mid-run set checks to avoid sampling races
 
                     // Permit mismatch (aligned with scheduler health summary):
-                    // heldPermits must not exceed active + zIF (allow small tolerance for
+                    // heldPermits must not exceed active + zombiesInFlight (allow small tolerance
+                    // for
                     // concurrent state transitions)
                     int totalPermits = params.maxConcurrent;
                     int available = semaphore.availablePermits();
@@ -560,10 +643,18 @@ class PrioritySchedulerStressTest {
     shutdownToggler.get(10, TimeUnit.SECONDS);
     invariantChecker.get(10, TimeUnit.SECONDS);
 
-    // Allow workers to finish and settle
-    Thread.sleep(3000);
-    // Poll for zIF to settle
-    long zifDeadline = System.currentTimeMillis() + 3000L;
+    // Wait for all active agent futures to complete (ensures finally blocks have run)
+    java.util.Map<String, Future<?>> futures = acquisitionService.getActiveAgentsFutures();
+    for (Future<?> future : futures.values()) {
+      try {
+        future.get(5, TimeUnit.SECONDS);
+      } catch (Exception ignored) {
+        // Future may be cancelled or failed - that's fine
+      }
+    }
+
+    // Poll for zombiesInFlight to settle (should be quick now that all workers finished)
+    long zifDeadline = System.currentTimeMillis() + 2000L;
     while (System.currentTimeMillis() < zifDeadline
         && Math.max(0, acquisitionService.getZombiesInFlight()) > 0) {
       try {
@@ -575,6 +666,15 @@ class PrioritySchedulerStressTest {
     }
     int zifAfter = Math.max(0, acquisitionService.getZombiesInFlight());
 
+    // Process any remaining completion queue items after threads have stopped
+    // This ensures agents that completed just before shutdown are properly rescheduled
+    try {
+      acquisitionService.saturatePool(Long.MAX_VALUE, null, agentWorkPool);
+    } catch (Exception e) {
+      // Best-effort: ignore errors during post-shutdown processing
+    }
+
+    // Shutdown pools
     agentWorkPool.shutdownNow();
     testThreads.shutdownNow();
 
@@ -627,7 +727,7 @@ class PrioritySchedulerStressTest {
     for (int i = 0; i < params.numAgents; i++) {
       Agent a = mockAgent("combined-agent-" + i, "combined");
       AgentExecution exec = RandomExecutionFactory.randomized(10, 500);
-      ExecutionInstrumentation instr = mock(ExecutionInstrumentation.class);
+      ExecutionInstrumentation instr = TestFixtures.createMockInstrumentation();
       acquisitionService.registerAgent(a, exec, instr);
     }
 
@@ -769,8 +869,18 @@ class PrioritySchedulerStressTest {
     shutdownToggler.get(10, TimeUnit.SECONDS);
     invariantChecker.get(10, TimeUnit.SECONDS);
 
-    // Allow workers to finish; poll for zIF to converge to 0 (eventual consistency window)
-    long zifDeadline = System.currentTimeMillis() + 5000L;
+    // Wait for all active agent futures to complete (ensures finally blocks have run)
+    java.util.Map<String, Future<?>> futures = acquisitionService.getActiveAgentsFutures();
+    for (Future<?> future : futures.values()) {
+      try {
+        future.get(5, TimeUnit.SECONDS);
+      } catch (Exception ignored) {
+        // Future may be cancelled or failed - that's fine
+      }
+    }
+
+    // Poll for zombiesInFlight to settle (should be quick now that all workers finished)
+    long zifDeadline = System.currentTimeMillis() + 2000L;
     while (System.currentTimeMillis() < zifDeadline
         && Math.max(0, acquisitionService.getZombiesInFlight()) > 0) {
       try {
@@ -783,6 +893,7 @@ class PrioritySchedulerStressTest {
     int zifAfter = Math.max(0, acquisitionService.getZombiesInFlight());
 
     // Process any remaining completion queue items after threads have stopped
+    // This ensures agents that completed just before shutdown are properly rescheduled
     try {
       acquisitionService.saturatePool(Long.MAX_VALUE, null, agentWorkPool);
     } catch (Exception e) {
@@ -846,10 +957,59 @@ class PrioritySchedulerStressTest {
   }
 
   private static Agent mockAgent(String name, String provider) {
-    Agent a = mock(Agent.class);
-    org.mockito.Mockito.when(a.getAgentType()).thenReturn(name);
-    org.mockito.Mockito.when(a.getProviderName()).thenReturn(provider);
-    return a;
+    return TestFixtures.createMockAgent(name, provider);
+  }
+
+  /**
+   * Verifies that key metrics were recorded during the stress run.
+   *
+   * <p>Checks that acquisition and cleanup metrics were recorded, indicating the stress test
+   * exercised the expected code paths.
+   */
+  private void verifyMetricsRecorded() {
+    // Verify acquisition metrics were recorded
+    java.util.concurrent.atomic.AtomicLong acquireAttempts =
+        new java.util.concurrent.atomic.AtomicLong(0);
+    registry
+        .counters()
+        .forEach(
+            c -> {
+              if (c.id().name().equals("cats.redisPriority.acquire.attempts")) {
+                acquireAttempts.addAndGet((long) c.count());
+              }
+            });
+    assertThat(acquireAttempts.get())
+        .describedAs("Acquisition attempts should be recorded during stress")
+        .isGreaterThan(0);
+
+    java.util.concurrent.atomic.AtomicLong acquiredCount =
+        new java.util.concurrent.atomic.AtomicLong(0);
+    registry
+        .counters()
+        .forEach(
+            c -> {
+              if (c.id().name().equals("cats.redisPriority.acquire.acquired")) {
+                acquiredCount.addAndGet((long) c.count());
+              }
+            });
+    assertThat(acquiredCount.get())
+        .describedAs("Acquired count should be recorded during stress")
+        .isGreaterThan(0);
+
+    // Verify cleanup metrics were recorded (zombie or orphan cleanup)
+    java.util.concurrent.atomic.AtomicLong cleanupTimerCount =
+        new java.util.concurrent.atomic.AtomicLong(0);
+    registry
+        .timers()
+        .forEach(
+            t -> {
+              if (t.id().name().equals("cats.redisPriority.cleanup.time")) {
+                cleanupTimerCount.addAndGet(t.count());
+              }
+            });
+    assertThat(cleanupTimerCount.get())
+        .describedAs("Cleanup timer should be recorded during stress")
+        .isGreaterThan(0);
   }
 
   private static final class StressParams {

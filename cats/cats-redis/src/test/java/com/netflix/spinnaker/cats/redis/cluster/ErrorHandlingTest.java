@@ -16,6 +16,7 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import static com.netflix.spinnaker.cats.redis.cluster.TestFixtures.createTestScriptManager;
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -33,22 +34,33 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Comprehensive error handling tests for PriorityScheduler components.
+ * Error handling tests for PriorityScheduler components.
  *
- * <p>Tests critical error scenarios that may not be covered elsewhere: - AgentSchedulingException
- * usage and propagation - Script loading failures and recovery - Batch operation failures with
- * proper fallback - Configuration validation edge cases - Resource cleanup under error conditions
+ * <p>Tests error scenarios including:
+ *
+ * <ul>
+ *   <li>AgentSchedulingException usage and propagation
+ *   <li>Script loading failures and recovery
+ *   <li>Batch operation failures with fallback
+ *   <li>Configuration validation edge cases
+ *   <li>Resource cleanup under error conditions
+ * </ul>
+ *
+ * <p>Tests in this suite focus on graceful error handling behavior (no crashes, proper fallback)
+ * rather than implementation details (specific metric values).
  */
 @Testcontainers
-@DisplayName("Error Handling Comprehensive Tests")
-public class ErrorHandlingComprehensiveTest {
+@DisplayName("Error Handling Tests")
+@SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+public class ErrorHandlingTest {
 
   @Container
   static GenericContainer<?> redis =
-      new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
+      new GenericContainer<>("redis:7-alpine")
+          .withExposedPorts(6379)
+          .withCommand("redis-server", "--requirepass", "testpass");
 
   private JedisPool jedisPool;
   private RedisScriptManager scriptManager;
@@ -61,23 +73,14 @@ public class ErrorHandlingComprehensiveTest {
 
   @BeforeEach
   void setUp() {
-    String redisHost = redis.getHost();
-    Integer redisPort = redis.getMappedPort(6379);
-
-    JedisPoolConfig poolConfig = new JedisPoolConfig();
-    poolConfig.setMaxTotal(8);
-    jedisPool = new JedisPool(poolConfig, redisHost, redisPort);
+    jedisPool = TestFixtures.createTestJedisPool(redis, "testpass", 8);
 
     // Clean Redis state
     try (Jedis jedis = jedisPool.getResource()) {
       jedis.flushAll();
     }
 
-    scriptManager =
-        new RedisScriptManager(
-            jedisPool,
-            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
-    scriptManager.initializeScripts();
+    scriptManager = createTestScriptManager(jedisPool);
 
     schedulerProperties = new PrioritySchedulerProperties();
     schedulerProperties.getKeys().setWaitingSet("waiting");
@@ -99,7 +102,7 @@ public class ErrorHandlingComprehensiveTest {
             shardingFilter,
             agentProperties,
             schedulerProperties,
-            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+            TestFixtures.createTestMetrics());
   }
 
   @AfterEach
@@ -116,6 +119,10 @@ public class ErrorHandlingComprehensiveTest {
   @DisplayName("AgentSchedulingException Tests")
   class AgentSchedulingExceptionTests {
 
+    /**
+     * Tests that AgentSchedulingException can be created with message only. Verifies message is set
+     * correctly and cause is null.
+     */
     @Test
     @DisplayName("Should create exception with message only")
     void shouldCreateExceptionWithMessage() {
@@ -126,6 +133,10 @@ public class ErrorHandlingComprehensiveTest {
       assertThat(exception.getCause()).isNull();
     }
 
+    /**
+     * Tests that AgentSchedulingException can be created with message and cause. Verifies both
+     * message and cause are set correctly.
+     */
     @Test
     @DisplayName("Should create exception with message and cause")
     void shouldCreateExceptionWithMessageAndCause() {
@@ -137,6 +148,10 @@ public class ErrorHandlingComprehensiveTest {
       assertThat(exception.getCause()).isEqualTo(cause);
     }
 
+    /**
+     * Tests that AgentSchedulingException can wrap a cause exception. Verifies cause is set and
+     * message contains the cause's message.
+     */
     @Test
     @DisplayName("Should create exception wrapping cause")
     void shouldCreateExceptionWrappingCause() {
@@ -147,6 +162,7 @@ public class ErrorHandlingComprehensiveTest {
       assertThat(exception.getMessage()).contains("Lua script error");
     }
 
+    /** Tests that AgentSchedulingException extends RuntimeException. */
     @Test
     @DisplayName("Should be instance of RuntimeException")
     void shouldBeInstanceOfRuntimeException() {
@@ -159,6 +175,10 @@ public class ErrorHandlingComprehensiveTest {
   @DisplayName("Script Loading Failure Tests")
   class ScriptLoadingFailureTests {
 
+    /**
+     * Tests that script loading failures are wrapped in AgentSchedulingException. Verifies that
+     * initializeScripts wraps script compilation errors with appropriate message and cause.
+     */
     @Test
     @DisplayName("Should handle corrupted Lua script gracefully")
     void shouldHandleCorruptedLuaScript() {
@@ -170,9 +190,7 @@ public class ErrorHandlingComprehensiveTest {
           .thenThrow(new RuntimeException("Script compilation error"));
 
       RedisScriptManager failingScriptManager =
-          new RedisScriptManager(
-              mockPool,
-              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+          new RedisScriptManager(mockPool, TestFixtures.createTestMetrics());
 
       // Script loading should wrap the exception in AgentSchedulingException - this is expected
       // behavior
@@ -188,15 +206,15 @@ public class ErrorHandlingComprehensiveTest {
       verify(mockJedis, atLeastOnce()).scriptLoad(anyString());
     }
 
+    /**
+     * Tests that RedisScriptManager validates script names. Verifies that unknown, null, and empty
+     * script names throw IllegalArgumentException with appropriate messages.
+     */
     @Test
     @DisplayName("Should validate script names and throw for unknown scripts")
     void shouldValidateScriptNamesAndThrowForUnknownScripts() {
       // Test that accessing unknown script SHA throws appropriate exception
-      RedisScriptManager manager =
-          new RedisScriptManager(
-              jedisPool,
-              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
-      manager.initializeScripts();
+      RedisScriptManager manager = createTestScriptManager(jedisPool);
 
       assertThatThrownBy(
               () -> {
@@ -227,6 +245,11 @@ public class ErrorHandlingComprehensiveTest {
   @DisplayName("Batch Operation Failure Tests")
   class BatchOperationFailureTests {
 
+    /**
+     * Tests that batch operation failures fall back to individual mode gracefully. Uses a spy to
+     * inject an invalid SHA for the batch acquisition script, verifying that saturatePool handles
+     * the failure without throwing exceptions.
+     */
     @Test
     @DisplayName("Should fallback to individual mode when batch script fails")
     void shouldFallbackWhenBatchScriptFails() throws Exception {
@@ -250,21 +273,30 @@ public class ErrorHandlingComprehensiveTest {
               shardingFilter,
               agentProperties,
               schedulerProperties,
-              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+              TestFixtures.createTestMetrics());
 
-      // Register some agents
-      for (int i = 1; i <= 3; i++) {
-        Agent agent = createMockAgent("fallback-agent-" + i, "test-provider");
-        AgentExecution execution = mock(AgentExecution.class);
-        ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
-        serviceWithFailingBatch.registerAgent(agent, execution, instrumentation);
+      // Register some agents and add them to WAITING_SET so they can be acquired
+      try (Jedis jedis = jedisPool.getResource()) {
+        long nowSec = TestFixtures.getRedisTimeSeconds(jedis);
+        for (int i = 1; i <= 3; i++) {
+          Agent agent = TestFixtures.createMockAgent("fallback-agent-" + i, "test-provider");
+          AgentExecution execution = mock(AgentExecution.class);
+          ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
+          serviceWithFailingBatch.registerAgent(agent, execution, instrumentation);
+
+          // Add agents to WAITING_SET so they can be acquired
+          jedis.zadd("waiting", nowSec - 1, "fallback-agent-" + i); // Ready now
+        }
       }
 
       // The key test: verify that when batch operations fail, the system handles it gracefully
       // We don't care about the exact number acquired - we care that it doesn't crash
+      java.util.concurrent.atomic.AtomicInteger acquiredRef =
+          new java.util.concurrent.atomic.AtomicInteger(0);
       assertThatCode(
               () -> {
                 int acquired = serviceWithFailingBatch.saturatePool(0L, null, executorService);
+                acquiredRef.set(acquired);
 
                 // Should handle the failure gracefully - any result >= 0 is acceptable
                 // The important thing is no exception was thrown
@@ -272,10 +304,19 @@ public class ErrorHandlingComprehensiveTest {
               })
           .doesNotThrowAnyException();
 
-      // Additional verification: ensure the batch script was actually called (and failed)
+      // Verify the batch script was actually called (and failed)
       verify(spyScriptManager, atLeastOnce()).getScriptSha(RedisScriptManager.ACQUIRE_AGENTS);
+
+      // Note: Metrics and Redis state verification are intentionally omitted here.
+      // The key assertion is graceful error handling (no exception thrown), not specific
+      // metric values or Redis state. Fallback metrics would require mocking the metrics
+      // object, and Redis state is inherently variable in fallback scenarios.
     }
 
+    /**
+     * Tests that partial batch failures are handled gracefully. Verifies saturatePool returns
+     * without throwing exceptions and acquires a reasonable number of agents (0-3 range).
+     */
     @Test
     @DisplayName("Should handle partial batch failure gracefully")
     void shouldHandlePartialBatchFailure() throws Exception {
@@ -284,13 +325,14 @@ public class ErrorHandlingComprehensiveTest {
 
       // Register agents
       for (int i = 1; i <= 3; i++) {
-        Agent agent = createMockAgent("partial-agent-" + i, "test-provider");
+        Agent agent = TestFixtures.createMockAgent("partial-agent-" + i, "test-provider");
         AgentExecution execution = mock(AgentExecution.class);
-        ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+        ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
         acquisitionService.registerAgent(agent, execution, instrumentation);
       }
 
-      // Close Redis connection mid-operation to simulate partial failure
+      // Note: Simulating partial failure mid-operation (e.g., closing Redis connection) is
+      // complex and may be flaky. This test verifies resilience by checking graceful handling.
       int acquired = acquisitionService.saturatePool(0L, null, executorService);
 
       // Should handle gracefully - either succeed with batch or fallback
@@ -303,6 +345,10 @@ public class ErrorHandlingComprehensiveTest {
   @DisplayName("Configuration Edge Cases")
   class ConfigurationEdgeCaseTests {
 
+    /**
+     * Tests that zero batch size configuration is handled gracefully. When batch size is 0 and
+     * batch operations are enabled, saturatePool should not throw exceptions.
+     */
     @Test
     @DisplayName("Should handle zero batch size configuration")
     void shouldHandleZeroBatchSize() {
@@ -317,14 +363,15 @@ public class ErrorHandlingComprehensiveTest {
               shardingFilter,
               agentProperties,
               schedulerProperties,
-              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+              TestFixtures.createTestMetrics());
 
-      Agent agent = createMockAgent("zero-batch-agent", "test-provider");
+      Agent agent = TestFixtures.createMockAgent("zero-batch-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
-      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
       serviceWithZeroBatch.registerAgent(agent, execution, instrumentation);
 
       // Should handle zero batch size gracefully (likely fallback to individual)
+      // Note: Mode verification (batch vs individual) is omitted; key assertion is no exception.
       assertThatCode(
               () -> {
                 int acquired = serviceWithZeroBatch.saturatePool(0L, null, executorService);
@@ -333,6 +380,10 @@ public class ErrorHandlingComprehensiveTest {
           .doesNotThrowAnyException();
     }
 
+    /**
+     * Tests that negative batch size configuration is handled gracefully. When batch size is -1,
+     * saturatePool should not throw exceptions.
+     */
     @Test
     @DisplayName("Should handle negative batch size configuration")
     void shouldHandleNegativeBatchSize() {
@@ -347,11 +398,11 @@ public class ErrorHandlingComprehensiveTest {
               shardingFilter,
               agentProperties,
               schedulerProperties,
-              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+              TestFixtures.createTestMetrics());
 
-      Agent agent = createMockAgent("negative-batch-agent", "test-provider");
+      Agent agent = TestFixtures.createMockAgent("negative-batch-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
-      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
       serviceWithNegativeBatch.registerAgent(agent, execution, instrumentation);
 
       // Should handle negative batch size gracefully
@@ -363,6 +414,10 @@ public class ErrorHandlingComprehensiveTest {
           .doesNotThrowAnyException();
     }
 
+    /**
+     * Tests that extreme batch size configuration (Integer.MAX_VALUE) is handled gracefully without
+     * crashing or throwing exceptions.
+     */
     @Test
     @DisplayName("Should handle extreme batch size configurations")
     void shouldHandleExtremeBatchSizes() {
@@ -378,11 +433,11 @@ public class ErrorHandlingComprehensiveTest {
               shardingFilter,
               agentProperties,
               schedulerProperties,
-              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+              TestFixtures.createTestMetrics());
 
-      Agent agent = createMockAgent("large-batch-agent", "test-provider");
+      Agent agent = TestFixtures.createMockAgent("large-batch-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
-      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
       serviceWithLargeBatch.registerAgent(agent, execution, instrumentation);
 
       // Should handle extreme batch size without crashing
@@ -399,18 +454,24 @@ public class ErrorHandlingComprehensiveTest {
   @DisplayName("Resource Cleanup Under Error Conditions")
   class ResourceCleanupTests {
 
+    /**
+     * Tests that local state is maintained when Redis pool fails. After pool closure, saturatePool
+     * should handle gracefully (acquire 0 agents) while preserving local registration state.
+     */
     @Test
     @DisplayName("Should cleanup resources when Redis pool fails")
     void shouldCleanupResourcesWhenRedisPoolFails() throws Exception {
-      Agent agent = createMockAgent("cleanup-agent", "test-provider");
+      Agent agent = TestFixtures.createMockAgent("cleanup-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
-      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
       acquisitionService.registerAgent(agent, execution, instrumentation);
 
       // Close the Redis pool to simulate failure
       jedisPool.close();
 
       // Should handle pool closure gracefully
+      // Note: Metrics verification is omitted; focus is on graceful handling and state
+      // preservation.
       assertThatCode(
               () -> {
                 int acquired = acquisitionService.saturatePool(0L, null, executorService);
@@ -422,14 +483,19 @@ public class ErrorHandlingComprehensiveTest {
       assertThat(acquisitionService.getRegisteredAgentCount()).isEqualTo(1);
     }
 
+    /**
+     * Tests that concurrent agent registration and acquisition operations are thread-safe. Runs
+     * acquisition and registration in parallel threads and verifies no
+     * ConcurrentModificationException occurs, with final state being consistent.
+     */
     @Test
     @DisplayName("Should handle concurrent modification of agent maps")
     void shouldHandleConcurrentModificationOfAgentMaps() throws Exception {
       // Register initial agents
       for (int i = 1; i <= 5; i++) {
-        Agent agent = createMockAgent("concurrent-agent-" + i, "test-provider");
+        Agent agent = TestFixtures.createMockAgent("concurrent-agent-" + i, "test-provider");
         AgentExecution execution = mock(AgentExecution.class);
-        ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+        ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
         acquisitionService.registerAgent(agent, execution, instrumentation);
       }
 
@@ -452,9 +518,11 @@ public class ErrorHandlingComprehensiveTest {
           new Thread(
               () -> {
                 for (int i = 6; i <= 10; i++) {
-                  Agent agent = createMockAgent("concurrent-agent-" + i, "test-provider");
+                  Agent agent =
+                      TestFixtures.createMockAgent("concurrent-agent-" + i, "test-provider");
                   AgentExecution execution = mock(AgentExecution.class);
-                  ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+                  ExecutionInstrumentation instrumentation =
+                      TestFixtures.createMockInstrumentation();
                   acquisitionService.registerAgent(agent, execution, instrumentation);
                   try {
                     Thread.sleep(15);
@@ -466,6 +534,7 @@ public class ErrorHandlingComprehensiveTest {
               });
 
       // Should handle concurrent access without throwing exceptions
+      // Note: Metrics and Redis state verification are omitted; focus is on thread safety.
       assertThatCode(
               () -> {
                 acquisitionThread.start();
@@ -478,12 +547,5 @@ public class ErrorHandlingComprehensiveTest {
       // Verify final state is consistent
       assertThat(acquisitionService.getRegisteredAgentCount()).isEqualTo(10);
     }
-  }
-
-  private Agent createMockAgent(String name, String providerType) {
-    Agent agent = mock(Agent.class);
-    when(agent.getAgentType()).thenReturn(name);
-    when(agent.getProviderName()).thenReturn(providerType);
-    return agent;
   }
 }
