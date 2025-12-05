@@ -32,10 +32,14 @@ public final class ExecutorUtils {
   private ExecutorUtils() {}
 
   /**
-   * Create an on-demand single-thread executor: no core threads, one max thread, configurable
+   * Creates an on-demand single-thread executor: no core threads, one max thread, configurable
    * keep-alive, and daemon threads with a friendly name. The thread is created only when a task is
    * submitted and will be terminated after the idle period, keeping thread metrics clean during
    * idle windows.
+   *
+   * @param threadNamePattern thread name pattern with '#' as placeholder for thread number
+   * @param keepAliveMs idle time before thread termination (clamped to at least 1ms)
+   * @return configured executor service
    */
   public static java.util.concurrent.ExecutorService newOnDemandSingleThreadExecutor(
       String threadNamePattern, long keepAliveMs) {
@@ -47,25 +51,27 @@ public final class ExecutorUtils {
             java.util.concurrent.TimeUnit.MILLISECONDS,
             new java.util.concurrent.SynchronousQueue<>(),
             r -> {
-              Thread t = new Thread(r, threadNamePattern.replace("#", "0"));
-              t.setDaemon(true);
-              t.setUncaughtExceptionHandler(
+              Thread workerThread = new Thread(r, threadNamePattern.replace("#", "0"));
+              workerThread.setDaemon(true);
+              workerThread.setUncaughtExceptionHandler(
                   (thread, throwable) ->
                       log.error(
                           "Uncaught exception in {}: {}",
                           thread.getName(),
                           String.valueOf(throwable.getMessage()),
                           throwable));
-              return t;
+              return workerThread;
             });
     exec.allowCoreThreadTimeOut(true);
     return exec;
   }
 
   /**
-   * Create a cached thread pool with a named thread factory.
+   * Creates a cached thread pool with a named thread factory. Threads are daemon and use the
+   * provided name format.
    *
-   * <p>Threads are daemon and use the provided name format (e.g., "PriorityAgentWorker-%d").
+   * @param nameFormat thread name format with '%d' as placeholder (e.g., "PriorityAgentWorker-%d")
+   * @return configured cached thread pool
    */
   public static java.util.concurrent.ExecutorService newNamedCachedThreadPool(String nameFormat) {
     com.google.common.util.concurrent.ThreadFactoryBuilder builder =
@@ -83,9 +89,12 @@ public final class ExecutorUtils {
   }
 
   /**
-   * Create a single-thread scheduled executor with a named thread factory.
+   * Creates a single-thread scheduled executor with a named thread factory. Thread is daemon and
+   * uses the provided name format.
    *
-   * <p>Thread is daemon and uses the provided name format (e.g., "PriorityAgentScheduler-%d").
+   * @param nameFormat thread name format with '%d' as placeholder (e.g.,
+   *     "PriorityAgentScheduler-%d")
+   * @return configured scheduled executor service
    */
   public static java.util.concurrent.ScheduledExecutorService newNamedSingleThreadScheduledExecutor(
       String nameFormat) {

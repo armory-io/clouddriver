@@ -17,43 +17,38 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import com.netflix.spinnaker.cats.agent.Agent;
+import lombok.Getter;
 
+/**
+ * Lock holder for an acquired agent with associated Redis scores.
+ *
+ * <p>Fields:
+ *
+ * <ul>
+ *   <li>{@code acquireScore} - score the agent was acquired with (used to verify ownership on
+ *       release)
+ *   <li>{@code releaseScore} - score for re-adding to the waiting set after completion
+ * </ul>
+ */
+@Getter
 public class AgentLock extends com.netflix.spinnaker.cats.agent.AgentLock {
-  // The score the agent was acquired with (Used to ensure we own this agent on release).
+
+  /** Score the agent was acquired with (used to verify ownership on release). */
   private final String acquireScore;
-  // The score the agent was released from the waiting set with (used to ensure it is re-added to
-  // the
-  // waiting set with the right score).
+
+  /** Score for re-adding to the waiting set after completion. */
   private final String releaseScore;
 
   /**
-   * Constructor for AgentLock.
+   * Constructs an AgentLock.
    *
-   * @param agent The agent associated with this lock
-   * @param acquireScore The score the agent was acquired with
-   * @param releaseScore The score the agent was released from the waiting set with
+   * @param agent the agent associated with this lock
+   * @param acquireScore the score the agent was acquired with
+   * @param releaseScore the score for re-adding to the waiting set
    */
   public AgentLock(Agent agent, String acquireScore, String releaseScore) {
     super(agent);
     this.acquireScore = acquireScore;
     this.releaseScore = releaseScore;
-  }
-
-  /**
-   * Get the acquire score for this agent.
-   *
-   * @return The acquire score
-   */
-  public String getAcquireScore() {
-    return acquireScore;
-  }
-
-  /**
-   * Get the release score for this agent.
-   *
-   * @return The release score
-   */
-  public String getReleaseScore() {
-    return releaseScore;
   }
 }

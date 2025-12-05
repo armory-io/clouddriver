@@ -45,7 +45,7 @@ public class PrioritySchedulerConfiguration {
   private volatile Pattern disabledAgentPattern;
   private volatile ExecutorService agentWorkPool;
   private volatile ScheduledExecutorService schedulerExecutorService;
-  private volatile Semaphore runningAgents;
+  private volatile Semaphore maxConcurrentSemaphore;
 
   /**
    * Constructs a new PriorityConfiguration instance with the provided properties.
@@ -111,8 +111,8 @@ public class PrioritySchedulerConfiguration {
    *
    * @return Optional semaphore for instance-wide concurrency control
    */
-  public Semaphore getRunningAgents() {
-    return runningAgents;
+  public Semaphore getMaxConcurrentSemaphore() {
+    return maxConcurrentSemaphore;
   }
 
   /**
@@ -270,45 +270,95 @@ public class PrioritySchedulerConfiguration {
 
   // === Cleanup executor shutdown timeouts (sourced from sub-blocks) ===
 
+  /**
+   * Get the graceful shutdown await time for zombie cleanup executor.
+   *
+   * @return shutdown await time in milliseconds
+   */
   public long getZombieExecutorShutdownAwaitMs() {
     return schedulerProperties.getZombieCleanup().getExecutorShutdownAwaitMs();
   }
 
+  /**
+   * Get the forced shutdown await time for zombie cleanup executor.
+   *
+   * @return forced shutdown await time in milliseconds
+   */
   public long getZombieExecutorShutdownForceAwaitMs() {
     return schedulerProperties.getZombieCleanup().getExecutorShutdownForceAwaitMs();
   }
 
+  /**
+   * Get the graceful shutdown await time for orphan cleanup executor.
+   *
+   * @return shutdown await time in milliseconds
+   */
   public long getOrphanExecutorShutdownAwaitMs() {
     return schedulerProperties.getOrphanCleanup().getExecutorShutdownAwaitMs();
   }
 
+  /**
+   * Get the forced shutdown await time for orphan cleanup executor.
+   *
+   * @return forced shutdown await time in milliseconds
+   */
   public long getOrphanExecutorShutdownForceAwaitMs() {
     return schedulerProperties.getOrphanCleanup().getExecutorShutdownForceAwaitMs();
   }
 
+  /**
+   * Get the graceful shutdown await time for reconcile executor.
+   *
+   * @return shutdown await time in milliseconds
+   */
   public long getReconcileExecutorShutdownAwaitMs() {
     return safeReconcile().getExecutorShutdownAwaitMs();
   }
 
+  /**
+   * Get the forced shutdown await time for reconcile executor.
+   *
+   * @return forced shutdown await time in milliseconds
+   */
   public long getReconcileExecutorShutdownForceAwaitMs() {
     return safeReconcile().getExecutorShutdownForceAwaitMs();
   }
 
+  /**
+   * Get the maximum time budget for zombie cleanup operations.
+   *
+   * @return run budget in milliseconds (0 = unlimited)
+   */
   public long getZombieRunBudgetMs() {
     return schedulerProperties.getZombieCleanup().getRunBudgetMs();
   }
 
+  /**
+   * Get the maximum time budget for orphan cleanup operations.
+   *
+   * @return run budget in milliseconds (0 = unlimited)
+   */
   public long getOrphanRunBudgetMs() {
     return schedulerProperties.getOrphanCleanup().getRunBudgetMs();
   }
 
+  /**
+   * Get the maximum time budget for reconcile operations.
+   *
+   * @return run budget in milliseconds (0 = unlimited)
+   */
   public long getReconcileRunBudgetMs() {
     return safeReconcile().getRunBudgetMs();
   }
 
+  /**
+   * Get reconcile properties with null-safe fallback.
+   *
+   * @return reconcile properties (never null)
+   */
   private ReconcileProperties safeReconcile() {
-    ReconcileProperties r = schedulerProperties.getReconcile();
-    return r != null ? r : new ReconcileProperties();
+    ReconcileProperties reconcileProps = schedulerProperties.getReconcile();
+    return reconcileProps != null ? reconcileProps : new ReconcileProperties();
   }
 
   /** Shutdown all managed resources. */
@@ -363,12 +413,12 @@ public class PrioritySchedulerConfiguration {
     int maxConcurrentAgents = agentProperties.getMaxConcurrentAgents();
 
     if (maxConcurrentAgents <= 0) {
-      this.runningAgents = null; // unbounded mode; callers null-check
+      this.maxConcurrentSemaphore = null; // unbounded mode; callers null-check
       log.info("Concurrency semaphore disabled (unbounded mode)");
       return;
     }
 
-    this.runningAgents = new Semaphore(maxConcurrentAgents);
+    this.maxConcurrentSemaphore = new Semaphore(maxConcurrentAgents);
     log.info("Created concurrency semaphore with {} permits", maxConcurrentAgents);
   }
 }

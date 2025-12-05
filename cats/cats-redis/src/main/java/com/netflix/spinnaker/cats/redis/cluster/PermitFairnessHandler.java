@@ -19,7 +19,8 @@ package com.netflix.spinnaker.cats.redis.cluster;
 /**
  * Interface used by cleanup services to perform fairness operations during early cancellation.
  *
- * <p>Responsibilities: - Provide an exactly-once hook for early permit release and zIF compensation
+ * <p>Responsibilities: - Provide an exactly-once hook for early permit release and zombiesInFlight
+ * compensation
  *
  * <p>Non-responsibilities: - Scheduling logic, cadence, or Redis operations
  */
@@ -30,5 +31,5 @@ public interface PermitFairnessHandler {
    *
    * @param agentType the agent identifier
    */
-  void tryEarlyPermitReleaseAndMaybeIncrementZif(String agentType);
+  void tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight(String agentType);
 }

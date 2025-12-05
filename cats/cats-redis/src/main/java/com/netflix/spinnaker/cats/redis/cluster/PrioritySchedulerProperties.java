@@ -20,6 +20,7 @@ import javax.annotation.PostConstruct;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -32,6 +33,7 @@ import org.springframework.stereotype.Component;
 @ConfigurationProperties(prefix = "redis.scheduler")
 @Getter
 @Setter
+@Slf4j
 public class PrioritySchedulerProperties {
 
   /** Circuit breaker configuration for protecting against cascading failures. */
@@ -54,7 +56,7 @@ public class PrioritySchedulerProperties {
     private long halfOpenDurationMs = 5000;
   }
 
-  // === CORE SCHEDULING PROPERTIES ===
+  // === Core scheduling properties ===
 
   /**
    * How often the scheduler runs to check for ready agents (milliseconds). Controls the frequency
@@ -84,7 +86,7 @@ public class PrioritySchedulerProperties {
    */
   private long timeCacheDurationMs = 10000L; // 10 seconds
 
-  // === CLEANUP SERVICES ===
+  // === Cleanup services ===
 
   /** Zombie cleanup configuration for stuck agents. */
   private ZombieCleanupProperties zombieCleanup = new ZombieCleanupProperties();
@@ -95,7 +97,7 @@ public class PrioritySchedulerProperties {
   /** Reconcile offload executor shutdown timeouts. */
   private ReconcileProperties reconcile = new ReconcileProperties();
 
-  // === PERFORMANCE & RESILIENCE ===
+  // === Performance & resilience ===
 
   /**
    * Enable batch operations for Redis operations. When enabled, the scheduler will group agent
@@ -307,27 +309,27 @@ public class PrioritySchedulerProperties {
     return orphanCleanup.isRemoveNumericOnlyAgents();
   }
 
-  // === JITTER (public proxies) ===
+  // === Jitter (public proxies) ===
 
   /** Initial registration jitter in whole seconds (0 disables). */
   public int getJitterInitialRegistrationSeconds() {
-    JitterProperties j = getJitter();
-    return j != null ? j.getInitialRegistrationSeconds() : 0;
+    JitterProperties jitterProps = getJitter();
+    return jitterProps != null ? jitterProps.getInitialRegistrationSeconds() : 0;
   }
 
   /** Shutdown smoothing jitter in whole seconds (0 disables). */
   public int getJitterShutdownSeconds() {
-    JitterProperties j = getJitter();
-    return j != null ? j.getShutdownSeconds() : 0;
+    JitterProperties jitterProps = getJitter();
+    return jitterProps != null ? jitterProps.getShutdownSeconds() : 0;
   }
 
   /** Ratio applied to non-zero failure backoff delays. Range [0.0, 1.0]. */
   public double getJitterFailureBackoffRatio() {
-    JitterProperties j = getJitter();
-    return j != null ? j.getFailureBackoffRatio() : 0.0d;
+    JitterProperties jitterProps = getJitter();
+    return jitterProps != null ? jitterProps.getFailureBackoffRatio() : 0.0d;
   }
 
-  // === FAILURE BACKOFF (public proxies) ===
+  // === Failure backoff (public proxies) ===
 
   /** Master switch for failure-aware backoff. */
   public boolean isFailureBackoffEnabled() {
@@ -481,6 +483,24 @@ public class PrioritySchedulerProperties {
     }
     validateNonNegative(
         orphanCleanup.getRunBudgetMs(), "redis.scheduler.orphan-cleanup.run-budget-ms");
+
+    // Warn if leadership TTL is not sufficiently larger than run budget to prevent duplicate work
+    // during cleanup. If cleanup takes longer than leadership TTL, another pod may acquire
+    // leadership and start a duplicate cleanup pass.
+    long leadershipTtlMs = orphanCleanup.getLeadershipTtlMs();
+    long runBudgetMs = orphanCleanup.getRunBudgetMs();
+    long minimumMarginMs = 60000L; // 1 minute margin
+    if (runBudgetMs > 0 && leadershipTtlMs < runBudgetMs + minimumMarginMs) {
+      log.warn(
+          "Orphan cleanup leadership-ttl-ms ({}) should be >= run-budget-ms ({}) + {}ms margin "
+              + "to prevent duplicate cleanup work when cleanup approaches budget limit. "
+              + "Consider increasing leadership-ttl-ms to at least {}.",
+          leadershipTtlMs,
+          runBudgetMs,
+          minimumMarginMs,
+          runBudgetMs + minimumMarginMs);
+    }
+
     if (reconcile == null) {
       reconcile = new ReconcileProperties();
     }
@@ -731,7 +751,7 @@ class OrphanCleanupProperties {
    */
   private long thresholdMs = 600000L; // 10 minutes
 
-  /** How often to check for and clean up orphaned agents (milliseconds). */
+  /** How often to check for and clean up orphaned agents (milliseconds). Default: 5 minutes. */
   private long intervalMs = 300000L; // 5 minutes
 
   /**
