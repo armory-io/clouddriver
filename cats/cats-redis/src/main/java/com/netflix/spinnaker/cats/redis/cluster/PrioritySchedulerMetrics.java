@@ -35,7 +35,142 @@ import redis.clients.jedis.JedisPool;
  * scheduler=priority} tag for filtering.
  */
 @Component
-public final class PrioritySchedulerMetrics {
+public class PrioritySchedulerMetrics {
+
+  /**
+   * No-op implementation for use when metrics collection is disabled or unavailable. All methods
+   * are overridden to do nothing, avoiding null checks throughout the codebase.
+   */
+  public static final PrioritySchedulerMetrics NOOP =
+      new PrioritySchedulerMetrics((Registry) null) {
+        @Override
+        public void recordRunCycle(boolean success, long elapsedMs) {}
+
+        @Override
+        public void incrementRunFailure(String reason) {}
+
+        @Override
+        public void incrementRunFailure(String agentType, String provider, String reason) {}
+
+        @Override
+        public void incrementAcquireAttempts() {}
+
+        @Override
+        public void incrementAcquired(long count) {}
+
+        @Override
+        public void recordAcquireTime(String mode, long elapsedMs) {}
+
+        @Override
+        public void recordAcquireTime(
+            String mode, String agentType, String provider, long elapsedMs) {}
+
+        @Override
+        public void incrementSubmissionFailure(String reason) {}
+
+        @Override
+        public void incrementBatchFallback() {}
+
+        @Override
+        public void incrementStallDetected() {}
+
+        @Override
+        public void recordCircuitBreakerTrip(String name, String reason) {}
+
+        @Override
+        public void recordCircuitBreakerRecovery(String name) {}
+
+        @Override
+        public void recordCircuitBreakerBlocked(String name) {}
+
+        @Override
+        public void incrementAcquireValidationFailure(String reason) {}
+
+        @Override
+        public void recordRepopulateTime(long elapsedMs) {}
+
+        @Override
+        public void incrementRepopulateAdded(long added) {}
+
+        @Override
+        public void incrementRepopulateError(String reason) {}
+
+        @Override
+        public void recordCleanupTime(String type, long elapsedMs) {}
+
+        @Override
+        public void incrementCleanupCleaned(String type, long cleaned) {}
+
+        @Override
+        public void recordScriptEval(String script, long elapsedMs) {}
+
+        @Override
+        public void incrementScriptError(String script, String reason) {}
+
+        @Override
+        public void incrementScriptsReload() {}
+
+        @Override
+        public void incrementInvalidMember(String where) {}
+
+        @Override
+        public void incrementInvalidPair(String phase) {}
+
+        @Override
+        public void incrementScriptResultTypeError(String script) {}
+
+        @Override
+        public void incrementStateInconsistentActive() {}
+
+        @Override
+        public void incrementRedisPoolError(String metric) {}
+
+        @Override
+        public void incrementRemoveAgentFallback() {}
+
+        @Override
+        public void incrementCleanupSkipped(String type) {}
+
+        @Override
+        public void incrementCleanupTimeout(String type) {}
+
+        @Override
+        public void incrementCasContention(String location) {}
+
+        @Override
+        public void incrementZombiesInFlightNegative() {}
+
+        @Override
+        public void recordPermitMismatch(int mismatch) {}
+
+        @Override
+        public void recordZombiesInFlightHighWater(int highWater) {}
+
+        @Override
+        public void incrementScheduleRetryExhausted() {}
+
+        @Override
+        public void incrementScheduleRecovery(boolean success) {}
+
+        @Override
+        public synchronized void registerGauges(
+            JedisPool jedisPool,
+            Supplier<Number> registeredAgents,
+            Supplier<Number> activeAgents,
+            Supplier<Number> readyCount,
+            Supplier<Number> oldestOverdueSeconds,
+            Supplier<Number> degraded,
+            Supplier<Number> capacityPerCycle,
+            Supplier<Number> queueDepth,
+            Supplier<Number> semaphoreAvailable,
+            Supplier<Number> completionQueueSize,
+            Supplier<Number> timeOffsetMs,
+            Supplier<Number> readyToCapacityRatio,
+            Supplier<Number> zombiesInFlight) {}
+
+        @Override
+        public void registerExecutorGauges(ThreadPoolExecutor executor) {}
+      };
 
   private static final Logger log = LoggerFactory.getLogger(PrioritySchedulerMetrics.class);
 
@@ -105,10 +240,48 @@ public final class PrioritySchedulerMetrics {
   /**
    * Creates a new metrics collector bound to the provided registry.
    *
-   * @param registry Spectator registry used to create meters
+   * @param registry Spectator registry used to create meters (null for NOOP instance)
    */
   public PrioritySchedulerMetrics(Registry registry) {
     this.registry = registry;
+
+    // For NOOP instance (null registry), all Ids remain null since methods are overridden
+    if (registry == null) {
+      this.runCycleTimeId = null;
+      this.runFailuresId = null;
+      this.acquireAttemptsId = null;
+      this.acquiredCountId = null;
+      this.acquireTimeId = null;
+      this.submissionFailuresId = null;
+      this.batchFallbacksId = null;
+      this.stallDetectedId = null;
+      this.circuitBreakerTripId = null;
+      this.circuitBreakerRecoveryId = null;
+      this.circuitBreakerBlockedId = null;
+      this.acquireValidationFailureId = null;
+      this.invalidMemberId = null;
+      this.invalidPairId = null;
+      this.scriptResultTypeErrorId = null;
+      this.stateInconsistentActiveId = null;
+      this.repopulateTimeId = null;
+      this.repopulateAddedId = null;
+      this.repopulateErrorsId = null;
+      this.cleanupTimeId = null;
+      this.cleanupCleanedId = null;
+      this.cleanupSkippedId = null;
+      this.cleanupTimeoutId = null;
+      this.scriptsEvalId = null;
+      this.scriptsErrorsId = null;
+      this.scriptsLatencyId = null;
+      this.scriptsReloadsId = null;
+      this.redisPoolErrorsId = null;
+      this.removeAgentFallbackId = null;
+      this.casContentionId = null;
+      this.zombiesInFlightNegativeId = null;
+      this.scheduleRetryExhaustedId = null;
+      this.scheduleRecoveryId = null;
+      return;
+    }
 
     // Run cycle metrics
     this.runCycleTimeId = createId("run.cycleTime");

@@ -93,7 +93,7 @@ public class ZombieCleanupService {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.schedulerProperties = schedulerProperties;
-    this.metrics = metrics;
+    this.metrics = metrics != null ? metrics : PrioritySchedulerMetrics.NOOP;
     compileExceptionalAgentsPattern();
 
     PrioritySchedulerProperties.Keys keysCfg = schedulerProperties.getKeys();
@@ -494,10 +494,8 @@ public class ZombieCleanupService {
 
         zombiesCleanedUp.add(totalCleaned);
         long totalElapsedMs = nowMs() - start;
-        if (metrics != null) {
-          metrics.recordCleanupTime("zombie", totalElapsedMs);
-          metrics.incrementCleanupCleaned("zombie", totalCleaned);
-        }
+        metrics.recordCleanupTime("zombie", totalElapsedMs);
+        metrics.incrementCleanupCleaned("zombie", totalCleaned);
         if (totalCleaned > 0) {
           log.info(
               "Zombie cleanup cycle completed: {} agents cleaned (scanned={}, zombies={}, elapsed={}ms, budget={}ms)",
@@ -517,9 +515,7 @@ public class ZombieCleanupService {
 
       } catch (Exception e) {
         log.error("Error during zombie agent cleanup", e);
-        if (metrics != null) {
-          metrics.recordCleanupTime("zombie", nowMs() - start);
-        }
+        metrics.recordCleanupTime("zombie", nowMs() - start);
         return 0;
       }
     } finally {

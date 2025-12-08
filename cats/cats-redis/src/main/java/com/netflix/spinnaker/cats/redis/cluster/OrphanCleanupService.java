@@ -98,7 +98,7 @@ public class OrphanCleanupService {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.schedulerProperties = schedulerProperties;
-    this.metrics = metrics;
+    this.metrics = metrics != null ? metrics : PrioritySchedulerMetrics.NOOP;
 
     PrioritySchedulerProperties.Keys keysCfg = schedulerProperties.getKeys();
     String hash = keysCfg.getHashTag();
@@ -219,10 +219,8 @@ public class OrphanCleanupService {
             totalElapsedMs,
             budgetMs);
       }
-      if (metrics != null) {
-        metrics.recordCleanupTime("orphan", nowMs() - start);
-        metrics.incrementCleanupCleaned("orphan", totalCleaned);
-      }
+      metrics.recordCleanupTime("orphan", nowMs() - start);
+      metrics.incrementCleanupCleaned("orphan", totalCleaned);
     } catch (Exception e) {
       log.error("Error during orphan cleanup", e);
     } finally {
@@ -264,10 +262,8 @@ public class OrphanCleanupService {
       // Update the last cleanup timestamp
       lastOrphanCleanup = nowMs();
       // Record metrics (consistent with cleanupOrphanedAgentsIfNeeded)
-      if (metrics != null) {
-        metrics.recordCleanupTime("orphan", nowMs() - start);
-        metrics.incrementCleanupCleaned("orphan", totalCleaned);
-      }
+      metrics.recordCleanupTime("orphan", nowMs() - start);
+      metrics.incrementCleanupCleaned("orphan", totalCleaned);
       return totalCleaned;
     } catch (Exception e) {
       log.error("Error during forced orphan cleanup", e);

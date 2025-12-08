@@ -92,7 +92,7 @@ public class PrioritySchedulerCircuitBreaker {
     this.timeWindowMs = timeWindowMs;
     this.cooldownMs = cooldownMs;
     this.halfOpenDurationMs = halfOpenDurationMs;
-    this.metrics = metrics;
+    this.metrics = metrics != null ? metrics : PrioritySchedulerMetrics.NOOP;
   }
 
   /**
@@ -124,9 +124,7 @@ public class PrioritySchedulerCircuitBreaker {
           }
         }
         totalBlocked.increment();
-        if (metrics != null) {
-          metrics.recordCircuitBreakerBlocked(name);
-        }
+        metrics.recordCircuitBreakerBlocked(name);
         return false;
 
       case HALF_OPEN:
@@ -142,9 +140,7 @@ public class PrioritySchedulerCircuitBreaker {
           transitionToOpen(now, "Half-open period expired without recovery");
         }
         totalBlocked.increment();
-        if (metrics != null) {
-          metrics.recordCircuitBreakerBlocked(name);
-        }
+        metrics.recordCircuitBreakerBlocked(name);
         return false;
 
       default:
@@ -161,9 +157,7 @@ public class PrioritySchedulerCircuitBreaker {
     if (currentState == State.HALF_OPEN) {
       if (transitionToClosed(System.currentTimeMillis())) {
         log.info("Circuit breaker '{}' recovered, transitioning from HALF_OPEN to CLOSED", name);
-        if (metrics != null) {
-          metrics.recordCircuitBreakerRecovery(name);
-        }
+        metrics.recordCircuitBreakerRecovery(name);
       }
     }
   }
@@ -195,9 +189,7 @@ public class PrioritySchedulerCircuitBreaker {
                   failures, consecutive, failureThreshold);
           if (transitionToOpen(now, reason)) {
             log.warn("Circuit breaker '{}' tripped: {}", name, reason, exception);
-            if (metrics != null) {
-              metrics.recordCircuitBreakerTrip(name, exception.getClass().getSimpleName());
-            }
+            metrics.recordCircuitBreakerTrip(name, exception.getClass().getSimpleName());
           }
         }
         break;
@@ -207,9 +199,7 @@ public class PrioritySchedulerCircuitBreaker {
         String reason = "probe failed during half-open";
         if (transitionToOpen(now, reason)) {
           log.warn("Circuit breaker '{}' probe failed, returning to OPEN state", name, exception);
-          if (metrics != null) {
-            metrics.recordCircuitBreakerTrip(name, "probe_failure");
-          }
+          metrics.recordCircuitBreakerTrip(name, "probe_failure");
         }
         break;
 

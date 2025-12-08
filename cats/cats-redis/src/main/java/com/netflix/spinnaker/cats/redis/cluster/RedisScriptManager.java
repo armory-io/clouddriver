@@ -95,7 +95,7 @@ public class RedisScriptManager {
    */
   public RedisScriptManager(JedisPool jedisPool, PrioritySchedulerMetrics metrics) {
     this.jedisPool = jedisPool;
-    this.metrics = metrics;
+    this.metrics = metrics != null ? metrics : PrioritySchedulerMetrics.NOOP;
   }
 
   /**

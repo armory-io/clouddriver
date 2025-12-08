@@ -456,7 +456,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     this.shardingFilter = shardingFilter;
     this.agentProperties = agentProperties;
     this.schedulerProperties = schedulerProperties;
-    this.metrics = metrics;
+    this.metrics = metrics != null ? metrics : PrioritySchedulerMetrics.NOOP;
 
     // Initialize circuit breakers with configuration settings
     PrioritySchedulerProperties.CircuitBreaker cbConfig = schedulerProperties.getCircuitBreaker();
@@ -576,17 +576,13 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     // Store reference for fairness bookkeeping (zombie in-flight compensation)
     this.maxConcurrentSemaphoreRef = maxConcurrentSemaphore;
     log.debug("Starting agent acquisition cycle {}, known agents: {}", runCount, agents.size());
-    if (metrics != null) {
-      metrics.incrementAcquireAttempts();
-    }
+    metrics.incrementAcquireAttempts();
 
     // Check circuit breaker before attempting acquisition
     if (!acquisitionCircuitBreaker.allowRequest()) {
       log.warn(
           "Acquisition circuit breaker is OPEN - skipping agent acquisition cycle {}", runCount);
-      if (metrics != null) {
-        metrics.recordCircuitBreakerBlocked("acquisition");
-      }
+      metrics.recordCircuitBreakerBlocked("acquisition");
       return 0;
     }
 
@@ -626,9 +622,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             "Skipping agent acquisition - at max concurrent limit ({} running, {} max)",
             currentlyRunning,
             maxConcurrentAgents);
-        if (metrics != null) {
-          metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
-        }
+        metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
         return 0;
       }
 
@@ -771,9 +765,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                       minIntervalSec,
                       jedisPool.getNumActive(),
                       jedisPool.getNumWaiters());
-                  if (metrics != null) {
-                    metrics.incrementStallDetected();
-                  }
+                  metrics.incrementStallDetected();
                 }
               }
             } catch (Exception ignore) {
@@ -791,9 +783,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           if (log.isDebugEnabled()) {
             log.debug("No locally eligible agents ready for execution");
           }
-          if (metrics != null) {
-            metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
-          }
+          metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
           return 0;
         }
       }
@@ -854,9 +844,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               currentlyRunning,
               maxConcurrentAgents);
         }
-        if (metrics != null) {
-          metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
-        }
+        metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
         return 0;
       }
 
@@ -993,9 +981,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     registrySnapshot,
                     nowMsCached,
                     chunkStartMs);
-            if (metrics != null) {
-              metrics.recordAcquireTime("batch", System.currentTimeMillis() - chunkStartMs);
-            }
+            metrics.recordAcquireTime("batch", System.currentTimeMillis() - chunkStartMs);
           } catch (Exception e) {
             // Note: saturatePoolBatch catches Throwable internally and records fallback metrics,
             // so this catch should rarely fire. However, it's kept as a safety net for any
@@ -1009,13 +995,11 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             // In these rare cases, metrics may be double-counted, but this is acceptable as it
             // indicates a problem that needs investigation.
             log.warn("Batch acquisition failed for chunk, falling back to individual", e);
-            if (metrics != null) {
-              // Record fallback metrics here as well (in case exception propagated from
-              // saturatePoolBatch). Note: This may result in double-counting if saturatePoolBatch
-              // already recorded metrics, but this is acceptable for the safety net case.
-              metrics.incrementBatchFallback();
-              metrics.recordAcquireTime("fallback", System.currentTimeMillis() - chunkStartMs);
-            }
+            // Record fallback metrics here as well (in case exception propagated from
+            // saturatePoolBatch). Note: This may result in double-counting if saturatePoolBatch
+            // already recorded metrics, but this is acceptable for the safety net case.
+            metrics.incrementBatchFallback();
+            metrics.recordAcquireTime("fallback", System.currentTimeMillis() - chunkStartMs);
             workersToSubmit.clear();
             acquiredThisChunk =
                 saturatePoolIndividual(
@@ -1039,9 +1023,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                   attemptedThisCycle,
                   registrySnapshot,
                   nowMsCached);
-          if (metrics != null) {
-            metrics.recordAcquireTime("individual", System.currentTimeMillis() - chunkStartMs);
-          }
+          metrics.recordAcquireTime("individual", System.currentTimeMillis() - chunkStartMs);
         }
 
         if (acquiredThisChunk <= 0) {
@@ -1179,10 +1161,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             agentsAcquiredThisCycle);
       }
 
-      if (metrics != null) {
-        metrics.incrementAcquired(agentsAcquiredThisCycle);
-        metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
-      }
+      metrics.incrementAcquired(agentsAcquiredThisCycle);
+      metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
 
       // Record successful acquisition to circuit breaker
       acquisitionCircuitBreaker.recordSuccess();
@@ -1197,9 +1177,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       redisCircuitBreaker.recordFailure(e);
       acquisitionCircuitBreaker.recordFailure(e);
 
-      if (metrics != null) {
-        metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
-      }
+      metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
       return 0;
 
       // Design note: Catch Throwable as final safety net for acquisition cycle.
@@ -1217,9 +1195,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         acquisitionCircuitBreaker.recordFailure((Exception) e);
       }
 
-      if (metrics != null) {
-        metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
-      }
+      metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
       return 0;
     }
   }
@@ -1235,9 +1211,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     // Check Redis circuit breaker before attempting repopulation
     if (!redisCircuitBreaker.allowRequest()) {
       log.debug("Redis circuit breaker is OPEN - skipping repopulation for cycle {}", runCount);
-      if (metrics != null) {
-        metrics.recordCircuitBreakerBlocked("redis");
-      }
+      metrics.recordCircuitBreakerBlocked("redis");
       // Note: cachedMinEnabledIntervalSec is event-driven (updated on register/unregister)
       return;
     }
@@ -1251,24 +1225,18 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       if (nowMsForRepop - last >= refreshPeriodMs
           && lastRepopulateEpochMs.compareAndSet(last, nowMsForRepop)) {
         repopulateRedisAgents(jedis);
-        if (metrics != null) {
-          metrics.recordRepopulateTime(System.currentTimeMillis() - start);
-        }
+        metrics.recordRepopulateTime(System.currentTimeMillis() - start);
         redisCircuitBreaker.recordSuccess();
       }
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
       log.warn("Redis connection error during repopulation", e);
       redisCircuitBreaker.recordFailure(e);
-      if (metrics != null) {
-        metrics.incrementRepopulateError("redis_connection");
-        metrics.recordRepopulateTime(System.currentTimeMillis() - start);
-      }
+      metrics.incrementRepopulateError("redis_connection");
+      metrics.recordRepopulateTime(System.currentTimeMillis() - start);
     } catch (Exception e) {
       log.warn("Repopulation attempt failed", e);
-      if (metrics != null) {
-        metrics.incrementRepopulateError(e.getClass().getSimpleName());
-        metrics.recordRepopulateTime(System.currentTimeMillis() - start);
-      }
+      metrics.incrementRepopulateError(e.getClass().getSimpleName());
+      metrics.recordRepopulateTime(System.currentTimeMillis() - start);
     }
   }
 
@@ -1296,15 +1264,11 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     long start = now;
     try (Jedis jedis = jedisPool.getResource()) {
       repopulateRedisAgents(jedis);
-      if (metrics != null) {
-        metrics.recordRepopulateTime(System.currentTimeMillis() - start);
-      }
+      metrics.recordRepopulateTime(System.currentTimeMillis() - start);
       return true;
     } catch (Exception e) {
       log.warn("Repopulation attempt failed", e);
-      if (metrics != null) {
-        metrics.incrementRepopulateError(e.getClass().getSimpleName());
-      }
+      metrics.incrementRepopulateError(e.getClass().getSimpleName());
       return false;
     }
   }
@@ -1555,9 +1519,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         boolean scoreNumeric = deadlineScore != null && deadlineScore.matches("^\\d+$");
         boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
         if (!scoreNumeric || agentNumeric) {
-          if (metrics != null) {
-            metrics.incrementInvalidPair("acquire_batch");
-          }
+          metrics.incrementInvalidPair("acquire_batch");
           // Skip invalid pair; release semaphore since we won't attempt this one
           if (maxConcurrentSemaphore != null) {
             maxConcurrentSemaphore.release();
@@ -1616,9 +1578,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                 Long.parseLong(new String((byte[]) c0, java.nio.charset.StandardCharsets.UTF_8));
           }
         } catch (Exception ex) {
-          if (metrics != null) {
-            metrics.incrementAcquireValidationFailure("batch_result_count_parse");
-          }
+          metrics.incrementAcquireValidationFailure("batch_result_count_parse");
         }
 
         Set<String> acquiredAgentTypes = new HashSet<>();
@@ -1655,9 +1615,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                 successCount,
                 acquiredAgentTypes.size());
           }
-          if (metrics != null) {
-            metrics.incrementAcquireValidationFailure("batch_result_count_mismatch");
-          }
+          metrics.incrementAcquireValidationFailure("batch_result_count_mismatch");
           // Note: Permits for candidates not in acquiredAgentTypes will be released in another
           // processing loop. If successCount > acquiredAgentTypes.size(),
           // there are unparsed agents that Redis says were acquired, but we couldn't parse them.
@@ -1727,9 +1685,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               log.warn(
                   "Skipping agent {} due to invalid/missing acquire score - will retry on next cycle",
                   agentType);
-              if (metrics != null) {
-                metrics.incrementAcquireValidationFailure("batch_score_corruption");
-              }
+              metrics.incrementAcquireValidationFailure("batch_score_corruption");
             }
           } else {
             // Failure: Agent lost to another pod in race condition
@@ -1772,10 +1728,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
       // Record fallback metrics - this ensures metrics are recorded even when exception
       // doesn't propagate to outer catch block
-      if (metrics != null) {
-        metrics.incrementBatchFallback();
-        metrics.recordAcquireTime("fallback", System.currentTimeMillis() - batchStartMs);
-      }
+      metrics.incrementBatchFallback();
+      metrics.recordAcquireTime("fallback", System.currentTimeMillis() - batchStartMs);
 
       // Clean up partial state before fallback:
       // 1. Remove activeAgents entries for workers added before exception (fallback will
@@ -2190,9 +2144,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     + "This fallback has a race condition that may cause agent loss.",
                 agentType,
                 lastScriptException);
-            if (metrics != null) {
-              metrics.incrementRemoveAgentFallback();
-            }
+            metrics.incrementRemoveAgentFallback();
             try {
               jedis.zrem(WORKING_SET, agentType);
               // Best-effort: check if in waiting before removing
@@ -2907,7 +2859,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                     batchArgs);
         int added = parseAddAgentsCount(result);
         log.debug("Batch added {} missing agents to Redis", added);
-        if (metrics != null && added > 0) {
+        if (added > 0) {
           metrics.incrementRepopulateAdded(added);
         }
       } catch (Exception e) {
@@ -2946,7 +2898,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
     }
     log.debug("Individual added {} missing agents to Redis", added);
-    if (metrics != null && added > 0) {
+    if (added > 0) {
       metrics.incrementRepopulateAdded(added);
     }
   }
@@ -3006,9 +2958,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         boolean scoreNumeric = deadlineScoreString != null && deadlineScoreString.matches("^\\d+$");
         boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
         if (!scoreNumeric || agentNumeric) {
-          if (metrics != null) {
-            metrics.incrementInvalidPair("repopulate_fallback_batch");
-          }
+          metrics.incrementInvalidPair("repopulate_fallback_batch");
           continue;
         }
         batchArgs.add(agentType); // agent name
@@ -3069,7 +3019,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
       log.debug(
           "Repopulated Redis with {} agents ({} actually added/updated)", totalAgents, totalAdded);
-      if (metrics != null && totalAdded > 0) {
+      if (totalAdded > 0) {
         metrics.incrementRepopulateAdded(totalAdded);
       }
 
@@ -3558,9 +3508,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     boolean scoreNumeric = score != null && score.matches("^\\d+$");
     boolean agentNumeric = agentType != null && agentType.matches("^\\d+$");
     if (!scoreNumeric || agentNumeric) {
-      if (metrics != null) {
-        metrics.incrementInvalidPair(context);
-      }
+      metrics.incrementInvalidPair(context);
       return false;
     }
     return true;
@@ -3633,9 +3581,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               "Unexpected return type from MOVE_AGENTS for agent {}: {}",
               agentType,
               result.getClass().getName());
-          if (metrics != null) {
-            metrics.incrementAcquireValidationFailure("unexpected_type");
-          }
+          metrics.incrementAcquireValidationFailure("unexpected_type");
           return null;
         }
 
@@ -3643,9 +3589,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         // This guards against Redis type coercion surprises or external mutations
         if (scoreString == null || scoreString.isEmpty()) {
           log.warn("Empty acquire score from MOVE_AGENTS for agent {}", agentType);
-          if (metrics != null) {
-            metrics.incrementAcquireValidationFailure("empty_score");
-          }
+          metrics.incrementAcquireValidationFailure("empty_score");
           return null;
         }
 
@@ -3664,9 +3608,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               agentType,
               scoreString,
               result.getClass().getSimpleName());
-          if (metrics != null) {
-            metrics.incrementAcquireValidationFailure("non_numeric_score");
-          }
+          metrics.incrementAcquireValidationFailure("non_numeric_score");
           return null;
         }
 
@@ -4366,9 +4308,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
 
       // Track rejection metric
-      if (metrics != null) {
-        metrics.incrementSubmissionFailure("rejected");
-      }
+      metrics.incrementSubmissionFailure("rejected");
 
       // Requeue the agent preserving its original readiness priority
       requeueRejectedAgent(worker);
@@ -4395,9 +4335,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
 
       // Track generic submission failure
-      if (metrics != null) {
-        metrics.incrementSubmissionFailure(e.getClass().getSimpleName());
-      }
+      metrics.incrementSubmissionFailure(e.getClass().getSimpleName());
 
       // Requeue to avoid lingering working entries on submission errors
       requeueRejectedAgent(worker);

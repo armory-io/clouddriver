@@ -21,7 +21,6 @@ import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.nowM
 import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.overBudget;
 import static com.netflix.spinnaker.cats.redis.cluster.support.ExecutorUtils.newOnDemandSingleThreadExecutor;
 
-import com.netflix.spectator.api.DefaultRegistry;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.AgentScheduler;
@@ -171,9 +170,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
       PrioritySchedulerProperties schedulerProperties,
       PrioritySchedulerMetrics metrics) {
 
-    // Initialize services with defensive null checking
-    this.metrics =
-        (metrics != null) ? metrics : new PrioritySchedulerMetrics(new DefaultRegistry());
+    // Initialize services with defensive null checking (use NOOP if null)
+    this.metrics = metrics != null ? metrics : PrioritySchedulerMetrics.NOOP;
     this.scriptManager = new RedisScriptManager(jedisPool, this.metrics);
     this.config = new PrioritySchedulerConfiguration(agentProperties, schedulerProperties);
     this.acquisitionService =
@@ -1313,9 +1311,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
           if (acquisitionService.getRegisteredAgent(agentType) == null || !numeric) {
             // Inconsistent local tracking; clean it up to avoid leaks
             acquisitionService.removeActiveAgent(agentType);
-            if (metrics != null) {
-              metrics.incrementStateInconsistentActive();
-            }
+            metrics.incrementStateInconsistentActive();
           }
         }
       } catch (Exception ignore) {

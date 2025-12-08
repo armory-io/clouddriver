@@ -285,6 +285,34 @@ class AgentAcquisitionServiceTest {
     return new Semaphore(5);
   }
 
+  @Test
+  @DisplayName("Service uses NOOP metrics when null metrics provided")
+  void usesNoopMetricsWhenNullProvided() throws Exception {
+    // Create service with null metrics - should use NOOP internally
+    AgentAcquisitionService serviceWithNullMetrics =
+        new AgentAcquisitionService(
+            jedisPool,
+            scriptManager,
+            intervalProvider,
+            shardingFilter,
+            agentProperties,
+            schedulerProperties,
+            null);
+
+    // Verify metrics field is set to NOOP, not null
+    PrioritySchedulerMetrics metricsField =
+        TestFixtures.getField(serviceWithNullMetrics, AgentAcquisitionService.class, "metrics");
+    assertThat(metricsField)
+        .as("Metrics should be NOOP instance when null is provided")
+        .isNotNull()
+        .isSameAs(PrioritySchedulerMetrics.NOOP);
+
+    // Verify operations that use metrics don't throw NPE
+    String agentType = "agent-noop-metrics";
+    assertThatCode(() -> serviceWithNullMetrics.earlyReleasePermitIfHeld(agentType))
+        .doesNotThrowAnyException();
+  }
+
   @Nested
   @DisplayName("Agent Registration Tests")
   class AgentRegistrationTests {
