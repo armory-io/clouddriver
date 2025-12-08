@@ -95,6 +95,10 @@ public final class PrioritySchedulerMetrics {
   private final Id casContentionId;
   private final Id zombiesInFlightNegativeId;
 
+  // Schedule metrics
+  private final Id scheduleRetryExhaustedId;
+  private final Id scheduleRecoveryId;
+
   // Guard against duplicate PolledMeter registrations
   private volatile boolean gaugesRegistered = false;
 
@@ -156,6 +160,10 @@ public final class PrioritySchedulerMetrics {
     // Permit accounting
     this.casContentionId = createId("cas.contention");
     this.zombiesInFlightNegativeId = createId("scheduler.zombiesInFlight.negative");
+
+    // Schedule metrics
+    this.scheduleRetryExhaustedId = createId("schedule.retryExhausted");
+    this.scheduleRecoveryId = createId("schedule.recovery");
   }
 
   /**
@@ -503,6 +511,23 @@ public final class PrioritySchedulerMetrics {
    */
   public void recordZombiesInFlightHighWater(int highWater) {
     registry.gauge(createId("scheduler.zombiesInFlight.highWater")).set(highWater);
+  }
+
+  /**
+   * Increments counter when Redis scheduling retries are exhausted and an agent is queued for
+   * recovery. This indicates transient Redis failures during agent completion processing.
+   */
+  public void incrementScheduleRetryExhausted() {
+    registry.counter(scheduleRetryExhaustedId).increment();
+  }
+
+  /**
+   * Increments counter when an agent is successfully recovered after schedule retry exhaustion.
+   *
+   * @param success true if recovery succeeded, false if it failed again
+   */
+  public void incrementScheduleRecovery(boolean success) {
+    registry.counter(scheduleRecoveryId.withTag("success", Boolean.toString(success))).increment();
   }
 
   /**

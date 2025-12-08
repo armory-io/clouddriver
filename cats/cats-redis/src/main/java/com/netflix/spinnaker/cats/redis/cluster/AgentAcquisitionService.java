@@ -347,6 +347,11 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   private final ConcurrentLinkedQueue<AgentCompletion> completionQueue =
       new ConcurrentLinkedQueue<>();
 
+  // Recovery queue for agents that failed Redis scheduling after retry exhaustion.
+  // Agents in this queue will be retried on the next scheduler cycle.
+  private final ConcurrentLinkedQueue<AgentRecovery> scheduleRecoveryQueue =
+      new ConcurrentLinkedQueue<>();
+
   // Time-based repopulation cadence control (epoch millis of last repopulation)
   private final java.util.concurrent.atomic.AtomicLong lastRepopulateEpochMs =
       new java.util.concurrent.atomic.AtomicLong(0L);
@@ -398,6 +403,33 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       this.throwableClassName = throwableClassName;
     }
   }
+
+  /**
+   * Represents an agent that failed Redis scheduling and needs recovery on next cycle. Tracks the
+   * original offset and retry attempt count to prevent infinite retry loops.
+   */
+  private static class AgentRecovery {
+    final Agent agent;
+    final long offsetMs;
+    final int attemptCount;
+
+    AgentRecovery(Agent agent, long offsetMs) {
+      this.agent = agent;
+      this.offsetMs = offsetMs;
+      // attemptCount reflects completed recovery attempts; start at 0 so first processing is
+      // attempt #1
+      this.attemptCount = 0;
+    }
+
+    AgentRecovery(Agent agent, long offsetMs, int attemptCount) {
+      this.agent = agent;
+      this.offsetMs = offsetMs;
+      this.attemptCount = attemptCount;
+    }
+  }
+
+  /** Maximum number of recovery attempts before permanently dropping an agent. */
+  private static final int MAX_RECOVERY_ATTEMPTS = 3;
 
   /**
    * Constructs a new AgentAcquisitionService.
@@ -638,6 +670,9 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
       // Phase 1: Process queued agent completions
       processQueuedCompletions(jedis, nowMsCached);
+
+      // Phase 1.5: Process recovery queue for agents that failed Redis scheduling
+      processRecoveryQueue(jedis);
 
       // Phase 2: Agent repopulation (Redis recovery, periodic)
       long nowMsForRepop = System.currentTimeMillis();
@@ -3099,6 +3134,100 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   }
 
   /**
+   * Process agents that failed Redis scheduling and were queued for recovery. This method is called
+   * from saturatePool to retry scheduling agents that previously failed due to transient Redis
+   * errors.
+   *
+   * <p>Agents are retried with their original offset. If an agent exceeds MAX_RECOVERY_ATTEMPTS, it
+   * is logged as permanently failed and dropped (will be recovered by periodic repopulation).
+   *
+   * @param jedis Redis connection for scheduling operations
+   */
+  private void processRecoveryQueue(Jedis jedis) {
+    if (scheduleRecoveryQueue.isEmpty()) {
+      return;
+    }
+
+    int queueSize = scheduleRecoveryQueue.size();
+    log.debug("Processing {} agents from schedule recovery queue", queueSize);
+
+    int recovered = 0;
+    int failed = 0;
+    int dropped = 0;
+
+    AgentRecovery recovery;
+    while ((recovery = scheduleRecoveryQueue.poll()) != null) {
+      String agentType = recovery.agent.getAgentType();
+
+      // attemptCount is the number of completed recovery attempts; drop once it reaches the max
+      if (recovery.attemptCount >= MAX_RECOVERY_ATTEMPTS) {
+        // Exceeded max recovery attempts - drop agent (will be recovered by repopulation)
+        log.error(
+            "Agent {} permanently failed after {} recovery attempts - dropping (will recover via repopulation)",
+            agentType,
+            recovery.attemptCount);
+        metrics.incrementScheduleRecovery(false);
+        dropped++;
+        continue;
+      }
+
+      try {
+        String nextScore = score(jedis, recovery.offsetMs);
+
+        Object result =
+            scriptManager.evalshaWithSelfHeal(
+                jedis,
+                RedisScriptManager.ADD_AGENT,
+                java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+                java.util.Arrays.asList(agentType, nextScore));
+
+        // ADD_AGENT returns 1 if agent was added, 0 if already present in either set.
+        // Either outcome means the agent is now in Redis - treat both as success.
+        boolean scheduled = result != null && ((Long) result).intValue() == 1;
+        if (scheduled) {
+          log.debug(
+              "Successfully recovered agent {} on attempt {}",
+              agentType,
+              recovery.attemptCount + 1);
+        } else {
+          // Agent already exists in Redis (likely re-added by repopulation) - treat as success
+          log.debug("Agent {} already scheduled during recovery (result={})", agentType, result);
+        }
+
+        metrics.incrementScheduleRecovery(true);
+        recovered++;
+      } catch (Exception e) {
+        log.warn(
+            "Recovery attempt {} failed for agent {}: {}",
+            recovery.attemptCount + 1,
+            agentType,
+            e.getMessage());
+
+        // Re-queue with incremented attempt count
+        scheduleRecoveryQueue.offer(
+            new AgentRecovery(recovery.agent, recovery.offsetMs, recovery.attemptCount + 1));
+        metrics.incrementScheduleRecovery(false);
+        failed++;
+      }
+    }
+
+    // Only log at info level if there's something noteworthy (failures or drops)
+    if (dropped > 0 || failed > 0) {
+      log.info(
+          "Recovery queue processed: recovered={}, failed={}, dropped={}",
+          recovered,
+          failed,
+          dropped);
+    } else if (recovered > 0) {
+      log.debug(
+          "Recovery queue processed: recovered={}, failed={}, dropped={}",
+          recovered,
+          failed,
+          dropped);
+    }
+  }
+
+  /**
    * Drain all pending agent completions from the queue for processing.
    *
    * <p>Thread-safety: Only called from single-threaded scheduler executor, but queue accepts offers
@@ -3988,9 +4117,15 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         if (retryCount >= maxRetries) {
           log.error(
               "Failed to schedule agent {} in Redis after {} attempts", agentType, maxRetries, e);
-          // Don't lose the agent - try to re-queue it later
+          metrics.incrementScheduleRetryExhausted();
+
+          // Queue for recovery on next scheduler cycle (unless shutting down)
           if (!shuttingDown.get()) {
-            log.warn("Will attempt to recover agent {} on next scheduler cycle", agentType);
+            scheduleRecoveryQueue.offer(new AgentRecovery(agent, offsetMs));
+            log.warn(
+                "Agent {} queued for recovery on next scheduler cycle (recovery_queue_size={})",
+                agentType,
+                scheduleRecoveryQueue.size());
           }
         } else {
           log.warn(
@@ -4003,6 +4138,11 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             log.warn("Interrupted during Redis retry backoff for agent {}", agentType);
+            metrics.incrementScheduleRetryExhausted();
+            // Still queue for recovery if interrupted
+            if (!shuttingDown.get()) {
+              scheduleRecoveryQueue.offer(new AgentRecovery(agent, offsetMs));
+            }
             return;
           }
         }

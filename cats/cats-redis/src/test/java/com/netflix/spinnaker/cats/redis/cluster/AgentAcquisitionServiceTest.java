@@ -11431,9 +11431,206 @@ class AgentAcquisitionServiceTest {
         AgentAcquisitionService.ConsistencyCheckResult result =
             acquisitionService.checkSetConsistency(10);
 
-        // Then - should sample at most 10 agents
+        // Then - should sample at most 10 samples
         assertThat(result.getSampled()).isLessThanOrEqualTo(10);
         assertThat(result.hasViolations()).isFalse();
+      }
+    }
+  }
+
+  @Nested
+  @DisplayName("Schedule Recovery Tests")
+  class ScheduleRecoveryTests {
+
+    /**
+     * Tests that agents failing Redis scheduling are queued for recovery and successfully recovered
+     * on the next scheduler cycle.
+     *
+     * <p>This test verifies the fix for item #156: completion reschedule dropped after retry
+     * exhaustion. When Redis scheduling fails after max retries, the agent should be queued for
+     * recovery rather than silently dropped.
+     */
+    @Test
+    @DisplayName("Should recover agents queued after schedule retry exhaustion")
+    void shouldRecoverAgentsQueuedAfterScheduleRetryExhaustion() throws Exception {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Setup: Register an agent
+        Agent agent = TestFixtures.createMockAgent("recovery-test-agent", "recovery-provider");
+        AgentExecution execution = mock(AgentExecution.class);
+        ExecutionInstrumentation instr = TestFixtures.createMockInstrumentation();
+        acquisitionService.registerAgent(agent, execution, instr);
+
+        // Verify agent is registered
+        assertThat(acquisitionService.getRegisteredAgentCount()).isEqualTo(1);
+
+        // Get access to the recovery queue via reflection
+        java.lang.reflect.Field recoveryQueueField =
+            AgentAcquisitionService.class.getDeclaredField("scheduleRecoveryQueue");
+        recoveryQueueField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.ConcurrentLinkedQueue<Object> recoveryQueue =
+            (java.util.concurrent.ConcurrentLinkedQueue<Object>)
+                recoveryQueueField.get(acquisitionService);
+
+        // Manually add an agent to the recovery queue (simulating retry exhaustion)
+        java.lang.reflect.Constructor<?> recoveryConstructor =
+            Class.forName(AgentAcquisitionService.class.getName() + "$AgentRecovery")
+                .getDeclaredConstructor(Agent.class, long.class);
+        recoveryConstructor.setAccessible(true);
+        Object agentRecovery = recoveryConstructor.newInstance(agent, 0L);
+        recoveryQueue.offer(agentRecovery);
+
+        // Verify recovery queue has the agent
+        assertThat(recoveryQueue.size()).isEqualTo(1);
+
+        // When: Call processRecoveryQueue via reflection
+        java.lang.reflect.Method processRecoveryMethod =
+            AgentAcquisitionService.class.getDeclaredMethod("processRecoveryQueue", Jedis.class);
+        processRecoveryMethod.setAccessible(true);
+        processRecoveryMethod.invoke(acquisitionService, jedis);
+
+        // Then: Recovery queue should be empty (agent processed)
+        assertThat(recoveryQueue.size()).isEqualTo(0);
+
+        // And: Agent should be in waiting set in Redis
+        Double waitingScore = jedis.zscore("waiting", "recovery-test-agent");
+        assertThat(waitingScore)
+            .describedAs("Agent should be in waiting set after recovery")
+            .isNotNull();
+      }
+    }
+
+    /**
+     * Tests that agents exceeding MAX_RECOVERY_ATTEMPTS are dropped rather than retried infinitely.
+     */
+    @Test
+    @DisplayName("Should drop agents after max recovery attempts")
+    void shouldDropAgentsAfterMaxRecoveryAttempts() throws Exception {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Setup: Register an agent
+        Agent agent = TestFixtures.createMockAgent("drop-test-agent", "drop-provider");
+        AgentExecution execution = mock(AgentExecution.class);
+        ExecutionInstrumentation instr = TestFixtures.createMockInstrumentation();
+        acquisitionService.registerAgent(agent, execution, instr);
+
+        // Get access to the recovery queue via reflection
+        java.lang.reflect.Field recoveryQueueField =
+            AgentAcquisitionService.class.getDeclaredField("scheduleRecoveryQueue");
+        recoveryQueueField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.ConcurrentLinkedQueue<Object> recoveryQueue =
+            (java.util.concurrent.ConcurrentLinkedQueue<Object>)
+                recoveryQueueField.get(acquisitionService);
+
+        // Get MAX_RECOVERY_ATTEMPTS via reflection
+        java.lang.reflect.Field maxAttemptsField =
+            AgentAcquisitionService.class.getDeclaredField("MAX_RECOVERY_ATTEMPTS");
+        maxAttemptsField.setAccessible(true);
+        int maxAttempts = (int) maxAttemptsField.get(null);
+
+        // Manually add an agent with attemptCount >= MAX_RECOVERY_ATTEMPTS
+        java.lang.reflect.Constructor<?> recoveryConstructor =
+            Class.forName(AgentAcquisitionService.class.getName() + "$AgentRecovery")
+                .getDeclaredConstructor(Agent.class, long.class, int.class);
+        recoveryConstructor.setAccessible(true);
+        Object agentRecovery = recoveryConstructor.newInstance(agent, 0L, maxAttempts);
+        recoveryQueue.offer(agentRecovery);
+
+        // Ensure agent is NOT in Redis before recovery
+        jedis.zrem("waiting", "drop-test-agent");
+        jedis.zrem("working", "drop-test-agent");
+        assertThat(jedis.zscore("waiting", "drop-test-agent")).isNull();
+        assertThat(jedis.zscore("working", "drop-test-agent")).isNull();
+
+        // When: Call processRecoveryQueue
+        java.lang.reflect.Method processRecoveryMethod =
+            AgentAcquisitionService.class.getDeclaredMethod("processRecoveryQueue", Jedis.class);
+        processRecoveryMethod.setAccessible(true);
+        processRecoveryMethod.invoke(acquisitionService, jedis);
+
+        // Then: Recovery queue should be empty (agent dropped, not re-queued)
+        assertThat(recoveryQueue.size()).isEqualTo(0);
+
+        // And: Agent should NOT be in Redis (was dropped, not scheduled)
+        assertThat(jedis.zscore("waiting", "drop-test-agent"))
+            .describedAs("Agent should NOT be in waiting set after being dropped")
+            .isNull();
+      }
+    }
+
+    /**
+     * Tests that schedule recovery integrates properly with the saturatePool cycle.
+     *
+     * <p>This test verifies that processRecoveryQueue is called during saturatePool by checking
+     * that the recovery queue is drained. The detailed behavior of processRecoveryQueue (adding
+     * agents to Redis) is verified by the other tests in this class that call processRecoveryQueue
+     * directly.
+     *
+     * <p>Note: After recovery adds agent to waiting, saturatePool may immediately acquire it
+     * (moving to working), execute it, and queue completion. The completion is processed on the
+     * NEXT saturatePool call, so the agent may not be in Redis after a single saturatePool call.
+     */
+    @Test
+    @DisplayName("Should process recovery queue during saturatePool")
+    void shouldProcessRecoveryQueueDuringSaturatePool() throws Exception {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Setup: Register an agent
+        Agent agent = TestFixtures.createMockAgent("saturate-recovery-agent", "saturate-provider");
+        AgentExecution execution = mock(AgentExecution.class);
+        ExecutionInstrumentation instr = TestFixtures.createMockInstrumentation();
+        acquisitionService.registerAgent(agent, execution, instr);
+
+        // Remove agent from Redis so recovery will attempt to add it
+        jedis.zrem("waiting", "saturate-recovery-agent");
+        jedis.zrem("working", "saturate-recovery-agent");
+
+        // Get access to the recovery queue via reflection
+        java.lang.reflect.Field recoveryQueueField =
+            AgentAcquisitionService.class.getDeclaredField("scheduleRecoveryQueue");
+        recoveryQueueField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.ConcurrentLinkedQueue<Object> recoveryQueue =
+            (java.util.concurrent.ConcurrentLinkedQueue<Object>)
+                recoveryQueueField.get(acquisitionService);
+
+        // Add agent to recovery queue
+        java.lang.reflect.Constructor<?> recoveryConstructor =
+            Class.forName(AgentAcquisitionService.class.getName() + "$AgentRecovery")
+                .getDeclaredConstructor(Agent.class, long.class);
+        recoveryConstructor.setAccessible(true);
+        Object agentRecovery = recoveryConstructor.newInstance(agent, 0L);
+        recoveryQueue.offer(agentRecovery);
+        assertThat(recoveryQueue.size()).isEqualTo(1);
+
+        // When: Run saturatePool (which calls processRecoveryQueue internally)
+        Semaphore semaphore = new Semaphore(10);
+        acquisitionService.saturatePool(1L, semaphore, executorService);
+
+        // Then: Recovery queue should be empty (proves processRecoveryQueue was called)
+        assertThat(recoveryQueue.size())
+            .describedAs("Recovery queue should be empty after saturatePool processes it")
+            .isEqualTo(0);
+
+        // And: Agent should be recoverable in the system (waiting, working, or completion queue)
+        // After a single saturatePool cycle, the agent may be:
+        // - In waiting (recovered but not yet acquired)
+        // - In working (recovered and acquired)
+        // - In completion queue (executed and awaiting next cycle)
+        // - Back in waiting (if completion was processed via second internal call)
+        //
+        // We verify the agent wasn't permanently lost by running a second saturatePool
+        // to process any pending completions
+        acquisitionService.saturatePool(2L, semaphore, executorService);
+
+        // Now check agent is in Redis
+        Double waitingScore = jedis.zscore("waiting", "saturate-recovery-agent");
+        Double workingScore = jedis.zscore("working", "saturate-recovery-agent");
+        assertThat(waitingScore != null || workingScore != null)
+            .describedAs(
+                "Agent should be in Redis after recovery and completion processing. "
+                    + "waiting=%s, working=%s",
+                waitingScore, workingScore)
+            .isTrue();
       }
     }
   }
