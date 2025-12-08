@@ -1188,7 +1188,7 @@ class RedisScriptManagerTest {
       // Verify at least latency timer recorded (sum across tags)
       long timerSum = 0L;
       for (com.netflix.spectator.api.Meter meter : registry) {
-        if (meter.id().name().equals("cats.redisPriority.scripts.latency")) {
+        if (meter.id().name().equals("cats.priorityScheduler.scripts.latency")) {
           for (com.netflix.spectator.api.Measurement ms : meter.measure()) {
             timerSum += (long) ms.value();
           }
@@ -1234,11 +1234,18 @@ class RedisScriptManagerTest {
           registry
               .counter(
                   registry
-                      .createId("cats.redisPriority.scripts.eval")
+                      .createId("cats.priorityScheduler.scripts.eval")
+                      .withTag("scheduler", "priority")
                       .withTag("script", RedisScriptManager.SCORE_AGENTS))
               .count();
       assertThat(evalCount).isGreaterThanOrEqualTo(1);
-      assertThat(registry.counter("cats.redisPriority.scripts.reloads").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.scripts.reloads")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .isGreaterThanOrEqualTo(1);
     }
   }

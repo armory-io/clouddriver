@@ -974,7 +974,7 @@ class PrioritySchedulerStressTest {
         .counters()
         .forEach(
             c -> {
-              if (c.id().name().equals("cats.redisPriority.acquire.attempts")) {
+              if (c.id().name().equals("cats.priorityScheduler.acquire.attempts")) {
                 acquireAttempts.addAndGet((long) c.count());
               }
             });
@@ -988,7 +988,7 @@ class PrioritySchedulerStressTest {
         .counters()
         .forEach(
             c -> {
-              if (c.id().name().equals("cats.redisPriority.acquire.acquired")) {
+              if (c.id().name().equals("cats.priorityScheduler.acquire.acquired")) {
                 acquiredCount.addAndGet((long) c.count());
               }
             });
@@ -1003,7 +1003,7 @@ class PrioritySchedulerStressTest {
         .timers()
         .forEach(
             t -> {
-              if (t.id().name().equals("cats.redisPriority.cleanup.time")) {
+              if (t.id().name().equals("cats.priorityScheduler.cleanup.time")) {
                 cleanupTimerCount.addAndGet(t.count());
               }
             });

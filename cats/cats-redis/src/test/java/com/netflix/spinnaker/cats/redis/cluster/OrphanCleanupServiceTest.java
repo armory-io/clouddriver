@@ -74,7 +74,7 @@ import redis.clients.jedis.params.SetParams;
  *   <li>Working orphans: Valid agents moved to WAITING with preserved score; invalid removed
  *   <li>Waiting orphans: Valid entries preserved (never removed by age alone); invalid removed
  *   <li>Shard gating: Only shard-owned invalid entries removed
- *   <li>Metrics: {@code cats.redisPriority.cleanup.time} and {@code cleanup.cleaned} recorded
+ *   <li>Metrics: {@code cats.priorityScheduler.cleanup.time} and {@code cleanup.cleaned} recorded
  * </ul>
  */
 @Testcontainers
@@ -125,7 +125,11 @@ class OrphanCleanupServiceTest {
    */
   private long getCleanupTimeCount() {
     return registry
-        .timer(registry.createId("cats.redisPriority.cleanup.time").withTag("type", "orphan"))
+        .timer(
+            registry
+                .createId("cats.priorityScheduler.cleanup.time")
+                .withTag("scheduler", "priority")
+                .withTag("type", "orphan"))
         .count();
   }
 
@@ -136,7 +140,11 @@ class OrphanCleanupServiceTest {
    */
   private long getCleanupCleanedCount() {
     return registry
-        .counter(registry.createId("cats.redisPriority.cleanup.cleaned").withTag("type", "orphan"))
+        .counter(
+            registry
+                .createId("cats.priorityScheduler.cleanup.cleaned")
+                .withTag("scheduler", "priority")
+                .withTag("type", "orphan"))
         .count();
   }
 

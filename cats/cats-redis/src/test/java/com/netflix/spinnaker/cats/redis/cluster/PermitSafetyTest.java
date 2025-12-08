@@ -175,7 +175,11 @@ class PermitSafetyTest {
       // Verify submission failure metric incremented
       assertThat(
               registry
-                  .counter("cats.redisPriority.acquire.submissionFailures", "reason", "rejected")
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.submissionFailures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "rejected"))
                   .count())
           .describedAs("Submission failure metric should be incremented with reason='rejected'")
           .isGreaterThanOrEqualTo(1);
@@ -198,7 +202,13 @@ class PermitSafetyTest {
       }
 
       // Verify acquisition metrics calls
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
     }
@@ -278,7 +288,10 @@ class PermitSafetyTest {
       assertThat(
               registry
                   .counter(
-                      "cats.redisPriority.acquire.submissionFailures", "reason", "OutOfMemoryError")
+                      registry
+                          .createId("cats.priorityScheduler.acquire.submissionFailures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "OutOfMemoryError"))
                   .count())
           .describedAs("Submission failure metric should be tagged with OutOfMemoryError")
           .isGreaterThanOrEqualTo(1);
@@ -292,7 +305,13 @@ class PermitSafetyTest {
       }
 
       // Verify acquisition metrics calls
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Acquisition attempts metric should be incremented")
           .isGreaterThanOrEqualTo(1);
 

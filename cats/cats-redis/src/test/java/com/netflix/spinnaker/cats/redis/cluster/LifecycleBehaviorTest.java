@@ -307,7 +307,13 @@ class LifecycleBehaviorTest {
       }
 
       // Verify metrics calls - saturatePool() called twice
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "Acquire attempts should be incremented twice (acquisition + completion processing)")
           .isGreaterThanOrEqualTo(2);

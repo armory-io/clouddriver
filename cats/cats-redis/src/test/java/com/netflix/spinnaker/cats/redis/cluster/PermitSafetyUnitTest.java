@@ -124,7 +124,11 @@ class PermitSafetyUnitTest {
       // Verify submission failure metric incremented
       assertThat(
               registry
-                  .counter("cats.redisPriority.acquire.submissionFailures", "reason", "rejected")
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.submissionFailures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "rejected"))
                   .count())
           .describedAs("Submission failure metric should be incremented with reason='rejected'")
           .isGreaterThanOrEqualTo(1);
@@ -147,7 +151,13 @@ class PermitSafetyUnitTest {
       }
 
       // Verify acquisition metrics were recorded
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Acquisition attempts metric should be incremented")
           .isGreaterThanOrEqualTo(1);
     } finally {

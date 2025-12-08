@@ -362,7 +362,10 @@ class BatchOperationsTest {
       // Verify batch mode was used - check that recordAcquireTime("batch", ...) was called
       com.netflix.spectator.api.Timer batchTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       long batchTimerCount = batchTimer.count();
 
       // Note: Batch mode is used during acquisition, not registration
@@ -507,14 +510,18 @@ class BatchOperationsTest {
             metricsRegistry
                 .timer(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.time")
+                        .createId("cats.priorityScheduler.cleanup.time")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         long initialCleanupCleanedCount =
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
 
@@ -531,7 +538,9 @@ class BatchOperationsTest {
                       metricsRegistry
                           .counter(
                               metricsRegistry
-                                  .createId("cats.redisPriority.cleanup.cleaned")
+                                  .createId("cats.priorityScheduler.cleanup.cleaned")
+                                  .withTag("scheduler", "priority")
+                                  .withTag("scheduler", "priority")
                                   .withTag("type", "zombie"))
                           .count();
                   boolean counterIncremented = currentCleaned > initialCleanupCleanedCount;
@@ -565,7 +574,9 @@ class BatchOperationsTest {
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         assertThat(finalCleaned)
@@ -609,7 +620,9 @@ class BatchOperationsTest {
             metricsRegistry
                 .timer(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.time")
+                        .createId("cats.priorityScheduler.cleanup.time")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         assertThat(cleanupTimeCount)
@@ -620,7 +633,9 @@ class BatchOperationsTest {
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         assertThat(cleanupCleanedCount)
@@ -647,7 +662,9 @@ class BatchOperationsTest {
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         assertThat(finalCleanedCount)
@@ -720,14 +737,18 @@ class BatchOperationsTest {
           metricsRegistry
               .timer(
                   metricsRegistry
-                      .createId("cats.redisPriority.cleanup.time")
+                      .createId("cats.priorityScheduler.cleanup.time")
+                      .withTag("scheduler", "priority")
+                      .withTag("scheduler", "priority")
                       .withTag("type", "orphan"))
               .count();
       long initialCleanupCleanedCount =
           metricsRegistry
               .counter(
                   metricsRegistry
-                      .createId("cats.redisPriority.cleanup.cleaned")
+                      .createId("cats.priorityScheduler.cleanup.cleaned")
+                      .withTag("scheduler", "priority")
+                      .withTag("scheduler", "priority")
                       .withTag("type", "orphan"))
               .count();
 
@@ -777,7 +798,9 @@ class BatchOperationsTest {
           metricsRegistry
               .timer(
                   metricsRegistry
-                      .createId("cats.redisPriority.cleanup.time")
+                      .createId("cats.priorityScheduler.cleanup.time")
+                      .withTag("scheduler", "priority")
+                      .withTag("scheduler", "priority")
                       .withTag("type", "orphan"))
               .count();
       assertThat(cleanupTimeCount)
@@ -788,7 +811,9 @@ class BatchOperationsTest {
           metricsRegistry
               .counter(
                   metricsRegistry
-                      .createId("cats.redisPriority.cleanup.cleaned")
+                      .createId("cats.priorityScheduler.cleanup.cleaned")
+                      .withTag("scheduler", "priority")
+                      .withTag("scheduler", "priority")
                       .withTag("type", "orphan"))
               .count();
       assertThat(cleanupCleanedCount)
@@ -928,14 +953,18 @@ class BatchOperationsTest {
             metricsRegistry
                 .timer(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.time")
+                        .createId("cats.priorityScheduler.cleanup.time")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         long initialCleanupCleanedCount =
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
 
@@ -951,7 +980,9 @@ class BatchOperationsTest {
                       metricsRegistry
                           .counter(
                               metricsRegistry
-                                  .createId("cats.redisPriority.cleanup.cleaned")
+                                  .createId("cats.priorityScheduler.cleanup.cleaned")
+                                  .withTag("scheduler", "priority")
+                                  .withTag("scheduler", "priority")
                                   .withTag("type", "zombie"))
                           .count();
                   boolean counterIncremented = currentCleaned > initialCleanupCleanedCount;
@@ -979,7 +1010,9 @@ class BatchOperationsTest {
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         assertThat(finalCleaned)
@@ -1015,7 +1048,9 @@ class BatchOperationsTest {
             metricsRegistry
                 .timer(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.time")
+                        .createId("cats.priorityScheduler.cleanup.time")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         assertThat(cleanupTimeCount)
@@ -1026,7 +1061,9 @@ class BatchOperationsTest {
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         assertThat(cleanupCleanedCount)
@@ -1156,7 +1193,9 @@ class BatchOperationsTest {
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
 
@@ -1171,7 +1210,9 @@ class BatchOperationsTest {
                   metricsRegistry
                       .counter(
                           metricsRegistry
-                              .createId("cats.redisPriority.cleanup.cleaned")
+                              .createId("cats.priorityScheduler.cleanup.cleaned")
+                              .withTag("scheduler", "priority")
+                              .withTag("scheduler", "priority")
                               .withTag("type", "zombie"))
                       .count();
               return currentCleaned > initialCleanupCleanedCount;
@@ -1200,7 +1241,9 @@ class BatchOperationsTest {
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         assertThat(finalCleaned)
@@ -1395,14 +1438,23 @@ class BatchOperationsTest {
       // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime,
       // incrementAcquired)
       // Both paths should have called saturatePool() twice (acquisition + completion processing)
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Acquire attempts should be incremented for both batch and fallback paths")
           .isGreaterThanOrEqualTo(2);
 
       // Verify batch mode used for batch path (check metrics mode tag)
       com.netflix.spectator.api.Timer batchModeTimer =
           registry.timer(
-              registry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              registry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       assertThat(batchModeTimer.count())
           .describedAs("Batch mode timer should be recorded for batch path")
           .isGreaterThan(0);
@@ -1540,7 +1592,13 @@ class BatchOperationsTest {
 
       // Verify repopulation metrics (incrementRepopulateAdded, recordRepopulateTime)
       // Both paths should have called repopulateIfDue() once
-      assertThat(registry.counter("cats.redisPriority.repopulate.added").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.repopulate.added")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Repopulate added should be incremented for both batch and fallback paths")
           .isGreaterThanOrEqualTo(2); // 2 agents x 2 paths = 4, but may be more due to registration
     }
@@ -1649,14 +1707,23 @@ class BatchOperationsTest {
       // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime with
       // mode="batch"/"fallback", incrementAcquired)
       // Both paths should have called saturatePool() once
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Acquire attempts should be incremented for both batch and fallback paths")
           .isGreaterThanOrEqualTo(2);
 
       // Verify batch mode used for batch path (check metrics mode tag)
       com.netflix.spectator.api.Timer batchModeTimer =
           registry.timer(
-              registry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              registry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       assertThat(batchModeTimer.count())
           .describedAs("Batch mode timer should be recorded for batch path")
           .isGreaterThan(0);
@@ -1666,7 +1733,10 @@ class BatchOperationsTest {
       // The fallback timer is recorded when batch acquisition fails and falls back to individual.
       com.netflix.spectator.api.Timer fallbackModeTimer =
           registry.timer(
-              registry.createId("cats.redisPriority.acquire.time").withTag("mode", "fallback"));
+              registry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "fallback"));
       // Fallback timer may or may not be recorded depending on the exact failure path
       // The key verification is that both paths successfully acquired agents (verified above)
     }
@@ -1941,7 +2011,8 @@ class BatchOperationsTest {
         com.netflix.spectator.api.Timer batchTimer =
             metricsRegistry.timer(
                 metricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "batch"));
         assertThat(batchTimer.count())
             .describedAs(
@@ -1949,7 +2020,13 @@ class BatchOperationsTest {
             .isGreaterThan(0);
 
         // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime, incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("Acquire attempts should be incremented")
             .isGreaterThan(0);
 
@@ -2026,7 +2103,8 @@ class BatchOperationsTest {
         com.netflix.spectator.api.Timer batchTimer =
             metricsRegistry.timer(
                 metricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "batch"));
         assertThat(batchTimer.count())
             .describedAs(
@@ -2034,7 +2112,13 @@ class BatchOperationsTest {
             .isGreaterThan(0);
 
         // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime, incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("Acquire attempts should be incremented")
             .isGreaterThan(0);
       }
@@ -2166,7 +2250,13 @@ class BatchOperationsTest {
             .isEqualTo(3);
 
         // Verify metrics calls (incrementAcquireAttempts, incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("Acquire attempts should be incremented even with script failure")
             .isGreaterThan(0);
       }
@@ -2225,7 +2315,8 @@ class BatchOperationsTest {
         com.netflix.spectator.api.Timer batchTimer =
             metricsRegistry.timer(
                 metricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "batch"));
         assertThat(batchTimer.count())
             .describedAs(
@@ -2233,7 +2324,13 @@ class BatchOperationsTest {
             .isGreaterThan(0);
 
         // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime, incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("Acquire attempts should be incremented")
             .isGreaterThan(0);
       }
@@ -2289,7 +2386,8 @@ class BatchOperationsTest {
         com.netflix.spectator.api.Timer batchTimer =
             metricsRegistry.timer(
                 metricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "batch"));
         assertThat(batchTimer.count())
             .describedAs(
@@ -2297,7 +2395,13 @@ class BatchOperationsTest {
             .isGreaterThan(0);
 
         // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime, incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("Acquire attempts should be incremented")
             .isGreaterThan(0);
       }
@@ -2348,7 +2452,8 @@ class BatchOperationsTest {
         com.netflix.spectator.api.Timer batchTimer =
             metricsRegistry.timer(
                 metricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "batch"));
         assertThat(batchTimer.count())
             .describedAs(
@@ -2356,7 +2461,13 @@ class BatchOperationsTest {
             .isGreaterThan(0);
 
         // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime, incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("Acquire attempts should be incremented")
             .isGreaterThan(0);
       }
@@ -2431,7 +2542,13 @@ class BatchOperationsTest {
 
         // Verify metrics calls (incrementAcquireAttempts called 3 times, recordAcquireTime,
         // incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs(
                 "Acquire attempts should be incremented 3 times (once per concurrent call)")
             .isGreaterThanOrEqualTo(3);
@@ -2523,7 +2640,13 @@ class BatchOperationsTest {
         assertThat(testAcquisitionService.getRegisteredAgentCount()).isEqualTo(10);
 
         // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime, incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs(
                 "Acquire attempts should be incremented during dynamic registration scenario")
             .isGreaterThan(0);
@@ -2595,14 +2718,18 @@ class BatchOperationsTest {
             metricsRegistry
                 .timer(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.time")
+                        .createId("cats.priorityScheduler.cleanup.time")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         long initialCleanupCleanedCount =
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
 
@@ -2636,7 +2763,9 @@ class BatchOperationsTest {
                 metricsRegistry
                     .timer(
                         metricsRegistry
-                            .createId("cats.redisPriority.cleanup.time")
+                            .createId("cats.priorityScheduler.cleanup.time")
+                            .withTag("scheduler", "priority")
+                            .withTag("scheduler", "priority")
                             .withTag("type", "zombie"))
                     .count())
             .describedAs("recordCleanupTime('zombie', elapsed) should be called")
@@ -2646,7 +2775,9 @@ class BatchOperationsTest {
                 metricsRegistry
                     .counter(
                         metricsRegistry
-                            .createId("cats.redisPriority.cleanup.cleaned")
+                            .createId("cats.priorityScheduler.cleanup.cleaned")
+                            .withTag("scheduler", "priority")
+                            .withTag("scheduler", "priority")
                             .withTag("type", "zombie"))
                     .count())
             .describedAs("incrementCleanupCleaned('zombie', count) should be called")
@@ -2717,14 +2848,18 @@ class BatchOperationsTest {
             metricsRegistry
                 .timer(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.time")
+                        .createId("cats.priorityScheduler.cleanup.time")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
         long initialCleanupCleanedCount =
             metricsRegistry
                 .counter(
                     metricsRegistry
-                        .createId("cats.redisPriority.cleanup.cleaned")
+                        .createId("cats.priorityScheduler.cleanup.cleaned")
+                        .withTag("scheduler", "priority")
+                        .withTag("scheduler", "priority")
                         .withTag("type", "zombie"))
                 .count();
 
@@ -2760,7 +2895,9 @@ class BatchOperationsTest {
                 metricsRegistry
                     .timer(
                         metricsRegistry
-                            .createId("cats.redisPriority.cleanup.time")
+                            .createId("cats.priorityScheduler.cleanup.time")
+                            .withTag("scheduler", "priority")
+                            .withTag("scheduler", "priority")
                             .withTag("type", "zombie"))
                     .count())
             .describedAs("recordCleanupTime('zombie', elapsed) should be called")
@@ -2770,7 +2907,9 @@ class BatchOperationsTest {
                 metricsRegistry
                     .counter(
                         metricsRegistry
-                            .createId("cats.redisPriority.cleanup.cleaned")
+                            .createId("cats.priorityScheduler.cleanup.cleaned")
+                            .withTag("scheduler", "priority")
+                            .withTag("scheduler", "priority")
                             .withTag("type", "zombie"))
                     .count())
             .describedAs("incrementCleanupCleaned('zombie', count) should be called")
@@ -2840,7 +2979,13 @@ class BatchOperationsTest {
             .doesNotThrowAnyException();
 
         // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime, incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("Acquire attempts should be incremented even under memory pressure")
             .isGreaterThan(0);
       }
@@ -2905,7 +3050,13 @@ class BatchOperationsTest {
         assertThat(limitedSemaphore.availablePermits()).isEqualTo(2);
 
         // Verify metrics calls (incrementAcquireAttempts)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("Acquire attempts should be incremented")
             .isGreaterThan(0);
       }
@@ -3443,7 +3594,13 @@ class BatchOperationsTest {
         }
 
         // Verify metrics calls (incrementAcquireAttempts, recordAcquireTime, incrementAcquired)
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("Acquire attempts should be incremented during repopulation")
             .isGreaterThan(0);
       }

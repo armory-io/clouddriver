@@ -152,18 +152,364 @@ class PrioritySchedulerMetricsTest {
       metrics.incrementScriptError("ADD_AGENTS", "NOSCRIPT");
       metrics.incrementScriptsReload();
 
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .isGreaterThanOrEqualTo(1);
-      assertThat(registry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .isGreaterThanOrEqualTo(5);
-      assertThat(registry.counter("cats.redisPriority.batch.fallbacks").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.batchFallbacks")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .isGreaterThanOrEqualTo(1);
-      assertThat(registry.counter("cats.redisPriority.repopulate.added").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.repopulate.added")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .isGreaterThanOrEqualTo(3);
-      assertThat(registry.counter("cats.redisPriority.scripts.reloads").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.scripts.reloads")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .isGreaterThanOrEqualTo(1);
-      assertThat(registry.counter("cats.redisPriority.run.failures").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.run.failures")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .isGreaterThanOrEqualTo(0);
+    }
+
+    /**
+     * Tests that permit accounting metrics (CAS contention, zombiesInFlight negative, permit
+     * mismatch, zombiesInFlight high-water) are recorded correctly.
+     *
+     * <p>Verifies: CAS contention counter increments with location tag, zombiesInFlight negative
+     * counter increments, permit mismatch gauge records value, zombiesInFlight high-water gauge
+     * records value.
+     */
+    @Test
+    @DisplayName("Permit accounting metrics increment and record correctly")
+    void permitAccountingMetricsRecorded() {
+      Registry registry = new DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+
+      // Exercise permit accounting metrics
+      metrics.incrementCasContention("zombie_cleanup");
+      metrics.incrementCasContention("worker_completion");
+      metrics.incrementCasContention("zombie_cleanup"); // Second increment for same location
+      metrics.incrementZombiesInFlightNegative();
+      metrics.incrementZombiesInFlightNegative();
+      metrics.recordPermitMismatch(3);
+      metrics.recordZombiesInFlightHighWater(5);
+
+      // Verify CAS contention counters with location tags
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.cas.contention")
+                          .withTag("scheduler", "priority")
+                          .withTag("location", "zombie_cleanup"))
+                  .count())
+          .isEqualTo(2);
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.cas.contention")
+                          .withTag("scheduler", "priority")
+                          .withTag("location", "worker_completion"))
+                  .count())
+          .isEqualTo(1);
+
+      // Verify zombiesInFlight negative counter
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.scheduler.zombiesInFlight.negative")
+                          .withTag("scheduler", "priority"))
+                  .count())
+          .isEqualTo(2);
+
+      // Verify permit mismatch gauge (last value wins for gauges)
+      assertThat(
+              registry
+                  .gauge(
+                      registry
+                          .createId("cats.priorityScheduler.scheduler.permitMismatch")
+                          .withTag("scheduler", "priority"))
+                  .value())
+          .isEqualTo(3.0);
+
+      // Verify zombiesInFlight high-water gauge
+      assertThat(
+              registry
+                  .gauge(
+                      registry
+                          .createId("cats.priorityScheduler.scheduler.zombiesInFlight.highWater")
+                          .withTag("scheduler", "priority"))
+                  .value())
+          .isEqualTo(5.0);
+    }
+
+    /**
+     * Tests that permit mismatch gauge can be updated multiple times and retains latest value.
+     *
+     * <p>Verifies gauge semantics where only the latest recorded value is retained.
+     */
+    @Test
+    @DisplayName("Permit mismatch gauge retains latest value")
+    void permitMismatchGaugeRetainsLatestValue() {
+      Registry registry = new DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+
+      // Record multiple values - gauge should retain latest
+      metrics.recordPermitMismatch(0);
+      assertThat(
+              registry
+                  .gauge(
+                      registry
+                          .createId("cats.priorityScheduler.scheduler.permitMismatch")
+                          .withTag("scheduler", "priority"))
+                  .value())
+          .isEqualTo(0.0);
+
+      metrics.recordPermitMismatch(5);
+      assertThat(
+              registry
+                  .gauge(
+                      registry
+                          .createId("cats.priorityScheduler.scheduler.permitMismatch")
+                          .withTag("scheduler", "priority"))
+                  .value())
+          .isEqualTo(5.0);
+
+      metrics.recordPermitMismatch(-2); // Negative mismatch possible in edge cases
+      assertThat(
+              registry
+                  .gauge(
+                      registry
+                          .createId("cats.priorityScheduler.scheduler.permitMismatch")
+                          .withTag("scheduler", "priority"))
+                  .value())
+          .isEqualTo(-2.0);
+
+      metrics.recordPermitMismatch(0); // Back to healthy state
+      assertThat(
+              registry
+                  .gauge(
+                      registry
+                          .createId("cats.priorityScheduler.scheduler.permitMismatch")
+                          .withTag("scheduler", "priority"))
+                  .value())
+          .isEqualTo(0.0);
+    }
+
+    /**
+     * Tests that executor gauges are registered and report correct values.
+     *
+     * <p>Verifies: activeThreads, poolSize, queueSize, completedTasks gauges are registered with
+     * the scheduler=priority tag and report executor state.
+     */
+    @Test
+    @DisplayName("Executor gauges report thread pool state")
+    void executorGaugesReportThreadPoolState() {
+      Registry registry = new DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+
+      // Create a ThreadPoolExecutor with known configuration
+      java.util.concurrent.ThreadPoolExecutor executor =
+          new java.util.concurrent.ThreadPoolExecutor(
+              2, // core pool size
+              4, // max pool size
+              60L,
+              java.util.concurrent.TimeUnit.SECONDS,
+              new java.util.concurrent.LinkedBlockingQueue<>(10));
+
+      try {
+        // Register executor gauges
+        metrics.registerExecutorGauges(executor);
+
+        // Submit some tasks to populate executor state
+        java.util.concurrent.CountDownLatch taskStarted =
+            new java.util.concurrent.CountDownLatch(2);
+        java.util.concurrent.CountDownLatch taskComplete =
+            new java.util.concurrent.CountDownLatch(1);
+
+        for (int i = 0; i < 2; i++) {
+          executor.submit(
+              () -> {
+                taskStarted.countDown();
+                try {
+                  taskComplete.await();
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                }
+              });
+        }
+
+        // Wait for tasks to start
+        taskStarted.await(1, java.util.concurrent.TimeUnit.SECONDS);
+
+        // Update polled meters
+        PolledMeter.update(registry);
+
+        // Verify executor gauges with scheduler=priority tag
+        double activeThreads =
+            gaugeValueWithTag(registry, "cats.priorityScheduler.executor.activeThreads");
+        double poolSize = gaugeValueWithTag(registry, "cats.priorityScheduler.executor.poolSize");
+        double queueSize = gaugeValueWithTag(registry, "cats.priorityScheduler.executor.queueSize");
+
+        assertThat(activeThreads).isGreaterThanOrEqualTo(1.0);
+        assertThat(poolSize).isGreaterThanOrEqualTo(1.0);
+        assertThat(queueSize).isGreaterThanOrEqualTo(0.0);
+
+        // Allow tasks to complete
+        taskComplete.countDown();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(e);
+      } finally {
+        executor.shutdownNow();
+      }
+    }
+
+    /**
+     * Tests that registerExecutorGauges handles null executor gracefully.
+     *
+     * <p>Verifies no exception is thrown when null is passed.
+     */
+    @Test
+    @DisplayName("Executor gauges handle null executor gracefully")
+    void executorGaugesHandleNullExecutor() {
+      Registry registry = new DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+
+      // Should not throw
+      metrics.registerExecutorGauges(null);
+
+      // Verify no executor gauges were registered
+      PolledMeter.update(registry);
+      double activeThreads =
+          gaugeValueWithTag(registry, "cats.priorityScheduler.executor.activeThreads");
+      assertThat(activeThreads).isNaN();
+    }
+
+    /**
+     * Tests that per-agent run failure metric includes agentType and provider tags.
+     *
+     * <p>Verifies the 3-argument incrementRunFailure method records metrics with agent-specific
+     * tags for debugging agent-specific issues.
+     */
+    @Test
+    @DisplayName("Per-agent run failure includes agentType and provider tags")
+    void perAgentRunFailureIncludesAgentTags() {
+      Registry registry = new DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+
+      // Record per-agent failures
+      metrics.incrementRunFailure("TestAgent/us-east-1", "aws", "NullPointerException");
+      metrics.incrementRunFailure("TestAgent/us-east-1", "aws", "NullPointerException");
+      metrics.incrementRunFailure("OtherAgent/eu-west-1", "gcp", "IOException");
+
+      // Verify per-agent metric with all tags
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.run.failures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "NullPointerException")
+                          .withTag("agentType", "TestAgent/us-east-1")
+                          .withTag("provider", "aws"))
+                  .count())
+          .isEqualTo(2);
+
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.run.failures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "IOException")
+                          .withTag("agentType", "OtherAgent/eu-west-1")
+                          .withTag("provider", "gcp"))
+                  .count())
+          .isEqualTo(1);
+    }
+
+    /**
+     * Tests that per-agent acquire time metric includes agentType and provider tags.
+     *
+     * <p>Verifies the 4-argument recordAcquireTime method records timing with agent-specific tags.
+     */
+    @Test
+    @DisplayName("Per-agent acquire time includes agentType and provider tags")
+    void perAgentAcquireTimeIncludesAgentTags() {
+      Registry registry = new DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+
+      // Record per-agent acquire times
+      metrics.recordAcquireTime("auto", "TestAgent/us-east-1", "aws", 50);
+      metrics.recordAcquireTime("auto", "TestAgent/us-east-1", "aws", 100);
+
+      // Verify per-agent timer with all tags
+      com.netflix.spectator.api.Timer timer =
+          registry.timer(
+              registry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto")
+                  .withTag("agentType", "TestAgent/us-east-1")
+                  .withTag("provider", "aws"));
+
+      assertThat(timer.count()).isEqualTo(2);
+      assertThat(timer.totalTime()).isGreaterThan(0);
+    }
+
+    private static double gaugeValueWithTag(Registry registry, String name) {
+      PolledMeter.update(registry);
+      for (Meter meter : registry) {
+        if (meter.id().name().equals(name) && hasSchedulerTag(meter)) {
+          for (Measurement ms : meter.measure()) {
+            return ms.value();
+          }
+        }
+      }
+      return Double.NaN;
+    }
+
+    private static boolean hasSchedulerTag(Meter meter) {
+      for (com.netflix.spectator.api.Tag tag : meter.id().tags()) {
+        if ("scheduler".equals(tag.key()) && "priority".equals(tag.value())) {
+          return true;
+        }
+      }
+      return false;
     }
   }
 
@@ -240,7 +586,7 @@ class PrioritySchedulerMetricsTest {
           zero // zombiesInFlight
           );
 
-      double v = gaugeValue(registry, "cats.redisPriority.readyToCapacityRatio");
+      double v = gaugeValue(registry, "cats.priorityScheduler.scheduler.readyToCapacityRatio");
       assertThat(v).isEqualTo(2.0d);
     }
 
@@ -261,9 +607,9 @@ class PrioritySchedulerMetricsTest {
         m.registerGauges(
             pool, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero);
 
-        double active = gaugeValue(registry, "cats.redisPriority.redisPool.active");
-        double idle = gaugeValue(registry, "cats.redisPriority.redisPool.idle");
-        double waiters = gaugeValue(registry, "cats.redisPriority.redisPool.waiters");
+        double active = gaugeValue(registry, "cats.priorityScheduler.redisPool.active");
+        double idle = gaugeValue(registry, "cats.priorityScheduler.redisPool.idle");
+        double waiters = gaugeValue(registry, "cats.priorityScheduler.redisPool.waiters");
 
         assertThat(active).isGreaterThanOrEqualTo(0.0d);
         assertThat(idle).isGreaterThanOrEqualTo(0.0d);
@@ -430,7 +776,7 @@ class PrioritySchedulerMetricsTest {
       long total = 0;
       long oomTagged = 0;
       for (Meter meter : registry) {
-        if (meter.id().name().equals("cats.redisPriority.run.failures")) {
+        if (meter.id().name().equals("cats.priorityScheduler.run.failures")) {
           String reason = "";
           for (com.netflix.spectator.api.Tag tag : meter.id().tags()) {
             if (tag.key().equals("reason")) {
@@ -738,11 +1084,23 @@ class PrioritySchedulerMetricsTest {
       assertThat(acquired).isBetween(0, agentProperties.getMaxConcurrentAgents());
 
       // Verify acquisition metrics recorded
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Acquisition attempts should be recorded")
           .isGreaterThanOrEqualTo(1);
       // Acquired count may be 0 if all agents were unregistered before acquisition completed
-      assertThat(registry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Acquired count should be recorded")
           .isGreaterThanOrEqualTo(0);
 
@@ -815,7 +1173,13 @@ class PrioritySchedulerMetricsTest {
       svc.saturatePool(3L, permits, Executors.newCachedThreadPool());
 
       // Verify acquisition metrics
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Acquisition attempts should be recorded")
           .isGreaterThanOrEqualTo(1);
 
@@ -891,7 +1255,13 @@ class PrioritySchedulerMetricsTest {
       svc.saturatePool(4L, permits, Executors.newCachedThreadPool());
 
       // Verify acquisition metrics
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Acquisition attempts should be recorded")
           .isGreaterThanOrEqualTo(1);
 
@@ -981,7 +1351,13 @@ class PrioritySchedulerMetricsTest {
       assertThat(acquired).isBetween(0, agentTypes.size());
 
       // Verify acquisition metrics recorded (individual mode)
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Acquisition attempts should be recorded")
           .isGreaterThanOrEqualTo(1);
 

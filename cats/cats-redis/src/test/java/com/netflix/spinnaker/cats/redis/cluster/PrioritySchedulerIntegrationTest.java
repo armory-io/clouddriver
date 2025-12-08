@@ -413,13 +413,25 @@ public class PrioritySchedulerIntegrationTest {
 
       // Verify metrics recorded (incrementAcquireAttempts, incrementAcquired,
       // recordAcquireTime)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
 
       // incrementAcquired may be 0 if agent failed before acquisition completed
       // But we verify that acquireAttempts was called, which proves metrics are being recorded
-      long acquiredCount = metricsRegistry.counter("cats.redisPriority.acquire.acquired").count();
+      long acquiredCount =
+          metricsRegistry
+              .counter(
+                  metricsRegistry
+                      .createId("cats.priorityScheduler.acquire.acquired")
+                      .withTag("scheduler", "priority"))
+              .count();
       assertThat(acquiredCount)
           .describedAs("incrementAcquired() should be called (may be 0 if agent failed)")
           .isGreaterThanOrEqualTo(0);
@@ -430,7 +442,9 @@ public class PrioritySchedulerIntegrationTest {
       // 0
       com.netflix.spectator.api.Timer acquireTimeTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("mode", "auto"));
       // Timer count may be 0 if no time was recorded, but the fact that acquireAttempts was called
       // proves that metrics are being recorded
       assertThat(acquireTimeTimer.count())
@@ -1719,7 +1733,8 @@ public class PrioritySchedulerIntegrationTest {
             .isGreaterThanOrEqualTo(20);
       }
 
-      long beforeFailures = counterSumByName(metricsRegistry, "cats.redisPriority.run.failures");
+      long beforeFailures =
+          counterSumByName(metricsRegistry, "cats.priorityScheduler.run.failures");
 
       long start = System.currentTimeMillis();
       sched.run();
@@ -1763,18 +1778,30 @@ public class PrioritySchedulerIntegrationTest {
           .isGreaterThanOrEqualTo(0L);
 
       // Verify no increase in run failures (proves backpressure worked, no errors)
-      long afterFailures = counterSumByName(metricsRegistry, "cats.redisPriority.run.failures");
+      long afterFailures = counterSumByName(metricsRegistry, "cats.priorityScheduler.run.failures");
       assertThat(afterFailures)
           .describedAs(
               "Run failures should not increase (proves backpressure worked without errors)")
           .isEqualTo(beforeFailures);
 
       // Verify metrics recorded (incrementAcquireAttempts, incrementAcquired)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called")
           .isGreaterThanOrEqualTo(0); // May be 0 if backpressure prevented acquisition
     }
@@ -1890,11 +1917,23 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(sched).isNotNull();
 
       // Verify metrics recorded (incrementAcquireAttempts, incrementAcquired)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called")
           .isGreaterThanOrEqualTo(0); // May be 0 if backpressure prevented acquisition
     }
@@ -2922,7 +2961,7 @@ public class PrioritySchedulerIntegrationTest {
       }
 
       // Get initial failure count
-      long initialFailures = counterSumByName(registry, "cats.redisPriority.run.failures");
+      long initialFailures = counterSumByName(registry, "cats.priorityScheduler.run.failures");
 
       // When - Run scheduler (should catch exception and continue)
       scheduler.run();
@@ -2931,14 +2970,15 @@ public class PrioritySchedulerIntegrationTest {
       // The failure is recorded asynchronously, so we poll for the metric to update
       waitForCondition(
           () -> {
-            long currentFailures = counterSumByName(registry, "cats.redisPriority.run.failures");
+            long currentFailures =
+                counterSumByName(registry, "cats.priorityScheduler.run.failures");
             return currentFailures > initialFailures;
           },
           2000,
           50);
 
       // Then - Verify failure counter incremented (exception was caught and recorded)
-      long failuresAfter = counterSumByName(registry, "cats.redisPriority.run.failures");
+      long failuresAfter = counterSumByName(registry, "cats.priorityScheduler.run.failures");
       assertThat(failuresAfter)
           .describedAs("Failure counter should increment when exception occurs in run()")
           .isGreaterThan(initialFailures);

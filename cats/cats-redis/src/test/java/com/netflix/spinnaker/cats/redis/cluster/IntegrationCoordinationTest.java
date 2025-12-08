@@ -273,14 +273,16 @@ class IntegrationCoordinationTest {
       acq.earlyReleasePermitIfHeld("agent/zif-test");
       assertThat(Math.max(0, acq.getZombiesInFlight())).isEqualTo(1);
       assertThat(sem.availablePermits()).isEqualTo(1);
-      assertThat(gaugeValue(registry, "cats.redisPriority.zombiesInFlight")).isEqualTo(1.0d);
+      assertThat(gaugeValue(registry, "cats.priorityScheduler.scheduler.zombiesInFlight"))
+          .isEqualTo(1.0d);
 
       Field zifField = AgentAcquisitionService.class.getDeclaredField("zombiesInFlight");
       zifField.setAccessible(true);
       ((java.util.concurrent.atomic.AtomicInteger) zifField.get(acq)).decrementAndGet();
 
       assertThat(Math.max(0, acq.getZombiesInFlight())).isEqualTo(0);
-      assertThat(gaugeValue(registry, "cats.redisPriority.zombiesInFlight")).isEqualTo(0.0d);
+      assertThat(gaugeValue(registry, "cats.priorityScheduler.scheduler.zombiesInFlight"))
+          .isEqualTo(0.0d);
     }
   }
 

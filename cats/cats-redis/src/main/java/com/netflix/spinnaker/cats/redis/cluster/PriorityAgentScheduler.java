@@ -265,6 +265,12 @@ public class PriorityAgentScheduler extends CatsModuleAware
       log.debug("Failed to register scheduler gauges", e);
     }
 
+    // Register executor gauges if using ThreadPoolExecutor
+    if (config.getAgentWorkPool() instanceof java.util.concurrent.ThreadPoolExecutor) {
+      this.metrics.registerExecutorGauges(
+          (java.util.concurrent.ThreadPoolExecutor) config.getAgentWorkPool());
+    }
+
     log.info("PriorityAgentScheduler initialized successfully");
   }
 
@@ -724,14 +730,20 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     // Permit reconciliation: warn and mark degraded if heldPermits > active + zombiesInFlight
     boolean permitMismatch = false;
+    int permitMismatchValue = 0;
     if (maxConcurrentSemaphore != null && maxConcurrent > 0) {
       int heldPermits = Math.max(0, maxConcurrent - availablePermits);
       int accounted = activeCount + zombiesInFlight;
-      if (heldPermits > accounted) {
+      permitMismatchValue = heldPermits - accounted;
+      if (permitMismatchValue > 0) {
         permitMismatch = true;
         // Do not emit immediate WARN; include in periodic summary instead
       }
+      // Record permit accounting metrics for production observability
+      metrics.recordPermitMismatch(permitMismatchValue);
     }
+    // Record zombiesInFlight high-water mark (current snapshot; ideally track max across period)
+    metrics.recordZombiesInFlightHighWater(zombiesInFlight);
 
     // Set consistency check: verify no agent exists in both waiting and working sets
     AgentAcquisitionService.ConsistencyCheckResult consistencyResult =

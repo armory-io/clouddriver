@@ -557,14 +557,22 @@ class AgentAcquisitionServiceTest {
       // metricsForTest
       com.netflix.spectator.api.Registry repopMetricsRegistry =
           TestFixtures.getField(metricsForRepop, PrioritySchedulerMetrics.class, "registry");
-      assertThat(repopMetricsRegistry.counter("cats.redisPriority.repopulate.added").count())
+      assertThat(
+              repopMetricsRegistry
+                  .counter(
+                      repopMetricsRegistry
+                          .createId("cats.priorityScheduler.repopulate.added")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementRepopulateAdded() should be called with count of agents added during repopulation")
           .isGreaterThanOrEqualTo(2); // At least 2 agents should be added
 
       com.netflix.spectator.api.Timer repopTimeTimer =
           repopMetricsRegistry.timer(
-              repopMetricsRegistry.createId("cats.redisPriority.repopulate.time"));
+              repopMetricsRegistry
+                  .createId("cats.priorityScheduler.repopulate.time")
+                  .withTag("scheduler", "priority"));
       assertThat(repopTimeTimer.count())
           .describedAs("recordRepopulateTime() should be called when repopulation occurs")
           .isGreaterThanOrEqualTo(1);
@@ -710,19 +718,34 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(), recordAcquireTime()
       // Metrics should be recorded even if acquisition succeeds
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(1) should be called with count of agents acquired")
           .isEqualTo(1);
 
       // Verify recordAcquireTime() was called (timer should have at least 1 count)
       com.netflix.spectator.api.Timer acquireTimeTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(1);
@@ -844,12 +867,24 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts() called twice, incrementAcquired(2) then
       // incrementAcquired(0)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called twice (once per saturatePool call)")
           .isGreaterThanOrEqualTo(2);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquired() should be called with total count of 2 (first call acquired 2, second acquired 0)")
           .isEqualTo(2);
@@ -858,7 +893,10 @@ class AgentAcquisitionServiceTest {
       // Note: recordAcquireTime may be called once per acquisition cycle, not per saturatePool call
       com.netflix.spectator.api.Timer acquireTimeTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(1);
@@ -986,19 +1024,34 @@ class AgentAcquisitionServiceTest {
       verify(instrumentation, timeout(300).atLeast(1)).executionCompleted(eq(agent1), anyLong());
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(), recordAcquireTime()
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(1) should be called with count of agents acquired")
           .isEqualTo(1);
 
       // Verify recordAcquireTime() was called (timer should have at least 1 count)
       com.netflix.spectator.api.Timer acquireTimeTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called when agent acquired")
           .isGreaterThanOrEqualTo(1);
@@ -1105,11 +1158,23 @@ class AgentAcquisitionServiceTest {
       }
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(0)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called even when no agents acquired")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquired(0) should be called with count of 0 when no agents acquired")
           .isEqualTo(0);
@@ -1210,12 +1275,24 @@ class AgentAcquisitionServiceTest {
       }
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(0)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called even when filter blocks acquisition")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquired(0) should be called with count of 0 when no agents acquired")
           .isEqualTo(0);
@@ -1318,17 +1395,41 @@ class AgentAcquisitionServiceTest {
       }
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired() for both pods
-      assertThat(metricsRegistryA.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistryA
+                  .counter(
+                      metricsRegistryA
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Pod A: incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
-      assertThat(metricsRegistryA.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistryA
+                  .counter(
+                      metricsRegistryA
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Pod A: incrementAcquired() should be called with acquired count")
           .isEqualTo(aAcquired);
 
-      assertThat(metricsRegistryB.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistryB
+                  .counter(
+                      metricsRegistryB
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Pod B: incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
-      assertThat(metricsRegistryB.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistryB
+                  .counter(
+                      metricsRegistryB
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Pod B: incrementAcquired() should be called with acquired count")
           .isEqualTo(bAcquired);
     }
@@ -1378,7 +1479,13 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts() called even on error
       // Metrics should be recorded even when Redis connection fails
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called even on Redis connection failure")
           .isGreaterThanOrEqualTo(1);
@@ -1386,13 +1493,17 @@ class AgentAcquisitionServiceTest {
       // Verify recordAcquireTime() called even on error (with mode="auto" or "fallback")
       com.netflix.spectator.api.Timer acquireTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       long autoTimerCount = acquireTimer.count();
       // Timer might be recorded with mode="auto" or "fallback" depending on error path
       com.netflix.spectator.api.Timer fallbackTimer =
           metricsRegistry.timer(
               metricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "fallback"));
       long fallbackTimerCount = fallbackTimer.count();
 
@@ -1487,18 +1598,33 @@ class AgentAcquisitionServiceTest {
       assertThat(acquired).isGreaterThanOrEqualTo(0);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(0), recordAcquireTime()
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called even when agent is missing")
           .isGreaterThanOrEqualTo(2); // At least 2 calls (repopulation + acquisition)
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called with count of agents acquired")
           .isGreaterThanOrEqualTo(0);
 
       // Verify recordAcquireTime() was called for both calls
       com.netflix.spectator.api.Timer acquireTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(2); // At least 2 calls (repopulation + acquisition)
@@ -1720,11 +1846,23 @@ class AgentAcquisitionServiceTest {
       assertThat(testService.isDegraded()).isFalse();
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(0)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquired(0) should be called with count of 0 when no agents acquired")
           .isEqualTo(0);
@@ -1782,13 +1920,25 @@ class AgentAcquisitionServiceTest {
       assertThat(testService.getDegradedReason()).contains("oldest_overdue=");
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired()
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
 
       // Note: incrementAcquired() count depends on whether agents were actually acquired
       // The test verifies degraded state, not acquisition, so count may be 0 or >0
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called (count depends on acquisition)")
           .isGreaterThanOrEqualTo(0);
 
@@ -1847,11 +1997,23 @@ class AgentAcquisitionServiceTest {
       assertThat(testService.isDegraded()).isFalse();
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(0)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquired(0) should be called with count of 0 when no agents acquired")
           .isEqualTo(0);
@@ -1922,11 +2084,23 @@ class AgentAcquisitionServiceTest {
       assertThat(afterTs).isEqualTo(0L);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(0)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquired(0) should be called with count of 0 when no agents acquired")
           .isEqualTo(0);
@@ -1980,19 +2154,34 @@ class AgentAcquisitionServiceTest {
           TestFixtures.getField(acquisitionService, AgentAcquisitionService.class, "metrics");
       com.netflix.spectator.api.Registry metricsRegistry =
           TestFixtures.getField(serviceMetrics, PrioritySchedulerMetrics.class, "registry");
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquired(0) should be called with count of 0 when no agents acquired")
           .isEqualTo(0);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(1);
@@ -2324,19 +2513,32 @@ class AgentAcquisitionServiceTest {
           TestFixtures.getField(acquisitionService, AgentAcquisitionService.class, "metrics");
       com.netflix.spectator.api.Registry serviceMetricsRegistry =
           TestFixtures.getField(serviceMetrics, PrioritySchedulerMetrics.class, "registry");
-      assertThat(serviceMetricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              serviceMetricsRegistry
+                  .counter(
+                      serviceMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(serviceMetricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              serviceMetricsRegistry
+                  .counter(
+                      serviceMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called with count of agents acquired")
           .isGreaterThanOrEqualTo(1);
 
       com.netflix.spectator.api.Timer serviceAcquireTimeTimer =
           serviceMetricsRegistry.timer(
               serviceMetricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "auto"));
       assertThat(serviceAcquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
@@ -2402,18 +2604,33 @@ class AgentAcquisitionServiceTest {
       testServiceWithMetrics.saturatePool(0L, null, executorService);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(), recordAcquireTime()
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called with count of agents acquired")
           .isGreaterThanOrEqualTo(1);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(1);
@@ -2523,19 +2740,32 @@ class AgentAcquisitionServiceTest {
           TestFixtures.getField(acquisitionService, AgentAcquisitionService.class, "metrics");
       com.netflix.spectator.api.Registry serviceMetricsRegistry =
           TestFixtures.getField(serviceMetrics, PrioritySchedulerMetrics.class, "registry");
-      assertThat(serviceMetricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              serviceMetricsRegistry
+                  .counter(
+                      serviceMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(serviceMetricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              serviceMetricsRegistry
+                  .counter(
+                      serviceMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called with count of agents acquired")
           .isGreaterThanOrEqualTo(1);
 
       com.netflix.spectator.api.Timer serviceAcquireTimeTimer =
           serviceMetricsRegistry.timer(
               serviceMetricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "auto"));
       assertThat(serviceAcquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
@@ -2631,20 +2861,33 @@ class AgentAcquisitionServiceTest {
       int testAcquired = testService.saturatePool(0L, null, executorService);
 
       // Verify metrics
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
       if (testAcquired > 0) {
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.acquired")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("incrementAcquired() should be called with count of agents acquired")
             .isGreaterThanOrEqualTo(1);
 
         com.netflix.spectator.api.Timer acquireTimeTimer =
             metricsRegistry.timer(
                 metricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "auto"));
         assertThat(acquireTimeTimer.count())
             .describedAs("recordAcquireTime('auto', elapsed) should be called")
@@ -2756,14 +2999,26 @@ class AgentAcquisitionServiceTest {
       assertThat(stats.getFailureRate()).isGreaterThan(0);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired()
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
       // Note: incrementAcquired() count depends on how many agents were actually acquired
       // The first call should have acquired at least 1 agent (the failing agent)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called with count of agents acquired")
           .isGreaterThanOrEqualTo(1);
 
@@ -2884,20 +3139,35 @@ class AgentAcquisitionServiceTest {
       // Check that timer with mode="batch" was recorded (not "auto" or "individual")
       com.netflix.spectator.api.Timer batchTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       assertThat(batchTimer.count())
           .describedAs("Batch mode should be used - timer with mode='batch' should be recorded")
           .isGreaterThan(0);
 
       // Verify metrics: incrementAcquireAttempts() was called (at least once, possibly twice if
       // repopulation triggered)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
       // Verify metrics: incrementAcquired(5) was called
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(5) should be called with count of agents acquired")
           .isEqualTo(5);
 
@@ -3101,12 +3371,24 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(3),
       // recordAcquireTime("batch")
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquired(3) should be called with count of agents acquired (limited by concurrency)")
           .isEqualTo(3);
@@ -3114,7 +3396,10 @@ class AgentAcquisitionServiceTest {
       // Verify recordAcquireTime("batch", ...) was called (timer should have at least 1 count)
       com.netflix.spectator.api.Timer batchTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       assertThat(batchTimer.count())
           .describedAs("recordAcquireTime('batch', elapsed) should be called for batch acquisition")
           .isGreaterThanOrEqualTo(1);
@@ -3223,19 +3508,34 @@ class AgentAcquisitionServiceTest {
       // Verify batch operation was used - check that recordAcquireTime("batch", ...) was called
       com.netflix.spectator.api.Timer batchTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       assertThat(batchTimer.count())
           .describedAs("Batch mode should be used - timer with mode='batch' should be recorded")
           .isGreaterThan(0);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(2),
       // recordAcquireTime("batch")
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(2) should be called with count of agents acquired")
           .isEqualTo(2);
 
@@ -3456,25 +3756,39 @@ class AgentAcquisitionServiceTest {
       com.netflix.spectator.api.Registry filteringMetricsRegistry =
           TestFixtures.getField(filteringMetrics, PrioritySchedulerMetrics.class, "registry");
 
-      assertThat(filteringMetricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              filteringMetricsRegistry
+                  .counter(
+                      filteringMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
       if (acquired > 0) {
-        assertThat(filteringMetricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+        assertThat(
+                filteringMetricsRegistry
+                    .counter(
+                        filteringMetricsRegistry
+                            .createId("cats.priorityScheduler.acquire.acquired")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("incrementAcquired() should be called with count of agents acquired")
             .isGreaterThanOrEqualTo(1);
 
         com.netflix.spectator.api.Timer batchTimer =
             filteringMetricsRegistry.timer(
                 filteringMetricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "batch"));
         com.netflix.spectator.api.Timer autoTimer =
             filteringMetricsRegistry.timer(
                 filteringMetricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "auto"));
         assertThat(batchTimer.count() + autoTimer.count())
             .describedAs("recordAcquireTime() should be called (mode='batch' or 'auto')")
@@ -3589,13 +3903,20 @@ class AgentAcquisitionServiceTest {
 
       // Verify fallback occurred - check that incrementBatchFallback() was called
       // This proves that batch failure was detected and fallback was triggered
-      long fallbackCount = metricsRegistry.counter("cats.redisPriority.batch.fallbacks").count();
+      long fallbackCount =
+          metricsRegistry
+              .counter(
+                  metricsRegistry
+                      .createId("cats.priorityScheduler.acquire.batchFallbacks")
+                      .withTag("scheduler", "priority"))
+              .count();
 
       // Verify fallback mode was used - check that recordAcquireTime("fallback", ...) was called
       com.netflix.spectator.api.Timer fallbackTimer =
           metricsRegistry.timer(
               metricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "fallback"));
       long fallbackTimerCount = fallbackTimer.count();
 
@@ -3629,7 +3950,13 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(),
       // recordAcquireTime("fallback")
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
@@ -3661,7 +3988,10 @@ class AgentAcquisitionServiceTest {
       // Check if batch mode was actually used by checking if batch timer was recorded
       com.netflix.spectator.api.Timer batchTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       long batchTimerCount = batchTimer.count();
 
       // After fixing the code bug: saturatePoolBatch now records fallback metrics internally
@@ -3734,7 +4064,13 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts() was called (at least once, possibly twice if
       // repopulation triggered)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
@@ -3742,7 +4078,13 @@ class AgentAcquisitionServiceTest {
       // Verify metrics: incrementAcquired() was called if agents were acquired
       // Note: incrementAcquired is only called if agents were actually acquired (count > 0)
       // The requirement is to test the fallback path, not necessarily to acquire agents
-      long acquiredCount = metricsRegistry.counter("cats.redisPriority.acquire.acquired").count();
+      long acquiredCount =
+          metricsRegistry
+              .counter(
+                  metricsRegistry
+                      .createId("cats.priorityScheduler.acquire.acquired")
+                      .withTag("scheduler", "priority"))
+              .count();
       if (acquired > 0) {
         assertThat(acquiredCount)
             .describedAs(
@@ -3873,20 +4215,44 @@ class AgentAcquisitionServiceTest {
           .isGreaterThanOrEqualTo(0);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired() for both pods
-      assertThat(metricsRegistry1.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry1
+                  .counter(
+                      metricsRegistry1
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Pod1: incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry2.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry2
+                  .counter(
+                      metricsRegistry2
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Pod2: incrementAcquireAttempts() should be called")
           .isGreaterThanOrEqualTo(1);
 
       // Verify incrementAcquired() was called for both pods
-      assertThat(metricsRegistry1.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry1
+                  .counter(
+                      metricsRegistry1
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Pod1: incrementAcquired() should be called with count of agents acquired")
           .isEqualTo(acquired1);
 
-      assertThat(metricsRegistry2.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry2
+                  .counter(
+                      metricsRegistry2
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("Pod2: incrementAcquired() should be called with count of agents acquired")
           .isEqualTo(acquired2);
 
@@ -4091,20 +4457,35 @@ class AgentAcquisitionServiceTest {
       // Verify batch mode was used
       com.netflix.spectator.api.Timer batchTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       assertThat(batchTimer.count())
           .describedAs("Batch mode should be used - timer with mode='batch' should be recorded")
           .isGreaterThan(0);
 
       // Verify metrics: incrementAcquireAttempts() was called (at least once, possibly twice if
       // repopulation triggered)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
       // Verify metrics: incrementAcquired(3) was called
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(3) should be called with count of agents acquired")
           .isEqualTo(3);
 
@@ -4302,20 +4683,35 @@ class AgentAcquisitionServiceTest {
       // called
       com.netflix.spectator.api.Timer batchTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       assertThat(batchTimer.count())
           .describedAs("Batch mode should be used - timer with mode='batch' should be recorded")
           .isGreaterThan(0);
 
       // Verify metrics: incrementAcquireAttempts() was called (at least once, possibly twice if
       // repopulation triggered)
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
       // Verify metrics: incrementAcquired(10) was called
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(10) should be called with count of agents acquired")
           .isEqualTo(10);
 
@@ -4476,12 +4872,24 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(),
       // recordAcquireTime("batch")
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquired() should be called with count of agents acquired (limited by batch size)")
           .isGreaterThanOrEqualTo(0); // May be 0 if batch size limit prevented acquisition
@@ -4489,7 +4897,10 @@ class AgentAcquisitionServiceTest {
       // Verify recordAcquireTime("batch", ...) was called (timer should have at least 1 count)
       com.netflix.spectator.api.Timer batchTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       assertThat(batchTimer.count())
           .describedAs("recordAcquireTime('batch', elapsed) should be called for batch acquisition")
           .isGreaterThanOrEqualTo(1);
@@ -4540,27 +4951,46 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(3),
       // recordAcquireTime("individual" or "auto")
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(3) should be called with count of agents acquired")
           .isEqualTo(3);
 
       // Verify individual mode was used (not batch mode)
       com.netflix.spectator.api.Timer batchTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "batch"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "batch"));
       com.netflix.spectator.api.Timer individualTimer =
           metricsRegistry.timer(
               metricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "individual"));
       com.netflix.spectator.api.Timer autoTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
 
       // When batch is disabled, should use individual or auto mode, not batch
       assertThat(batchTimer.count())
@@ -4676,20 +5106,35 @@ class AgentAcquisitionServiceTest {
       // Note: recordRepopulateTime() is NOT called when repopulation happens inline in
       // saturatePool()
       // (it's only called in repopulateIfDue() and repopulateIfDueNow())
-      assertThat(metricsRegistry.counter("cats.redisPriority.repopulate.added").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.repopulate.added")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementRepopulateAdded() should be called when new-agent is repopulated")
           .isGreaterThanOrEqualTo(1);
 
       // Verify acquisition metrics: incrementAcquireAttempts(), recordAcquireTime()
       // saturatePool() always calls these metrics even when repopulation occurs
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(1);
@@ -4854,14 +5299,26 @@ class AgentAcquisitionServiceTest {
       }
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(1) called
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
       // If agent was acquired, verify incrementAcquired() was called
       if (acquired > 0) {
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.acquired")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("incrementAcquired(1) should be called with count of agents acquired")
             .isGreaterThanOrEqualTo(1);
 
@@ -4869,7 +5326,8 @@ class AgentAcquisitionServiceTest {
         com.netflix.spectator.api.Timer acquireTimeTimer =
             metricsRegistry.timer(
                 metricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "auto"));
         assertThat(acquireTimeTimer.count())
             .describedAs("recordAcquireTime('auto', elapsed) should be called when agent acquired")
@@ -4957,7 +5415,13 @@ class AgentAcquisitionServiceTest {
       // Verify metrics: incrementRepopulateAdded()
       // Note: recordRepopulateTime() is NOT called when repopulation happens inline in
       // saturatePool()
-      assertThat(metricsRegistry.counter("cats.redisPriority.repopulate.added").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.repopulate.added")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementRepopulateAdded() should be called when agents are repopulated")
           .isGreaterThanOrEqualTo(numAgents);
 
@@ -5043,19 +5507,34 @@ class AgentAcquisitionServiceTest {
       // Note: incrementRepopulateAdded is only called when agents are actually added
       // Note: recordRepopulateTime() is NOT called when repopulation happens inline in
       // saturatePool()
-      assertThat(metricsRegistry.counter("cats.redisPriority.repopulate.added").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.repopulate.added")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementRepopulateAdded() should be called when agents are repopulated")
           .isGreaterThanOrEqualTo(numAgents);
 
       // Verify acquisition metrics: incrementAcquireAttempts(), recordAcquireTime()
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(1);
@@ -5184,7 +5663,13 @@ class AgentAcquisitionServiceTest {
         assertThat(acquired).isGreaterThanOrEqualTo(0);
 
         // Verify metrics: incrementAcquireAttempts() was called even on Redis failure
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs(
                 "incrementAcquireAttempts() should be called on every saturatePool() invocation, even on Redis failure")
             .isEqualTo(1);
@@ -5194,7 +5679,8 @@ class AgentAcquisitionServiceTest {
         com.netflix.spectator.api.Timer autoTimer =
             metricsRegistry.timer(
                 metricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "auto"));
         assertThat(autoTimer.count())
             .describedAs(
@@ -5349,9 +5835,10 @@ class AgentAcquisitionServiceTest {
       assertThat(
               registry
                   .counter(
-                      "cats.redisPriority.acquire.validationFailures",
-                      "reason",
-                      "non_numeric_score")
+                      registry
+                          .createId("cats.priorityScheduler.validation.acquireFailures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "non_numeric_score"))
                   .count())
           .isEqualTo(1);
 
@@ -5359,7 +5846,11 @@ class AgentAcquisitionServiceTest {
       metrics.incrementAcquireValidationFailure("empty_score");
       assertThat(
               registry
-                  .counter("cats.redisPriority.acquire.validationFailures", "reason", "empty_score")
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.validation.acquireFailures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "empty_score"))
                   .count())
           .isEqualTo(1);
 
@@ -5368,7 +5859,10 @@ class AgentAcquisitionServiceTest {
       assertThat(
               registry
                   .counter(
-                      "cats.redisPriority.acquire.validationFailures", "reason", "unexpected_type")
+                      registry
+                          .createId("cats.priorityScheduler.validation.acquireFailures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "unexpected_type"))
                   .count())
           .isEqualTo(1);
 
@@ -5378,9 +5872,10 @@ class AgentAcquisitionServiceTest {
       assertThat(
               registry
                   .counter(
-                      "cats.redisPriority.acquire.validationFailures",
-                      "reason",
-                      "non_numeric_score")
+                      registry
+                          .createId("cats.priorityScheduler.validation.acquireFailures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "non_numeric_score"))
                   .count())
           .isEqualTo(3);
     }
@@ -5464,19 +5959,32 @@ class AgentAcquisitionServiceTest {
       assertThat(testSemaphore.availablePermits()).isEqualTo(1);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(), recordAcquireTime()
-      assertThat(semaphoreMetricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              semaphoreMetricsRegistry
+                  .counter(
+                      semaphoreMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(semaphoreMetricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              semaphoreMetricsRegistry
+                  .counter(
+                      semaphoreMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(1) should be called with count of agents acquired")
           .isEqualTo(1);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           semaphoreMetricsRegistry.timer(
               semaphoreMetricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
@@ -5547,7 +6055,13 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts() and recordAcquireTime() called even when no
       // agents acquired
-      assertThat(semaphoreMetricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              semaphoreMetricsRegistry
+                  .counter(
+                      semaphoreMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called even when semaphore is exhausted")
           .isGreaterThanOrEqualTo(1);
@@ -5555,7 +6069,8 @@ class AgentAcquisitionServiceTest {
       com.netflix.spectator.api.Timer acquireTimeTimer =
           semaphoreMetricsRegistry.timer(
               semaphoreMetricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs(
@@ -5796,19 +6311,32 @@ class AgentAcquisitionServiceTest {
       assertThat(completedCount.get()).isEqualTo(2);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(2), recordAcquireTime()
-      assertThat(semaphoreMetricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              semaphoreMetricsRegistry
+                  .counter(
+                      semaphoreMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(semaphoreMetricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              semaphoreMetricsRegistry
+                  .counter(
+                      semaphoreMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(2) should be called with count of agents acquired")
           .isEqualTo(2);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           semaphoreMetricsRegistry.timer(
               semaphoreMetricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
@@ -5857,19 +6385,32 @@ class AgentAcquisitionServiceTest {
       waitForNoActiveAgents(semaphoreService, 1000);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(1), recordAcquireTime()
-      assertThat(semaphoreMetricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              semaphoreMetricsRegistry
+                  .counter(
+                      semaphoreMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(semaphoreMetricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              semaphoreMetricsRegistry
+                  .counter(
+                      semaphoreMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(1) should be called with count of agents acquired")
           .isEqualTo(1);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           semaphoreMetricsRegistry.timer(
               semaphoreMetricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
@@ -5963,19 +6504,32 @@ class AgentAcquisitionServiceTest {
 
         // Verify metrics: incrementAcquireAttempts() called twice, incrementAcquired(),
         // recordAcquireTime()
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.attempts")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs(
                 "incrementAcquireAttempts() should be called on every saturatePool() invocation")
             .isGreaterThanOrEqualTo(2); // Called twice (first tick and second tick)
 
-        assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+        assertThat(
+                metricsRegistry
+                    .counter(
+                        metricsRegistry
+                            .createId("cats.priorityScheduler.acquire.acquired")
+                            .withTag("scheduler", "priority"))
+                    .count())
             .describedAs("incrementAcquired() should be called with count of agents acquired")
             .isGreaterThanOrEqualTo(1); // At least 1 agent acquired in first tick
 
         com.netflix.spectator.api.Timer acquireTimeTimer =
             metricsRegistry.timer(
                 metricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "auto"));
         assertThat(acquireTimeTimer.count())
             .describedAs("recordAcquireTime('auto', elapsed) should be called")
@@ -6059,18 +6613,33 @@ class AgentAcquisitionServiceTest {
       assertThat(acquired).isGreaterThanOrEqualTo(0);
 
       // Verify metrics: incrementAcquireAttempts(), incrementAcquired(), recordAcquireTime()
-      assertThat(registry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isEqualTo(1);
 
-      assertThat(registry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called with count of agents acquired")
           .isGreaterThanOrEqualTo(0); // May be 0 if no agents were ready
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           registry.timer(
-              registry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              registry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(1);
@@ -6174,19 +6743,32 @@ class AgentAcquisitionServiceTest {
           TestFixtures.getField(scanLimitService, AgentAcquisitionService.class, "metrics");
       com.netflix.spectator.api.Registry scanLimitMetricsRegistry =
           TestFixtures.getField(scanLimitMetrics, PrioritySchedulerMetrics.class, "registry");
-      assertThat(scanLimitMetricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              scanLimitMetricsRegistry
+                  .counter(
+                      scanLimitMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(scanLimitMetricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              scanLimitMetricsRegistry
+                  .counter(
+                      scanLimitMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired() should be called with count of agents acquired")
           .isEqualTo(expectedCap);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           scanLimitMetricsRegistry.timer(
               scanLimitMetricsRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "batch"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('batch', elapsed) should be called for batch acquisition")
@@ -6475,7 +7057,11 @@ class AgentAcquisitionServiceTest {
       // Check metrics were actually incremented
       assertThat(
               rejectionRegistry
-                  .counter("cats.redisPriority.acquire.submissionFailures", "reason", "rejected")
+                  .counter(
+                      rejectionRegistry
+                          .createId("cats.priorityScheduler.acquire.submissionFailures")
+                          .withTag("scheduler", "priority")
+                          .withTag("reason", "rejected"))
                   .count())
           .isGreaterThan(0);
 
@@ -6520,14 +7106,21 @@ class AgentAcquisitionServiceTest {
 
       // Verify metrics: incrementAcquireAttempts() and recordAcquireTime() called even when no
       // agents ready
-      assertThat(rejectionRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              rejectionRegistry
+                  .counter(
+                      rejectionRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called even when no agents are ready")
           .isGreaterThanOrEqualTo(1);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           rejectionRegistry.timer(
               rejectionRegistry
-                  .createId("cats.redisPriority.acquire.time")
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
                   .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs(
@@ -6786,13 +7379,22 @@ class AgentAcquisitionServiceTest {
       // chunk
       com.netflix.spectator.api.Registry fairnessRegistry =
           TestFixtures.getField(fairnessMetrics, PrioritySchedulerMetrics.class, "registry");
-      assertThat(fairnessRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              fairnessRegistry
+                  .counter(
+                      fairnessRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquireAttempts() should be called even for empty chunk")
           .isGreaterThanOrEqualTo(1);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           fairnessRegistry.timer(
-              fairnessRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              fairnessRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called even for empty chunk")
           .isGreaterThanOrEqualTo(1);
@@ -6933,7 +7535,12 @@ class AgentAcquisitionServiceTest {
       com.netflix.spectator.api.Registry batchThrowableMetricsRegistry =
           TestFixtures.getField(batchThrowableMetrics, PrioritySchedulerMetrics.class, "registry");
       assertThat(
-              batchThrowableMetricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+              batchThrowableMetricsRegistry
+                  .counter(
+                      batchThrowableMetricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation, even when batch fails")
           .isGreaterThanOrEqualTo(1);
@@ -6942,7 +7549,10 @@ class AgentAcquisitionServiceTest {
       if (acquired > 0) {
         assertThat(
                 batchThrowableMetricsRegistry
-                    .counter("cats.redisPriority.acquire.acquired")
+                    .counter(
+                        batchThrowableMetricsRegistry
+                            .createId("cats.priorityScheduler.acquire.acquired")
+                            .withTag("scheduler", "priority"))
                     .count())
             .describedAs(
                 "incrementAcquired() should be called with count of agents acquired via fallback")
@@ -6952,12 +7562,14 @@ class AgentAcquisitionServiceTest {
         com.netflix.spectator.api.Timer autoTimer =
             batchThrowableMetricsRegistry.timer(
                 batchThrowableMetricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "auto"));
         com.netflix.spectator.api.Timer fallbackTimer =
             batchThrowableMetricsRegistry.timer(
                 batchThrowableMetricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "fallback"));
         assertThat(autoTimer.count() + fallbackTimer.count())
             .describedAs("recordAcquireTime() should be called (mode='auto' or 'fallback')")
@@ -6967,7 +7579,8 @@ class AgentAcquisitionServiceTest {
         com.netflix.spectator.api.Timer autoTimer =
             batchThrowableMetricsRegistry.timer(
                 batchThrowableMetricsRegistry
-                    .createId("cats.redisPriority.acquire.time")
+                    .createId("cats.priorityScheduler.acquire.time")
+                    .withTag("scheduler", "priority")
                     .withTag("mode", "auto"));
         assertThat(autoTimer.count())
             .describedAs(
@@ -7075,18 +7688,33 @@ class AgentAcquisitionServiceTest {
           TestFixtures.getField(acquisitionService, AgentAcquisitionService.class, "metrics");
       com.netflix.spectator.api.Registry metricsRegistry =
           TestFixtures.getField(serviceMetrics, PrioritySchedulerMetrics.class, "registry");
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.attempts").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.attempts")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs(
               "incrementAcquireAttempts() should be called on every saturatePool() invocation")
           .isGreaterThanOrEqualTo(1);
 
-      assertThat(metricsRegistry.counter("cats.redisPriority.acquire.acquired").count())
+      assertThat(
+              metricsRegistry
+                  .counter(
+                      metricsRegistry
+                          .createId("cats.priorityScheduler.acquire.acquired")
+                          .withTag("scheduler", "priority"))
+                  .count())
           .describedAs("incrementAcquired(1) should be called with count of agents acquired")
           .isEqualTo(1);
 
       com.netflix.spectator.api.Timer acquireTimeTimer =
           metricsRegistry.timer(
-              metricsRegistry.createId("cats.redisPriority.acquire.time").withTag("mode", "auto"));
+              metricsRegistry
+                  .createId("cats.priorityScheduler.acquire.time")
+                  .withTag("scheduler", "priority")
+                  .withTag("mode", "auto"));
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(1);
@@ -9061,7 +9689,11 @@ class AgentAcquisitionServiceTest {
         // Record blocked count before attempt
         long blockedBefore =
             cbMetricsRegistry
-                .counter("cats.redisPriority.circuitBreaker.blocked", "name", "acquisition")
+                .counter(
+                    cbMetricsRegistry
+                        .createId("cats.priorityScheduler.circuitBreaker.blocked")
+                        .withTag("scheduler", "priority")
+                        .withTag("name", "acquisition"))
                 .count();
 
         // Attempt acquisition while OPEN - should return 0 (blocked)
@@ -9074,7 +9706,11 @@ class AgentAcquisitionServiceTest {
         // Verify blocked metric incremented
         long blockedAfter =
             cbMetricsRegistry
-                .counter("cats.redisPriority.circuitBreaker.blocked", "name", "acquisition")
+                .counter(
+                    cbMetricsRegistry
+                        .createId("cats.priorityScheduler.circuitBreaker.blocked")
+                        .withTag("scheduler", "priority")
+                        .withTag("name", "acquisition"))
                 .count();
         assertThat(blockedAfter)
             .describedAs("Blocked metric should be incremented when acquisition is blocked")
@@ -9174,7 +9810,11 @@ class AgentAcquisitionServiceTest {
       // Record blocked count before repopulation attempt
       long blockedBefore =
           cbMetricsRegistry
-              .counter("cats.redisPriority.circuitBreaker.blocked", "name", "redis")
+              .counter(
+                  cbMetricsRegistry
+                      .createId("cats.priorityScheduler.circuitBreaker.blocked")
+                      .withTag("scheduler", "priority")
+                      .withTag("name", "redis"))
               .count();
 
       // Attempt repopulation while OPEN - should be blocked
@@ -9183,7 +9823,11 @@ class AgentAcquisitionServiceTest {
       // Verify blocked metric incremented for redis circuit breaker
       long blockedAfter =
           cbMetricsRegistry
-              .counter("cats.redisPriority.circuitBreaker.blocked", "name", "redis")
+              .counter(
+                  cbMetricsRegistry
+                      .createId("cats.priorityScheduler.circuitBreaker.blocked")
+                      .withTag("scheduler", "priority")
+                      .withTag("name", "redis"))
               .count();
       assertThat(blockedAfter)
           .describedAs("Redis circuit breaker blocked metric should be incremented")
@@ -9841,7 +10485,12 @@ class AgentAcquisitionServiceTest {
 
         // Verify acquisition was attempted (attempts counter should be incremented)
         long attemptCount =
-            redisFailRegistry.counter("cats.redisPriority.acquire.attempts").count();
+            redisFailRegistry
+                .counter(
+                    redisFailRegistry
+                        .createId("cats.priorityScheduler.acquire.attempts")
+                        .withTag("scheduler", "priority"))
+                .count();
         assertThat(attemptCount)
             .describedAs("Acquisition attempts should be recorded even when batch fails")
             .isGreaterThan(0);

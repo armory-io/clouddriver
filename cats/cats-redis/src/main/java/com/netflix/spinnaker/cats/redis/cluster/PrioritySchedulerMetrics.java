@@ -19,6 +19,7 @@ package com.netflix.spinnaker.cats.redis.cluster;
 import com.netflix.spectator.api.Id;
 import com.netflix.spectator.api.Registry;
 import com.netflix.spectator.api.patterns.PolledMeter;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
@@ -27,48 +28,62 @@ import org.springframework.stereotype.Component;
 import redis.clients.jedis.JedisPool;
 
 /**
- * Metrics collection for the Priority Redis scheduler.
+ * Metrics collection for the Priority Scheduler.
  *
- * <p>Provides Spectator metrics for monitoring scheduler health and performance.
+ * <p>Provides Spectator metrics for monitoring scheduler health and performance. All metrics use
+ * the namespace {@code cats.priorityScheduler.<domain>.<metric>} and include a common {@code
+ * scheduler=priority} tag for filtering.
  */
 @Component
 public final class PrioritySchedulerMetrics {
 
   private static final Logger log = LoggerFactory.getLogger(PrioritySchedulerMetrics.class);
 
+  /** Metric namespace prefix for all priority scheduler metrics. */
+  private static final String METRIC_PREFIX = "cats.priorityScheduler.";
+
   private final Registry registry;
 
+  // Run cycle metrics
   private final Id runCycleTimeId;
   private final Id runFailuresId;
 
+  // Acquisition metrics
   private final Id acquireAttemptsId;
   private final Id acquiredCountId;
   private final Id acquireTimeId;
   private final Id submissionFailuresId;
   private final Id batchFallbacksId;
   private final Id stallDetectedId;
+
+  // Circuit breaker metrics
   private final Id circuitBreakerTripId;
   private final Id circuitBreakerRecoveryId;
   private final Id circuitBreakerBlockedId;
+
+  // Validation metrics
   private final Id acquireValidationFailureId;
-
-  private final Id repopulateTimeId;
-  private final Id repopulateAddedId;
-  private final Id repopulateErrorsId;
-
-  private final Id cleanupTimeId;
-  private final Id cleanupCleanedId;
-
-  private final Id scriptsEvalId;
-  private final Id scriptsErrorsId;
-  private final Id scriptsLatencyId;
-  private final Id scriptsReloadsId;
-
-  // Validation/consistency metrics
   private final Id invalidMemberId;
   private final Id invalidPairId;
   private final Id scriptResultTypeErrorId;
   private final Id stateInconsistentActiveId;
+
+  // Repopulation metrics
+  private final Id repopulateTimeId;
+  private final Id repopulateAddedId;
+  private final Id repopulateErrorsId;
+
+  // Cleanup metrics
+  private final Id cleanupTimeId;
+  private final Id cleanupCleanedId;
+  private final Id cleanupSkippedId;
+  private final Id cleanupTimeoutId;
+
+  // Script execution metrics
+  private final Id scriptsEvalId;
+  private final Id scriptsErrorsId;
+  private final Id scriptsLatencyId;
+  private final Id scriptsReloadsId;
 
   // Redis pool health metrics
   private final Id redisPoolErrorsId;
@@ -76,9 +91,9 @@ public final class PrioritySchedulerMetrics {
   // Agent removal metrics
   private final Id removeAgentFallbackId;
 
-  // Cleanup metrics
-  private final Id cleanupSkippedId;
-  private final Id cleanupTimeoutId;
+  // Permit accounting metrics
+  private final Id casContentionId;
+  private final Id zombiesInFlightNegativeId;
 
   // Guard against duplicate PolledMeter registrations
   private volatile boolean gaugesRegistered = false;
@@ -91,53 +106,66 @@ public final class PrioritySchedulerMetrics {
   public PrioritySchedulerMetrics(Registry registry) {
     this.registry = registry;
 
-    this.runCycleTimeId =
-        registry
-            .createId("cats.redisPriority.run.cycleTime")
-            .withTag("scheduler", "priority")
-            .withTag("component", "scheduler");
-    this.runFailuresId = registry.createId("cats.redisPriority.run.failures");
+    // Run cycle metrics
+    this.runCycleTimeId = createId("run.cycleTime");
+    this.runFailuresId = createId("run.failures");
 
-    this.acquireAttemptsId = registry.createId("cats.redisPriority.acquire.attempts");
-    this.acquiredCountId = registry.createId("cats.redisPriority.acquire.acquired");
-    this.acquireTimeId = registry.createId("cats.redisPriority.acquire.time");
-    this.submissionFailuresId = registry.createId("cats.redisPriority.acquire.submissionFailures");
-    this.batchFallbacksId = registry.createId("cats.redisPriority.batch.fallbacks");
-    this.stallDetectedId = registry.createId("cats.redisPriority.acquire.stallDetected");
-    this.circuitBreakerTripId = registry.createId("cats.redisPriority.circuitBreaker.trip");
-    this.circuitBreakerRecoveryId = registry.createId("cats.redisPriority.circuitBreaker.recovery");
-    this.circuitBreakerBlockedId = registry.createId("cats.redisPriority.circuitBreaker.blocked");
-    this.acquireValidationFailureId =
-        registry.createId("cats.redisPriority.acquire.validationFailures");
+    // Acquisition metrics
+    this.acquireAttemptsId = createId("acquire.attempts");
+    this.acquiredCountId = createId("acquire.acquired");
+    this.acquireTimeId = createId("acquire.time");
+    this.submissionFailuresId = createId("acquire.submissionFailures");
+    this.batchFallbacksId = createId("acquire.batchFallbacks");
+    this.stallDetectedId = createId("acquire.stallDetected");
 
-    this.repopulateTimeId = registry.createId("cats.redisPriority.repopulate.time");
-    this.repopulateAddedId = registry.createId("cats.redisPriority.repopulate.added");
-    this.repopulateErrorsId = registry.createId("cats.redisPriority.repopulate.errors");
+    // Circuit breaker metrics
+    this.circuitBreakerTripId = createId("circuitBreaker.trip");
+    this.circuitBreakerRecoveryId = createId("circuitBreaker.recovery");
+    this.circuitBreakerBlockedId = createId("circuitBreaker.blocked");
 
-    this.cleanupTimeId = registry.createId("cats.redisPriority.cleanup.time");
-    this.cleanupCleanedId = registry.createId("cats.redisPriority.cleanup.cleaned");
+    // Validation metrics (consolidated under validation domain)
+    this.acquireValidationFailureId = createId("validation.acquireFailures");
+    this.invalidMemberId = createId("validation.invalidMember");
+    this.invalidPairId = createId("validation.invalidPair");
+    this.scriptResultTypeErrorId = createId("validation.scriptResultTypeError");
+    this.stateInconsistentActiveId = createId("validation.inconsistentActive");
 
-    this.scriptsEvalId = registry.createId("cats.redisPriority.scripts.eval");
-    this.scriptsErrorsId = registry.createId("cats.redisPriority.scripts.errors");
-    this.scriptsLatencyId = registry.createId("cats.redisPriority.scripts.latency");
-    this.scriptsReloadsId = registry.createId("cats.redisPriority.scripts.reloads");
+    // Repopulation metrics
+    this.repopulateTimeId = createId("repopulate.time");
+    this.repopulateAddedId = createId("repopulate.added");
+    this.repopulateErrorsId = createId("repopulate.errors");
 
-    // Validation/consistency
-    this.invalidMemberId = registry.createId("cats.redisPriority.redis.invalidMember");
-    this.invalidPairId = registry.createId("cats.redisPriority.add.invalidPair");
-    this.scriptResultTypeErrorId = registry.createId("cats.redisPriority.scripts.resultTypeError");
-    this.stateInconsistentActiveId =
-        registry.createId("cats.redisPriority.state.inconsistentActive");
+    // Cleanup metrics
+    this.cleanupTimeId = createId("cleanup.time");
+    this.cleanupCleanedId = createId("cleanup.cleaned");
+    this.cleanupSkippedId = createId("cleanup.skipped");
+    this.cleanupTimeoutId = createId("cleanup.timeout");
+
+    // Script execution metrics
+    this.scriptsEvalId = createId("scripts.eval");
+    this.scriptsErrorsId = createId("scripts.errors");
+    this.scriptsLatencyId = createId("scripts.latency");
+    this.scriptsReloadsId = createId("scripts.reloads");
 
     // Redis pool health
-    this.redisPoolErrorsId = registry.createId("cats.redisPriority.redisPool.errors");
+    this.redisPoolErrorsId = createId("redisPool.errors");
 
     // Agent removal
-    this.removeAgentFallbackId = registry.createId("cats.redisPriority.removeAgent.fallbackUsed");
+    this.removeAgentFallbackId = createId("removeAgent.fallbackUsed");
 
-    // Cleanup
-    this.cleanupSkippedId = registry.createId("cats.redisPriority.cleanup.skipped");
-    this.cleanupTimeoutId = registry.createId("cats.redisPriority.cleanup.timeout");
+    // Permit accounting
+    this.casContentionId = createId("cas.contention");
+    this.zombiesInFlightNegativeId = createId("scheduler.zombiesInFlight.negative");
+  }
+
+  /**
+   * Creates a metric ID with the standard prefix and base tags.
+   *
+   * @param suffix the metric name suffix (e.g., "acquire.attempts")
+   * @return fully qualified metric ID with scheduler=priority tag
+   */
+  private Id createId(String suffix) {
+    return registry.createId(METRIC_PREFIX + suffix).withTag("scheduler", "priority");
   }
 
   /**
@@ -159,6 +187,23 @@ public final class PrioritySchedulerMetrics {
    */
   public void incrementRunFailure(String reason) {
     registry.counter(runFailuresId.withTag("reason", safe(reason))).increment();
+  }
+
+  /**
+   * Records a per-agent execution failure for debugging agent-specific issues.
+   *
+   * @param agentType the agent type identifier
+   * @param provider the provider name
+   * @param reason failure category (low-cardinality)
+   */
+  public void incrementRunFailure(String agentType, String provider, String reason) {
+    registry
+        .counter(
+            runFailuresId
+                .withTag("reason", safe(reason))
+                .withTag("agentType", safe(agentType))
+                .withTag("provider", safe(provider)))
+        .increment();
   }
 
   /** Increments the acquisition attempts counter. */
@@ -186,6 +231,24 @@ public final class PrioritySchedulerMetrics {
   public void recordAcquireTime(String mode, long elapsedMs) {
     registry
         .timer(acquireTimeId.withTag("mode", safe(mode)))
+        .record(elapsedMs, TimeUnit.MILLISECONDS);
+  }
+
+  /**
+   * Records per-agent acquisition latency for debugging agent-specific acquisition patterns.
+   *
+   * @param mode acquisition mode label
+   * @param agentType the agent type identifier
+   * @param provider the provider name
+   * @param elapsedMs elapsed time in milliseconds
+   */
+  public void recordAcquireTime(String mode, String agentType, String provider, long elapsedMs) {
+    registry
+        .timer(
+            acquireTimeId
+                .withTag("mode", safe(mode))
+                .withTag("agentType", safe(agentType))
+                .withTag("provider", safe(provider)))
         .record(elapsedMs, TimeUnit.MILLISECONDS);
   }
 
@@ -402,6 +465,47 @@ public final class PrioritySchedulerMetrics {
   }
 
   /**
+   * Increments counter when a CAS (compare-and-set) operation on permit state fails. This indicates
+   * contention between concurrent operations (e.g., zombie cleanup racing with worker completion).
+   * High rates may indicate accounting issues or unexpected concurrency patterns.
+   *
+   * @param location code location where contention occurred (e.g., "zombie_cleanup",
+   *     "worker_completion")
+   */
+  public void incrementCasContention(String location) {
+    registry.counter(casContentionId.withTag("location", safe(location))).increment();
+  }
+
+  /**
+   * Increments counter when zombiesInFlight decrement would go negative. This indicates an
+   * accounting bug where more decrements occurred than increments. The counter is clamped to 0, but
+   * this metric tracks occurrences for debugging.
+   */
+  public void incrementZombiesInFlightNegative() {
+    registry.counter(zombiesInFlightNegativeId).increment();
+  }
+
+  /**
+   * Records the permit mismatch gauge value. Expected value is 0; non-zero indicates accounting
+   * drift. Calculated as: (permitsHeld + availablePermits + zombiesInFlight) - totalPermits
+   *
+   * @param mismatch the calculated mismatch value
+   */
+  public void recordPermitMismatch(int mismatch) {
+    registry.gauge(createId("scheduler.permitMismatch")).set(mismatch);
+  }
+
+  /**
+   * Records the high-water mark for zombiesInFlight since last reporting period. Helps identify
+   * peak zombie accumulation that may not be visible in point-in-time gauges.
+   *
+   * @param highWater the maximum zombiesInFlight value observed
+   */
+  public void recordZombiesInFlightHighWater(int highWater) {
+    registry.gauge(createId("scheduler.zombiesInFlight.highWater")).set(highWater);
+  }
+
+  /**
    * Registers gauges that are shared across scheduler services. Safe to call multiple times.
    *
    * @param jedisPool Redis connection pool for pool metrics (may be null)
@@ -437,86 +541,121 @@ public final class PrioritySchedulerMetrics {
       return;
     }
 
-    // Acquisition/scheduler state gauges
-    registerGauge("cats.redisPriority.registeredAgents", registeredAgents);
-    registerGauge("cats.redisPriority.activeAgents", activeAgents);
-    registerGauge("cats.redisPriority.readyCount", readyCount);
-    registerGauge("cats.redisPriority.oldestOverdueSeconds", oldestOverdueSeconds);
-    registerGauge("cats.redisPriority.degraded", degraded);
-    registerGauge("cats.redisPriority.capacityPerCycle", capacityPerCycle);
-    registerGauge("cats.redisPriority.queueDepth", queueDepth);
-    registerGauge("cats.redisPriority.semaphore.available", semaphoreAvailable);
-    registerGauge("cats.redisPriority.completionQueue.size", completionQueueSize);
-    registerGauge("cats.redisPriority.timeOffsetMs", timeOffsetMs);
-    registerGauge("cats.redisPriority.readyToCapacityRatio", readyToCapacityRatio);
-    registerGauge("cats.redisPriority.zombiesInFlight", zombiesInFlight);
+    // Scheduler state gauges (consolidated under scheduler.* domain)
+    registerGauge("scheduler.registeredAgents", registeredAgents);
+    registerGauge("scheduler.activeAgents", activeAgents);
+    registerGauge("scheduler.readyCount", readyCount);
+    registerGauge("scheduler.oldestOverdueSeconds", oldestOverdueSeconds);
+    registerGauge("scheduler.degraded", degraded);
+    registerGauge("scheduler.capacityPerCycle", capacityPerCycle);
+    registerGauge("scheduler.queueDepth", queueDepth);
+    registerGauge("scheduler.semaphoreAvailable", semaphoreAvailable);
+    registerGauge("scheduler.completionQueueSize", completionQueueSize);
+    registerGauge("scheduler.timeOffsetMs", timeOffsetMs);
+    registerGauge("scheduler.readyToCapacityRatio", readyToCapacityRatio);
+    registerGauge("scheduler.zombiesInFlight", zombiesInFlight);
 
     // JedisPool gauges
     if (jedisPool != null) {
-      // Anchor object ensures unique meter identity
-      Object activeAnchor = new Object();
-      Object idleAnchor = new Object();
-      Object waitersAnchor = new Object();
-      PolledMeter.using(registry)
-          .withId(registry.createId("cats.redisPriority.redisPool.active"))
-          .monitorValue(
-              activeAnchor,
-              o -> {
-                try {
-                  return jedisPool.getNumActive();
-                } catch (Exception e) {
-                  // Use DEBUG to avoid log spam during transient pool issues
-                  log.debug(
-                      "Failed to get Redis pool active connections count for metric cats.redisPriority.redisPool.active",
-                      e);
-                  incrementRedisPoolError("active");
-                  return 0;
-                }
-              });
-      PolledMeter.using(registry)
-          .withId(registry.createId("cats.redisPriority.redisPool.idle"))
-          .monitorValue(
-              idleAnchor,
-              o -> {
-                try {
-                  return jedisPool.getNumIdle();
-                } catch (Exception e) {
-                  // Use DEBUG to avoid log spam during transient pool issues
-                  log.debug(
-                      "Failed to get Redis pool idle connections count for metric cats.redisPriority.redisPool.idle",
-                      e);
-                  incrementRedisPoolError("idle");
-                  return 0;
-                }
-              });
-      PolledMeter.using(registry)
-          .withId(registry.createId("cats.redisPriority.redisPool.waiters"))
-          .monitorValue(
-              waitersAnchor,
-              o -> {
-                try {
-                  return jedisPool.getNumWaiters();
-                } catch (Exception e) {
-                  // Use DEBUG to avoid log spam during transient pool issues
-                  log.debug(
-                      "Failed to get Redis pool waiters count for metric cats.redisPriority.redisPool.waiters",
-                      e);
-                  incrementRedisPoolError("waiters");
-                  return 0;
-                }
-              });
+      registerJedisPoolGauges(jedisPool);
     }
 
     gaugesRegistered = true;
   }
 
-  private void registerGauge(String name, Supplier<Number> supplier) {
+  /**
+   * Registers executor thread pool gauges for observability.
+   *
+   * @param executor the thread pool executor to monitor (may be null)
+   */
+  public void registerExecutorGauges(ThreadPoolExecutor executor) {
+    if (executor == null) {
+      return;
+    }
+
+    Object activeAnchor = new Object();
+    Object poolSizeAnchor = new Object();
+    Object queueSizeAnchor = new Object();
+    Object completedAnchor = new Object();
+
+    PolledMeter.using(registry)
+        .withId(createId("executor.activeThreads"))
+        .monitorValue(activeAnchor, o -> executor.getActiveCount());
+
+    PolledMeter.using(registry)
+        .withId(createId("executor.poolSize"))
+        .monitorValue(poolSizeAnchor, o -> executor.getPoolSize());
+
+    PolledMeter.using(registry)
+        .withId(createId("executor.queueSize"))
+        .monitorValue(queueSizeAnchor, o -> executor.getQueue().size());
+
+    PolledMeter.using(registry)
+        .withId(createId("executor.completedTasks"))
+        .monitorValue(completedAnchor, o -> executor.getCompletedTaskCount());
+  }
+
+  private void registerJedisPoolGauges(JedisPool jedisPool) {
+    Object activeAnchor = new Object();
+    Object idleAnchor = new Object();
+    Object waitersAnchor = new Object();
+
+    PolledMeter.using(registry)
+        .withId(createId("redisPool.active"))
+        .monitorValue(
+            activeAnchor,
+            o -> {
+              try {
+                return jedisPool.getNumActive();
+              } catch (Exception e) {
+                log.debug(
+                    "Failed to get Redis pool active connections count for metric cats.priorityScheduler.redisPool.active",
+                    e);
+                incrementRedisPoolError("active");
+                return 0;
+              }
+            });
+
+    PolledMeter.using(registry)
+        .withId(createId("redisPool.idle"))
+        .monitorValue(
+            idleAnchor,
+            o -> {
+              try {
+                return jedisPool.getNumIdle();
+              } catch (Exception e) {
+                log.debug(
+                    "Failed to get Redis pool idle connections count for metric cats.priorityScheduler.redisPool.idle",
+                    e);
+                incrementRedisPoolError("idle");
+                return 0;
+              }
+            });
+
+    PolledMeter.using(registry)
+        .withId(createId("redisPool.waiters"))
+        .monitorValue(
+            waitersAnchor,
+            o -> {
+              try {
+                return jedisPool.getNumWaiters();
+              } catch (Exception e) {
+                log.debug(
+                    "Failed to get Redis pool waiters count for metric cats.priorityScheduler.redisPool.waiters",
+                    e);
+                incrementRedisPoolError("waiters");
+                return 0;
+              }
+            });
+  }
+
+  private void registerGauge(String suffix, Supplier<Number> supplier) {
     if (supplier == null) {
       return;
     }
     Object anchor = new Object();
     PolledMeter.using(registry)
-        .withId(registry.createId(name))
+        .withId(createId(suffix))
         .monitorValue(anchor, o -> toDouble(supplier.get()));
   }
 

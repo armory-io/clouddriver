@@ -201,6 +201,10 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               "Early permit release for {}: started=false, skipping zombiesInFlight increment",
               agentType);
         }
+      } else {
+        // CAS failed: permit was already released by worker completion or another cleanup path
+        metrics.incrementCasContention("zombie_cleanup");
+        log.debug("Early permit release for {}: CAS failed (permit already released)", agentType);
       }
     } catch (Exception e) {
       // Best-effort; do not propagate exceptions to callers in cleanup paths
@@ -4476,6 +4480,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         executionInstrumentation.executionFailed(agent, cause, elapsedTimeMs(startTimeMs));
         capturedCause = cause;
         failureClass = acquisitionService.classifyFailure(cause);
+
+        // Record per-agent failure metric for debugging agent-specific issues
+        try {
+          acquisitionService.metrics.incrementRunFailure(
+              agentType, agent.getProviderName(), cause.getClass().getSimpleName());
+        } catch (Exception metricEx) {
+          log.debug("Failed to record per-agent failure metric for {}", agentType, metricEx);
+        }
       } finally {
         // Cancel any scheduled dead-man action FIRST
         try {
@@ -4513,6 +4525,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               log.debug("Released permit for {}", agentType);
             }
           } else {
+            // CAS failed: permit was pre-released by cleanup (zombie or shutdown)
+            acquisitionService.metrics.incrementCasContention("worker_completion");
             // Permit was pre-released by cleanup. Decrement raw zombiesInFlight if it was
             // incremented.
             if (runStateForAgent.zombiesInFlightIncremented.get()) {
@@ -4523,6 +4537,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
                       current -> {
                         int result = current - 1;
                         if (result < 0) {
+                          // Track negative zombiesInFlight occurrences for production observability
+                          acquisitionService.metrics.incrementZombiesInFlightNegative();
                           // Log ERROR when negative value detected (rate-limited to avoid flooding)
                           if (shouldWarnNow(
                               acquisitionService.lastZifNegativeErrorEpochMs, 60_000)) {

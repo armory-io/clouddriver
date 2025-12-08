@@ -45,9 +45,9 @@ import redis.clients.jedis.exceptions.JedisConnectionException;
  * <p><b>Metrics Verified:</b>
  *
  * <ul>
- *   <li>{@code cats.redisPriority.circuitBreaker.trip} - recorded when circuit trips to OPEN
- *   <li>{@code cats.redisPriority.circuitBreaker.blocked} - recorded for each blocked request
- *   <li>{@code cats.redisPriority.circuitBreaker.recovery} - recorded when circuit recovers to
+ *   <li>{@code cats.priorityScheduler.circuitBreaker.trip} - recorded when circuit trips to OPEN
+ *   <li>{@code cats.priorityScheduler.circuitBreaker.blocked} - recorded for each blocked request
+ *   <li>{@code cats.priorityScheduler.circuitBreaker.recovery} - recorded when circuit recovers to
  *       CLOSED
  * </ul>
  *
@@ -121,11 +121,11 @@ public class PrioritySchedulerCircuitBreakerTest {
     assertThat(
             registry
                 .counter(
-                    "cats.redisPriority.circuitBreaker.trip",
-                    "name",
-                    "test",
-                    "reason",
-                    "JedisConnectionException")
+                    registry
+                        .createId("cats.priorityScheduler.circuitBreaker.trip")
+                        .withTag("scheduler", "priority")
+                        .withTag("name", "test")
+                        .withTag("reason", "JedisConnectionException"))
                 .count())
         .isEqualTo(1);
   }
@@ -188,7 +188,13 @@ public class PrioritySchedulerCircuitBreakerTest {
 
     // Verify recovery metric recorded
     assertThat(
-            registry.counter("cats.redisPriority.circuitBreaker.recovery", "name", "test").count())
+            registry
+                .counter(
+                    registry
+                        .createId("cats.priorityScheduler.circuitBreaker.recovery")
+                        .withTag("scheduler", "priority")
+                        .withTag("name", "test"))
+                .count())
         .isEqualTo(1);
   }
 
@@ -266,7 +272,13 @@ public class PrioritySchedulerCircuitBreakerTest {
 
     // Verify blocked metric recorded for each blocked request
     assertThat(
-            registry.counter("cats.redisPriority.circuitBreaker.blocked", "name", "test").count())
+            registry
+                .counter(
+                    registry
+                        .createId("cats.priorityScheduler.circuitBreaker.blocked")
+                        .withTag("scheduler", "priority")
+                        .withTag("name", "test"))
+                .count())
         .isEqualTo(10);
   }
 
