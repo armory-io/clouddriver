@@ -313,9 +313,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   // shutdown)
   // 3. trimToSize() is called to shed capacity after large spikes
   // 4. JVM thread-local storage is efficient for this access pattern
-  // The alternative (new ArrayList/HashSet per cycle) would create ~10 objects x 1Hz = significant
-  // GC pressure at scale (100K+ agents). Profiling confirmed this optimization reduces GC pause
-  // times.
+  // The alternative (new ArrayList/HashSet per cycle) would create ~10 objects x 1Hz = GC pressure
+  // at high agent counts. This optimization reduces GC pause times.
   private static final ThreadLocal<Set<AgentWorker>> REUSABLE_WORKERS_SET =
       ThreadLocal.withInitial(HashSet::new);
 
@@ -1546,11 +1545,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
 
       // Invariant: candidateAgents and agentScorePairs must be aligned
       // Each candidate has exactly one (agent, score) pair in agentScorePairs
-      assert candidateAgents.size() * 2 == agentScorePairs.size()
-          : "Index alignment violated: candidateAgents.size()="
-              + candidateAgents.size()
-              + " but agentScorePairs.size()="
-              + agentScorePairs.size();
+      if (candidateAgents.size() * 2 != agentScorePairs.size()) {
+        log.error(
+            "Index alignment violated: candidateAgents.size()={} but agentScorePairs.size()={}",
+            candidateAgents.size(),
+            agentScorePairs.size());
+        metrics.incrementAcquireValidationFailure("index_alignment");
+        return 0;
+      }
 
       // Execute batch acquisition Lua script
       Object result =

@@ -44,11 +44,11 @@ public final class ScriptResults {
      * Constructs a batch removal result.
      *
      * @param removedCount number of items removed (clamped to non-negative)
-     * @param members list of removed member names (null-safe)
+     * @param members list of removed member names (null-safe, defensively copied)
      */
     public BatchRemovalResult(int removedCount, List<String> members) {
       this.removedCount = Math.max(0, removedCount);
-      this.members = members == null ? Collections.emptyList() : members;
+      this.members = members == null ? Collections.emptyList() : List.copyOf(members);
     }
   }
 

@@ -314,7 +314,7 @@ public class PrioritySchedulerIntegrationTest {
       MockAgentExecution exec = new MockAgentExecution();
       exec.setShouldFail(true); // Agent will throw exception on execution
 
-      // Create metrics registry we can inspect (proves metrics integration)
+      // Create metrics registry we can inspect (for metrics integration verification)
       com.netflix.spectator.api.Registry metricsRegistry =
           new com.netflix.spectator.api.DefaultRegistry();
       PrioritySchedulerMetrics testMetrics = new PrioritySchedulerMetrics(metricsRegistry);
@@ -424,7 +424,7 @@ public class PrioritySchedulerIntegrationTest {
           .isGreaterThanOrEqualTo(1);
 
       // incrementAcquired may be 0 if agent failed before acquisition completed
-      // But we verify that acquireAttempts was called, which proves metrics are being recorded
+      // Verify acquireAttempts was called to confirm metrics are being recorded
       long acquiredCount =
           metricsRegistry
               .counter(
@@ -445,8 +445,8 @@ public class PrioritySchedulerIntegrationTest {
               metricsRegistry
                   .createId("cats.priorityScheduler.acquire.time")
                   .withTag("mode", "auto"));
-      // Timer count may be 0 if no time was recorded, but the fact that acquireAttempts was called
-      // proves that metrics are being recorded
+      // Timer count may be 0 if no time was recorded, but acquireAttempts being called
+      // confirms metrics are being recorded
       assertThat(acquireTimeTimer.count())
           .describedAs("recordAcquireTime('auto', elapsed) should be called (count may be 0)")
           .isGreaterThanOrEqualTo(0);
@@ -629,7 +629,7 @@ public class PrioritySchedulerIntegrationTest {
 
       // Verify pattern matching worked correctly
       // Pattern "disabled-agent" should match agent type "disabled-agent"
-      // Verified indirectly: agent not registered and not in Redis proves pattern matched
+      // Verified indirectly: agent not registered and not in Redis confirms pattern matched
       // Direct verification would require accessing private isAgentEnabled() method
     }
   }
@@ -663,7 +663,7 @@ public class PrioritySchedulerIntegrationTest {
 
       scheduler.schedule(agent, execution, instrumentation);
 
-      // Verify agent was added to Redis (proves scripts are initialized and working)
+      // Verify agent was added to Redis (confirms scripts are initialized and working)
       java.util.concurrent.atomic.AtomicReference<Double> scoreRef =
           new java.util.concurrent.atomic.AtomicReference<>();
       boolean scoreFound =
@@ -685,7 +685,7 @@ public class PrioritySchedulerIntegrationTest {
               50);
       assertThat(scoreFound)
           .describedAs(
-              "Agent should be in WAITING_SET (proves scripts are initialized and working)")
+              "Agent should be in WAITING_SET (confirms scripts are initialized and working)")
           .isTrue();
       Double score = scoreRef.get();
       if (score == null) {
@@ -696,14 +696,14 @@ public class PrioritySchedulerIntegrationTest {
       }
       assertThat(score)
           .describedAs(
-              "Agent should be in WAITING_SET (proves scripts are initialized and working)")
+              "Agent should be in WAITING_SET (confirms scripts are initialized and working)")
           .isNotNull();
 
-      // Verify agent registered in internal maps (proves registration path works)
+      // Verify agent registered in internal maps (confirms registration path works)
       PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
       assertThat(stats.getRegisteredAgents())
           .describedAs(
-              "Agent should be registered (proves scripts initialized and registration works)")
+              "Agent should be registered (confirms scripts initialized and registration works)")
           .isEqualTo(1);
     }
 
@@ -735,7 +735,7 @@ public class PrioritySchedulerIntegrationTest {
       PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
       assertThat(stats)
           .describedAs(
-              "Scheduler stats should be accessible (proves no Redis connection errors occurred)")
+              "Scheduler stats should be accessible (confirms no Redis connection errors occurred)")
           .isNotNull();
       assertThat(stats.getRegisteredAgents())
           .describedAs(
@@ -883,7 +883,7 @@ public class PrioritySchedulerIntegrationTest {
 
       // Verify pattern matching worked correctly
       // Pattern ".*test.*" should match "test-agent" but not "prod-agent"
-      // Verified indirectly: test-agent not registered and prod-agent registered proves pattern
+      // Verified indirectly: test-agent not registered and prod-agent registered confirms pattern
       // matched
     }
 
@@ -986,7 +986,7 @@ public class PrioritySchedulerIntegrationTest {
       // Verify scheduler processed the agent successfully
       PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
       assertThat(stats)
-          .describedAs("Scheduler stats should be available (proves scheduler ran successfully)")
+          .describedAs("Scheduler stats should be available (confirms scheduler ran successfully)")
           .isNotNull();
 
       // Verify agent remains registered after scheduler run
@@ -1081,13 +1081,13 @@ public class PrioritySchedulerIntegrationTest {
       // the scheduler's operation rather than accessing internal fields
       assertThat(customScheduler).isNotNull();
 
-      // Verify scheduler is functional with custom config (proves config was used)
+      // Verify scheduler is functional with custom config (confirms config was used)
       PriorityAgentScheduler.SchedulerStats stats = customScheduler.getStats();
       assertThat(stats)
           .describedAs("Scheduler should be functional with custom config")
           .isNotNull();
       assertThat(stats.getRegisteredAgents())
-          .describedAs("Agent should be registered (proves scheduler works with custom config)")
+          .describedAs("Agent should be registered (confirms scheduler works with custom config)")
           .isEqualTo(1);
     }
   }
@@ -1120,31 +1120,31 @@ public class PrioritySchedulerIntegrationTest {
 
       // When & Then - Verify all components are correctly wired by testing scheduler functionality
       // Instead of using reflection to access internal fields, verify wiring through behavior:
-      // - Scheduler can register agents (proves acquisitionService is wired)
-      // - Scheduler can run (proves all services are initialized)
-      // - Scheduler stats are available (proves metrics and services are accessible)
+      // - Scheduler can register agents (confirms acquisitionService is wired)
+      // - Scheduler can run (confirms all services are initialized)
+      // - Scheduler stats are available (confirms metrics and services are accessible)
 
       scheduler.initialize();
 
-      // Verify scheduler is functional (proves all components are wired correctly)
+      // Verify scheduler is functional (confirms all components are wired correctly)
       PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
       assertThat(stats).isNotNull();
       assertThat(stats.getRegisteredAgents()).isEqualTo(0); // No agents registered yet
 
-      // Verify scheduler can register agents (proves acquisitionService is wired)
+      // Verify scheduler can register agents (confirms acquisitionService is wired)
       Agent testAgent = TestFixtures.createMockAgent("wiring-test-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
       ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
       scheduler.schedule(testAgent, execution, instrumentation);
 
-      // Verify agent was registered (proves acquisitionService is functional)
+      // Verify agent was registered (confirms acquisitionService is functional)
       stats = scheduler.getStats();
       assertThat(stats.getRegisteredAgents()).isEqualTo(1);
 
-      // Verify scheduler can run without errors (proves all services are initialized)
+      // Verify scheduler can run without errors (confirms all services are initialized)
       scheduler.run();
 
-      // Verify stats are still accessible after run (proves services remain functional)
+      // Verify stats are still accessible after run (confirms services remain functional)
       stats = scheduler.getStats();
       assertThat(stats).isNotNull();
     }
@@ -1205,7 +1205,7 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(stats1).isNotNull();
       assertThat(stats2).isNotNull();
 
-      // Both schedulers should be functional (proves configuration was applied)
+      // Both schedulers should be functional (confirms configuration was applied)
       // The actual concurrency limit enforcement can be verified through integration tests
       // that register multiple agents and verify acquisition limits
     }
@@ -1238,7 +1238,7 @@ public class PrioritySchedulerIntegrationTest {
       // Gauges are polled, so we verify registration indirectly through registry state
       assertThat(registry).isNotNull();
 
-      // Verify scheduler is functional (proves metrics initialization succeeded)
+      // Verify scheduler is functional (confirms metrics initialization succeeded)
       PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
       assertThat(stats).isNotNull();
 
@@ -1247,7 +1247,7 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(stats.getRegisteredAgents()).isGreaterThanOrEqualTo(0);
 
       // Note: Direct gauge value verification is not possible since gauges are polled,
-      // but the fact that scheduler operates correctly proves metrics are registered
+      // but the scheduler operating correctly confirms metrics are registered
     }
   }
 
@@ -1490,11 +1490,11 @@ public class PrioritySchedulerIntegrationTest {
         // rescheduled
         // If agent completed quickly before shutdown, it might already be rescheduled with a new
         // score
-        // The key verification is that agent is NOT in working set (proves shutdown handled it
+        // The key verification is that agent is NOT in working set (confirms shutdown handled it
         // correctly)
         Double waitingScore = jedis.zscore("waiting", "shutdown-agent-1");
         // Agent might be in waiting set (requeued) or might have completed and been rescheduled
-        // The critical check is that it's NOT in working set (proves shutdown handled it)
+        // The key check is that it's NOT in working set (confirms shutdown handled it)
         // If waitingScore is null, agent might have completed and been rescheduled, which is also
         // acceptable
         // The key is that shutdown completed gracefully without errors
@@ -1504,12 +1504,12 @@ public class PrioritySchedulerIntegrationTest {
       PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
       assertThat(stats)
           .describedAs(
-              "Scheduler stats should be accessible after shutdown (proves scheduler state is accessible)")
+              "Scheduler stats should be accessible after shutdown (confirms scheduler state is accessible)")
           .isNotNull();
       // Verify scheduler is not running after shutdown
       assertThat(stats.isRunning())
           .describedAs(
-              "Scheduler should not be running after shutdown (proves resources cleaned up)")
+              "Scheduler should not be running after shutdown (confirms resources cleaned up)")
           .isFalse();
       // The shutdown process should handle any active agents properly
     }
@@ -1614,11 +1614,11 @@ public class PrioritySchedulerIntegrationTest {
                   .isNull();
             } else {
               // Agent completed quickly and was removed - this is acceptable
-              // The key verification is that only one execution occurred (proves atomic
+              // The key verification is that only one execution occurred (confirms atomic
               // acquisition)
               assertThat(totalExecutions)
                   .describedAs(
-                      "Only one execution should occur (proves atomic acquisition worked). "
+                      "Only one execution should occur (confirms atomic acquisition worked). "
                           + "Agent may have completed quickly and been removed from Redis.")
                   .isEqualTo(1);
             }
@@ -1631,7 +1631,7 @@ public class PrioritySchedulerIntegrationTest {
               // The primary verification is that at most one execution occurred
               assertThat(totalExecutions)
                   .describedAs(
-                      "At most one execution should occur (proves atomic acquisition). "
+                      "At most one execution should occur (confirms atomic acquisition). "
                           + "Agent may have completed quickly and been removed from Redis.")
                   .isLessThanOrEqualTo(1);
             } else {
@@ -1777,11 +1777,11 @@ public class PrioritySchedulerIntegrationTest {
           .describedAs("Duration should be reasonable (backpressure prevents rapid spinning)")
           .isGreaterThanOrEqualTo(0L);
 
-      // Verify no increase in run failures (proves backpressure worked, no errors)
+      // Verify no increase in run failures (confirms backpressure worked, no errors)
       long afterFailures = counterSumByName(metricsRegistry, "cats.priorityScheduler.run.failures");
       assertThat(afterFailures)
           .describedAs(
-              "Run failures should not increase (proves backpressure worked without errors)")
+              "Run failures should not increase (confirms backpressure worked without errors)")
           .isEqualTo(beforeFailures);
 
       // Verify metrics recorded (incrementAcquireAttempts, incrementAcquired)
@@ -1913,7 +1913,7 @@ public class PrioritySchedulerIntegrationTest {
           .describedAs("Duration should be reasonable (backpressure prevents rapid spinning)")
           .isGreaterThanOrEqualTo(0L);
 
-      // Verify scheduler didn't fail (proves backpressure worked without errors)
+      // Verify scheduler didn't fail (confirms backpressure worked without errors)
       assertThat(sched).isNotNull();
 
       // Verify metrics recorded (incrementAcquireAttempts, incrementAcquired)
@@ -2122,7 +2122,7 @@ public class PrioritySchedulerIntegrationTest {
       try (Jedis jedis = jedisPool.getResource()) {
         assertThat(simultaneousCleanups.get())
             .describedAs(
-                "Counter should be 0 after both services complete (proves sequential execution)")
+                "Counter should be 0 after both services complete (confirms sequential execution)")
             .isEqualTo(0);
 
         // Verify leadership acquisition/release worked correctly
@@ -2513,8 +2513,8 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(delta).isBetween(3L, 7L);
 
       // ASSERTION: Agent moved from WAITING_SET to WORKING_SET
-      // Verified: The fact that agent was rescheduled back to WAITING_SET with error interval
-      // proves it was acquired (moved to WORKING_SET), executed (failed), and rescheduled.
+      // Verified: Agent rescheduled back to WAITING_SET with error interval confirms
+      // it was acquired (moved to WORKING_SET), executed (failed), and rescheduled.
       // Direct WORKING_SET assertion is not possible because execution completes before we can
       // check.
 
@@ -3345,20 +3345,21 @@ public class PrioritySchedulerIntegrationTest {
 
       // Verify properties remain consistent (cached, not re-read dynamically)
       assertThat(optimizationsAgentProperties.getMaxConcurrentAgents())
-          .describedAs("Cached maxConcurrentAgents should remain consistent (proves caching works)")
+          .describedAs(
+              "Cached maxConcurrentAgents should remain consistent (confirms caching works)")
           .isEqualTo(initialMaxConcurrent);
       assertThat(optimizationsSchedulerProperties.getIntervalMs())
-          .describedAs("Cached intervalMs should remain consistent (proves caching works)")
+          .describedAs("Cached intervalMs should remain consistent (confirms caching works)")
           .isEqualTo(initialIntervalMs);
       assertThat(optimizationsSchedulerProperties.getZombieCleanup().getThresholdMs())
-          .describedAs("Cached zombieThreshold should remain consistent (proves caching works)")
+          .describedAs("Cached zombieThreshold should remain consistent (confirms caching works)")
           .isEqualTo(initialZombieThreshold);
 
       // Verify scheduler uses cached properties (stats available, scheduler functional)
       PriorityAgentScheduler.SchedulerStats stats = optimizationsScheduler.getStats();
       assertThat(stats)
           .describedAs(
-              "Scheduler stats should be available (proves scheduler ran using cached config)")
+              "Scheduler stats should be available (confirms scheduler ran using cached config)")
           .isNotNull();
 
       // Verify scheduler stats reflect cached configuration
@@ -3472,7 +3473,7 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(statsAfterRuns.getRegisteredAgents())
           .describedAs("Registered agents should remain stable after multiple runs (no leak)")
           .isEqualTo(2);
-      // Run count should increase (proves scheduler is operating)
+      // Run count should increase (confirms scheduler is operating)
       assertThat(statsAfterRuns.getRunCount())
           .describedAs("Run count should increase after multiple runs")
           .isGreaterThan(0);
@@ -3791,7 +3792,7 @@ public class PrioritySchedulerIntegrationTest {
         // The critical verification is that the scheduler continues operating (already verified
         // above)
         // and that normal agents are still being processed (verified by semaphore permits = 5)
-        // This proves the poison agent was isolated and didn't break the scheduler
+        // This confirms the poison agent was isolated and didn't break the scheduler
         // Note: The agent will be re-registered on next repopulation cycle
         assertThat(semaphore.availablePermits())
             .describedAs(
@@ -4207,15 +4208,15 @@ public class PrioritySchedulerIntegrationTest {
           // completed
           // If agents completed quickly, they might be rescheduled with new scores, but they should
           // not be lost
-          // The key verification is that agents are NOT in working set (proves shutdown handled
+          // The key verification is that agents are NOT in working set (confirms shutdown handled
           // them)
           // and at least one should be in waiting set (requeued) or both completed
           boolean atLeastOneInWaiting = waitingScore1 != null || waitingScore2 != null;
           // If both agents completed quickly, they might have been rescheduled, but we've verified
-          // they're not in working set, which proves shutdown handled them correctly
+          // they're not in working set, which confirms shutdown handled them correctly
           assertThat(workingScore1 == null && workingScore2 == null)
               .describedAs(
-                  "Both agents should be removed from WORKING_SET after shutdown (proves shutdown handled them)")
+                  "Both agents should be removed from WORKING_SET after shutdown (confirms shutdown handled them)")
               .isTrue();
         }
 
@@ -4261,27 +4262,27 @@ public class PrioritySchedulerIntegrationTest {
         PriorityAgentScheduler.SchedulerStats stats = complexScheduler.getStats();
         assertThat(stats)
             .describedAs(
-                "Scheduler stats should be accessible (proves cross-service interactions work correctly)")
+                "Scheduler stats should be accessible (confirms cross-service interactions work correctly)")
             .isNotNull();
 
         assertDoesNotThrow(
             () -> complexScheduler.run(),
-            "Scheduler should continue to run (proves no interference)");
+            "Scheduler should continue to run (confirms no interference)");
 
         // Verify both cleanup services are functional (counters accessible, may be 0 if no cleanup
         // occurred)
         assertThat(stats.getOrphansCleanedUp())
             .describedAs(
-                "Orphan cleanup counter should be accessible (proves orphan cleanup service is functional)")
+                "Orphan cleanup counter should be accessible (confirms orphan cleanup service is functional)")
             .isGreaterThanOrEqualTo(0);
         assertThat(stats.getZombiesCleanedUp())
             .describedAs(
-                "Zombie cleanup counter should be accessible (proves zombie cleanup service is functional)")
+                "Zombie cleanup counter should be accessible (confirms zombie cleanup service is functional)")
             .isGreaterThanOrEqualTo(0);
 
         assertThat(stats.getRunCount())
             .describedAs(
-                "Scheduler run count should increase (proves scheduler remains functional despite concurrent cleanup)")
+                "Scheduler run count should increase (confirms scheduler remains functional despite concurrent cleanup)")
             .isGreaterThan(0);
       }
 
@@ -4311,7 +4312,7 @@ public class PrioritySchedulerIntegrationTest {
         // Run scheduler multiple times to verify resilience
         assertDoesNotThrow(() -> complexScheduler.run(), "Scheduler run should be resilient");
 
-        // Verify scheduler can run multiple times (proves resilience)
+        // Verify scheduler can run multiple times (confirms resilience)
         for (int i = 0; i < 3; i++) {
           assertDoesNotThrow(
               () -> complexScheduler.run(),
@@ -4322,14 +4323,14 @@ public class PrioritySchedulerIntegrationTest {
         PriorityAgentScheduler.SchedulerStats stats = complexScheduler.getStats();
         assertThat(stats)
             .describedAs(
-                "Scheduler stats should be accessible after multiple runs (proves scheduler still works)")
+                "Scheduler stats should be accessible after multiple runs (confirms scheduler still works)")
             .isNotNull();
 
-        // Verify run count increases (proves saturatePool() executed successfully)
+        // Verify run count increases (confirms saturatePool() executed successfully)
         long runCount = stats.getRunCount();
         assertThat(runCount)
             .describedAs(
-                "Scheduler run count should increase after multiple runs (proves scheduler remains functional)")
+                "Scheduler run count should increase after multiple runs (confirms scheduler remains functional)")
             .isGreaterThan(initialStats.getRunCount());
 
         // Verify scheduler state remains consistent
@@ -4337,7 +4338,7 @@ public class PrioritySchedulerIntegrationTest {
             .describedAs("Scheduler should remain in running state after multiple runs")
             .isTrue();
 
-        // Verify metrics tracked correctly (proves resilience)
+        // Verify metrics tracked correctly (confirms resilience)
         assertThat(stats.getRegisteredAgents())
             .describedAs("Registered agents metric should be tracked")
             .isGreaterThanOrEqualTo(0);
@@ -4407,34 +4408,34 @@ public class PrioritySchedulerIntegrationTest {
         long finalRunCount = complexScheduler.getStats().getRunCount();
         assertThat(finalRunCount)
             .describedAs(
-                "Run count should increase (proves scheduler ran successfully despite cleanup Redis failure). "
+                "Run count should increase (confirms scheduler ran successfully despite cleanup Redis failure). "
                     + "Initial: "
                     + initialRunCount
                     + ", Final: "
                     + finalRunCount)
             .isGreaterThan(initialRunCount);
 
-        // Verify scheduler stats are accessible (proves scheduler still functional)
+        // Verify scheduler stats are accessible (confirms scheduler still functional)
         PriorityAgentScheduler.SchedulerStats stats = complexScheduler.getStats();
         assertThat(stats)
             .describedAs(
-                "Scheduler stats should be accessible after run (proves scheduler still works despite cleanup Redis failure)")
+                "Scheduler stats should be accessible after run (confirms scheduler still works despite cleanup Redis failure)")
             .isNotNull();
 
-        // Verify scheduler can run multiple times (proves resilience)
+        // Verify scheduler can run multiple times (confirms resilience)
         assertDoesNotThrow(
             () -> complexScheduler.run(),
             "Scheduler should continue to run after cleanup Redis failure");
         long secondRunCount = complexScheduler.getStats().getRunCount();
         assertThat(secondRunCount)
             .describedAs(
-                "Run count should continue to increase (proves acquisition still works after cleanup failure)")
+                "Run count should continue to increase (confirms acquisition still works after cleanup failure)")
             .isGreaterThan(finalRunCount);
 
-        // Verify agent is still registered (proves scheduler state maintained)
+        // Verify agent is still registered (confirms scheduler state maintained)
         assertThat(stats.getRegisteredAgents())
             .describedAs(
-                "Agent should still be registered (proves scheduler state maintained despite cleanup failure)")
+                "Agent should still be registered (confirms scheduler state maintained despite cleanup failure)")
             .isGreaterThanOrEqualTo(1);
       }
     }
@@ -4616,14 +4617,14 @@ public class PrioritySchedulerIntegrationTest {
         }
 
         // Verify state consistency maintained during rapid toggles
-        // Check that scheduler stats are still accessible (proves no inconsistent state)
+        // Check that scheduler stats are still accessible (confirms no inconsistent state)
         PriorityAgentScheduler.SchedulerStats finalStats = complexScheduler.getStats();
         assertThat(finalStats)
             .describedAs(
-                "Scheduler stats should be accessible after rapid enable/disable cycles (proves state consistency)")
+                "Scheduler stats should be accessible after rapid enable/disable cycles (confirms state consistency)")
             .isNotNull();
 
-        // Verify runCount increased (proves scheduler ran when enabled)
+        // Verify runCount increased (confirms scheduler ran when enabled)
         // Note: runCount should increase by exactly enabledCycles (one per enabled cycle)
         long finalRunCount = finalStats.getRunCount();
         assertThat(finalRunCount)
@@ -4653,10 +4654,10 @@ public class PrioritySchedulerIntegrationTest {
             .isEqualTo(registeredAgentsBefore);
 
         // Verify scheduler state is consistent (no exceptions, stats accessible)
-        // The fact that we can get stats and runCount increased correctly proves state consistency
+        // Stats and runCount increased correctly confirms state consistency
         assertThat(complexScheduler)
             .describedAs(
-                "Scheduler should remain functional after rapid state toggles (proves state consistency)")
+                "Scheduler should remain functional after rapid state toggles (confirms state consistency)")
             .isNotNull();
       }
 
@@ -4680,6 +4681,8 @@ public class PrioritySchedulerIntegrationTest {
         // Capture initial state
         long initialRunCount = complexScheduler.getStats().getRunCount();
         int initialRegisteredAgents = complexScheduler.getStats().getRegisteredAgents();
+        java.util.concurrent.atomic.AtomicReference<Exception> threadException =
+            new java.util.concurrent.atomic.AtomicReference<>();
 
         // All threads try to initialize and run concurrently
         for (int i = 0; i < NUM_THREADS; i++) {
@@ -4690,7 +4693,7 @@ public class PrioritySchedulerIntegrationTest {
                   complexScheduler.initialize();
                   complexScheduler.run();
                 } catch (Exception e) {
-                  e.printStackTrace();
+                  threadException.compareAndSet(null, e);
                 } finally {
                   doneLatch.countDown();
                 }
@@ -4699,49 +4702,49 @@ public class PrioritySchedulerIntegrationTest {
 
         startLatch.countDown();
         assertTrue(doneLatch.await(15, TimeUnit.SECONDS), "All threads should complete");
+        assertThat(threadException.get())
+            .describedAs("No exceptions should occur during concurrent scheduler operations")
+            .isNull();
 
         // THEN: Verify thread safety - scheduler state remains consistent
-        // Verify all threads completed without exceptions (doneLatch.await succeeded)
-        // This is verified by the assertTrue above - if any thread threw an exception, await would
-        // timeout
 
         // Verify scheduler state is consistent (no corruption from race conditions)
         PriorityAgentScheduler.SchedulerStats finalStats = complexScheduler.getStats();
         assertThat(finalStats)
             .describedAs(
-                "Scheduler stats should be accessible after concurrent operations (proves no corruption)")
+                "Scheduler stats should be accessible after concurrent operations (confirms no corruption)")
             .isNotNull();
 
-        // Verify run count increased (proves operations executed despite concurrency)
+        // Verify run count increased (confirms operations executed despite concurrency)
         long finalRunCount = finalStats.getRunCount();
         assertThat(finalRunCount)
             .describedAs(
-                "Run count should increase after concurrent operations (proves operations executed). "
+                "Run count should increase after concurrent operations (confirms operations executed). "
                     + "Initial: "
                     + initialRunCount
                     + ", Final: "
                     + finalRunCount)
             .isGreaterThanOrEqualTo(initialRunCount);
 
-        // Verify registered agents count consistent (proves no state corruption)
+        // Verify registered agents count consistent (confirms no state corruption)
         int finalRegisteredAgents = finalStats.getRegisteredAgents();
         assertThat(finalRegisteredAgents)
             .describedAs(
-                "Registered agents count should remain consistent (proves no state corruption from race conditions). "
+                "Registered agents count should remain consistent (confirms no state corruption from race conditions). "
                     + "Initial: "
                     + initialRegisteredAgents
                     + ", Final: "
                     + finalRegisteredAgents)
             .isEqualTo(initialRegisteredAgents);
 
-        // Verify scheduler can still operate after concurrent access (proves thread safety)
+        // Verify scheduler can still operate after concurrent access (confirms thread safety)
         assertDoesNotThrow(
             () -> complexScheduler.run(),
             "Scheduler should continue to operate after concurrent initialization and run");
         long postConcurrencyRunCount = complexScheduler.getStats().getRunCount();
         assertThat(postConcurrencyRunCount)
             .describedAs(
-                "Scheduler should continue to operate after concurrent access (proves thread safety maintained)")
+                "Scheduler should continue to operate after concurrent access (confirms thread safety maintained)")
             .isGreaterThan(finalRunCount);
       }
 
@@ -4778,30 +4781,30 @@ public class PrioritySchedulerIntegrationTest {
             () -> complexScheduler.run(), "Scheduler should be resilient to service exceptions");
 
         // Verify service isolation occurred
-        // Check that scheduler stats are still accessible (proves scheduler continues despite
+        // Check that scheduler stats are still accessible (confirms scheduler continues despite
         // exceptions)
         PriorityAgentScheduler.SchedulerStats finalStats = complexScheduler.getStats();
         assertThat(finalStats)
             .describedAs(
-                "Scheduler stats should be accessible after run (proves service isolation - scheduler continues)")
+                "Scheduler stats should be accessible after run (confirms service isolation - scheduler continues)")
             .isNotNull();
 
-        // Verify runCount increased (proves scheduler ran successfully despite potential service
+        // Verify runCount increased (confirms scheduler ran successfully despite potential service
         // exceptions)
         long finalRunCount = finalStats.getRunCount();
         assertThat(finalRunCount)
             .describedAs(
-                "Run count should increase (proves scheduler ran successfully despite service exceptions). "
+                "Run count should increase (confirms scheduler ran successfully despite service exceptions). "
                     + "Initial: "
                     + initialRunCount
                     + ", Final: "
                     + finalRunCount)
             .isGreaterThan(initialRunCount);
 
-        // Verify scheduler remains functional (proves service isolation worked)
+        // Verify scheduler remains functional (confirms service isolation worked)
         assertThat(complexScheduler)
             .describedAs(
-                "Scheduler should remain functional after service exceptions (proves service isolation)")
+                "Scheduler should remain functional after service exceptions (confirms service isolation)")
             .isNotNull();
       }
     }

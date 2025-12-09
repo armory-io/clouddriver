@@ -407,7 +407,7 @@ class AgentAcquisitionServiceTest {
       }
 
       // Verify no Redis write operations performed for disabled agent
-      // This is verified indirectly: agent NOT in WAITING_SET proves no write occurred
+      // Verified indirectly: agent NOT in WAITING_SET confirms no write occurred
       // The fact that getRegisteredAgentCount() == 0 and agent is not in Redis confirms
       // that registerAgent() returned early without performing Redis operations
     }
@@ -781,7 +781,7 @@ class AgentAcquisitionServiceTest {
       // Verify repopulation occurred when runCount=0
       // Repopulation should have added the agent to Redis before acquisition
       // Verified indirectly: agent was acquired, which requires it to be in Redis first
-      // The fact that acquired=1 proves repopulation worked (agent was in Redis and ready)
+      // acquired=1 confirms repopulation worked (agent was in Redis and ready)
 
       // Verify circuit breaker: success recorded (circuit breaker disabled in setup, but verify
       // status)
@@ -1813,8 +1813,7 @@ class AgentAcquisitionServiceTest {
       // Verify performance metrics (registration time per agent)
       // We can't directly measure registration time per agent without instrumentation,
       // but we can verify that all registrations completed successfully and in reasonable time
-      // The fact that all threads completed and all agents are registered proves performance is
-      // acceptable
+      // All threads completed and all agents registered confirms acceptable performance
       // For more detailed performance verification, we'd need to add timing instrumentation to
       // registerAgent()
     }
@@ -3080,7 +3079,7 @@ class AgentAcquisitionServiceTest {
       int reacquired = testService.saturatePool(2L, null, executorService);
       assertThat(reacquired)
           .describedAs(
-              "Failed agent should be re-acquirable in next cycle (proves re-queuing worked)")
+              "Failed agent should be re-acquirable in next cycle (confirms re-queuing worked)")
           .isGreaterThanOrEqualTo(
               0); // May be 0 if agent is still in backoff, but should be acquirable eventually
 
@@ -3203,14 +3202,14 @@ class AgentAcquisitionServiceTest {
       // Verify immediately after acquisition - agents should be tracked in activeAgents
       // Note: Mock executions complete immediately, so activeAgentCount might be < 5 if agents
       // completed
-      // The key verification is that acquired=5 (proves batch acquisition worked)
+      // The key verification is acquired=5 (confirms batch acquisition worked)
       int activeCount = testService.getActiveAgentCount();
       assertThat(activeCount)
           .describedAs(
               "Active agent count should be between 0 and 5 (agents may complete quickly). "
                   + "acquired="
                   + acquired
-                  + " proves batch acquisition worked")
+                  + " confirms batch acquisition worked")
           .isBetween(0, 5);
 
       // Verify Redis state: all 5 agents in WORKING_SET during execution with deadline
@@ -3238,7 +3237,7 @@ class AgentAcquisitionServiceTest {
                         + " should be in WORKING_SET with deadline score (in the future)")
                 .isGreaterThan((double) currentTimeSeconds); // Must be in the future
 
-            // If in working set, should NOT be in waiting set (proves transition occurred)
+            // If in working set, should NOT be in waiting set (confirms transition occurred)
             assertThat(waitingScore)
                 .describedAs(
                     "Agent batch-agent-"
@@ -3253,14 +3252,14 @@ class AgentAcquisitionServiceTest {
 
         // After batch acquisition (acquired=5), agents should be in WORKING_SET
         // They might complete quickly and be removed from Redis, but batch acquisition still worked
-        // If agents completed immediately, they might not be in Redis, but acquired=5 proves batch
-        // acquisition worked
+        // If agents completed immediately, they might not be in Redis, but acquired=5 confirms
+        // batch acquisition worked
         if (agentsInWorking == 0 && agentsInWaiting == 0) {
           // Agents completed immediately and were removed from Redis - this is acceptable
-          // The key verification is that acquired=5 (proves batch acquisition worked)
+          // The key verification is acquired=5 (confirms batch acquisition worked)
           assertThat(acquired)
               .describedAs(
-                  "If agents completed immediately (not in Redis), acquired count should be 5 (proves batch acquisition worked). "
+                  "If agents completed immediately (not in Redis), acquired count should be 5 (confirms batch acquisition worked). "
                       + "Working: "
                       + agentsInWorking
                       + ", Waiting: "
@@ -3362,7 +3361,7 @@ class AgentAcquisitionServiceTest {
           .describedAs("Should acquire exactly 3 agents due to concurrency limit")
           .isEqualTo(3);
 
-      // Verify remaining 2 agents stay in WAITING_SET (proves batch respects limit)
+      // Verify remaining 2 agents stay in WAITING_SET (confirms batch respects limit)
       // Check immediately after acquisition (agents may complete quickly)
       try (Jedis jedis = jedisPool.getResource()) {
         // First 3 agents should be in working set (acquired) or have completed
@@ -3476,7 +3475,7 @@ class AgentAcquisitionServiceTest {
         long totalAgents = workingAgents + waitingAgents;
 
         // Agents may complete quickly and be removed from Redis
-        // The key verification is that acquired=3 (proves concurrency limit was enforced)
+        // The key verification is acquired=3 (confirms concurrency limit was enforced)
         // and that remaining agents stayed in WAITING_SET (verified earlier)
         // Total agents in Redis may be less than 5 if agents completed quickly
         assertThat(totalAgents)
@@ -3484,7 +3483,7 @@ class AgentAcquisitionServiceTest {
                 "Total agents in Redis should be between 0 and 5 (agents may complete quickly). "
                     + "acquired="
                     + acquired
-                    + " proves concurrency limit was enforced")
+                    + " confirms concurrency limit was enforced")
             .isBetween(0L, 5L);
       }
     }
@@ -3567,7 +3566,7 @@ class AgentAcquisitionServiceTest {
           .describedAs("incrementAcquired(2) should be called with count of agents acquired")
           .isEqualTo(2);
 
-      // Verify remaining 2 agents stayed in waiting set (proves semaphore limit was enforced)
+      // Verify remaining 2 agents stayed in waiting set (confirms semaphore limit was enforced)
       // Check immediately after acquisition (agents may complete quickly)
       try (Jedis jedis = jedisPool.getResource()) {
         // First 2 agents should be in working set (acquired) or have completed
@@ -3735,7 +3734,7 @@ class AgentAcquisitionServiceTest {
           .isGreaterThanOrEqualTo(1);
 
       // Verify filtered agents remain in waiting (not acquired due to filtering)
-      // This proves filtering is working and the multiplier is needed
+      // This confirms filtering is working and the multiplier is needed
       try (Jedis jedis = jedisPool.getResource()) {
         for (int i = 1; i <= 5; i++) {
           Double score = jedis.zscore("waiting", "filtered-agent-" + i);
@@ -3746,7 +3745,7 @@ class AgentAcquisitionServiceTest {
       }
 
       // Verify accepted agents were actually acquired (moved to WORKING_SET)
-      // This proves the multiplier mechanism allowed acquisition despite filtering
+      // This confirms the multiplier mechanism allowed acquisition despite filtering
       try (Jedis jedis = jedisPool.getResource()) {
         int acceptedAgentsAcquired = 0;
         for (int i = 1; i <= 3; i++) {
@@ -3755,7 +3754,7 @@ class AgentAcquisitionServiceTest {
 
           // Accepted agents should be either in working set (acquired) or back in waiting
           // (completed quickly)
-          // The key verification is that at least some were acquired (acquired > 0 proves
+          // The key verification is that at least some were acquired (acquired > 0 confirms
           // multiplier worked)
           if (workingScore != null) {
             acceptedAgentsAcquired++;
@@ -3768,7 +3767,7 @@ class AgentAcquisitionServiceTest {
         }
         // At least some accepted agents should have been acquired (proving multiplier worked)
         // Note: They might complete quickly and be back in waiting, but acquisition count > 0
-        // proves it
+        // confirms it
         assertThat(acceptedAgentsAcquired > 0 || acquired > 0)
             .describedAs(
                 "At least some accepted agents should be acquired (proving multiplier mechanism worked). "
@@ -3930,7 +3929,7 @@ class AgentAcquisitionServiceTest {
       // 3. Fallback was triggered (metrics recorded)
 
       // Verify fallback occurred - check that incrementBatchFallback() was called
-      // This proves that batch failure was detected and fallback was triggered
+      // This confirms batch failure was detected and fallback was triggered
       long fallbackCount =
           metricsRegistry
               .counter(
@@ -3954,7 +3953,7 @@ class AgentAcquisitionServiceTest {
       // 2. Batch script was called (proving batch mode was attempted)
       // 3. Fallback to individual mode occurred (agents were acquired despite batch failure)
 
-      // Verify batch script was called (this proves batch mode was attempted and exception was
+      // Verify batch script was called (confirms batch mode was attempted and exception was
       // thrown)
       verify(spyScriptManager, atLeastOnce())
           .evalshaWithSelfHeal(
@@ -3964,7 +3963,7 @@ class AgentAcquisitionServiceTest {
               any(java.util.List.class));
 
       // Verify fallback occurred - check that fallback metrics were recorded
-      // This proves that batch failure was detected and fallback was triggered
+      // This confirms batch failure was detected and fallback was triggered
       assertThat(fallbackCount)
           .describedAs(
               "Fallback counter should be incremented when batch fails and fallback occurs")
@@ -3995,7 +3994,7 @@ class AgentAcquisitionServiceTest {
       // The key verification is that fallback metrics were recorded (fallbackCount > 0,
       // fallbackTimerCount > 0)
 
-      // Verify agents were actually acquired despite batch failure (proves fallback
+      // Verify agents were actually acquired despite batch failure (confirms fallback
       // worked)
       // Check Redis state - agents should be in WORKING_SET if acquired
       try (Jedis jedis = jedisPool.getResource()) {
@@ -4064,14 +4063,14 @@ class AgentAcquisitionServiceTest {
                       + acquired)
               .isGreaterThan(0);
         } else {
-          // Agents weren't acquired, but fallback metrics were recorded - this proves fallback path
+          // Agents weren't acquired, but fallback metrics were recorded - confirms fallback path
           // was tested
           // The fallback occurred (metrics recorded), even if agents weren't acquired due to other
           // conditions
           assertThat(fallbackCount + fallbackTimerCount)
               .describedAs(
                   "Fallback occurred (metrics recorded) even though no agents were acquired. "
-                      + "This proves the fallback path was tested. Acquired: "
+                      + "This confirms the fallback path was tested. Acquired: "
                       + acquired
                       + ", "
                       + "Fallback counter: "
@@ -4148,7 +4147,7 @@ class AgentAcquisitionServiceTest {
           .isGreaterThanOrEqualTo(0)
           .isLessThanOrEqualTo(3);
 
-      // Verify no duplicate agents in WORKING_SET (proves atomic acquisition)
+      // Verify no duplicate agents in WORKING_SET (confirms atomic acquisition)
       try (Jedis jedis = jedisPool.getResource()) {
         // Get all agents in working set
         Set<String> workingAgents = jedis.zrange("working", 0, -1);
@@ -4157,7 +4156,7 @@ class AgentAcquisitionServiceTest {
         Set<String> uniqueAgents = new HashSet<>(workingAgents);
         assertThat(workingAgents.size())
             .describedAs(
-                "No duplicate agents in WORKING_SET (proves atomic acquisition). "
+                "No duplicate agents in WORKING_SET (confirms atomic acquisition). "
                     + "Total: "
                     + workingAgents.size()
                     + ", Unique: "
@@ -4184,7 +4183,7 @@ class AgentAcquisitionServiceTest {
 
     /**
      * Tests that race conditions between pods are handled gracefully. Verifies no duplicate agents
-     * in WORKING_SET (proves atomic acquisition), each agent acquired by exactly one pod, and
+     * in WORKING_SET (confirms atomic acquisition), each agent acquired by exactly one pod, and
      * metrics recorded for both pods (incrementAcquireAttempts, incrementAcquired).
      */
     @Test
@@ -4309,7 +4308,7 @@ class AgentAcquisitionServiceTest {
       pod1Service.saturatePool(2L, null, executorService);
       pod2Service.saturatePool(1L, null, executorService);
 
-      // Verify no duplicate agents in WORKING_SET (proves atomic acquisition)
+      // Verify no duplicate agents in WORKING_SET (confirms atomic acquisition)
       // Check immediately after acquisition, before agents complete
       try (Jedis jedis = jedisPool.getResource()) {
         // Get all agents in working set
@@ -4319,7 +4318,7 @@ class AgentAcquisitionServiceTest {
         Set<String> uniqueAgents = new HashSet<>(workingAgents);
         assertThat(workingAgents.size())
             .describedAs(
-                "No duplicate agents in WORKING_SET (proves atomic acquisition). "
+                "No duplicate agents in WORKING_SET (confirms atomic acquisition). "
                     + "Total: "
                     + workingAgents.size()
                     + ", Unique: "
@@ -4521,14 +4520,14 @@ class AgentAcquisitionServiceTest {
       // Verify immediately after acquisition - agents should be tracked in activeAgents
       // Note: Mock executions complete immediately, so activeAgentCount might be < 3 if agents
       // completed
-      // The key verification is that acquired=3 (proves batch acquisition worked)
+      // The key verification is acquired=3 (confirms batch acquisition worked)
       int activeCount = testService.getActiveAgentCount();
       assertThat(activeCount)
           .describedAs(
               "Active agent count should be between 0 and 3 (agents may complete quickly). "
                   + "acquired="
                   + acquired
-                  + " proves batch acquisition worked")
+                  + " confirms batch acquisition worked")
           .isBetween(0, 3);
 
       // Verify Redis state: agents should be in WORKING_SET immediately after acquisition
@@ -4544,7 +4543,7 @@ class AgentAcquisitionServiceTest {
 
           if (workingScore != null) {
             agentsInWorking++;
-            // If in working set, should NOT be in waiting set (proves transition occurred)
+            // If in working set, should NOT be in waiting set (confirms transition occurred)
             assertThat(waitingScore)
                 .describedAs(
                     "Agent " + name + " should be removed from WAITING_SET after batch acquisition")
@@ -4557,14 +4556,14 @@ class AgentAcquisitionServiceTest {
 
         // After batch acquisition (acquired=3), agents should be in WORKING_SET
         // They might complete quickly and be removed from Redis, but batch acquisition still worked
-        // If agents completed immediately, they might not be in Redis, but acquired=3 proves batch
-        // acquisition worked
+        // If agents completed immediately, they might not be in Redis, but acquired=3 confirms
+        // batch acquisition worked
         if (agentsInWorking == 0 && agentsInWaiting == 0) {
           // Agents completed immediately and were removed from Redis - this is acceptable
-          // The key verification is that acquired=3 (proves batch acquisition worked)
+          // The key verification is acquired=3 (confirms batch acquisition worked)
           assertThat(acquired)
               .describedAs(
-                  "If agents completed immediately (not in Redis), acquired count should be 3 (proves batch acquisition worked). "
+                  "If agents completed immediately (not in Redis), acquired count should be 3 (confirms batch acquisition worked). "
                       + "Working: "
                       + agentsInWorking
                       + ", Waiting: "
@@ -4764,7 +4763,7 @@ class AgentAcquisitionServiceTest {
         // After batch acquisition (acquired=10), all 10 agents should have been processed
         // They might be: in working (executing), back in waiting (completed and rescheduled), or
         // removed (if not rescheduled)
-        // The key verification is that batch acquisition occurred (acquired=10 proves it)
+        // The key verification is that batch acquisition occurred (acquired=10 confirms it)
         assertThat(agentsInWorking + agentsInWaiting)
             .describedAs(
                 "All 10 agents should be in either WORKING_SET (executing) or WAITING_SET (rescheduled). "
@@ -4839,7 +4838,7 @@ class AgentAcquisitionServiceTest {
       // Verify batch size limit is enforced (activeAgentCount <= batchSize)
       assertThat(testService.getActiveAgentCount())
           .describedAs(
-              "Only batchSize (2) agents should be active at once (proves batch size limit enforced)")
+              "Only batchSize (2) agents should be active at once (confirms batch size limit enforced)")
           .isLessThanOrEqualTo(2);
 
       // Verify Redis state: at most batchSize agents in WORKING_SET, remaining in WAITING_SET
@@ -4854,7 +4853,7 @@ class AgentAcquisitionServiceTest {
 
           if (workingScore != null) {
             agentsInWorking++;
-            // If in working set, should NOT be in waiting set (proves transition occurred)
+            // If in working set, should NOT be in waiting set (confirms transition occurred)
             assertThat(waitingScore)
                 .describedAs(
                     "Agent batch-limit-agent-"
@@ -4882,7 +4881,7 @@ class AgentAcquisitionServiceTest {
         // Agents may complete quickly and be removed from Redis
         // The key verification is that batch size limit was enforced (activeAgentCount <=
         // batchSize)
-        // and that initialAcquired > 0 (proves batch acquisition occurred)
+        // and that initialAcquired > 0 (confirms batch acquisition occurred)
         // Total agents in Redis may be 0 if all agents completed quickly
         assertThat(agentsInWorking + agentsInWaiting)
             .describedAs(
@@ -5733,7 +5732,7 @@ class AgentAcquisitionServiceTest {
         // We can verify failures were recorded by checking the circuit breaker's internal state
         // Since we can't directly access failure counts, we verify that circuit breakers exist and
         // are functional
-        // The fact that saturatePool returned 0 (instead of crashing) proves circuit breakers
+        // saturatePool returned 0 (instead of crashing) confirms circuit breakers
         // handled the failure
         assertThat(cbStatus.containsKey("redis"))
             .describedAs("Redis circuit breaker should be present")
@@ -6378,7 +6377,7 @@ class AgentAcquisitionServiceTest {
         // Note: Agents may have completed and been removed from Redis, so we verify the key
         // behavior:
         // Only 2 agents were acquired (verified by completedCount=2 and permits released)
-        // The fact that acquired=2 and completedCount=2 proves semaphore limit was respected
+        // acquired=2 and completedCount=2 confirms semaphore limit was respected
       }
 
       // Verify execution instrumentation was called for both acquired agents
@@ -7258,6 +7257,8 @@ class AgentAcquisitionServiceTest {
       // WHEN: Multiple threads try to remove the same agents concurrently
       CountDownLatch startLatch = new CountDownLatch(1);
       CountDownLatch doneLatch = new CountDownLatch(NUM_THREADS);
+      java.util.concurrent.atomic.AtomicReference<Exception> threadException =
+          new java.util.concurrent.atomic.AtomicReference<>();
 
       for (int i = 0; i < NUM_THREADS; i++) {
         concurrencyExecutor.submit(
@@ -7270,7 +7271,7 @@ class AgentAcquisitionServiceTest {
                   concurrencyService.removeActiveAgent("agent-" + j);
                 }
               } catch (Exception e) {
-                e.printStackTrace();
+                threadException.compareAndSet(null, e);
               } finally {
                 doneLatch.countDown();
               }
@@ -7279,6 +7280,9 @@ class AgentAcquisitionServiceTest {
 
       startLatch.countDown(); // Start all threads
       assertTrue(doneLatch.await(10, TimeUnit.SECONDS), "All threads should complete");
+      assertThat(threadException.get())
+          .describedAs("No exceptions should occur during concurrent removeActiveAgent calls")
+          .isNull();
 
       // THEN: Operations should complete successfully without exceptions
       // The main goal is to ensure removeActiveAgent is thread-safe and idempotent
@@ -7447,7 +7451,7 @@ class AgentAcquisitionServiceTest {
       // Verify Redis state: agents moved from WAITING_SET to WORKING_SET
       try (Jedis jedis = fairnessJedisPool.getResource()) {
         // Agents may have completed, but at least some should have been in working set
-        // The key verification is that acquired=5, which proves agents were moved from WAITING_SET
+        // The key verification is acquired=5, which confirms agents were moved from WAITING_SET
         // to WORKING_SET
         // Agents may have completed quickly and been removed from Redis
       }
@@ -7703,7 +7707,7 @@ class AgentAcquisitionServiceTest {
       assertThat(maintainedActivation).isTrue();
 
       // Final verification: Agent should still be active (timer hasn't fired prematurely)
-      // This proves timer uses nowMsCached (consistent time source), not nowMsWithOffset()
+      // This confirms timer uses nowMsCached (consistent time source), not nowMsWithOffset()
       assertThat(acquisitionService.getActiveAgentCount())
           .describedAs(
               "Agent should still be active after 500ms (dead-man timer uses consistent time source, "
@@ -11634,7 +11638,7 @@ class AgentAcquisitionServiceTest {
         Semaphore semaphore = new Semaphore(10);
         acquisitionService.saturatePool(1L, semaphore, executorService);
 
-        // Then: Recovery queue should be empty (proves processRecoveryQueue was called)
+        // Then: Recovery queue should be empty (confirms processRecoveryQueue was called)
         assertThat(recoveryQueue.size())
             .describedAs("Recovery queue should be empty after saturatePool processes it")
             .isEqualTo(0);
@@ -11642,18 +11646,35 @@ class AgentAcquisitionServiceTest {
         // And: Agent should be recoverable in the system (waiting, working, or completion queue)
         // After a single saturatePool cycle, the agent may be:
         // - In waiting (recovered but not yet acquired)
-        // - In working (recovered and acquired)
+        // - In working (recovered and acquired, executing asynchronously)
         // - In completion queue (executed and awaiting next cycle)
         // - Back in waiting (if completion was processed via second internal call)
         //
-        // We verify the agent wasn't permanently lost by running a second saturatePool
-        // to process any pending completions
-        acquisitionService.saturatePool(2L, semaphore, executorService);
+        // Agent execution happens asynchronously on executor thread. We need to:
+        // 1. Wait for execution to complete (active count drops or agent appears in Redis)
+        // 2. Run additional saturatePool cycles to process pending completions
+        // 3. Poll for agent to appear in Redis (handles async timing variations)
 
-        // Now check agent is in Redis
+        // Poll for agent to appear in Redis, running saturatePool to process completions
+        // This handles the race between async execution and completion processing
+        boolean agentInRedis =
+            TestFixtures.waitForCondition(
+                () -> {
+                  // Run saturatePool to process any pending completions
+                  acquisitionService.saturatePool(
+                      System.currentTimeMillis(), semaphore, executorService);
+                  // Check if agent is in Redis
+                  Double waiting = jedis.zscore("waiting", "saturate-recovery-agent");
+                  Double working = jedis.zscore("working", "saturate-recovery-agent");
+                  return waiting != null || working != null;
+                },
+                3000, // 3 second timeout (generous for async completion processing)
+                100); // Poll every 100ms
+
+        // Final verification
         Double waitingScore = jedis.zscore("waiting", "saturate-recovery-agent");
         Double workingScore = jedis.zscore("working", "saturate-recovery-agent");
-        assertThat(waitingScore != null || workingScore != null)
+        assertThat(agentInRedis)
             .describedAs(
                 "Agent should be in Redis after recovery and completion processing. "
                     + "waiting=%s, working=%s",

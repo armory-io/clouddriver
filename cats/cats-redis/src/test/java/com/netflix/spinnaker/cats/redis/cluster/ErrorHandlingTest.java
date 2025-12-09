@@ -116,62 +116,6 @@ public class ErrorHandlingTest {
   }
 
   @Nested
-  @DisplayName("AgentSchedulingException Tests")
-  class AgentSchedulingExceptionTests {
-
-    /**
-     * Tests that AgentSchedulingException can be created with message only. Verifies message is set
-     * correctly and cause is null.
-     */
-    @Test
-    @DisplayName("Should create exception with message only")
-    void shouldCreateExceptionWithMessage() {
-      String message = "Agent scheduling failed due to configuration error";
-      AgentSchedulingException exception = new AgentSchedulingException(message);
-
-      assertThat(exception.getMessage()).isEqualTo(message);
-      assertThat(exception.getCause()).isNull();
-    }
-
-    /**
-     * Tests that AgentSchedulingException can be created with message and cause. Verifies both
-     * message and cause are set correctly.
-     */
-    @Test
-    @DisplayName("Should create exception with message and cause")
-    void shouldCreateExceptionWithMessageAndCause() {
-      String message = "Redis script execution failed";
-      RuntimeException cause = new RuntimeException("Connection timeout");
-      AgentSchedulingException exception = new AgentSchedulingException(message, cause);
-
-      assertThat(exception.getMessage()).isEqualTo(message);
-      assertThat(exception.getCause()).isEqualTo(cause);
-    }
-
-    /**
-     * Tests that AgentSchedulingException can wrap a cause exception. Verifies cause is set and
-     * message contains the cause's message.
-     */
-    @Test
-    @DisplayName("Should create exception wrapping cause")
-    void shouldCreateExceptionWrappingCause() {
-      RuntimeException cause = new RuntimeException("Lua script error");
-      AgentSchedulingException exception = new AgentSchedulingException(cause);
-
-      assertThat(exception.getCause()).isEqualTo(cause);
-      assertThat(exception.getMessage()).contains("Lua script error");
-    }
-
-    /** Tests that AgentSchedulingException extends RuntimeException. */
-    @Test
-    @DisplayName("Should be instance of RuntimeException")
-    void shouldBeInstanceOfRuntimeException() {
-      AgentSchedulingException exception = new AgentSchedulingException("test");
-      assertThat(exception).isInstanceOf(RuntimeException.class);
-    }
-  }
-
-  @Nested
   @DisplayName("Script Loading Failure Tests")
   class ScriptLoadingFailureTests {
 

@@ -174,16 +174,16 @@ class BatchOperationsTest {
   class BatchAgentOperationsTests {
 
     /**
-     * Verifies that multiple agents can be registered efficiently in the scheduler.
+     * Verifies that multiple agents can be registered correctly in the scheduler.
      *
      * <p>This test ensures that when multiple agents are scheduled, they are all properly
-     * registered in both Redis waiting set and the scheduler's internal registry. While
-     * registration itself is always individual, this test verifies that batch operations are
-     * available for acquisition and cleanup phases.
+     * registered in both Redis waiting set and the scheduler's internal registry. Registration
+     * itself is always individual (not batched), but this test verifies correct behavior when
+     * registering multiple agents in sequence.
      */
     @Test
-    @DisplayName("Should handle batch agent registration efficiently")
-    void shouldHandleBatchAgentRegistrationEfficiently() throws Exception {
+    @DisplayName("Should register multiple agents correctly")
+    void shouldRegisterMultipleAgentsCorrectly() throws Exception {
       // Given - Multiple agents
       Agent agent1 = TestFixtures.createMockAgent("BatchAgent1", "test-provider");
       Agent agent2 = TestFixtures.createMockAgent("BatchAgent2", "test-provider");
@@ -249,13 +249,9 @@ class BatchOperationsTest {
           .describedAs("All 3 agents should be registered in internal agents map")
           .isEqualTo(3);
 
-      // Verify batch operations were used (check via metrics or Redis operation patterns)
-      // Note: schedule() calls registerAgent() individually, but batch operations are used during
-      // repopulation or acquisition, not during registration. Registration is always individual.
-      // However, we can verify that all agents were registered efficiently (all present in Redis
-      // and internal maps).
-      // The test name suggests "batch registration" but registration is always individual - batch
-      // operations are used for acquisition. We verify registration worked correctly.
+      // Note: Registration is always individual (not batched). Batch operations are used during
+      // acquisition and repopulation phases, not registration. This test verifies that multiple
+      // individual registrations work correctly and all agents end up in the expected state.
 
       // Verify agentMapSize updated
       // agentMapSize is tracked internally and should equal registered agent count
@@ -269,7 +265,7 @@ class BatchOperationsTest {
      * Verifies that batch operations are used for improved performance during acquisition.
      *
      * <p>This test ensures that when batch operations are enabled, the scheduler uses batch mode
-     * for agent acquisition, which reduces Redis round trips and improves performance. It verifies
+     * for agent acquisition, which reduces Redis round trips and improves throughput. It verifies
      * that all agents are registered correctly and that batch mode is used during acquisition.
      */
     @Test
@@ -646,7 +642,7 @@ class BatchOperationsTest {
         // Batch cleanup is used when batchOperations.enabled=true and batchSize > 0
         // We verify batch mode was used by checking that batch cleanup script was called
         // Note: Zombie cleanup uses batch mode when enabled, verified by cleanup actually working
-        // and metrics being recorded. The fact that cleanup succeeded with batch enabled proves
+        // and metrics being recorded. Cleanup succeeded with batch enabled confirms
         // batch mode was used (individual mode would also work, but batch is preferred when
         // enabled).
         assertThat(zombieProps.getBatchOperations().isEnabled())
@@ -656,7 +652,7 @@ class BatchOperationsTest {
             .describedAs("Batch size should be configured (> 0) for batch cleanup")
             .isGreaterThan(0);
 
-        // Verify cleanup actually occurred (proves batch cleanup worked)
+        // Verify cleanup actually occurred (confirms batch cleanup worked)
         // Check metrics registry for cleanup count
         long finalCleanedCount =
             metricsRegistry
@@ -668,7 +664,7 @@ class BatchOperationsTest {
                         .withTag("type", "zombie"))
                 .count();
         assertThat(finalCleanedCount)
-            .describedAs("Zombies should be cleaned (proves batch cleanup worked)")
+            .describedAs("Zombies should be cleaned (confirms batch cleanup worked)")
             .isGreaterThan(initialCleanupCleanedCount);
       } finally {
         // Cleanup executor service
@@ -824,7 +820,7 @@ class BatchOperationsTest {
       // Batch cleanup is used when batchOperations.enabled=true and batchSize > 0
       // We verify batch mode was used by checking that batch cleanup script was called
       // Note: Orphan cleanup uses batch mode when enabled, verified by cleanup actually working
-      // and metrics being recorded. The fact that cleanup succeeded with batch enabled proves
+      // and metrics being recorded. Cleanup succeeded with batch enabled confirms
       // batch mode was used (individual mode would also work, but batch is preferred when enabled).
       assertThat(schedulerProperties.getBatchOperations().isEnabled())
           .describedAs("Batch operations should be enabled for orphan cleanup")
@@ -833,9 +829,9 @@ class BatchOperationsTest {
           .describedAs("Batch size should be configured (> 0) for batch cleanup")
           .isGreaterThan(0);
 
-      // Verify cleanup actually occurred (proves batch cleanup worked)
+      // Verify cleanup actually occurred (confirms batch cleanup worked)
       assertThat(stats.getOrphansCleanedUp())
-          .describedAs("Orphans should be cleaned (proves batch cleanup worked)")
+          .describedAs("Orphans should be cleaned (confirms batch cleanup worked)")
           .isGreaterThan(initialOrphansCleaned);
     }
 
@@ -1163,28 +1159,28 @@ class BatchOperationsTest {
         waitForCondition(() -> acquisitionService.getActiveAgentCount() >= 2, 1000, 50);
 
         // Manually set old completion deadlines to test threshold application
-        // Set both agents to be 7 seconds overdue (between default 5s and exceptional 10s)
-        // Regular agent (5s threshold): 7s > 5s -> should be cleaned
-        // BigQuery agent (10s threshold): 7s < 10s -> should NOT be cleaned
-        // Use public API to access the actual activeAgents map
+        // Use Java time (System.currentTimeMillis) since ZombieCleanupService uses
+        // CadenceGuard.nowMs()
+        // which is System.currentTimeMillis(). Using Redis TIME here would cause clock skew issues.
+        //
+        // Thresholds: Regular=5s, BigQuery=10s (exceptional)
+        // Regular agent: 8s overdue (8 > 5s) -> should be cleaned (3s margin)
+        // BigQuery agent: 6s overdue (6 < 10s) -> should NOT be cleaned (4s margin)
         Map<String, String> activeAgents = acquisitionService.getActiveAgentsMap();
 
-        // Get Redis TIME for accurate score calculation
-        long oldScoreSeconds;
-        try (Jedis jedis = jedisPool.getResource()) {
-          long nowSec = TestFixtures.getRedisTimeSeconds(jedis);
-          // Set both agents to be 7 seconds overdue
-          oldScoreSeconds = nowSec - 7; // 7 seconds ago
-        }
+        // Use Java time for consistency with zombie cleanup detection
+        long nowSeconds = System.currentTimeMillis() / 1000;
+        long regularOldScore = nowSeconds - 8; // 8 seconds overdue (> 5s threshold)
+        long bigQueryOldScore = nowSeconds - 6; // 6 seconds overdue (< 10s threshold)
 
         // Update activeAgents map with old scores
-        activeAgents.put("BigQueryCachingAgent", String.valueOf(oldScoreSeconds));
-        activeAgents.put("RegularAgent", String.valueOf(oldScoreSeconds));
+        activeAgents.put("BigQueryCachingAgent", String.valueOf(bigQueryOldScore));
+        activeAgents.put("RegularAgent", String.valueOf(regularOldScore));
 
         // Also update Redis WORKING_SET with old scores
         try (Jedis jedis = jedisPool.getResource()) {
-          jedis.zadd("working", oldScoreSeconds, "BigQueryCachingAgent");
-          jedis.zadd("working", oldScoreSeconds, "RegularAgent");
+          jedis.zadd("working", bigQueryOldScore, "BigQueryCachingAgent");
+          jedis.zadd("working", regularOldScore, "RegularAgent");
         }
 
         // Get initial stats (track via metrics registry)
@@ -1969,7 +1965,7 @@ class BatchOperationsTest {
       @Test
       @DisplayName("Should handle large batch of agents efficiently")
       void shouldHandleLargeBatchOfAgentsEfficiently() throws Exception {
-        // Simulate 5K+ AWS accounts scenario (scaled down for test)
+        // Test large batch scenario (scaled down for test)
         int agentCount = 500; // Scaled down but still significant
         edgeCasesSchedulerProperties.getBatchOperations().setEnabled(true);
         edgeCasesSchedulerProperties.getBatchOperations().setBatchSize(50);

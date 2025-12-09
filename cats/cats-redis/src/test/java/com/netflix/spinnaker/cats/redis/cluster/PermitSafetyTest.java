@@ -449,7 +449,7 @@ class PermitSafetyTest {
       }
 
       // Execution failure metrics are tracked internally via ExecutionInstrumentation
-      // The fact that permit was released and agent was requeued proves failure was handled
+      // Permit released and agent requeued confirms failure was handled
 
       pool.shutdown();
       pool.awaitTermination(3, TimeUnit.SECONDS);

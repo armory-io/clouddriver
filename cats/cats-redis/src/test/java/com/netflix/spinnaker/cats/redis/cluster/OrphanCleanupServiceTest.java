@@ -195,7 +195,7 @@ class OrphanCleanupServiceTest {
                 "Waiting set should be empty (agents removed, not moved to waiting without acquisitionService)")
             .isEqualTo(0);
 
-        // Verify specific agents are NOT in waiting set (proves they were removed, not moved)
+        // Verify specific agents are NOT in waiting set (confirms they were removed, not moved)
         TestFixtures.assertAgentNotInSet(jedis, "waiting", "orphan-1");
         TestFixtures.assertAgentNotInSet(jedis, "waiting", "orphan-2");
       }
@@ -267,7 +267,7 @@ class OrphanCleanupServiceTest {
 
       assertThat(orphanService.getOrphansCleanedUp())
           .describedAs(
-              "Orphans cleaned up counter should be incremented by 1 (proves metrics called)")
+              "Orphans cleaned up counter should be incremented by 1 (confirms metrics called)")
           .isEqualTo(initialCleanedUp + 1);
     }
 
@@ -608,7 +608,7 @@ class OrphanCleanupServiceTest {
 
       assertThat(orphanService.getOrphansCleanedUp())
           .describedAs(
-              "Orphans cleaned up counter should be incremented by 2 (proves metrics called for combined WORKING + WAITING cleanup)")
+              "Orphans cleaned up counter should be incremented by 2 (confirms metrics called for combined WORKING + WAITING cleanup)")
           .isEqualTo(initialCleanedUp + 2);
     }
   }
@@ -660,7 +660,7 @@ class OrphanCleanupServiceTest {
 
     /**
      * Tests batch cleanup with small batch size. Verifies all orphans cleaned (5) despite batch
-     * size limit (2), pagination occurred (all 5 cleaned proves multiple batches), working set
+     * size limit (2), pagination occurred (all 5 cleaned confirms multiple batches), working set
      * empty, and metrics recorded.
      */
     @Test
@@ -695,10 +695,10 @@ class OrphanCleanupServiceTest {
 
       // Then - Should clean all orphans (multiple batches)
       // With batchSize=2 and 5 orphans, pagination should occur (at least 2-3 batches)
-      // The fact that all 5 orphans were cleaned proves pagination worked correctly
+      // All 5 orphans cleaned confirms pagination worked correctly
       assertThat(cleaned)
           .describedAs(
-              "All 5 orphans should be cleaned despite batchSize=2 (proves pagination occurred)")
+              "All 5 orphans should be cleaned despite batchSize=2 (confirms pagination occurred)")
           .isEqualTo(5);
 
       try (Jedis jedis = jedisPool.getResource()) {
@@ -933,7 +933,7 @@ class OrphanCleanupServiceTest {
       // Then
       assertThat(cleaned).isEqualTo(0);
 
-      // Verify cleanup time is recorded even with 0 cleaned (proves method ran successfully)
+      // Verify cleanup time is recorded even with 0 cleaned (confirms method ran successfully)
       assertThat(getCleanupTimeCount())
           .describedAs("recordCleanupTime('orphan', elapsed) should be called even with 0 cleaned")
           .isGreaterThan(initialCleanupTimeCount);
@@ -1068,13 +1068,13 @@ class OrphanCleanupServiceTest {
           .isLessThanOrEqualTo(afterCleanup);
 
       // Verify timestamp is closer to start than end (within first 500ms of cleanup start)
-      // This proves timestamp was updated early, not at the end
+      // This confirms timestamp was updated early, not at the end
       // Using 500ms threshold to account for CI/test environment variability while still
       // verifying that timestamp is updated early (not at the end of cleanup)
       long timeFromStart = lastCleanup - beforeCleanup;
       long totalDuration = afterCleanup - beforeCleanup;
       if (totalDuration > 0) {
-        // Timestamp should be updated within first 500ms (proves START update)
+        // Timestamp should be updated within first 500ms (confirms START update)
         // This threshold is generous enough for CI environments but still verifies early update
         assertThat(timeFromStart)
             .describedAs(
@@ -1248,7 +1248,7 @@ class OrphanCleanupServiceTest {
 
       assertThat(orphanService.getOrphansCleanedUp())
           .describedAs(
-              "Orphans cleaned up counter should be incremented by 1 (proves metrics called for valid agent rescheduling)")
+              "Orphans cleaned up counter should be incremented by 1 (confirms metrics called for valid agent rescheduling)")
           .isEqualTo(initialCleanedUp + 1);
     }
 
@@ -1360,7 +1360,7 @@ class OrphanCleanupServiceTest {
 
       assertThat(orphanService.getOrphansCleanedUp())
           .describedAs(
-              "Orphans cleaned up counter should be incremented by 3 (proves metrics called for mixed valid/invalid cleanup)")
+              "Orphans cleaned up counter should be incremented by 3 (confirms metrics called for mixed valid/invalid cleanup)")
           .isEqualTo(initialCleanedUp + 3);
     }
 
@@ -1821,8 +1821,8 @@ class OrphanCleanupServiceTest {
      *
      * <p>Verification approach: The test creates two service instances, has service1 acquire
      * leadership via cleanup, verifies service2 cannot acquire (leadership held), waits for TTL to
-     * expire, then verifies service2 can acquire leadership. This proves TTL expiry and leadership
-     * coordination work correctly.
+     * expire, then verifies service2 can acquire leadership. This confirms TTL expiry and
+     * leadership coordination work correctly.
      */
     @Test
     @DisplayName("tryAcquireCleanupLeadership respects TTL and returns false when held")
@@ -1931,7 +1931,7 @@ class OrphanCleanupServiceTest {
       long afterCleanup2AfterTtl = service2.getLastOrphanCleanup();
 
       // Verify service2 acquired leadership and ran cleanup (lastOrphanCleanup updated)
-      // This proves leadership was acquired (cleanup only runs after leadership acquisition)
+      // This confirms leadership was acquired (cleanup only runs after leadership acquisition)
       assertThat(afterCleanup2AfterTtl)
           .describedAs(
               "Service2 should have acquired leadership after TTL expiry and ran cleanup. Before: "
@@ -1942,7 +1942,7 @@ class OrphanCleanupServiceTest {
 
       // Optionally verify instance ID by checking Redis during cleanup execution
       // (cleanup releases leadership in finally block, so we can't check after it completes)
-      // The key verification is that cleanup ran, which proves leadership was acquired
+      // The key verification is that cleanup ran, which confirms leadership was acquired
     }
   }
 
@@ -2460,7 +2460,7 @@ class OrphanCleanupServiceTest {
    *
    * <p>Verification approach: The test creates two service instances, has service1 acquire
    * leadership, simulates a hung cleanup by not releasing leadership and waiting for TTL to expire,
-   * then verifies service2 can acquire leadership with a different instance ID. This proves the
+   * then verifies service2 can acquire leadership with a different instance ID. This confirms the
    * hang guard mechanism works by allowing TTL expiry to break leadership monopolization.
    */
   @Test
@@ -2578,7 +2578,7 @@ class OrphanCleanupServiceTest {
     // leadership might already be released. So let's check DURING cleanup by using a latch
 
     // Verify that service2 can acquire leadership after TTL expiry
-    // The key test is that cleanup runs, which proves leadership was acquired
+    // The key test is that cleanup runs, which confirms leadership was acquired
     // (lastOrphanCleanup is only updated AFTER leadership acquisition in
     // cleanupOrphanedAgentsIfNeeded)
 
@@ -2624,7 +2624,7 @@ class OrphanCleanupServiceTest {
 
     long lastCleanupAfter = service2.getLastOrphanCleanup();
 
-    // If lastOrphanCleanup is updated, it proves:
+    // If lastOrphanCleanup is updated, it confirms:
     // 1. Cleanup is enabled
     // 2. Interval check passed
     // 3. Leadership was acquired (lastOrphanCleanup is only updated after acquisition)
@@ -2708,7 +2708,7 @@ class OrphanCleanupServiceTest {
     String service2InstanceId = service2InstanceIdRef[0];
 
     // Verify service2 acquired leadership with a different instance ID
-    // This proves the hang guard mechanism (TTL expiry) allows service2 to acquire leadership
+    // This confirms the hang guard mechanism (TTL expiry) allows service2 to acquire leadership
     // even though service1 didn't explicitly release it
     // Note: If cleanup is very fast, leadership might already be released, but we've already
     // proven that service2 CAN acquire leadership (lastOrphanCleanup was updated above)

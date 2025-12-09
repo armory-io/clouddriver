@@ -315,7 +315,7 @@ class ZombieCleanupServiceTest {
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned)
       // Metrics are recorded during cleanup, verified indirectly via getZombiesCleanedUp() counter
       assertThat(zombieService.getZombiesCleanedUp())
-          .describedAs("Zombies cleaned up counter should be incremented (proves metrics called)")
+          .describedAs("Zombies cleaned up counter should be incremented (confirms metrics called)")
           .isEqualTo(1);
     }
 
@@ -462,7 +462,7 @@ class ZombieCleanupServiceTest {
       // Metrics are recorded during cleanup, verified indirectly via getZombiesCleanedUp() counter
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented by 3 (proves metrics called for batch cleanup)")
+              "Zombies cleaned up counter should be incremented by 3 (confirms metrics called for batch cleanup)")
           .isEqualTo(3);
     }
   }
@@ -542,7 +542,7 @@ class ZombieCleanupServiceTest {
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned)
       // Metrics are recorded during cleanup, verified indirectly via getZombiesCleanedUp() counter
       assertThat(zombieService.getZombiesCleanedUp())
-          .describedAs("Zombies cleaned up counter should be incremented (proves metrics called)")
+          .describedAs("Zombies cleaned up counter should be incremented (confirms metrics called)")
           .isEqualTo(initialCleanedUp + 1);
     }
 
@@ -622,7 +622,7 @@ class ZombieCleanupServiceTest {
       // Metrics are recorded during cleanup, verified indirectly via getZombiesCleanedUp() counter
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented (proves metrics called even for completed futures)")
+              "Zombies cleaned up counter should be incremented (confirms metrics called even for completed futures)")
           .isEqualTo(initialCleanedUp + 1);
     }
   }
@@ -655,12 +655,12 @@ class ZombieCleanupServiceTest {
       zombieService.cleanupZombieAgentsIfNeeded(activeAgents, activeAgentsFutures);
       long secondCleanupTime = zombieService.getLastZombieCleanup();
 
-      // Then - timestamps equal proves second call was skipped
+      // Then - timestamps equal confirms second call was skipped
       assertThat(firstCleanupTime)
           .describedAs("Second cleanup should be skipped (timestamps equal)")
           .isEqualTo(secondCleanupTime);
 
-      // Counter should be same (no zombies to clean in empty maps, but proves cleanup logic ran)
+      // Counter should be same (no zombies to clean in empty maps, but confirms cleanup logic ran)
       // Note: Counter doesn't increment because activeAgents is empty (0 zombies cleaned)
       // The timestamp equality is the primary verification that interval gating works
     }
@@ -944,7 +944,7 @@ class ZombieCleanupServiceTest {
       // Verify fallback behavior (individual cleanup attempted if batch fails)
       // Note: Zombie cleanup doesn't have explicit fallback to individual mode, but error handling
       // should be graceful
-      // The fact that cleaned=0 and no exception thrown proves graceful error handling
+      // cleaned=0 and no exception thrown confirms graceful error handling
 
       // Verify graceful degradation (service remains functional)
       assertThatCode(() -> invalidService.cleanupZombieAgents(activeAgents, activeAgentsFutures))
@@ -1003,7 +1003,7 @@ class ZombieCleanupServiceTest {
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned(2))
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented by 2 (proves metrics called for counter tracking test)")
+              "Zombies cleaned up counter should be incremented by 2 (confirms metrics called for counter tracking test)")
           .isEqualTo(initialCount + 2);
 
       // Verify counter persistence across multiple cleanup calls
@@ -1107,7 +1107,7 @@ class ZombieCleanupServiceTest {
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned)
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented (proves metrics called for stuck agent cleanup)")
+              "Zombies cleaned up counter should be incremented (confirms metrics called for stuck agent cleanup)")
           .isEqualTo(initialCleanedUp + 1);
     }
   }
@@ -1215,12 +1215,12 @@ class ZombieCleanupServiceTest {
 
       // Verify Redis cleanup attempted (script called even if agent not found)
       // Note: Script is called even if agent not in Redis - this is verified by cleanup returning 1
-      // The fact that cleaned=1 proves cleanup was attempted
+      // cleaned=1 confirms cleanup was attempted
 
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned)
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented (proves metrics called for local-only zombie cleanup)")
+              "Zombies cleaned up counter should be incremented (confirms metrics called for local-only zombie cleanup)")
           .isEqualTo(initialCleanedUp + 1);
     }
 
@@ -1287,7 +1287,7 @@ class ZombieCleanupServiceTest {
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned)
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented (proves metrics called for future cancellation test)")
+              "Zombies cleaned up counter should be incremented (confirms metrics called for future cancellation test)")
           .isEqualTo(initialCleanedUp + 1);
     }
 
@@ -1392,7 +1392,7 @@ class ZombieCleanupServiceTest {
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned(2))
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented by 2 (proves metrics called for selective cleanup)")
+              "Zombies cleaned up counter should be incremented by 2 (confirms metrics called for selective cleanup)")
           .isEqualTo(initialCleanedUp + 2);
     }
 
@@ -1463,7 +1463,7 @@ class ZombieCleanupServiceTest {
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned(2))
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented by 2 (proves metrics called for invalid score handling)")
+              "Zombies cleaned up counter should be incremented by 2 (confirms metrics called for invalid score handling)")
           .isEqualTo(initialCleanedUp + 2);
     }
 
@@ -1556,7 +1556,7 @@ class ZombieCleanupServiceTest {
       // Metrics are recorded during cleanup, verified indirectly via getZombiesCleanedUp() counter
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented by 1 (proves metrics called for threshold boundary test)")
+              "Zombies cleaned up counter should be incremented by 1 (confirms metrics called for threshold boundary test)")
           .isEqualTo(initialCleanedUp + 1);
     }
 
@@ -1629,7 +1629,7 @@ class ZombieCleanupServiceTest {
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned(3))
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented by 3 (proves metrics called for batch cleanup test)")
+              "Zombies cleaned up counter should be incremented by 3 (confirms metrics called for batch cleanup test)")
           .isEqualTo(initialCleanedUp + 3);
 
       // Verify batch size enforcement
@@ -1691,7 +1691,7 @@ class ZombieCleanupServiceTest {
       // Verify individual mode was used (verify individual script calls or verify batch
       // not used)
       // Since batch operations are disabled, cleanup must use individual mode
-      // Verified indirectly: cleanup succeeded with batch disabled, which proves individual mode
+      // Verified indirectly: cleanup succeeded with batch disabled, which confirms individual mode
       // worked
 
       // Verify all 2 futures cancelled
@@ -1715,7 +1715,7 @@ class ZombieCleanupServiceTest {
       // Metrics are recorded during cleanup, verified indirectly via getZombiesCleanedUp() counter
       assertThat(zombieService.getZombiesCleanedUp())
           .describedAs(
-              "Zombies cleaned up counter should be incremented by 2 (proves metrics called)")
+              "Zombies cleaned up counter should be incremented by 2 (confirms metrics called)")
           .isEqualTo(2);
     }
 
@@ -1781,7 +1781,7 @@ class ZombieCleanupServiceTest {
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned)
       // Metrics are recorded during cleanup, verified indirectly via getZombiesCleanedUp() counter
       assertThat(zombieService.getZombiesCleanedUp())
-          .describedAs("Zombies cleaned up counter should be incremented (proves metrics called)")
+          .describedAs("Zombies cleaned up counter should be incremented (confirms metrics called)")
           .isGreaterThanOrEqualTo(1);
     }
   }
@@ -1912,10 +1912,10 @@ class ZombieCleanupServiceTest {
       verify(acquisition).removeActiveAgent(agentType);
       verify(acquisition).tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight(agentType);
 
-      // Verify metrics counter incremented (proves recordCleanupTime and incrementCleanupCleaned
+      // Verify metrics counter incremented (confirms recordCleanupTime and incrementCleanupCleaned
       // called)
       assertThat(zombieService.getZombiesCleanedUp())
-          .describedAs("Zombies cleaned up counter should be incremented (proves metrics called)")
+          .describedAs("Zombies cleaned up counter should be incremented (confirms metrics called)")
           .isEqualTo(initialCleanedUp + 1);
 
       // Verify agent NOT in WAITING_SET (agent was never in Redis, so should not be there)
@@ -2076,7 +2076,7 @@ class ZombieCleanupServiceTest {
             exceptionalZombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
         assertThat(cleaned)
             .describedAs(
-                "Cleanup should work correctly with valid pattern (proves pattern compiled)")
+                "Cleanup should work correctly with valid pattern (confirms pattern compiled)")
             .isEqualTo(0);
       }
 
@@ -2320,7 +2320,7 @@ class ZombieCleanupServiceTest {
         // counter
         assertThat(exceptionalZombieService.getZombiesCleanedUp())
             .describedAs(
-                "Zombies cleaned up counter should be incremented by 2 (proves metrics called for default threshold test)")
+                "Zombies cleaned up counter should be incremented by 2 (confirms metrics called for default threshold test)")
             .isEqualTo(initialCleanedUp + 2);
       }
 
@@ -2409,7 +2409,7 @@ class ZombieCleanupServiceTest {
         // counter
         assertThat(exceptionalZombieService.getZombiesCleanedUp())
             .describedAs(
-                "Zombies cleaned up counter should be incremented by 1 (proves metrics called for exceptional threshold test)")
+                "Zombies cleaned up counter should be incremented by 1 (confirms metrics called for exceptional threshold test)")
             .isEqualTo(initialCleanedUp + 1);
       }
 
@@ -2495,7 +2495,7 @@ class ZombieCleanupServiceTest {
         // counter
         assertThat(exceptionalZombieService.getZombiesCleanedUp())
             .describedAs(
-                "Zombies cleaned up counter should be incremented by 2 (proves metrics called for exceptional threshold boundary test)")
+                "Zombies cleaned up counter should be incremented by 2 (confirms metrics called for exceptional threshold boundary test)")
             .isEqualTo(initialCleanedUp + 2);
       }
     }
@@ -2592,7 +2592,7 @@ class ZombieCleanupServiceTest {
         // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned(1))
         assertThat(exceptionalZombieService.getZombiesCleanedUp())
             .describedAs(
-                "Zombies cleaned up counter should be incremented by 1 (proves metrics called for contains pattern test)")
+                "Zombies cleaned up counter should be incremented by 1 (confirms metrics called for contains pattern test)")
             .isEqualTo(initialCleanedUp + 1);
       }
 
@@ -2670,7 +2670,7 @@ class ZombieCleanupServiceTest {
         // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned(1))
         assertThat(exceptionalZombieService.getZombiesCleanedUp())
             .describedAs(
-                "Zombies cleaned up counter should be incremented by 1 (proves metrics called for starts with pattern test)")
+                "Zombies cleaned up counter should be incremented by 1 (confirms metrics called for starts with pattern test)")
             .isEqualTo(initialCleanedUp + 1);
       }
 
@@ -2749,7 +2749,7 @@ class ZombieCleanupServiceTest {
         // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned(1))
         assertThat(exceptionalZombieService.getZombiesCleanedUp())
             .describedAs(
-                "Zombies cleaned up counter should be incremented by 1 (proves metrics called for ends with pattern test)")
+                "Zombies cleaned up counter should be incremented by 1 (confirms metrics called for ends with pattern test)")
             .isEqualTo(initialCleanedUp + 1);
       }
     }
@@ -2837,7 +2837,7 @@ class ZombieCleanupServiceTest {
         // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned(3))
         assertThat(exceptionalZombieService.getZombiesCleanedUp())
             .describedAs(
-                "Zombies cleaned up counter should be incremented by 3 (proves metrics called for mixed agent types test)")
+                "Zombies cleaned up counter should be incremented by 3 (confirms metrics called for mixed agent types test)")
             .isEqualTo(initialCleanedUp + 3);
       }
     }
