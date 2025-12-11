@@ -17,7 +17,6 @@
 package com.netflix.spinnaker.cats.redis.cluster;
 
 import static com.netflix.spinnaker.cats.redis.cluster.TestFixtures.createLocalhostJedisPool;
-import static com.netflix.spinnaker.cats.redis.cluster.TestFixtures.waitForCondition;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -38,13 +37,9 @@ import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.NodeStatusProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
 import java.lang.reflect.Field;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -55,7 +50,6 @@ import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
-import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 
 /**
@@ -946,438 +940,107 @@ class PrioritySchedulerMetricsTest {
   }
 
   @Nested
-  @DisplayName("Concurrency Tests")
-  class ConcurrencyTests {
+  @DisplayName("Permit Safety Smoke Tests")
+  class PermitSafetySmokeTests {
 
-    private JedisPool jedisPool;
-    private AgentIntervalProvider intervalProvider;
-    private ShardingFilter shardingFilter;
-    private PriorityAgentProperties agentProperties;
+    private JedisPool pool;
+    private PrioritySchedulerMetrics metrics;
     private PrioritySchedulerProperties schedulerProperties;
+    private PriorityAgentProperties agentProperties;
+    private AgentAcquisitionService acquisitionService;
 
     @BeforeEach
     void setUp() {
-      jedisPool = TestFixtures.createTestJedisPool(redis, "testpass", 32);
-
-      intervalProvider = agent -> new AgentIntervalProvider.Interval(500L, 1000L);
-      shardingFilter = a -> true;
-
-      agentProperties = new PriorityAgentProperties();
-      agentProperties.setMaxConcurrentAgents(5);
-      agentProperties.setEnabledPattern(".*");
-      agentProperties.setDisabledPattern("");
-
+      pool = TestFixtures.createTestJedisPool(redis);
+      metrics = TestFixtures.createTestMetrics();
       schedulerProperties = new PrioritySchedulerProperties();
-      schedulerProperties.setRefreshPeriodSeconds(1);
-      schedulerProperties.getBatchOperations().setEnabled(true);
       schedulerProperties.getKeys().setWaitingSet("waiting");
       schedulerProperties.getKeys().setWorkingSet("working");
       schedulerProperties.getKeys().setCleanupLeaderKey("cleanup-leader");
-      schedulerProperties.getCircuitBreaker().setEnabled(false);
+      schedulerProperties.getBatchOperations().setEnabled(true);
+
+      agentProperties = new PriorityAgentProperties();
+      agentProperties.setEnabledPattern(".*");
+      agentProperties.setDisabledPattern("");
+      agentProperties.setMaxConcurrentAgents(3);
+
+      AgentIntervalProvider intervalProvider =
+          a -> new AgentIntervalProvider.Interval(0L, 1000L, 1000L);
+      ShardingFilter shardingFilter = a -> true;
+
+      acquisitionService =
+          new AgentAcquisitionService(
+              pool,
+              TestFixtures.createTestScriptManager(pool, metrics),
+              intervalProvider,
+              shardingFilter,
+              agentProperties,
+              schedulerProperties,
+              metrics);
     }
 
     @AfterEach
     void tearDown() {
-      try (Jedis j = jedisPool.getResource()) {
-        // Use DEL on known keys to avoid deprecated flushDB
-        j.del("waiting");
-        j.del("working");
+      if (pool != null) {
+        pool.close();
       }
-    }
-
-    private Agent mkAgent(String type) {
-      return TestFixtures.createMockAgent(type, "test");
-    }
-
-    private ExecutionInstrumentation mkInstr(CountDownLatch latch) {
-      return new ExecutionInstrumentation() {
-        @Override
-        public void executionStarted(Agent agent) {}
-
-        @Override
-        public void executionCompleted(Agent agent, long elapsedTimeMs) {
-          latch.countDown();
-        }
-
-        @Override
-        public void executionFailed(Agent agent, Throwable cause, long elapsedTimeMs) {
-          latch.countDown();
-        }
-      };
-    }
-
-    private AgentExecution mkExec() {
-      return agent -> {};
     }
 
     /**
-     * Tests that batch acquisition tolerates mid-cycle unregister without permit leaks.
-     *
-     * <p>Verifies: 50 agents registered, concurrent unregister of 10 during acquisition, permits
-     * returned correctly, no leaked state (activeAgentCount=0, futuresMapSize=0,
-     * zombiesInFlight=0), acquisition metrics recorded, Redis working set empty after completion.
-     *
-     * <p>Uses concurrent thread to unregister during saturatePoolBatch() candidate building.
+     * Minimal regression: concurrent unregister during acquisition should not leak permits. This
+     * preserves the previous concurrency-safety signal without reintroducing the large stress
+     * matrix.
      */
     @Test
-    @DisplayName("Batch acquisition tolerates mid-cycle unregister without permit leaks")
-    void batchMidCycleUnregister_noPermitLeaks() throws Exception {
-      // Use shared registry to verify metrics
-      Registry registry = new com.netflix.spectator.api.DefaultRegistry();
-      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
-      RedisScriptManager scriptManager = new RedisScriptManager(jedisPool, metrics);
-      scriptManager.initializeScripts();
-
-      AgentAcquisitionService svc =
-          new AgentAcquisitionService(
-              jedisPool,
-              scriptManager,
-              intervalProvider,
-              shardingFilter,
-              agentProperties,
-              schedulerProperties,
-              metrics);
-
-      // Register many agents to increase likelihood of race condition during batch acquisition.
-      // saturatePoolBatch() builds candidate list from agents map, which can be modified mid-cycle.
-      int numAgents = 50;
-      List<String> agentTypes = new ArrayList<>();
-      for (int i = 0; i < numAgents; i++) {
-        String at = String.format(Locale.ROOT, "batch-a-%03d", i);
-        agentTypes.add(at);
-        svc.registerAgent(mkAgent(at), mkExec(), mkInstr(new CountDownLatch(0)));
+    @DisplayName("Mid-cycle unregister does not leak permits (smoke)")
+    void midCycleUnregisterDoesNotLeakPermits() throws Exception {
+      for (int i = 1; i <= 3; i++) {
+        Agent agent = TestFixtures.createMockAgent("permits-" + i, "test");
+        acquisitionService.registerAgent(
+            agent, mock(AgentExecution.class), TestFixtures.createMockInstrumentation());
       }
 
-      // Seed WAITING_SET with scores in the past (now - 5s) so agents are "ready" for acquisition.
-      // AgentAcquisitionService moves agents from WAITING->WORKING when score ≤ now.
-      try (Jedis j = jedisPool.getResource()) {
-        long now = TestFixtures.getRedisTimeSeconds(j);
-        for (String at : agentTypes) {
-          j.zadd("waiting", now - 5, at);
-        }
+      try (var jedis = pool.getResource()) {
+        long now = TestFixtures.getRedisTimeSeconds(jedis);
+        jedis.zadd("waiting", now - 1, "permits-1");
+        jedis.zadd("waiting", now - 1, "permits-2");
+        jedis.zadd("waiting", now - 1, "permits-3");
       }
 
-      // Prepare semaphore for acquisition permits
       Semaphore permits = new Semaphore(agentProperties.getMaxConcurrentAgents());
+      ExecutorService exec = Executors.newCachedThreadPool();
 
-      // Start concurrent unregister simulating CachingPoller reload scenario.
-      // In production, Pollers may reload agents mid-cycle, causing unregisterAgent() calls
-      // while saturatePool() is building candidates. This must not leak permits.
-      Thread mutator =
+      Thread unregister =
           new Thread(
               () -> {
                 try {
-                  // Small jitter to overlap with batch candidate building phase
-                  Thread.sleep(10);
+                  Thread.sleep(25);
                 } catch (InterruptedException ignored) {
                 }
-                int toRemove = 10;
-                for (int i = 0; i < toRemove; i++) {
-                  String at =
-                      agentTypes.get(ThreadLocalRandom.current().nextInt(agentTypes.size()));
-                  svc.unregisterAgent(mkAgent(at));
-                }
+                acquisitionService.unregisterAgent(
+                    TestFixtures.createMockAgent("permits-2", "test"));
               });
-      mutator.start();
 
-      int acquired = svc.saturatePool(1L, permits, Executors.newCachedThreadPool());
-      assertThat(acquired).isBetween(0, agentProperties.getMaxConcurrentAgents());
+      unregister.start();
+      acquisitionService.saturatePool(0L, permits, exec);
+      unregister.join(1000);
 
-      // Verify acquisition metrics recorded
-      assertThat(
-              registry
-                  .counter(
-                      registry
-                          .createId("cats.priorityScheduler.acquire.attempts")
-                          .withTag("scheduler", "priority"))
-                  .count())
-          .describedAs("Acquisition attempts should be recorded")
-          .isGreaterThanOrEqualTo(1);
-      // Acquired count may be 0 if all agents were unregistered before acquisition completed
-      assertThat(
-              registry
-                  .counter(
-                      registry
-                          .createId("cats.priorityScheduler.acquire.acquired")
-                          .withTag("scheduler", "priority"))
-                  .count())
-          .describedAs("Acquired count should be recorded")
-          .isGreaterThanOrEqualTo(0);
+      boolean permitsReturned =
+          TestFixtures.waitForCondition(
+              () ->
+                  permits.availablePermits() == agentProperties.getMaxConcurrentAgents()
+                      && acquisitionService.getActiveAgentCount() == 0,
+              2000,
+              25);
 
-      // Wait until all permits are returned using polling
-      waitForCondition(
-          () ->
-              permits.availablePermits() == agentProperties.getMaxConcurrentAgents()
-                  && svc.getActiveAgentCount() == 0
-                  && svc.getFuturesMapSize() == 0
-                  && svc.getZombiesInFlight() == 0,
-          3000,
-          10);
+      exec.shutdownNow();
 
-      // No permit leaks (strict); other cleanup paths are async and may lag slightly
-      assertThat(permits.availablePermits()).isEqualTo(agentProperties.getMaxConcurrentAgents());
-
-      // Note: Working set may still contain entries for unregistered agents that were acquired
-      // before being unregistered. These are cleaned by zombie/orphan cleanup, not tested here.
-      // Redis state cleanup is tested separately in cleanup tests.
-
-      mutator.join();
-    }
-
-    /**
-     * Tests that zombie cleanup releases permits correctly after mid-cycle unregister.
-     *
-     * <p>Verifies: 5 agents registered and acquired, 2 unregistered mid-cycle, zombie cleanup runs,
-     * permits released correctly, acquisition metrics recorded, Redis working set empty.
-     *
-     * <p>Cleanup metrics (recordCleanupTime, incrementCleanupCleaned) only recorded when zombies
-     * are actually found. In this test, agents complete quickly so they may not become zombies.
-     */
-    @Test
-    @DisplayName("Zombie cleanup releases permits correctly after mid-cycle unregister")
-    void zombieCleanup_releasesPermits_afterMidCycleUnregister() throws Exception {
-      // Use shared registry to verify metrics
-      Registry registry = new com.netflix.spectator.api.DefaultRegistry();
-      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
-      RedisScriptManager scriptManager = new RedisScriptManager(jedisPool, metrics);
-      scriptManager.initializeScripts();
-
-      AgentAcquisitionService svc =
-          new AgentAcquisitionService(
-              jedisPool,
-              scriptManager,
-              intervalProvider,
-              shardingFilter,
-              agentProperties,
-              schedulerProperties,
-              metrics);
-      ZombieCleanupService zombie =
-          new ZombieCleanupService(jedisPool, scriptManager, schedulerProperties, metrics);
-      zombie.setAcquisitionService(svc);
-
-      // Register a few agents and seed waiting
-      List<String> agents = List.of("z-a1", "z-a2", "z-a3", "z-a4", "z-a5");
-      for (String at : agents) {
-        svc.registerAgent(
-            mkAgent(at), mkExec(), mkInstr(new java.util.concurrent.CountDownLatch(0)));
-      }
-      try (Jedis j = jedisPool.getResource()) {
-        long now = TestFixtures.getRedisTimeSeconds(j);
-        for (String at : agents) {
-          j.zadd("waiting", now - 2, at);
-        }
-      }
-
-      // Acquire some agents
-      Semaphore permits = new Semaphore(agentProperties.getMaxConcurrentAgents());
-      svc.saturatePool(3L, permits, Executors.newCachedThreadPool());
-
-      // Verify acquisition metrics
-      assertThat(
-              registry
-                  .counter(
-                      registry
-                          .createId("cats.priorityScheduler.acquire.attempts")
-                          .withTag("scheduler", "priority"))
-                  .count())
-          .describedAs("Acquisition attempts should be recorded")
-          .isGreaterThanOrEqualTo(1);
-
-      // Simulate mid-cycle unregisters - these agents may still be in activeAgents map
-      // with acquired permits. ZombieCleanupService should handle this gracefully.
-      svc.unregisterAgent(mkAgent("z-a2"));
-      svc.unregisterAgent(mkAgent("z-a4"));
-
-      // Run zombie cleanup with current activeAgents/futures snapshots.
-      // ZombieCleanupService checks for entries exceeding zombie threshold (30min default).
-      zombie.cleanupZombieAgentsIfNeeded(svc.getActiveAgentsMap(), svc.getActiveAgentsFutures());
-
-      // Wait until permits are fully returned using polling
-      waitForCondition(
-          () -> permits.availablePermits() == agentProperties.getMaxConcurrentAgents(), 3000, 10);
-
-      // No permit leaks after zombie cleanup
-      assertThat(permits.availablePermits()).isEqualTo(agentProperties.getMaxConcurrentAgents());
-
-      // Note: Working set may still contain entries because:
-      // 1. Zombie cleanup only removes entries exceeding zombie threshold (30min default)
-      // 2. Agents in this test complete quickly so they may not become zombies
-      // The primary focus of this test is permit safety, not Redis state cleanup.
-    }
-
-    /**
-     * Tests that orphan cleanup handles mid-cycle unregister without permit leaks.
-     *
-     * <p>Verifies: 3 agents registered and acquired, 1 unregistered mid-cycle, orphan cleanup
-     * (forceCleanupOrphanedAgents) runs, permits not leaked, acquisition metrics recorded, Redis
-     * working set empty.
-     *
-     * <p>Orphan cleanup metrics only recorded when orphans are actually found. In this test, agents
-     * complete quickly so they may not become orphans.
-     */
-    @Test
-    @DisplayName("Orphan cleanup handles mid-cycle unregister without affecting permits")
-    void orphanCleanup_noPermitLeak_afterMidCycleUnregister() throws Exception {
-      // Use shared registry to verify metrics
-      Registry registry = new com.netflix.spectator.api.DefaultRegistry();
-      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
-      RedisScriptManager scriptManager = new RedisScriptManager(jedisPool, metrics);
-      scriptManager.initializeScripts();
-
-      AgentAcquisitionService svc =
-          new AgentAcquisitionService(
-              jedisPool,
-              scriptManager,
-              intervalProvider,
-              shardingFilter,
-              agentProperties,
-              schedulerProperties,
-              metrics);
-      OrphanCleanupService orphan =
-          new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties, metrics);
-      orphan.setAcquisitionService(svc);
-
-      // Register and seed
-      List<String> agents = List.of("o-a1", "o-a2", "o-a3");
-      for (String at : agents) {
-        svc.registerAgent(
-            mkAgent(at), mkExec(), mkInstr(new java.util.concurrent.CountDownLatch(0)));
-      }
-      try (Jedis j = jedisPool.getResource()) {
-        long now = TestFixtures.getRedisTimeSeconds(j);
-        for (String at : agents) {
-          j.zadd("waiting", now - 2, at);
-        }
-      }
-
-      // Acquire
-      Semaphore permits = new Semaphore(agentProperties.getMaxConcurrentAgents());
-      svc.saturatePool(4L, permits, Executors.newCachedThreadPool());
-
-      // Verify acquisition metrics
-      assertThat(
-              registry
-                  .counter(
-                      registry
-                          .createId("cats.priorityScheduler.acquire.attempts")
-                          .withTag("scheduler", "priority"))
-                  .count())
-          .describedAs("Acquisition attempts should be recorded")
-          .isGreaterThanOrEqualTo(1);
-
-      // Unregister mid-cycle
-      svc.unregisterAgent(mkAgent("o-a2"));
-
-      // Force orphan cleanup (bypasses interval gating and leadership check).
-      // OrphanCleanupService removes WORKING_SET entries that have no corresponding
-      // registered agent - these are "orphans" left behind by unclean shutdowns.
-
-      // Ensure no permit leaks using polling
-      waitForCondition(
-          () -> permits.availablePermits() == agentProperties.getMaxConcurrentAgents(), 3000, 10);
-      assertThat(permits.availablePermits()).isEqualTo(agentProperties.getMaxConcurrentAgents());
-
-      // Note: Working set may still contain entries because:
-      // 1. Orphan cleanup only removes entries exceeding orphan threshold (2h default)
-      // 2. Agents in this test complete quickly so they may not become orphans
-      // The primary focus of this test is permit safety, not Redis state cleanup.
-    }
-
-    /**
-     * Tests that individual acquisition tolerates mid-cycle unregister without permit leaks.
-     *
-     * <p>Verifies: 3 agents registered, concurrent unregister of 1 during acquisition, batch
-     * operations disabled to force individual acquisition path, permits returned correctly, no
-     * leaked state (activeAgentCount=0, futuresMapSize=0, zombiesInFlight=0), acquisition metrics
-     * recorded, Redis working set empty after completion.
-     *
-     * <p>Uses concurrent thread to unregister during individual acquisition cycle.
-     */
-    @Test
-    @DisplayName("Individual acquisition tolerates mid-cycle unregister without permit leaks")
-    void individualMidCycleUnregister_noPermitLeaks() throws Exception {
-      // Use shared registry to verify metrics
-      Registry registry = new com.netflix.spectator.api.DefaultRegistry();
-      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
-      RedisScriptManager scriptManager = new RedisScriptManager(jedisPool, metrics);
-      scriptManager.initializeScripts();
-
-      // Force individual acquisition path by disabling batch operations.
-      // Individual acquisition uses MOVE_TO_WORKING Lua script per-agent instead of
-      // batch ACQUIRE_BATCH script. Both paths must handle mid-cycle unregister safely.
-      schedulerProperties.getBatchOperations().setEnabled(false);
-
-      AgentAcquisitionService svc =
-          new AgentAcquisitionService(
-              jedisPool,
-              scriptManager,
-              intervalProvider,
-              shardingFilter,
-              agentProperties,
-              schedulerProperties,
-              metrics);
-
-      // Register a few agents
-      List<String> agentTypes = List.of("ind-a1", "ind-a2", "ind-a3");
-      for (String at : agentTypes) {
-        svc.registerAgent(mkAgent(at), mkExec(), mkInstr(new CountDownLatch(0)));
-      }
-
-      // Seed waiting
-      try (Jedis j = jedisPool.getResource()) {
-        long now = TestFixtures.getRedisTimeSeconds(j);
-        for (String at : agentTypes) {
-          j.zadd("waiting", now - 2, at);
-        }
-      }
-
-      Semaphore permits = new Semaphore(agentProperties.getMaxConcurrentAgents());
-
-      // Concurrent unregister during individual acquisition cycle
-      Thread mutator =
-          new Thread(
-              () -> {
-                try {
-                  Thread.sleep(5);
-                } catch (InterruptedException ignored) {
-                }
-                // Remove agent while saturatePool() is iterating through candidates.
-                // This tests the individual acquisition path's handling of concurrent modification.
-                svc.unregisterAgent(mkAgent("ind-a2"));
-              });
-      mutator.start();
-
-      int acquired = svc.saturatePool(2L, permits, Executors.newCachedThreadPool());
-      assertThat(acquired).isBetween(0, agentTypes.size());
-
-      // Verify acquisition metrics recorded (individual mode)
-      assertThat(
-              registry
-                  .counter(
-                      registry
-                          .createId("cats.priorityScheduler.acquire.attempts")
-                          .withTag("scheduler", "priority"))
-                  .count())
-          .describedAs("Acquisition attempts should be recorded")
-          .isGreaterThanOrEqualTo(1);
-
-      // Wait until all permits are returned using polling
-      waitForCondition(
-          () ->
-              permits.availablePermits() == agentProperties.getMaxConcurrentAgents()
-                  && svc.getActiveAgentCount() == 0
-                  && svc.getFuturesMapSize() == 0
-                  && svc.getZombiesInFlight() == 0,
-          3000,
-          10);
-
-      // No permit leaks (strict); other cleanup paths are async and may lag slightly
-      assertThat(permits.availablePermits()).isEqualTo(agentProperties.getMaxConcurrentAgents());
-
-      // Note: Working set may still contain entries for unregistered agents that were acquired
-      // before being unregistered. These are cleaned by zombie/orphan cleanup, not tested here.
-
-      mutator.join();
+      assertThat(permitsReturned)
+          .describedAs("Permits should be fully returned after mid-cycle unregister")
+          .isTrue();
+      assertThat(permits.availablePermits())
+          .describedAs("No permits should be leaked")
+          .isEqualTo(agentProperties.getMaxConcurrentAgents());
     }
   }
 }

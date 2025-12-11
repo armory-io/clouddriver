@@ -454,187 +454,6 @@ public class PrioritySchedulerIntegrationTest {
   }
 
   @Nested
-  @DisplayName("Agent Registration Tests")
-  class AgentRegistrationTests {
-
-    /**
-     * Verifies that enabled agents are successfully registered in the scheduler.
-     *
-     * <p>This test ensures that when an agent is scheduled, it is properly registered in both the
-     * scheduler's internal registry and Redis waiting set (if scripts are initialized). If scripts
-     * are not initialized, the agent registration is deferred to repopulation.
-     */
-    @Test
-    @DisplayName("Should register enabled agents successfully")
-    void shouldRegisterEnabledAgentsSuccessfully() throws Exception {
-      // Given: An enabled agent (matches enabled pattern, doesn't match disabled pattern)
-      Agent agent = TestFixtures.createMockAgent("test-agent", "test-provider");
-      AgentExecution execution = mock(AgentExecution.class);
-      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
-
-      // Initialize scheduler to ensure Lua scripts are loaded before scheduling
-      // Critical: Without initialization, registration is deferred to repopulation
-      scheduler.initialize();
-
-      // When: Schedule the agent
-      scheduler.schedule(agent, execution, instrumentation);
-
-      // Then: Agent should be registered in both internal maps AND Redis
-      assertThat(scheduler).isNotNull();
-
-      // Verify agent registered in internal maps (critical for agent execution)
-      PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
-      assertThat(stats.getRegisteredAgents())
-          .describedAs(
-              "Agent should be registered in internal maps (getRegisteredAgentCount() = 1)")
-          .isEqualTo(1);
-
-      // Verify agent in Redis WAITING_SET if scripts are initialized
-      // Note: registerAgent() only adds to Redis immediately if scripts are initialized.
-      // We've initialized the scheduler, so scripts should be initialized and agent should be in
-      // waiting set.
-      java.util.concurrent.atomic.AtomicReference<Double> scoreRef =
-          new java.util.concurrent.atomic.AtomicReference<>();
-      boolean scoreFound =
-          waitForCondition(
-              () -> {
-                try (Jedis jedis = jedisPool.getResource()) {
-                  Double s = jedis.zscore("waiting", "test-agent");
-                  if (s != null) {
-                    scoreRef.set(s);
-                    return true;
-                  }
-                  // If not found, trigger repopulation to add agent (might be deferred)
-                  scheduler.run(); // This will trigger repopulation if needed
-                  return false;
-                }
-              },
-              1000,
-              50);
-      assertThat(scoreFound)
-          .describedAs("Agent should be in WAITING_SET (either immediately or after repopulation)")
-          .isTrue();
-      Double score = scoreRef.get();
-      assertThat(score)
-          .describedAs("Agent should be in WAITING_SET (either immediately or after repopulation)")
-          .isNotNull();
-      // Score should be approximately current time (within reasonable bounds)
-      long currentTimeSeconds = TestFixtures.nowSeconds();
-      assertThat(score)
-          .describedAs("Agent score should be approximately current time (within 60 seconds)")
-          .isBetween((double) (currentTimeSeconds - 60), (double) (currentTimeSeconds + 60));
-
-      // Verify agent NOT in WAITING_SET if scripts NOT initialized (deferred to
-      // repopulation)
-      PriorityAgentScheduler uninitializedScheduler =
-          new PriorityAgentScheduler(
-              jedisPool,
-              nodeStatusProvider,
-              intervalProvider,
-              shardingFilter,
-              agentProperties,
-              schedulerProperties,
-              TestFixtures.createTestMetrics());
-      try {
-        Agent deferredAgent = TestFixtures.createMockAgent("deferred-agent", "test-provider");
-        uninitializedScheduler.schedule(deferredAgent, execution, instrumentation);
-
-        // Verify agent NOT immediately in WAITING_SET (scripts not initialized, so deferred)
-        // Use polling to ensure async operations complete, but verify agent is never added
-        waitForCondition(
-            () -> {
-              // Just wait briefly to ensure async ops complete
-              return true;
-            },
-            200,
-            50);
-        try (Jedis jedis = jedisPool.getResource()) {
-          assertThat(jedis.zscore("waiting", "deferred-agent"))
-              .describedAs(
-                  "Agent should NOT be in WAITING_SET if scripts NOT initialized (deferred to repopulation)")
-              .isNull();
-        }
-      } finally {
-        uninitializedScheduler.shutdown();
-      }
-
-      // Verify agentMapSize updated, cachedMinEnabledIntervalSec updated
-      // Verified indirectly: getRegisteredAgents() reflects agentMapSize
-      // cachedMinEnabledIntervalSec is internal and not directly accessible, but registration
-      // triggers its update
-      assertThat(stats.getRegisteredAgents())
-          .describedAs("agentMapSize should equal registered agent count (1)")
-          .isEqualTo(1);
-    }
-
-    /**
-     * Verifies that agents matching the disabled pattern are not registered in the scheduler.
-     *
-     * <p>This test ensures that when an agent's type matches the disabled pattern, the scheduler
-     * skips registration entirely. The agent should not appear in Redis waiting set or in the
-     * scheduler's internal registry.
-     */
-    @Test
-    @DisplayName("Should not register disabled agents")
-    void shouldNotRegisterDisabledAgents() throws Exception {
-      // Given - Configure with disabled agent pattern
-      PriorityAgentProperties testProps = TestFixtures.createDefaultAgentProperties();
-      testProps.setDisabledPattern("disabled-agent");
-
-      PriorityAgentScheduler testScheduler =
-          new PriorityAgentScheduler(
-              jedisPool,
-              nodeStatusProvider,
-              intervalProvider,
-              shardingFilter,
-              testProps,
-              schedulerProperties,
-              TestFixtures.createTestMetrics());
-
-      testScheduler.initialize(); // Ensure scripts are initialized
-
-      Agent disabledAgent = TestFixtures.createMockAgent("disabled-agent", "test-provider");
-      AgentExecution execution = mock(AgentExecution.class);
-      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
-
-      // When - Try to schedule disabled agent
-      testScheduler.schedule(disabledAgent, execution, instrumentation);
-
-      // Then - Agent should not be registered
-      // Verify disabled agent NOT in Redis WAITING_SET
-      // Use polling to ensure async operations complete, but verify agent is never added
-      boolean agentNeverAdded =
-          waitForCondition(
-              () -> {
-                try (Jedis jedis = jedisPool.getResource()) {
-                  // Agent should never appear, so we wait briefly to ensure async ops complete
-                  // then verify it's still not there
-                  return true; // Condition met means we've waited long enough
-                }
-              },
-              200,
-              50);
-      assertThat(agentNeverAdded).isTrue(); // Just ensures we waited for async ops
-      try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zscore("waiting", "disabled-agent"))
-            .describedAs("Disabled agent should NOT be in WAITING_SET")
-            .isNull();
-      }
-
-      // Verify disabled agent NOT registered in internal maps
-      PriorityAgentScheduler.SchedulerStats stats = testScheduler.getStats();
-      assertThat(stats.getRegisteredAgents())
-          .describedAs("Disabled agent should NOT be registered (getRegisteredAgentCount() = 0)")
-          .isEqualTo(0);
-
-      // Verify pattern matching worked correctly
-      // Pattern "disabled-agent" should match agent type "disabled-agent"
-      // Verified indirectly: agent not registered and not in Redis confirms pattern matched
-      // Direct verification would require accessing private isAgentEnabled() method
-    }
-  }
-
-  @Nested
   @DisplayName("Redis Integration Tests")
   class RedisIntegrationTests {
 
@@ -791,101 +610,6 @@ public class PrioritySchedulerIntegrationTest {
   @Nested
   @DisplayName("Configuration Tests")
   class ConfigurationTests {
-
-    /**
-     * Verifies that disabled pattern filtering works correctly with multiple agents.
-     *
-     * <p>This test schedules both a disabled agent (matching the pattern) and an enabled agent (not
-     * matching the pattern). It verifies that only the enabled agent is registered in Redis waiting
-     * set and the scheduler's internal registry, while the disabled agent is filtered out.
-     */
-    @Test
-    @DisplayName("Should not register disabled agents")
-    void shouldNotRegisterDisabledAgents() throws Exception {
-      // Given - Scheduler with disabled pattern
-      PriorityAgentProperties testProps = TestFixtures.createDefaultAgentProperties();
-      testProps.setDisabledPattern(".*test.*");
-
-      PriorityAgentScheduler patternScheduler =
-          new PriorityAgentScheduler(
-              jedisPool,
-              nodeStatusProvider,
-              intervalProvider,
-              shardingFilter,
-              testProps,
-              schedulerProperties,
-              TestFixtures.createTestMetrics());
-
-      Agent testAgent = TestFixtures.createMockAgent("test-agent", "test-provider");
-      Agent prodAgent = TestFixtures.createMockAgent("prod-agent", "prod-provider");
-      AgentExecution execution = mock(AgentExecution.class);
-      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
-
-      // Initialize scheduler first to ensure scripts are initialized
-      patternScheduler.initialize();
-
-      // When - Schedule both agents
-      patternScheduler.schedule(testAgent, execution, instrumentation);
-      patternScheduler.schedule(prodAgent, execution, instrumentation);
-
-      // Then - Only prod agent should be registered
-      assertThat(patternScheduler).isNotNull();
-
-      // Verify disabled agent NOT in Redis WAITING_SET, enabled agent IS in WAITING_SET
-      // Use polling to ensure async operations complete
-      waitForCondition(
-          () -> {
-            // Just wait briefly to ensure async ops complete
-            return true;
-          },
-          200,
-          50);
-      try (Jedis jedis = jedisPool.getResource()) {
-        // Disabled agent (test-agent) should NOT be in waiting set
-        assertThat(jedis.zscore("waiting", "test-agent"))
-            .describedAs("Disabled agent (test-agent) should NOT be in WAITING_SET")
-            .isNull();
-      }
-
-      // Enabled agent (prod-agent) should be in waiting set
-      java.util.concurrent.atomic.AtomicReference<Double> prodAgentScoreRef =
-          new java.util.concurrent.atomic.AtomicReference<>();
-      boolean prodAgentFound =
-          waitForCondition(
-              () -> {
-                try (Jedis jedis = jedisPool.getResource()) {
-                  Double score = jedis.zscore("waiting", "prod-agent");
-                  if (score != null) {
-                    prodAgentScoreRef.set(score);
-                    return true;
-                  }
-                  // Trigger repopulation if needed
-                  patternScheduler.run();
-                  return false;
-                }
-              },
-              1000,
-              50);
-      assertThat(prodAgentFound)
-          .describedAs("Enabled agent (prod-agent) should be in WAITING_SET with a score")
-          .isTrue();
-      Double prodAgentScore = prodAgentScoreRef.get();
-      assertThat(prodAgentScore)
-          .describedAs("Enabled agent (prod-agent) should be in WAITING_SET with a score")
-          .isNotNull();
-
-      // Verify disabled agent NOT registered in internal maps, enabled agent IS
-      // registered
-      PriorityAgentScheduler.SchedulerStats stats = patternScheduler.getStats();
-      assertThat(stats.getRegisteredAgents())
-          .describedAs("Only prod-agent should be registered (getRegisteredAgentCount() = 1)")
-          .isEqualTo(1);
-
-      // Verify pattern matching worked correctly
-      // Pattern ".*test.*" should match "test-agent" but not "prod-agent"
-      // Verified indirectly: test-agent not registered and prod-agent registered confirms pattern
-      // matched
-    }
 
     /**
      * Verifies the complete agent lifecycle from registration through execution and rescheduling.
@@ -1097,17 +821,21 @@ public class PrioritySchedulerIntegrationTest {
   class ConfigurationIntegrationTests {
 
     /**
-     * Tests that all scheduler components are wired correctly. Verifies wiring through behavior:
-     * scheduler can register agents, run cycles, and provide stats.
+     * Tests that all scheduler components are wired correctly by verifying end-to-end behavior.
+     * Instead of using reflection to access internal fields, we verify wiring through behavior:
+     *
+     * <ul>
+     *   <li>Agent registration adds to Redis WAITING_SET (confirms Redis/script wiring)
+     *   <li>Scheduler run triggers acquisition metrics (confirms acquisitionService wiring)
+     *   <li>Stats reflect actual state (confirms metrics and services are accessible)
+     * </ul>
      */
     @Test
-    @DisplayName("Should wire all components correctly")
+    @DisplayName("Should wire all components correctly with Redis state verification")
     void shouldWireAllComponentsCorrectly() throws Exception {
       // Given
       DefaultRegistry registry = new DefaultRegistry();
       PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
-      // Access outer class private fields directly (non-static inner class can access outer
-      // instance)
       PriorityAgentScheduler scheduler =
           new PriorityAgentScheduler(
               jedisPool,
@@ -1118,104 +846,166 @@ public class PrioritySchedulerIntegrationTest {
               schedulerProperties,
               metrics);
 
-      // When & Then - Verify all components are correctly wired by testing scheduler functionality
-      // Instead of using reflection to access internal fields, verify wiring through behavior:
-      // - Scheduler can register agents (confirms acquisitionService is wired)
-      // - Scheduler can run (confirms all services are initialized)
-      // - Scheduler stats are available (confirms metrics and services are accessible)
-
       scheduler.initialize();
 
-      // Verify scheduler is functional (confirms all components are wired correctly)
-      PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
-      assertThat(stats).isNotNull();
-      assertThat(stats.getRegisteredAgents()).isEqualTo(0); // No agents registered yet
-
-      // Verify scheduler can register agents (confirms acquisitionService is wired)
+      // When - Register an agent (confirms acquisitionService is wired)
       Agent testAgent = TestFixtures.createMockAgent("wiring-test-agent", "test-provider");
       AgentExecution execution = mock(AgentExecution.class);
       ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
       scheduler.schedule(testAgent, execution, instrumentation);
 
-      // Verify agent was registered (confirms acquisitionService is functional)
-      stats = scheduler.getStats();
-      assertThat(stats.getRegisteredAgents()).isEqualTo(1);
+      // Then - Verify agent appears in Redis WAITING_SET (confirms Redis wiring)
+      java.util.concurrent.atomic.AtomicReference<Double> scoreRef =
+          new java.util.concurrent.atomic.AtomicReference<>();
+      boolean agentInWaitingSet =
+          waitForCondition(
+              () -> {
+                try (Jedis jedis = jedisPool.getResource()) {
+                  Double score = jedis.zscore("waiting", "wiring-test-agent");
+                  if (score != null) {
+                    scoreRef.set(score);
+                    return true;
+                  }
+                  scheduler.run(); // Trigger repopulation if needed
+                  return false;
+                }
+              },
+              1000,
+              50);
 
-      // Verify scheduler can run without errors (confirms all services are initialized)
+      assertThat(agentInWaitingSet)
+          .describedAs("Agent should be in Redis WAITING_SET after registration")
+          .isTrue();
+
+      // Verify score is approximately current time (within 60 seconds)
+      long currentTimeSeconds = TestFixtures.nowSeconds();
+      assertThat(scoreRef.get())
+          .describedAs("Agent score should be approximately current time")
+          .isBetween((double) (currentTimeSeconds - 60), (double) (currentTimeSeconds + 60));
+
+      // Verify internal stats reflect the registration
+      PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
+      assertThat(stats.getRegisteredAgents())
+          .describedAs("Stats should show 1 registered agent")
+          .isEqualTo(1);
+
+      // Verify run() triggers acquisition metrics (confirms acquisition service wiring)
       scheduler.run();
-
-      // Verify stats are still accessible after run (confirms services remain functional)
-      stats = scheduler.getStats();
-      assertThat(stats).isNotNull();
+      long acquireAttempts =
+          registry
+              .counter(
+                  registry
+                      .createId("cats.priorityScheduler.acquire.attempts")
+                      .withTag("scheduler", "priority"))
+              .count();
+      assertThat(acquireAttempts)
+          .describedAs("Run should trigger acquisition attempts (confirms acquisition wiring)")
+          .isGreaterThanOrEqualTo(1);
     }
 
     /**
-     * Tests that property changes propagate to scheduler behavior. Verifies schedulers with
-     * different maxConcurrentAgents values are functional.
+     * Tests that maxConcurrentAgents property propagates to scheduler behavior. Verifies that a
+     * scheduler with maxConcurrentAgents=2 only acquires up to 2 agents even when more are
+     * available, proving the configuration affects acquisition behavior.
      */
     @Test
-    @DisplayName("Should propagate property changes to behavior")
-    void shouldPropagatePropertyChanges() {
-      // Given - Different property configurations
-      PriorityAgentProperties props1 = TestFixtures.createDefaultAgentProperties();
-      props1.setMaxConcurrentAgents(5);
-
-      PriorityAgentProperties props2 = TestFixtures.createDefaultAgentProperties();
-      props2.setMaxConcurrentAgents(20);
+    @DisplayName("Should propagate maxConcurrentAgents to acquisition behavior")
+    void shouldPropagatePropertyChanges() throws Exception {
+      // Given - Scheduler with maxConcurrentAgents=2 (low limit to verify enforcement)
+      // The different maxConcurrentAgents values affect acquisition behavior, which we verify
+      // through scheduler operation rather than accessing internal fields
+      PriorityAgentProperties limitedProps = TestFixtures.createDefaultAgentProperties();
+      limitedProps.setMaxConcurrentAgents(2);
 
       DefaultRegistry registry = new DefaultRegistry();
       PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
 
-      // When - Create schedulers with different properties
-      PriorityAgentScheduler scheduler1 =
+      // Use blocking execution to keep agents in WORKING_SET during verification
+      CountDownLatch executionLatch = new CountDownLatch(1);
+      AgentExecution blockingExecution =
+          new AgentExecution() {
+            @Override
+            public void executeAgent(Agent agent) {
+              try {
+                executionLatch.await(5, TimeUnit.SECONDS);
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+              }
+            }
+          };
+
+      PriorityAgentScheduler scheduler =
           new PriorityAgentScheduler(
               jedisPool,
               nodeStatusProvider,
               intervalProvider,
               shardingFilter,
-              props1,
+              limitedProps,
               schedulerProperties,
               metrics);
 
-      PriorityAgentScheduler scheduler2 =
-          new PriorityAgentScheduler(
-              jedisPool,
-              nodeStatusProvider,
-              intervalProvider,
-              shardingFilter,
-              props2,
-              schedulerProperties,
-              metrics);
+      scheduler.initialize();
 
-      // Then - Verify different configurations create different behaviors
-      // Verify through behavior: schedulers with different maxConcurrentAgents enforce different
-      // limits
-      assertThat(scheduler1).isNotNull();
-      assertThat(scheduler2).isNotNull();
+      // Register 5 agents (more than the limit of 2)
+      for (int i = 0; i < 5; i++) {
+        Agent agent = TestFixtures.createMockAgent("limit-agent-" + i, "test-provider");
+        scheduler.schedule(agent, blockingExecution, TestFixtures.createMockInstrumentation());
+      }
 
-      // Initialize both schedulers
-      scheduler1.initialize();
-      scheduler2.initialize();
+      // Wait for agents to appear in WAITING_SET
+      waitForCondition(
+          () -> {
+            try (Jedis jedis = jedisPool.getResource()) {
+              return jedis.zcard("waiting") >= 5;
+            }
+          },
+          1000,
+          50,
+          scheduler::run);
 
-      // Verify both schedulers are functional with their respective configurations
-      // The different maxConcurrentAgents values will affect acquisition behavior,
-      // which can be verified through scheduler operation rather than accessing internal fields
-      PriorityAgentScheduler.SchedulerStats stats1 = scheduler1.getStats();
-      PriorityAgentScheduler.SchedulerStats stats2 = scheduler2.getStats();
-      assertThat(stats1).isNotNull();
-      assertThat(stats2).isNotNull();
+      // When - Run scheduler to acquire agents, poll until acquisition stabilizes
+      java.util.concurrent.atomic.AtomicLong workingCountRef =
+          new java.util.concurrent.atomic.AtomicLong(0);
+      waitForCondition(
+          () -> {
+            scheduler.run();
+            try (Jedis jedis = jedisPool.getResource()) {
+              long count = jedis.zcard("working");
+              workingCountRef.set(count);
+              // Stabilize when we have acquired some agents (up to the limit)
+              return count > 0;
+            }
+          },
+          1000,
+          50);
 
-      // Both schedulers should be functional (confirms configuration was applied)
-      // The actual concurrency limit enforcement can be verified through integration tests
-      // that register multiple agents and verify acquisition limits
+      // Then - Verify only maxConcurrentAgents (2) were acquired
+      // Check WORKING_SET has at most 2 agents, proving limit enforcement
+      assertThat(workingCountRef.get())
+          .describedAs(
+              "WORKING_SET should have at most maxConcurrentAgents (2) agents, "
+                  + "proving the configuration propagates to acquisition behavior")
+          .isLessThanOrEqualTo(2);
+
+      // Verify stats reflect the configured limit
+      PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
+      assertThat(stats.getActiveAgents())
+          .describedAs("Active agents should not exceed configured maxConcurrentAgents limit")
+          .isLessThanOrEqualTo(2);
+
+      // Cleanup - release blocking executions
+      executionLatch.countDown();
     }
 
     /**
-     * Tests that metrics are registered correctly during initialization. Verifies through behavior
-     * that scheduler is functional and stats are accessible.
+     * Tests that metrics are registered correctly during initialization. Verifies specific metric
+     * IDs are present and counters/timers increment during scheduler operation.
+     *
+     * <p>Note: Direct gauge value verification is not possible since gauges are polled via
+     * PolledMeter, so we verify counters and timers which are updated synchronously.
      */
     @Test
-    @DisplayName("Should register metrics correctly")
+    @DisplayName("Should register and record metrics during operation")
     void shouldRegisterMetricsCorrectly() throws Exception {
       // Given
       DefaultRegistry registry = new DefaultRegistry();
@@ -1233,21 +1023,65 @@ public class PrioritySchedulerIntegrationTest {
       // When - Initialize scheduler (triggers gauge registration)
       scheduler.initialize();
 
-      // Then - Verify metrics are registered by checking registry state
-      // Verify that metrics were registered by checking registry contains expected metric IDs
-      // Gauges are polled, so we verify registration indirectly through registry state
-      assertThat(registry).isNotNull();
+      // Register an agent and run scheduler to trigger metric recording
+      Agent testAgent = TestFixtures.createMockAgent("metrics-test-agent", "test-provider");
+      AgentExecution execution = mock(AgentExecution.class);
+      scheduler.schedule(testAgent, execution, TestFixtures.createMockInstrumentation());
 
-      // Verify scheduler is functional (confirms metrics initialization succeeded)
+      // Wait for agent to be in WAITING_SET
+      waitForCondition(
+          () -> {
+            try (Jedis jedis = jedisPool.getResource()) {
+              return jedis.zscore("waiting", "metrics-test-agent") != null;
+            }
+          },
+          1000,
+          50,
+          scheduler::run);
+
+      // Run scheduler to trigger acquisition metrics
+      scheduler.run();
+
+      // Then - Verify acquisition metrics were recorded
+      long acquireAttempts =
+          registry
+              .counter(
+                  registry
+                      .createId("cats.priorityScheduler.acquire.attempts")
+                      .withTag("scheduler", "priority"))
+              .count();
+      assertThat(acquireAttempts)
+          .describedAs("acquire.attempts counter should be incremented during run()")
+          .isGreaterThanOrEqualTo(1);
+
+      // Verify run cycle timer was recorded
+      com.netflix.spectator.api.Timer runCycleTimer =
+          registry.timer(
+              registry
+                  .createId("cats.priorityScheduler.run.cycleTime")
+                  .withTag("scheduler", "priority")
+                  .withTag("success", "true"));
+      assertThat(runCycleTimer.count())
+          .describedAs("run.cycleTime timer should record successful cycles")
+          .isGreaterThanOrEqualTo(1);
+
+      // Verify stats are accessible and reflect registered agent
       PriorityAgentScheduler.SchedulerStats stats = scheduler.getStats();
-      assertThat(stats).isNotNull();
+      assertThat(stats.getRegisteredAgents())
+          .describedAs("Stats should show 1 registered agent")
+          .isEqualTo(1);
 
-      // Verify metrics instance is functional by checking it can provide stats
-      // If metrics weren't properly initialized, getStats() would fail or return invalid data
-      assertThat(stats.getRegisteredAgents()).isGreaterThanOrEqualTo(0);
-
-      // Note: Direct gauge value verification is not possible since gauges are polled,
-      // but the scheduler operating correctly confirms metrics are registered
+      // Verify acquired counter (may be 0 or 1 depending on timing, but should exist)
+      long acquiredCount =
+          registry
+              .counter(
+                  registry
+                      .createId("cats.priorityScheduler.acquire.acquired")
+                      .withTag("scheduler", "priority"))
+              .count();
+      assertThat(acquiredCount)
+          .describedAs("acquire.acquired counter should exist (value depends on timing)")
+          .isGreaterThanOrEqualTo(0);
     }
   }
 

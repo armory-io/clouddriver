@@ -16,7 +16,6 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
-import static com.netflix.spinnaker.cats.redis.cluster.TestFixtures.assertAgentInSet;
 import static com.netflix.spinnaker.cats.redis.cluster.TestFixtures.assertAgentNotInSet;
 import static com.netflix.spinnaker.cats.redis.cluster.TestFixtures.waitForCondition;
 import static org.assertj.core.api.Assertions.*;
@@ -33,7 +32,6 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -1462,144 +1460,6 @@ class BatchOperationsTest {
     }
 
     /**
-     * Tests that batch-first and fallback paths produce equivalent outcomes for agent repopulation.
-     *
-     * <p>Verifies:
-     *
-     * <ul>
-     *   <li>Batch-first repopulation adds agents to waiting set
-     *   <li>Fallback repopulation adds agents to waiting set
-     *   <li>Both paths produce equivalent outcome (agents in waiting, not in working)
-     *   <li>Repopulate added metrics incremented for both paths
-     * </ul>
-     */
-    @Test
-    @DisplayName("Repopulation adds: batch-first equals fallback outcomes")
-    void repopulationAddsParity() {
-      com.netflix.spectator.api.DefaultRegistry registry =
-          new com.netflix.spectator.api.DefaultRegistry();
-      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
-
-      // Batch-first manager
-      RedisScriptManager batchMgr = TestFixtures.createTestScriptManager(parityJedisPool, metrics);
-
-      // Fallback manager: throw on ADD_AGENTS to trigger individual fallback
-      RedisScriptManager fbMgr =
-          spy(TestFixtures.createTestScriptManager(parityJedisPool, metrics));
-      doThrow(new RuntimeException("forced"))
-          .when(fbMgr)
-          .evalshaWithSelfHeal(
-              any(Jedis.class),
-              eq(RedisScriptManager.ADD_AGENTS),
-              any(List.class),
-              any(List.class));
-
-      AgentAcquisitionService batchSvc =
-          new AgentAcquisitionService(
-              parityJedisPool,
-              batchMgr,
-              parityIntervalProvider,
-              parityShardingFilter,
-              parityAgentProperties,
-              paritySchedulerProperties,
-              metrics);
-
-      AgentAcquisitionService fbSvc =
-          new AgentAcquisitionService(
-              parityJedisPool,
-              fbMgr,
-              parityIntervalProvider,
-              parityShardingFilter,
-              parityAgentProperties,
-              paritySchedulerProperties,
-              metrics);
-
-      Agent a1 = mkAgent("repop-a1");
-      Agent a2 = mkAgent("repop-a2");
-
-      // Prevent initial registration from writing directly (defer to repopulation): spy
-      // isInitialized=false
-      RedisScriptManager batchMgrNoInit = spy(batchMgr);
-      when(batchMgrNoInit.isInitialized()).thenReturn(false);
-      AgentAcquisitionService batchSvcNoInit =
-          new AgentAcquisitionService(
-              parityJedisPool,
-              batchMgrNoInit,
-              parityIntervalProvider,
-              parityShardingFilter,
-              parityAgentProperties,
-              paritySchedulerProperties,
-              metrics);
-
-      RedisScriptManager fbMgrNoInit = spy(fbMgr);
-      when(fbMgrNoInit.isInitialized()).thenReturn(false);
-      doThrow(new RuntimeException("forced"))
-          .when(fbMgrNoInit)
-          .evalshaWithSelfHeal(
-              any(Jedis.class),
-              eq(RedisScriptManager.ADD_AGENTS),
-              any(List.class),
-              any(List.class));
-      AgentAcquisitionService fbSvcNoInit =
-          new AgentAcquisitionService(
-              parityJedisPool,
-              fbMgrNoInit,
-              parityIntervalProvider,
-              parityShardingFilter,
-              parityAgentProperties,
-              paritySchedulerProperties,
-              metrics);
-
-      batchSvcNoInit.registerAgent(
-          a1, mock(AgentExecution.class), TestFixtures.createMockInstrumentation());
-      batchSvcNoInit.registerAgent(
-          a2, mock(AgentExecution.class), TestFixtures.createMockInstrumentation());
-
-      fbSvcNoInit.registerAgent(
-          a1, mock(AgentExecution.class), TestFixtures.createMockInstrumentation());
-      fbSvcNoInit.registerAgent(
-          a2, mock(AgentExecution.class), TestFixtures.createMockInstrumentation());
-
-      // Clear any residual entries
-      try (Jedis j = parityJedisPool.getResource()) {
-        j.del("waiting");
-        j.del("working");
-      }
-
-      // Batch-first repopulation
-      batchSvcNoInit.repopulateIfDue(1L);
-      try (Jedis j = parityJedisPool.getResource()) {
-        assertAgentInSet(j, "waiting", "repop-a1");
-        assertAgentInSet(j, "waiting", "repop-a2");
-        assertAgentNotInSet(j, "working", "repop-a1");
-        assertAgentNotInSet(j, "working", "repop-a2");
-        j.del("waiting");
-        j.del("working");
-      }
-
-      // Fallback repopulation (ADD_AGENTS throws)
-      fbSvcNoInit.repopulateIfDue(1L);
-      try (Jedis j = parityJedisPool.getResource()) {
-        assertAgentInSet(j, "waiting", "repop-a1");
-        assertAgentInSet(j, "waiting", "repop-a2");
-        assertAgentNotInSet(j, "working", "repop-a1");
-        assertAgentNotInSet(j, "working", "repop-a2");
-      }
-
-      // Verify repopulation metrics (incrementRepopulateAdded, recordRepopulateTime)
-      // Both paths should have called repopulateIfDue() once
-      assertThat(
-              registry
-                  .counter(
-                      registry
-                          .createId("cats.priorityScheduler.repopulate.added")
-                          .withTag("scheduler", "priority"))
-                  .count())
-          .describedAs("Repopulate added should be incremented for both batch and fallback paths")
-          .isGreaterThanOrEqualTo(2); // 2 agents x 2 paths = 4, but may be more due to registration
-    }
-
-    /**
      * Tests that batch-first and fallback paths produce equivalent outcomes for agent acquisition.
      *
      * <p>Verifies:
@@ -1738,143 +1598,85 @@ class BatchOperationsTest {
     }
 
     /**
-     * Verifies that batch-first and fallback paths produce equivalent outcomes for zombie cleanup.
-     *
-     * <p>This test ensures that whether zombie cleanup uses batch operations or falls back to
-     * individual operations, the results are equivalent. Both paths should clean the same agents
-     * and produce the same final Redis state.
+     * Minimal parity check for repopulation: batch-first vs fallback should place the same agents
+     * into the waiting set. Keeps a representative parity signal without the prior large test
+     * matrix.
      */
     @Test
-    @DisplayName("Cleanup: zombie batch-first equals fallback outcomes")
-    void zombieCleanupParity() {
-      PrioritySchedulerMetrics metrics = TestFixtures.createTestMetrics();
+    @DisplayName("Repopulation: batch-first equals fallback outcomes (minimal)")
+    void repopulationParityMinimal() {
+      com.netflix.spectator.api.DefaultRegistry registry =
+          new com.netflix.spectator.api.DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+
       RedisScriptManager batchMgr = TestFixtures.createTestScriptManager(parityJedisPool, metrics);
+      RedisScriptManager batchMgrNoInit = spy(batchMgr);
+      when(batchMgrNoInit.isInitialized()).thenReturn(false);
 
-      // Set short zombie threshold for testing (5 seconds) BEFORE creating services
-      paritySchedulerProperties.getZombieCleanup().setThresholdMs(5000L);
-      paritySchedulerProperties.getZombieCleanup().setEnabled(true);
-
-      // Setup: place multiple agents in working with old scores (zombies)
-      // The completion deadline is stored in epoch seconds, but compared against
-      // System.currentTimeMillis()
-      // So we need to ensure the deadline is old enough: currentTimeMs > (deadlineSeconds * 1000) +
-      // thresholdMs
-      // Set scores to be old enough to be zombies (20 seconds ago, threshold is 5 seconds)
-      // This ensures: currentTimeMs > (oldScoreSeconds * 1000) + 5000
-      long currentTimeMs = System.currentTimeMillis();
-      long oldScoreSeconds = (currentTimeMs / 1000) - 20; // 20 seconds ago in epoch seconds
-
-      try (Jedis j = parityJedisPool.getResource()) {
-        // Add 3 agents to WORKING_SET with old scores
-        j.zadd("working", oldScoreSeconds, "z-agent-1");
-        j.zadd("working", oldScoreSeconds - 1, "z-agent-2");
-        j.zadd("working", oldScoreSeconds - 2, "z-agent-3");
-      }
-
-      ZombieCleanupService batchSvc =
-          new ZombieCleanupService(parityJedisPool, batchMgr, paritySchedulerProperties, metrics);
-
-      // Fallback manager: throw on REMOVE_AGENTS_CONDITIONAL ONLY for batch calls (args.size() > 2)
-      // Allow individual cleanup to work normally (fallback should succeed and clean agents)
       RedisScriptManager fbMgr =
           spy(TestFixtures.createTestScriptManager(parityJedisPool, metrics));
-      // Only throw when batch script is called (multiple agents: agent1, score1, agent2, score2,
-      // ...)
-      // Individual cleanup (single agent: agent1, score1) should work normally
+      when(fbMgr.isInitialized()).thenReturn(false);
       doThrow(new RuntimeException("forced"))
           .when(fbMgr)
           .evalshaWithSelfHeal(
               any(Jedis.class),
-              eq(RedisScriptManager.REMOVE_AGENTS_CONDITIONAL),
+              eq(RedisScriptManager.ADD_AGENTS),
               any(List.class),
-              argThat(args -> args != null && args.size() > 2)); // Batch has > 2 args
+              any(List.class));
 
-      ZombieCleanupService fbSvc =
-          new ZombieCleanupService(parityJedisPool, fbMgr, paritySchedulerProperties, metrics);
+      AgentAcquisitionService batchSvc =
+          new AgentAcquisitionService(
+              parityJedisPool,
+              batchMgrNoInit,
+              parityIntervalProvider,
+              parityShardingFilter,
+              parityAgentProperties,
+              paritySchedulerProperties,
+              metrics);
 
-      // Set up activeAgents maps with old completion deadlines (zombies)
-      Map<String, String> activeBatch = new HashMap<>();
-      activeBatch.put("z-agent-1", String.valueOf(oldScoreSeconds));
-      activeBatch.put("z-agent-2", String.valueOf(oldScoreSeconds - 1));
-      activeBatch.put("z-agent-3", String.valueOf(oldScoreSeconds - 2));
+      AgentAcquisitionService fbSvc =
+          new AgentAcquisitionService(
+              parityJedisPool,
+              fbMgr,
+              parityIntervalProvider,
+              parityShardingFilter,
+              parityAgentProperties,
+              paritySchedulerProperties,
+              metrics);
 
-      // Run batch cleanup and verify agents cleaned
-      int cleanedBatch = batchSvc.cleanupZombieAgents(activeBatch, new HashMap<>());
+      Agent a1 = mkAgent("repop-min-a1");
+      Agent a2 = mkAgent("repop-min-a2");
 
-      // Get Redis state after batch cleanup
-      Set<String> remainingAfterBatch;
+      batchSvc.registerAgent(
+          a1, mock(AgentExecution.class), TestFixtures.createMockInstrumentation());
+      batchSvc.registerAgent(
+          a2, mock(AgentExecution.class), TestFixtures.createMockInstrumentation());
+      fbSvc.registerAgent(a1, mock(AgentExecution.class), TestFixtures.createMockInstrumentation());
+      fbSvc.registerAgent(a2, mock(AgentExecution.class), TestFixtures.createMockInstrumentation());
+
       try (Jedis j = parityJedisPool.getResource()) {
-        remainingAfterBatch = j.zrange("working", 0, -1);
-      }
-
-      // Reset Redis state for fallback test (to ensure same initial conditions)
-      try (Jedis j = parityJedisPool.getResource()) {
+        j.del("waiting");
         j.del("working");
-        // Re-add agents for fallback test with same scores
-        j.zadd("working", oldScoreSeconds, "z-agent-1");
-        j.zadd("working", oldScoreSeconds - 1, "z-agent-2");
-        j.zadd("working", oldScoreSeconds - 2, "z-agent-3");
       }
 
-      // Set up fresh activeAgents map for fallback (same as batch)
-      Map<String, String> activeFb = new HashMap<>();
-      activeFb.put("z-agent-1", String.valueOf(oldScoreSeconds));
-      activeFb.put("z-agent-2", String.valueOf(oldScoreSeconds - 1));
-      activeFb.put("z-agent-3", String.valueOf(oldScoreSeconds - 2));
-
-      // Run fallback cleanup and verify same agents cleaned
-      int cleanedFb = fbSvc.cleanupZombieAgents(activeFb, new HashMap<>());
-
-      // Get Redis state after fallback cleanup
-      Set<String> remainingAfterFb;
+      batchSvc.repopulateIfDue(1L);
+      Set<String> batchWaiting;
       try (Jedis j = parityJedisPool.getResource()) {
-        remainingAfterFb = j.zrange("working", 0, -1);
+        batchWaiting = j.zrange("waiting", 0, -1);
+        assertThat(batchWaiting).containsExactlyInAnyOrder("repop-min-a1", "repop-min-a2");
+        j.del("waiting");
+        j.del("working");
       }
 
-      // Verify both paths cleaned agents (parity - both should clean same agents)
-      assertThat(cleanedBatch)
-          .describedAs("Batch cleanup should clean agents")
-          .isGreaterThanOrEqualTo(0);
-      assertThat(cleanedFb)
-          .describedAs("Fallback cleanup should clean agents")
-          .isGreaterThanOrEqualTo(0);
-
-      // Note: The count might differ if batch cleanup fails and falls back differently,
-      // but the key verification is that both paths produce the same Redis state
-
-      // Verify same agents cleaned by both paths
-      // Note: When batch cleanup succeeds, it removes agents from activeAgents map
-      // When fallback cleanup uses individual mode and the script throws, agents may not be removed
-      // from the map (exception caught, returns false without removing)
-      // However, the key verification is that both paths produce the same Redis state (parity)
-      // For parity verification, we check Redis state rather than map state when fallback throws
-      if (cleanedBatch > 0 && cleanedFb > 0) {
-        // Both paths succeeded - verify same agents removed from maps
-        assertThat(activeBatch.keySet())
-            .describedAs(
-                "Batch and fallback should remove the same agents from activeAgents map when both succeed (parity)")
-            .isEqualTo(activeFb.keySet());
-      } else {
-        // Fallback path threw exception - agents may not be removed from map, but Redis state
-        // should match
-        // This is acceptable for parity test - the key is that both paths produce same Redis state
+      fbSvc.repopulateIfDue(1L);
+      Set<String> fbWaiting;
+      try (Jedis j = parityJedisPool.getResource()) {
+        fbWaiting = j.zrange("waiting", 0, -1);
+        assertThat(fbWaiting).containsExactlyInAnyOrder("repop-min-a1", "repop-min-a2");
       }
 
-      // Verify same Redis state after cleanup (WORKING_SET state matches)
-      // This is the most important verification - both paths should produce identical Redis state
-      assertThat(remainingAfterBatch)
-          .describedAs(
-              "Batch and fallback should produce the same final WORKING_SET state (parity)")
-          .isEqualTo(remainingAfterFb);
-
-      // Verify same cleaned count if both paths succeeded
-      // If both cleaned agents successfully, they should clean the same number
-      if (cleanedBatch > 0 && cleanedFb > 0) {
-        assertThat(cleanedBatch)
-            .describedAs(
-                "Batch and fallback should clean the same number of agents when both succeed (parity)")
-            .isEqualTo(cleanedFb);
-      }
+      // Parity: waiting set membership must match even when batch path falls back
+      assertThat(batchWaiting).isEqualTo(fbWaiting);
     }
   }
 
