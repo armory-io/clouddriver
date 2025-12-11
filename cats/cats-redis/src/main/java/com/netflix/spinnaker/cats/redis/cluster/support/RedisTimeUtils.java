@@ -35,10 +35,15 @@ public final class RedisTimeUtils {
   private RedisTimeUtils() {}
 
   /**
-   * Compute a Redis ZSET score (seconds since epoch) from a millisecond delay.
+   * Computes a Redis ZSET score (seconds since epoch) from a millisecond delay.
    *
    * <p>Prefers a unified time source via {@code nowMsWithOffset} when supplied and positive;
    * otherwise falls back to Redis TIME and, on failure, the local clock.
+   *
+   * @param jedis Redis connection for TIME command fallback
+   * @param delayMs delay in milliseconds from current time
+   * @param nowMsWithOffset optional time source supplier (may be null)
+   * @return score as string representing seconds since epoch
    */
   public static String scoreFromMsDelay(Jedis jedis, long delayMs, LongSupplier nowMsWithOffset) {
     try {
@@ -71,10 +76,15 @@ public final class RedisTimeUtils {
   }
 
   /**
-   * Compute a Redis ZSET score (seconds since epoch) from a seconds delay.
+   * Computes a Redis ZSET score (seconds since epoch) from a seconds delay.
    *
    * <p>Prefers a unified time source via {@code nowMsWithOffset} when supplied and positive;
    * otherwise falls back to Redis TIME and, on failure, the local clock.
+   *
+   * @param jedis Redis connection for TIME command fallback
+   * @param delaySeconds delay in seconds from current time
+   * @param nowMsWithOffset optional time source supplier (may be null)
+   * @return score as string representing seconds since epoch
    */
   public static String scoreFromSecondsDelay(
       Jedis jedis, long delaySeconds, LongSupplier nowMsWithOffset) {

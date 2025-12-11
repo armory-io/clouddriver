@@ -34,20 +34,30 @@ import lombok.extern.slf4j.Slf4j;
 public final class ScriptResults {
   private ScriptResults() {}
 
+  /** Result holder for batch removal operations. */
   @Getter
   public static final class BatchRemovalResult {
     private final int removedCount;
     private final List<String> members;
 
+    /**
+     * Constructs a batch removal result.
+     *
+     * @param removedCount number of items removed (clamped to non-negative)
+     * @param members list of removed member names (null-safe, defensively copied)
+     */
     public BatchRemovalResult(int removedCount, List<String> members) {
       this.removedCount = Math.max(0, removedCount);
-      this.members = members == null ? Collections.emptyList() : members;
+      this.members = members == null ? Collections.emptyList() : List.copyOf(members);
     }
   }
 
   /**
-   * Parses the result of REMOVE_AGENTS_CONDITIONAL script which returns [count, [member1, member2,
+   * Parses the result of removeAgentsConditional script which returns [count, [member1, member2,
    * ...]].
+   *
+   * @param result raw Lua script result
+   * @return parsed batch removal result
    */
   public static BatchRemovalResult parseRemoveAgentsConditional(Object result) {
     int count = 0;
@@ -93,7 +103,12 @@ public final class ScriptResults {
     return new BatchRemovalResult(count, cleaned);
   }
 
-  /** Parse the count returned by ADD_AGENTS script which typically returns [count, ...]. */
+  /**
+   * Parses the count returned by addAgents script which typically returns [count, ...].
+   *
+   * @param result raw Lua script result
+   * @return number of agents added (0 if parsing fails)
+   */
   public static int parseAddAgentsCount(Object result) {
     try {
       if (result instanceof java.util.List) {

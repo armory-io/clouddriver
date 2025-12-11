@@ -18,6 +18,7 @@ package com.netflix.spinnaker.cats.redis.cluster;
 
 import static com.netflix.spinnaker.cats.redis.cluster.support.CadenceGuard.*;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.netflix.spinnaker.cats.agent.Agent;
 import com.netflix.spinnaker.cats.redis.cluster.support.ScriptResults;
 import java.net.InetAddress;
@@ -39,13 +40,12 @@ import redis.clients.jedis.params.SetParams;
  * agents), orphans have no running instance. The service uses leader election to coordinate cleanup
  * across pods, preventing duplicate work.
  *
- * <p>Key rules:
+ * <p>Key rules: preserve valid waiting agents; skip locally active agents (zombie cleaner handles
+ * those); move valid working orphans back to waiting.
  *
- * <ul>
- *   <li>Preserve valid waiting agents - only remove positively invalid ones
- *   <li>Skip locally active agents - zombie cleaner handles those
- *   <li>Move valid working orphans back to waiting, remove invalid ones
- * </ul>
+ * <p><b>Scope:</b> Agents from other pods only (no local RunState). Manipulates Redis and
+ * activeAgents map; <b>never</b> touches permits or zIF. See {@link ZombieCleanupService} for
+ * locally stuck agents.
  */
 @Component
 @Slf4j
@@ -69,7 +69,10 @@ public class OrphanCleanupService {
   private volatile String currentLeadershipId = null;
   private volatile long lastOrphanCleanup = 0;
 
-  // Reusable ThreadLocal collections to reduce GC pressure in cleanup hot paths
+  // Design decision: ThreadLocal proliferation (intentional performance optimization)
+  // Reusable containers reduce GC pressure in cleanup hot paths. Safe because cleanup runs in a
+  // single-threaded executor with proper finally-block clearing. See AgentAcquisitionService for
+  // detailed rationale.
   private static final ThreadLocal<java.util.List<String>> REUSABLE_INVALID_ARGS =
       ThreadLocal.withInitial(java.util.ArrayList::new);
   private static final ThreadLocal<java.util.List<String>> REUSABLE_ATTEMPTED_INVALID =
@@ -79,6 +82,14 @@ public class OrphanCleanupService {
   private static final ThreadLocal<java.util.Set<String>> REUSABLE_STRING_SET =
       ThreadLocal.withInitial(java.util.HashSet::new);
 
+  /**
+   * Constructs a new OrphanCleanupService.
+   *
+   * @param jedisPool Redis connection pool for cleanup operations
+   * @param scriptManager Lua script manager for atomic Redis operations
+   * @param schedulerProperties Configuration for cleanup behavior
+   * @param metrics Metrics collector for tracking cleanup operations
+   */
   public OrphanCleanupService(
       JedisPool jedisPool,
       RedisScriptManager scriptManager,
@@ -87,7 +98,7 @@ public class OrphanCleanupService {
     this.jedisPool = jedisPool;
     this.scriptManager = scriptManager;
     this.schedulerProperties = schedulerProperties;
-    this.metrics = metrics;
+    this.metrics = metrics != null ? metrics : PrioritySchedulerMetrics.NOOP;
 
     PrioritySchedulerProperties.Keys keysCfg = schedulerProperties.getKeys();
     String hash = keysCfg.getHashTag();
@@ -101,6 +112,8 @@ public class OrphanCleanupService {
   /**
    * Set reference to AgentAcquisitionService for advanced orphan processing. This provides access
    * to agent registry and active agent cleanup.
+   *
+   * @param acquisitionService the acquisition service for agent state coordination
    */
   public void setAcquisitionService(AgentAcquisitionService acquisitionService) {
     this.acquisitionService = acquisitionService;
@@ -110,6 +123,7 @@ public class OrphanCleanupService {
    * Remove ThreadLocal buffers held by the current thread to release per-thread memory. Intended to
    * be invoked on the owning executor thread during shutdown.
    */
+  @VisibleForTesting
   void removeThreadLocals() {
     try {
       REUSABLE_INVALID_ARGS.remove();
@@ -140,34 +154,16 @@ public class OrphanCleanupService {
       return;
     }
 
-    // Guard against long-running loops: if previous pass is still considered running for too long
-    // (e.g., due to a bug), skip starting another pass to avoid monopolizing cleanup leadership.
-    long maxPassDurationMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
-    if (maxPassDurationMs > 0 && lastOrphanCleanup > 0) {
-      long sinceLast = nowMs() - lastOrphanCleanup;
-      // If we haven't updated lastOrphanCleanup for > runBudgetMs, assume the previous pass hung
-      long threshold = maxPassDurationMs;
-      if (sinceLast > threshold) {
-        log.warn(
-            "Skipping orphan cleanup: previous pass appears hung ({}ms since last update > budget {}ms). Releasing leadership defensively.",
-            sinceLast,
-            maxPassDurationMs);
-        try {
-          releaseCleanupLeadership();
-        } catch (Exception ignore) {
-          // Best-effort leadership release – lock may already be gone or expired
-        }
-        // Bump the timestamp to avoid log spam; next cycle will attempt again
-        lastOrphanCleanup = nowMs();
-        return;
-      }
-    }
-
     // Check if enough time has passed since last cleanup
     long intervalMs = schedulerProperties.getOrphanCleanup().getIntervalMs();
     if (!isPeriodElapsed(lastOrphanCleanup, intervalMs)) {
       long remaining = intervalMs - (nowMs() - lastOrphanCleanup);
-      log.debug("Skipping orphan cleanup - interval not elapsed ({}ms remaining)", remaining);
+      if (log.isDebugEnabled()) {
+        log.debug(
+            "Skipping orphan cleanup - interval not elapsed ({}ms remaining, interval={}ms)",
+            remaining,
+            intervalMs);
+      }
       return;
     }
 
@@ -175,38 +171,58 @@ public class OrphanCleanupService {
     // Use leadership election to prevent multiple instances from running cleanup simultaneously
     boolean forceCleanup = schedulerProperties.getOrphanCleanup().isForceAllPods();
     if (!forceCleanup && !tryAcquireCleanupLeadership()) {
-      log.debug("Skipping orphan cleanup - leadership held by another instance");
+      if (log.isDebugEnabled()) {
+        log.debug("Skipping orphan cleanup - leadership held by another instance");
+      }
       return;
     }
 
     // Update timestamp immediately after acquiring leadership (or confirming forced run)
     lastOrphanCleanup = nowMs();
 
+    if (log.isDebugEnabled()) {
+      log.debug(
+          "Starting orphan cleanup cycle (forced={}, budget={}ms)",
+          forceCleanup,
+          schedulerProperties.getOrphanCleanup().getRunBudgetMs());
+    }
+
     try (Jedis jedis = jedisPool.getResource()) {
       final long budgetMs = schedulerProperties.getOrphanCleanup().getRunBudgetMs();
 
       int workingCleaned = cleanupOrphanedAgentsFromSet(jedis, WORKING_SET, start, budgetMs);
+      long workingElapsedMs = nowMs() - start;
       if (overBudget(start, budgetMs)) {
-        log.warn("Orphan cleanup budget exceeded after working set; skipping waiting set");
+        log.info(
+            "Orphan cleanup exceeded budget {}ms (elapsed={}ms); skipping waiting set (cleaned={})",
+            budgetMs,
+            workingElapsedMs,
+            workingCleaned);
         return;
       }
       int waitingCleaned = cleanupOrphanedAgentsFromSet(jedis, WAITING_SET, start, budgetMs);
       int totalCleaned = workingCleaned + waitingCleaned;
+      long totalElapsedMs = nowMs() - start;
 
       if (totalCleaned > 0) {
         orphansCleanedUp.add(totalCleaned);
         log.info(
-            "Orphan cleanup completed: {} agents cleaned ({} from working, {} from waiting)",
+            "Orphan cleanup cycle completed: {} agents cleaned ({} from working, {} from waiting, elapsed={}ms, budget={}ms)",
             totalCleaned,
             workingCleaned,
-            waitingCleaned);
+            waitingCleaned,
+            totalElapsedMs,
+            budgetMs);
+      } else if (log.isDebugEnabled()) {
+        log.debug(
+            "Orphan cleanup cycle completed: 0 agents cleaned (elapsed={}ms, budget={}ms)",
+            totalElapsedMs,
+            budgetMs);
       }
-      if (metrics != null) {
-        metrics.recordCleanupTime("orphan", nowMs() - start);
-        metrics.incrementCleanupCleaned("orphan", totalCleaned);
-      }
+      metrics.recordCleanupTime("orphan", nowMs() - start);
+      metrics.incrementCleanupCleaned("orphan", totalCleaned);
     } catch (Exception e) {
-      log.error("Failed to cleanup orphaned agents", e);
+      log.error("Error during orphan cleanup", e);
     } finally {
       // Release leadership if we acquired it (but not if forced cleanup)
       if (!forceCleanup) {
@@ -240,12 +256,17 @@ public class OrphanCleanupService {
             totalCleaned,
             workingCleaned,
             waitingCleaned);
+      } else if (log.isDebugEnabled()) {
+        log.debug("Forced orphan cleanup completed: 0 agents cleaned");
       }
       // Update the last cleanup timestamp
       lastOrphanCleanup = nowMs();
+      // Record metrics (consistent with cleanupOrphanedAgentsIfNeeded)
+      metrics.recordCleanupTime("orphan", nowMs() - start);
+      metrics.incrementCleanupCleaned("orphan", totalCleaned);
       return totalCleaned;
     } catch (Exception e) {
-      log.error("Failed to force cleanup orphaned agents", e);
+      log.error("Error during forced orphan cleanup", e);
       return 0;
     }
   }
@@ -255,7 +276,8 @@ public class OrphanCleanupService {
    *
    * @return total orphans cleaned up
    */
-  public long getOrphansCleanedUp() {
+  @VisibleForTesting
+  long getOrphansCleanedUp() {
     return orphansCleanedUp.sum();
   }
 
@@ -264,7 +286,8 @@ public class OrphanCleanupService {
    *
    * @return last cleanup timestamp in milliseconds
    */
-  public long getLastOrphanCleanup() {
+  @VisibleForTesting
+  long getLastOrphanCleanup() {
     return lastOrphanCleanup;
   }
 
@@ -281,109 +304,260 @@ public class OrphanCleanupService {
   private int cleanupOrphanedAgentsFromSet(
       Jedis jedis, String setName, long startEpochMs, long budgetMs) {
     long cutoffScore;
-    long thresholdForLogging;
 
     if (WAITING_SET.equals(setName)) {
-      // Waiting set: score = next execution time
-      // Orphan detection: score < (current_time - threshold)
-      // These are agents scheduled far in the past that never executed
+      // Waiting set: score = next execution time.
+      // Orphan candidates are entries whose ready-time is older than (now - threshold).
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
       cutoffScore = (nowMs() - orphanThreshold) / 1000;
-      thresholdForLogging = orphanThreshold;
     } else {
-      // Working set: score = completion deadline (acquire_time + timeout)
-      // Orphan detection: current_time > (score + threshold)
-      // Rearranged: score < (current_time - threshold)
-      // These are agents that should have completed but their pod might have crashed
+      // Working set: score = completion deadline (acquire_time + timeout).
+      // Orphan candidates are entries whose deadline is older than (now - threshold).
       long orphanThreshold = schedulerProperties.getOrphanCleanup().getThresholdMs();
       cutoffScore = (nowMs() - orphanThreshold) / 1000;
-      thresholdForLogging = orphanThreshold;
     }
 
     try {
       int totalCleaned = 0;
-      while (true) {
-        if (Thread.currentThread().isInterrupted()) {
-          log.warn("Stopping {} orphan scan due to interrupt", setName);
-          break;
-        }
-        if (overBudget(startEpochMs, budgetMs)) {
-          log.warn("Stopping {} orphan scan due to budget deadline", setName);
-          break;
-        }
+      int totalScanned = 0;
 
-        Set<Tuple> potentialOrphans = jedis.zrangeByScoreWithScores(setName, 0, cutoffScore);
-        if (potentialOrphans.isEmpty()) {
-          if (log.isDebugEnabled()) {
-            log.debug("Orphan scan: {} set analyzed, 0 candidates found", setName);
+      final int configuredBatch = schedulerProperties.getBatchOperations().getBatchSize();
+
+      if (configuredBatch <= 0) {
+        // Unbounded mode: retain legacy behavior for small environments.
+        // We fetch the full eligible range and process it. This maximizes simplicity and
+        // avoids pagination overhead when the candidate set is small.
+        int passNumber = 0;
+        while (true) {
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn(
+                "Stopping {} orphan scan due to interrupt (pass={}, cleaned={}, scanned={})",
+                setName,
+                passNumber,
+                totalCleaned,
+                totalScanned);
+            break;
           }
-          break;
-        }
+          long elapsedMs = nowMs() - startEpochMs;
+          if (overBudget(startEpochMs, budgetMs)) {
+            log.info(
+                "Stopping {} orphan scan due to budget deadline (pass={}, cleaned={}, scanned={}, elapsed={}ms, budget={}ms)",
+                setName,
+                passNumber,
+                totalCleaned,
+                totalScanned,
+                elapsedMs,
+                budgetMs);
+            break;
+          }
 
-        // Optional: remove numeric-only members in WAITING set (repair corruption)
-        int numericRemoved = 0;
-        if (WAITING_SET.equals(setName)
-            && schedulerProperties.getOrphanCleanup().isRemoveNumericOnlyAgents()) {
-          for (Tuple tuple : new java.util.ArrayList<>(potentialOrphans)) {
-            String name = tuple.getElement();
-            if (name != null && name.matches("^\\d{9,11}$")) {
-              try {
-                Object res =
-                    scriptManager.evalshaWithSelfHeal(
-                        jedis,
-                        RedisScriptManager.REMOVE_AGENT,
-                        java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                        java.util.Collections.singletonList(name));
-                boolean removed = res != null && ((Long) res).intValue() == 1;
-                if (removed) {
-                  numericRemoved++;
-                  if (metrics != null) {
-                    metrics.incrementInvalidMember("waiting_numeric_removed");
-                  }
-                }
-              } catch (Exception ignore) {
-                // Parsing/lookup best-effort – continue with fallback
-              }
+          Set<Tuple> all = jedis.zrangeByScoreWithScores(setName, 0, cutoffScore);
+          if (all == null || all.isEmpty()) {
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Orphan scan ({}/{}): {} set analyzed, 0 candidates found (total_scanned={}, total_cleaned={})",
+                  setName,
+                  passNumber,
+                  totalScanned,
+                  totalCleaned);
+            }
+            break;
+          }
+          totalScanned += all.size();
+          passNumber++;
+
+          java.util.List<Tuple> orphanList = REUSABLE_ORPHAN_LIST.get();
+          int cleanedThisPass = 0;
+          try {
+            orphanList.clear();
+            orphanList.addAll(all);
+            cleanedThisPass =
+                processOrphanBatch(jedis, setName, orphanList, startEpochMs, budgetMs);
+          } finally {
+            orphanList.clear();
+            if (orphanList instanceof java.util.ArrayList) {
+              ((java.util.ArrayList<?>) orphanList).trimToSize();
             }
           }
-          if (numericRemoved > 0) {
-            log.warn(
-                "Removed {} numeric-only waiting members during orphan cleanup", numericRemoved);
+
+          totalCleaned += cleanedThisPass;
+          if (cleanedThisPass == 0) {
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Orphan scan ({}/{}): {} set made no progress this pass; exiting early before budget is exhausted (total_scanned={}, total_cleaned={})",
+                  setName,
+                  passNumber,
+                  totalScanned,
+                  totalCleaned);
+            }
+            break;
           }
         }
 
-        if (log.isWarnEnabled()) {
-          log.warn(
-              "Orphan scan: {} set analyzed, {} candidates (older than {}ms) - processing",
-              setName,
-              potentialOrphans.size(),
-              thresholdForLogging);
-        }
-
-        java.util.List<Tuple> orphanList = REUSABLE_ORPHAN_LIST.get();
-        int cleanedThisPass = 0;
-        try {
-          orphanList.clear();
-          orphanList.addAll(potentialOrphans);
-          cleanedThisPass = processOrphanBatch(jedis, setName, orphanList, startEpochMs, budgetMs);
-        } finally {
-          orphanList.clear();
-          if (orphanList instanceof java.util.ArrayList) {
-            ((java.util.ArrayList<?>) orphanList).trimToSize();
-          }
-        }
-        totalCleaned += cleanedThisPass;
-
-        // Break when no progress was made to avoid infinite loops on valid-only candidates
-        if (cleanedThisPass == 0) {
-          log.warn(
-              "Orphan scan: {} set made no progress this pass; exiting early before budget is exhausted",
-              setName);
-          break;
-        }
+        // Per-set completion log removed - final summary below provides breakdown by set
+        return totalCleaned;
       }
 
-      return totalCleaned;
+      // Paged mode (batch-size > 0): cap per-iteration allocation and work in bounded windows.
+      // pageSize comes from batch-operations.batch-size to align with existing batching knobs.
+      final int pageSize = configuredBatch; // > 0 by guard above
+
+      if (WORKING_SET.equals(setName)) {
+        // Working set: head-advancing paging.
+        // Safe to mutate as we go because we always read from the head (LIMIT 0,pageSize).
+        // Moving/removing entries advances the head naturally; we won't skip eligible items.
+        int pageNumber = 0;
+        while (true) {
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn(
+                "Stopping {} orphan scan due to interrupt (page={}, cleaned={}, scanned={})",
+                setName,
+                pageNumber,
+                totalCleaned,
+                totalScanned);
+            break;
+          }
+          long elapsedMs = nowMs() - startEpochMs;
+          if (overBudget(startEpochMs, budgetMs)) {
+            log.info(
+                "Stopping {} orphan scan due to budget deadline (page={}, cleaned={}, scanned={}, elapsed={}ms, budget={}ms)",
+                setName,
+                pageNumber,
+                totalCleaned,
+                totalScanned,
+                elapsedMs,
+                budgetMs);
+            break;
+          }
+
+          Set<Tuple> page = jedis.zrangeByScoreWithScores(setName, 0, cutoffScore, 0, pageSize);
+          if (page == null || page.isEmpty()) {
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Orphan scan ({}/{}): {} page empty (head), stopping (total_scanned={}, total_cleaned={})",
+                  setName,
+                  pageNumber,
+                  setName,
+                  totalScanned,
+                  totalCleaned);
+            }
+            break;
+          }
+          totalScanned += page.size();
+          pageNumber++;
+
+          java.util.List<Tuple> orphanList = REUSABLE_ORPHAN_LIST.get();
+          int cleanedThisPass = 0;
+          try {
+            orphanList.clear();
+            orphanList.addAll(page);
+            cleanedThisPass =
+                processOrphanBatch(jedis, setName, orphanList, startEpochMs, budgetMs);
+          } finally {
+            orphanList.clear();
+            if (orphanList instanceof java.util.ArrayList) {
+              ((java.util.ArrayList<?>) orphanList).trimToSize();
+            }
+          }
+          totalCleaned += cleanedThisPass;
+
+          // If no progress, do not spin – deeper pages will have >= scores; exit early
+          if (cleanedThisPass == 0) {
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Orphan scan ({}/{}): {} set made no progress this pass; exiting early before budget is exhausted (total_scanned={}, total_cleaned={})",
+                  setName,
+                  pageNumber,
+                  totalScanned,
+                  totalCleaned);
+            }
+            break;
+          }
+        }
+        // Per-set completion log removed - final summary provides breakdown by set
+        return totalCleaned;
+      } else {
+        // Waiting set: two-phase per page.
+        // 1) Enumerate a page with OFFSET/COUNT without mutating the set, collecting invalid
+        //    candidates. This keeps OFFSET stable within the window despite concurrent writers.
+        // 2) Mutate (batch remove) only after enumeration; then advance OFFSET by
+        //    (pageCount - removedInWindow). If we removed everything, keep OFFSET to re-check
+        //    the new head (prevents skipping deeper candidates behind a run of valid ones).
+        int offset = 0;
+        int pageNumber = 0;
+        while (true) {
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn(
+                "Stopping {} orphan scan due to interrupt (page={}, offset={}, cleaned={}, scanned={})",
+                setName,
+                pageNumber,
+                offset,
+                totalCleaned,
+                totalScanned);
+            break;
+          }
+          long elapsedMs = nowMs() - startEpochMs;
+          if (overBudget(startEpochMs, budgetMs)) {
+            log.info(
+                "Stopping {} orphan scan due to budget deadline (page={}, offset={}, cleaned={}, scanned={}, elapsed={}ms, budget={}ms)",
+                setName,
+                pageNumber,
+                offset,
+                totalCleaned,
+                totalScanned,
+                elapsedMs,
+                budgetMs);
+            break;
+          }
+
+          Set<Tuple> page =
+              jedis.zrangeByScoreWithScores(setName, 0, cutoffScore, offset, pageSize);
+          if (page == null || page.isEmpty()) {
+            if (log.isDebugEnabled()) {
+              log.debug(
+                  "Orphan scan ({}/{}): {} page empty at offset {} (total_scanned={}, total_cleaned={})",
+                  setName,
+                  pageNumber,
+                  offset,
+                  totalScanned,
+                  totalCleaned);
+            }
+            break;
+          }
+          totalScanned += page.size();
+          pageNumber++;
+
+          java.util.List<Tuple> orphanList = REUSABLE_ORPHAN_LIST.get();
+          int cleanedThisWindow = 0;
+          try {
+            orphanList.clear();
+            orphanList.addAll(page);
+            cleanedThisWindow =
+                processOrphanBatch(jedis, setName, orphanList, startEpochMs, budgetMs);
+          } finally {
+            orphanList.clear();
+            if (orphanList instanceof java.util.ArrayList) {
+              ((java.util.ArrayList<?>) orphanList).trimToSize();
+            }
+          }
+
+          totalCleaned += cleanedThisWindow;
+
+          int pageCount = page.size();
+          if (pageCount < pageSize) {
+            break; // end of eligible range
+          }
+
+          int advance = pageCount - Math.max(0, cleanedThisWindow);
+          // If we removed everything in this window, keep offset (0 advance) to re-check the
+          // new head; otherwise, skip over the survivors we enumerated in this window.
+          if (advance > 0) {
+            offset += advance;
+          }
+        }
+        // Per-set completion log removed - final summary provides breakdown by set
+        return totalCleaned;
+      }
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
       log.warn("Redis connection error while scanning {} for orphans", setName, e);
@@ -426,17 +600,34 @@ public class OrphanCleanupService {
         try {
           invalidArgs.clear();
           attemptedInvalid.clear();
+          int scannedCount = 0;
           for (Tuple orphan : orphans) {
+            scannedCount++;
             if (Thread.currentThread().isInterrupted()) {
-              log.warn("Aborting waiting-batch build due to interrupt");
+              log.warn(
+                  "Stopping waiting-batch build due to interrupt (invalid={}, scanned={})",
+                  attemptedInvalid.size(),
+                  scannedCount);
               break;
             }
+            long elapsedMs = nowMs() - startEpochMs;
             if (overBudget(startEpochMs, budgetMs)) {
-              log.warn("Aborting waiting-batch build due to budget deadline");
+              log.info(
+                  "Stopping waiting-batch build due to budget deadline (invalid={}, scanned={}, elapsed={}ms, budget={}ms)",
+                  attemptedInvalid.size(),
+                  scannedCount,
+                  elapsedMs,
+                  budgetMs);
               break;
             }
             String agentName = orphan.getElement();
-            if (!isAgentStillValid(agentName)) {
+            boolean removeNumericOnly =
+                schedulerProperties.getOrphanCleanup().isRemoveNumericOnlyAgents();
+            boolean numericOnly =
+                removeNumericOnly && agentName != null && agentName.matches("^\\d{9,11}$");
+            // Treat epoch-length numeric-only members as corruption (member mistaken for score)
+            // when the admin flag is enabled. Otherwise only remove invalid entries.
+            if (numericOnly || !isAgentStillValid(agentName)) {
               // Shard-aware gating: Only remove invalid entries owned by this shard
               boolean belongsToThisShard;
               if (acquisitionService == null) {
@@ -476,29 +667,38 @@ public class OrphanCleanupService {
                   removedSet.addAll(parsed.getMembers());
                   for (String agentName : attemptedInvalid) {
                     if (Thread.currentThread().isInterrupted()) {
-                      log.warn("Stopping per-item fallback due to interrupt");
+                      log.warn(
+                          "Stopping per-item fallback due to interrupt (processed={}, remaining={})",
+                          attemptedInvalid.size() - attemptedInvalid.indexOf(agentName),
+                          attemptedInvalid.indexOf(agentName));
                       break;
                     }
+                    long elapsedMs = nowMs() - startEpochMs;
                     if (overBudget(startEpochMs, budgetMs)) {
-                      log.warn("Stopping per-item fallback due to budget deadline");
+                      log.info(
+                          "Stopping per-item fallback due to budget deadline (processed={}, remaining={}, elapsed={}ms, budget={}ms)",
+                          attemptedInvalid.size() - attemptedInvalid.indexOf(agentName),
+                          attemptedInvalid.indexOf(agentName),
+                          elapsedMs,
+                          budgetMs);
                       break;
                     }
                     if (!removedSet.contains(agentName)) {
-                      String scoreStr;
+                      String scoreString;
                       try {
-                        Double s = jedis.zscore(WAITING_SET, agentName);
-                        scoreStr = s != null ? String.valueOf(s.longValue()) : null;
+                        Double score = jedis.zscore(WAITING_SET, agentName);
+                        scoreString = score != null ? String.valueOf(score.longValue()) : null;
                       } catch (Exception ignore) {
-                        scoreStr = null;
+                        scoreString = null;
                       }
                       try {
-                        if (scoreStr != null) {
+                        if (scoreString != null) {
                           Object one =
                               scriptManager.evalshaWithSelfHeal(
                                   jedis,
                                   RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
                                   java.util.Collections.singletonList(WAITING_SET),
-                                  java.util.Arrays.asList(agentName, scoreStr));
+                                  java.util.Arrays.asList(agentName, scoreString));
                           ScriptResults.BatchRemovalResult oneParsed =
                               ScriptResults.parseRemoveAgentsConditional(one);
                           totalCleaned += oneParsed.getRemovedCount();
@@ -524,31 +724,65 @@ public class OrphanCleanupService {
                 }
               }
             } catch (Exception e) {
-              log.warn("Batch removal of invalid waiting agents failed, using individual path", e);
-              // Batch-first per-item: try conditional remove one-by-one, then fallback to
-              // REMOVE_AGENT
+              log.warn(
+                  "Batch removal of invalid waiting agents failed, using guarded individual path",
+                  e);
+              // Guarded per-item fallback: only act on invalid candidates we positively identify
               for (Tuple orphan : orphans) {
                 if (Thread.currentThread().isInterrupted()) {
-                  log.warn("Stopping individual conditional removal due to interrupt");
+                  log.warn(
+                      "Stopping individual conditional removal due to interrupt (processed={}, remaining={})",
+                      orphans.indexOf(orphan),
+                      orphans.size() - orphans.indexOf(orphan));
                   break;
                 }
+                long elapsedMs = nowMs() - startEpochMs;
                 if (overBudget(startEpochMs, budgetMs)) {
-                  log.warn("Stopping individual conditional removal due to budget deadline");
+                  log.info(
+                      "Stopping individual conditional removal due to budget deadline (processed={}, remaining={}, elapsed={}ms, budget={}ms)",
+                      orphans.indexOf(orphan),
+                      orphans.size() - orphans.indexOf(orphan),
+                      elapsedMs,
+                      budgetMs);
                   break;
                 }
+
                 String agentName = orphan.getElement();
-                String scoreStr = String.valueOf((long) orphan.getScore());
+                boolean removeNumericOnly =
+                    schedulerProperties.getOrphanCleanup().isRemoveNumericOnlyAgents();
+                boolean numericOnly =
+                    removeNumericOnly && agentName != null && agentName.matches("^\\d{9,11}$");
+                boolean invalid = numericOnly || !isAgentStillValid(agentName);
+
+                // Shard-aware gating: only this shard may act on invalid entries
+                boolean belongsToThisShard;
+                if (acquisitionService == null) {
+                  belongsToThisShard = true; // tests or unwired contexts
+                } else {
+                  try {
+                    belongsToThisShard = acquisitionService.belongsToThisShard(agentName);
+                  } catch (Exception ex) {
+                    belongsToThisShard = false; // fail-safe preserve
+                  }
+                }
+
+                if (!invalid || !belongsToThisShard) {
+                  continue; // preserve valid waiting entries and non-owned shard entries
+                }
+
+                String scoreString = String.valueOf((long) orphan.getScore());
                 try {
                   Object one =
                       scriptManager.evalshaWithSelfHeal(
                           jedis,
                           RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
                           java.util.Collections.singletonList(WAITING_SET),
-                          java.util.Arrays.asList(agentName, scoreStr));
+                          java.util.Arrays.asList(agentName, scoreString));
                   ScriptResults.BatchRemovalResult oneParsed =
                       ScriptResults.parseRemoveAgentsConditional(one);
                   totalCleaned += oneParsed.getRemovedCount();
                   if (oneParsed.getRemovedCount() == 0) {
+                    // As a final fallback for invalid entries only, attempt unconditional remove
                     Object fallback =
                         scriptManager.evalshaWithSelfHeal(
                             jedis,
@@ -583,11 +817,20 @@ public class OrphanCleanupService {
       // skip locally active work.
       for (int i = 0; i < orphans.size(); i += batchSize) {
         if (Thread.currentThread().isInterrupted()) {
-          log.warn("Aborting working-batch processing due to interrupt");
+          log.warn(
+              "Stopping working-batch processing due to interrupt (processed={}, remaining={})",
+              i,
+              orphans.size() - i);
           break;
         }
+        long elapsedMs = nowMs() - startEpochMs;
         if (overBudget(startEpochMs, budgetMs)) {
-          log.warn("Aborting working-batch processing due to budget deadline");
+          log.info(
+              "Stopping working-batch processing due to budget deadline (processed={}, remaining={}, elapsed={}ms, budget={}ms)",
+              i,
+              orphans.size() - i,
+              elapsedMs,
+              budgetMs);
           break;
         }
         int endIndex = Math.min(i + batchSize, orphans.size());
@@ -615,7 +858,9 @@ public class OrphanCleanupService {
       // Use Redis SET with NX and EX options for atomic lock acquisition with built-in expiry
       String result =
           jedis.set(
-              CLEANUP_LEADER_KEY, instanceId, SetParams.setParams().nx().ex(leadershipTtlSeconds));
+              CLEANUP_LEADER_KEY,
+              instanceId,
+              SetParams.setParams().nx().ex((long) leadershipTtlSeconds));
 
       boolean acquired = "OK".equals(result);
       if (acquired) {
@@ -669,8 +914,8 @@ public class OrphanCleanupService {
 
   /**
    * Fallback method to clean up orphaned agents individually when batch operations fail or are
-   * disabled. Implements dual-processing logic: - Valid agents (still configured) → Move to waiting
-   * for rescheduling - Invalid agents (removed accounts) → Remove completely from Redis
+   * disabled. Implements dual-processing logic: - Valid agents (still configured) -> Move to
+   * waiting for rescheduling - Invalid agents (removed accounts) -> Remove completely from Redis
    *
    * @param jedis Redis connection
    * @param setName Redis set name (working or waiting)
@@ -685,11 +930,22 @@ public class OrphanCleanupService {
 
     for (Tuple orphan : orphans) {
       if (Thread.currentThread().isInterrupted()) {
-        log.warn("Stopping individual orphan cleanup early due to interrupt");
+        log.warn(
+            "Stopping individual orphan cleanup early due to interrupt (cleaned={}, processed={}, remaining={})",
+            cleaned,
+            orphans.indexOf(orphan),
+            orphans.size() - orphans.indexOf(orphan));
         break;
       }
+      long elapsedMs = nowMs() - startEpochMs;
       if (overBudget(startEpochMs, budgetMs)) {
-        log.warn("Stopping individual orphan cleanup early due to budget deadline");
+        log.info(
+            "Stopping individual orphan cleanup early due to budget deadline (cleaned={}, processed={}, remaining={}, elapsed={}ms, budget={}ms)",
+            cleaned,
+            orphans.indexOf(orphan),
+            orphans.size() - orphans.indexOf(orphan),
+            elapsedMs,
+            budgetMs);
         break;
       }
       try {
@@ -745,13 +1001,13 @@ public class OrphanCleanupService {
             if (result != null && "swapped".equals(result)) {
               cleaned++;
               log.info(
-                  "Successfully moved orphaned agent {} (original score: {}, new score: {}) from working to waiting set (preserveReady={}).",
+                  "Successfully moved orphaned agent {} (original score: {}, new score: {}) from working to waiting set (preserve_ready={}).",
                   agentName,
                   (long) score,
                   Long.valueOf(newScore),
                   preservedScore != null);
 
-              // Also clean up local state if needed
+              // Clean up local active tracking; acquisition service preserves waiting if present.
               removeActiveAgent(agentName);
             } else {
               log.debug(
@@ -770,7 +1026,7 @@ public class OrphanCleanupService {
                       java.util.Arrays.asList(WORKING_SET, WAITING_SET),
                       java.util.Collections.singletonList(agentName));
 
-              // REMOVE_AGENT returns 1 for success
+              // removeAgent returns 1 for success
               boolean removed = result != null && ((Long) result).intValue() == 1;
               if (removed) {
                 cleaned++;
@@ -788,7 +1044,7 @@ public class OrphanCleanupService {
                       setName);
                 }
 
-                // Also clean up local state if needed
+                // Clean up local active tracking; waiting is preserved if present.
                 removeActiveAgent(agentName);
               } else {
                 log.debug(
@@ -799,13 +1055,18 @@ public class OrphanCleanupService {
               }
             } else {
               log.debug(
-                  "Preserving invalid working agent {} due to shard gating (belongsToThisShard=false)",
+                  "Preserving invalid working agent {} due to shard gating (belongs_to_this_shard=false)",
                   agentName);
             }
           }
         } else if (WAITING_SET.equals(setName)) {
-          // waiting: Only remove invalid entries; always respect shard gating
-          boolean removeCandidate = !isStillValid && belongsToThisShard;
+          // waiting: Only remove invalid entries; always respect shard gating.
+          // Numeric-only epoch-length names are considered corruption when enabled.
+          boolean removeNumericOnly =
+              schedulerProperties.getOrphanCleanup().isRemoveNumericOnlyAgents();
+          boolean numericOnly =
+              removeNumericOnly && agentName != null && agentName.matches("^\\d{9,11}$");
+          boolean removeCandidate = (numericOnly || !isStillValid) && belongsToThisShard;
           if (removeCandidate) {
             Object result =
                 scriptManager.evalshaWithSelfHeal(
@@ -849,18 +1110,42 @@ public class OrphanCleanupService {
   /**
    * Determine shard ownership for the given agent in a fail-safe way.
    *
-   * <p>Behavior:
+   * <p>This method implements a fail-safe design to prevent cross-shard deletions during orphan
+   * cleanup. When shard ownership cannot be determined, the method preserves entries by returning
+   * {@code false}, preventing cleanup actions on entries that may belong to other shards.
+   *
+   * <p><b>Fail-Safe Rationale:</b>
+   *
+   * <ul>
+   *   <li><b>Prevents data corruption:</b> Returning {@code false} on errors prevents this pod from
+   *       deleting entries that belong to other shards, which could cause agent loss across the
+   *       cluster.
+   *   <li><b>Safe during scale events:</b> When pods are added/removed, shard configuration changes
+   *       via {@code CachingPodsObserver.refreshHeartbeat()}. Transient exceptions during
+   *       reconfiguration (e.g., {@code NullPointerException} if shard state is being updated) are
+   *       handled safely by preserving entries.
+   *   <li><b>Accumulation trade-off:</b> The fail-safe design may cause orphaned entries to
+   *       accumulate over time if exceptions occur frequently, but this is preferable to the risk
+   *       of cross-shard deletions causing agent loss.
+   * </ul>
+   *
+   * <p><b>Behavior:</b>
    *
    * <ul>
    *   <li>Uses {@code acquisitionService.belongsToThisShard(agentName)} when available.
    *   <li>Returns {@code false} on any unexpected error to preserve entries (avoid cross-shard
-   *       delete).
+   *       delete). This is the fail-safe behavior.
    *   <li>Returns {@code true} when {@code acquisitionService} is not wired (e.g., in tests) to
    *       maintain consistent behavior without blocking cleanup flows.
    * </ul>
    *
+   * <p><b>Observability:</b> Logs exceptions for observability during scale events when shard
+   * configuration changes. Transient exceptions are logged at debug level; other exceptions are
+   * logged at warn level to help diagnose accumulation issues.
+   *
    * @param agentName agent identifier used for shard ownership check
-   * @return true if this shard should act on the agent, false otherwise
+   * @return true if this shard should act on the agent, false otherwise (fail-safe preserve on
+   *     errors)
    */
   private boolean safeBelongsToShard(String agentName) {
     if (acquisitionService == null) {
@@ -870,7 +1155,16 @@ public class OrphanCleanupService {
     }
     try {
       return acquisitionService.belongsToThisShard(agentName);
+    } catch (NullPointerException | IllegalStateException e) {
+      // Transient exceptions - log for observability (may be due to shard reconfiguration during
+      // scale events)
+      if (log.isDebugEnabled()) {
+        log.debug("Shard check failed for {}: {}", agentName, e.getMessage(), e);
+      }
+      return false; // Still fail-safe preserve
     } catch (Exception e) {
+      // Other exceptions - log but preserve
+      log.warn("Shard check exception for {}: {}", agentName, e.getMessage(), e);
       return false;
     }
   }
