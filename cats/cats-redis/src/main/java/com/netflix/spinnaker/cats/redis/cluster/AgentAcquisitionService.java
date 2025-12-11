@@ -664,10 +664,10 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       // Phase 1: Process queued agent completions
       processQueuedCompletions(jedis, nowMsCached);
 
-      // Phase 1.5: Process recovery queue for agents that failed Redis scheduling
+      // Phase 2: Process recovery queue for agents that failed Redis scheduling
       processRecoveryQueue(jedis);
 
-      // Phase 2: Agent repopulation (Redis recovery, periodic)
+      // Phase 3: Agent repopulation (Redis recovery, periodic)
       long nowMsForRepop = System.currentTimeMillis();
       long refreshPeriodMs = Math.max(1L, schedulerProperties.getRefreshPeriodSeconds()) * 1000L;
       long last = lastRepopulateEpochMs.get();
@@ -689,7 +689,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       // Note: cachedMinEnabledIntervalSec is event-driven (updated on register/unregister),
       // not polled - no need to update every cycle
 
-      // Phase 3: Determine current readiness state for diagnostics (gated by cadence/need)
+      // Phase 4: Determine current readiness state for diagnostics (gated by cadence/need)
       String currentScore = score(jedis, 0L, nowMsCached);
       long currentScoreSeconds = safeParseScore(currentScore, System.currentTimeMillis() / 1000L);
       // Gate diagnostics: only compute when debug is enabled, when warn cadence is due,
@@ -822,7 +822,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         }
       }
 
-      // Phase 4: Agent acquisition setup
+      // Phase 5: Agent acquisition setup
       // Reusing thread-local collection to avoid memory allocations
       Set<AgentWorker> workersToSubmit = REUSABLE_WORKERS_SET.get();
       workersToSubmit.clear(); // Clear any previous contents
@@ -899,7 +899,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           availableSlotsForNewAgents,
           queueDepthDebug);
 
-      // Phase 5: Acquire up to available slots in chunks of batch-size
+      // Phase 6: Acquire up to available slots in chunks of batch-size
       int remainingToAcquire = effectiveMaxToAcquire;
       int chunkOffset = 0; // Track offset for pagination through ready agents
 
@@ -1110,7 +1110,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         lastDiagEpochMs.set(System.currentTimeMillis());
       }
 
-      // Phase 6: Submit all acquired agents for execution
+      // Phase 7: Submit all acquired agents for execution
       // Submit each agent individually to handle rejections properly
       for (AgentWorker worker : workersToSubmit) {
         // Critical: Set semaphore before execution so it can be released when done
