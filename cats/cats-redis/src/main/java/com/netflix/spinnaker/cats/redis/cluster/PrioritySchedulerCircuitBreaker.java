@@ -20,13 +20,16 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 /**
  * Circuit breaker protecting the scheduler from cascading failures.
  *
- * <p>Responsibilities: - Track failures and transition between CLOSED → OPEN → HALF_OPEN → CLOSED -
- * Enforce cooldown and half-open probe windows - Emit simple counters for allowed/blocked requests
+ * <p>Responsibilities: - Track failures and transition between CLOSED -> OPEN -> HALF_OPEN ->
+ * CLOSED - Enforce cooldown and half-open probe windows - Emit simple counters for allowed/blocked
+ * requests
  *
  * <p>Non-responsibilities: - Redis time sourcing (uses System clock) - Scheduling logic (callers
  * use this as a guard)
@@ -89,7 +92,7 @@ public class PrioritySchedulerCircuitBreaker {
     this.timeWindowMs = timeWindowMs;
     this.cooldownMs = cooldownMs;
     this.halfOpenDurationMs = halfOpenDurationMs;
-    this.metrics = metrics;
+    this.metrics = metrics != null ? metrics : PrioritySchedulerMetrics.NOOP;
   }
 
   /**
@@ -121,9 +124,7 @@ public class PrioritySchedulerCircuitBreaker {
           }
         }
         totalBlocked.increment();
-        if (metrics != null) {
-          metrics.recordCircuitBreakerBlocked(name);
-        }
+        metrics.recordCircuitBreakerBlocked(name);
         return false;
 
       case HALF_OPEN:
@@ -139,9 +140,7 @@ public class PrioritySchedulerCircuitBreaker {
           transitionToOpen(now, "Half-open period expired without recovery");
         }
         totalBlocked.increment();
-        if (metrics != null) {
-          metrics.recordCircuitBreakerBlocked(name);
-        }
+        metrics.recordCircuitBreakerBlocked(name);
         return false;
 
       default:
@@ -158,9 +157,7 @@ public class PrioritySchedulerCircuitBreaker {
     if (currentState == State.HALF_OPEN) {
       if (transitionToClosed(System.currentTimeMillis())) {
         log.info("Circuit breaker '{}' recovered, transitioning from HALF_OPEN to CLOSED", name);
-        if (metrics != null) {
-          metrics.recordCircuitBreakerRecovery(name);
-        }
+        metrics.recordCircuitBreakerRecovery(name);
       }
     }
   }
@@ -192,9 +189,7 @@ public class PrioritySchedulerCircuitBreaker {
                   failures, consecutive, failureThreshold);
           if (transitionToOpen(now, reason)) {
             log.warn("Circuit breaker '{}' tripped: {}", name, reason, exception);
-            if (metrics != null) {
-              metrics.recordCircuitBreakerTrip(name, exception.getClass().getSimpleName());
-            }
+            metrics.recordCircuitBreakerTrip(name, exception.getClass().getSimpleName());
           }
         }
         break;
@@ -204,9 +199,7 @@ public class PrioritySchedulerCircuitBreaker {
         String reason = "probe failed during half-open";
         if (transitionToOpen(now, reason)) {
           log.warn("Circuit breaker '{}' probe failed, returning to OPEN state", name, exception);
-          if (metrics != null) {
-            metrics.recordCircuitBreakerTrip(name, "probe_failure");
-          }
+          metrics.recordCircuitBreakerTrip(name, "probe_failure");
         }
         break;
 
@@ -302,7 +295,24 @@ public class PrioritySchedulerCircuitBreaker {
     failureCount.set(0);
   }
 
-  /** Statistics holder for circuit breaker monitoring. */
+  /**
+   * Statistics holder for circuit breaker monitoring.
+   *
+   * <p>Fields:
+   *
+   * <ul>
+   *   <li>{@code name} - circuit breaker name
+   *   <li>{@code state} - current circuit breaker state
+   *   <li>{@code failureCount} - failures in current window
+   *   <li>{@code consecutiveFailures} - consecutive failures without success
+   *   <li>{@code totalAllowed} - total requests allowed through
+   *   <li>{@code totalBlocked} - total requests blocked
+   *   <li>{@code stateAgeMs} - time in current state (milliseconds)
+   *   <li>{@code lastFailureMs} - timestamp of last failure (milliseconds since epoch)
+   * </ul>
+   */
+  @Getter
+  @RequiredArgsConstructor
   public static class CircuitBreakerStats {
     private final String name;
     private final State state;
@@ -313,63 +323,11 @@ public class PrioritySchedulerCircuitBreaker {
     private final long stateAgeMs;
     private final long lastFailureMs;
 
-    public CircuitBreakerStats(
-        String name,
-        State state,
-        int failureCount,
-        int consecutiveFailures,
-        long totalAllowed,
-        long totalBlocked,
-        long stateAgeMs,
-        long lastFailureMs) {
-      this.name = name;
-      this.state = state;
-      this.failureCount = failureCount;
-      this.consecutiveFailures = consecutiveFailures;
-      this.totalAllowed = totalAllowed;
-      this.totalBlocked = totalBlocked;
-      this.stateAgeMs = stateAgeMs;
-      this.lastFailureMs = lastFailureMs;
-    }
-
     @Override
     public String toString() {
       return String.format(
           "CircuitBreaker[%s]: state=%s, failures=%d, consecutive=%d, allowed=%d, blocked=%d, age=%dms",
           name, state, failureCount, consecutiveFailures, totalAllowed, totalBlocked, stateAgeMs);
-    }
-
-    // Getters
-    public String getName() {
-      return name;
-    }
-
-    public State getState() {
-      return state;
-    }
-
-    public int getFailureCount() {
-      return failureCount;
-    }
-
-    public int getConsecutiveFailures() {
-      return consecutiveFailures;
-    }
-
-    public long getTotalAllowed() {
-      return totalAllowed;
-    }
-
-    public long getTotalBlocked() {
-      return totalBlocked;
-    }
-
-    public long getStateAgeMs() {
-      return stateAgeMs;
-    }
-
-    public long getLastFailureMs() {
-      return lastFailureMs;
     }
   }
 }

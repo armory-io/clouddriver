@@ -16,6 +16,7 @@
 
 package com.netflix.spinnaker.cats.redis.cluster;
 
+import com.google.common.annotations.VisibleForTesting;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -35,7 +36,7 @@ import redis.clients.jedis.JedisPool;
  * <p>Key operations:
  *
  * <ul>
- *   <li>Agent movement between sets (waiting ↔ working)
+ *   <li>Agent movement between sets (waiting <-> working)
  *   <li>Batch operations for performance
  *   <li>Conditional operations with ownership validation
  *   <li>Leadership management for distributed coordination
@@ -49,30 +50,32 @@ public class RedisScriptManager {
 
   // Script name constants for Redis Lua operations
 
-  // === BASIC OPERATIONS ===
+  // === Basic operations ===
   public static final String ADD_AGENT = "addAgent"; // Single agent addition
   public static final String ADD_AGENTS = "addAgents"; // Batch agent addition
   public static final String REMOVE_AGENT = "removeAgent"; // Single agent removal
+  public static final String REMOVE_AGENT_COMPLETION =
+      "removeAgentCompletion"; // Atomic removal preserving waiting entries during completion
 
-  // === STATE TRANSITIONS ===
+  // === State transitions ===
   public static final String MOVE_AGENTS =
-      "moveAgents"; // Unconditional waiting→working for agent acquisition
+      "moveAgents"; // Unconditional waiting->working for agent acquisition
   public static final String MOVE_AGENTS_CONDITIONAL =
-      "moveAgentsConditional"; // Conditional working→waiting with ownership verification
+      "moveAgentsConditional"; // Conditional working->waiting with ownership verification
 
-  // === QUERIES ===
+  // === Queries ===
   public static final String SCORE_AGENTS = "scoreAgents"; // Batch score lookup for multiple agents
   public static final String ZMSCORE_AGENTS =
       "zmscoreAgents"; // Atomic ZMSCORE for both sets; returns [1/0 per arg] ORed across sets
 
-  // === ADVANCED OPERATIONS ===
+  // === Advanced operations ===
   public static final String ACQUIRE_AGENTS =
-      "acquireAgents"; // Batch atomic waiting→working acquisition
+      "acquireAgents"; // Batch atomic waiting->working acquisition
   public static final String REMOVE_AGENTS_CONDITIONAL =
       "removeAgentsConditional"; // Conditional removal with score validation (orphan + zombie
   // cleanup)
 
-  // === SYSTEM ===
+  // === System ===
   public static final String RELEASE_LEADERSHIP =
       "releaseLeadership"; // Distributed leadership release
 
@@ -84,9 +87,15 @@ public class RedisScriptManager {
   // Single source of truth for Lua bodies used by both scriptLoad and EVAL fallback
   private final Map<String, String> scriptBodies = new ConcurrentHashMap<>();
 
+  /**
+   * Constructs a new RedisScriptManager.
+   *
+   * @param jedisPool Redis connection pool for script operations
+   * @param metrics Metrics collector for tracking script execution
+   */
   public RedisScriptManager(JedisPool jedisPool, PrioritySchedulerMetrics metrics) {
     this.jedisPool = jedisPool;
-    this.metrics = metrics;
+    this.metrics = metrics != null ? metrics : PrioritySchedulerMetrics.NOOP;
   }
 
   /**
@@ -121,7 +130,8 @@ public class RedisScriptManager {
    * @return The SHA hash for EVALSHA execution
    * @throws IllegalStateException if scripts are not initialized or script not found
    */
-  public String getScriptSha(String scriptName) {
+  @VisibleForTesting
+  String getScriptSha(String scriptName) {
     if (scriptName == null) {
       throw new IllegalArgumentException("Script name cannot be null");
     }
@@ -142,7 +152,8 @@ public class RedisScriptManager {
    *
    * @return Number of scripts currently loaded and cached
    */
-  public int getScriptCount() {
+  @VisibleForTesting
+  int getScriptCount() {
     return scriptShas.size();
   }
 
@@ -238,15 +249,15 @@ public class RedisScriptManager {
     // invariants used by the Priority scheduler. Inline comments explain expected semantics.
     Map<String, String> bodies = new LinkedHashMap<>();
 
-    // --- INDIVIDUAL OPERATIONS ---
+    // --- Individual operations ---
 
-    // ADD_AGENT: Add single agent to the waiting set with pipeline compatibility.
+    // addAgent: Add single agent to the waiting set with pipeline compatibility.
     // Invariants:
     // - An agent may be in at most one of waiting or working at any time.
     // - If present in either, re-adding is a no-op (idempotent enqueue).
-    // ARGS: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=score
-    // RETURNS: 1 if agent added successfully, 0 if agent already exists in either set
-    // USAGE: Pipeline-friendly for bulk operations, individual scheduling
+    // Args: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=score
+    // Returns: 1 if agent added successfully, 0 if agent already exists in either set
+    // Usage: Pipeline-friendly for bulk operations, individual scheduling
     bodies.put(
         ADD_AGENT,
         "-- Check if agent exists in either working or waiting set\n"
@@ -259,12 +270,12 @@ public class RedisScriptManager {
             + "  return 0  -- Already exists: no action taken\n"
             + "end\n");
 
-    // REMOVE_AGENT: Unconditionally remove agent from both working and waiting sets.
+    // removeAgent: Unconditionally remove agent from both working and waiting sets.
     // Invariants:
     // - Removal is idempotent; used by completion, zombie cleanup, and defensive cleanup.
-    // ARGS: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName
-    // RETURNS: 1 (always successful - removes from both sets regardless of presence)
-    // USAGE: Agent completion cleanup, zombie cleanup, pipeline-friendly removal
+    // Args: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName
+    // Returns: 1 (always successful - removes from both sets regardless of presence)
+    // Usage: Agent completion cleanup, zombie cleanup, pipeline-friendly removal
     bodies.put(
         REMOVE_AGENT,
         "-- Remove agent from working set (may not exist)\n"
@@ -273,12 +284,54 @@ public class RedisScriptManager {
             + "redis.call('zrem', KEYS[2], ARGV[1])\n"
             + "return 1  -- Always successful: Redis ZREM is idempotent\n");
 
-    // --- BATCH OPERATIONS ---
-
-    // ADD_AGENTS: Add single or multiple agents to the waiting set (consolidated from ADD_AGENT +
-    // BATCH_ADD_AGENTS).
+    // removeAgentCompletion: Atomically remove agent from working set, preserving waiting
+    // entry if present.
+    //
+    // Race condition context:
+    // The agent is NOT in both sets simultaneously. The race occurs during the transition:
+    //
+    // Timeline:
+    // 1. Agent completes execution -> Worker thread calls removeActiveAgent()
+    // 2. Worker: conditionalReleaseAgent() queues completion (in-memory queue, not Redis yet)
+    // 3. Worker: removeActiveAgent() reads WAITING_SET -> finds null (agent not rescheduled yet)
+    // 4. [RACE WINDOW] Scheduler thread: processQueuedCompletions() adds agent to WAITING_SET
+    // 5. Worker: removeActiveAgent() calls removeAgent script -> removes from both sets
+    //    -> This removes the just-added WAITING entry, causing agent loss!
+    //
+    // This script prevents the race by atomically checking-and-removing in a single Redis
+    // operation.
+    // If completion processing added the agent to WAITING between the check and removal, the
+    // waiting entry is preserved, preventing agent loss.
+    //
     // Invariants:
-    // - Same as ADD_AGENT but batched; returns {count, [added...]} for observability.
+    // - Atomically checks for waiting entry before removing to prevent race conditions.
+    // - Used by removeActiveAgent() to prevent losing agents that were just rescheduled.
+    // - If waiting entry exists, only removes from working; otherwise removes from both sets.
+    // Args: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName
+    // Returns: {removedFromWorking, preservedWaiting} where preservedWaiting=1 if waiting entry
+    // existed
+    // Usage: Worker completion cleanup to prevent race with completion queue processing
+    bodies.put(
+        REMOVE_AGENT_COMPLETION,
+        "-- Atomically check if agent exists in waiting set\n"
+            + "local waitingScore = redis.call('zscore', KEYS[2], ARGV[1])\n"
+            + "-- Remove from working set (always attempt)\n"
+            + "local removedFromWorking = redis.call('zrem', KEYS[1], ARGV[1])\n"
+            + "if waitingScore then\n"
+            + "  -- Waiting entry exists: preserve it (only remove from working)\n"
+            + "  return {removedFromWorking, 1}\n"
+            + "else\n"
+            + "  -- No waiting entry: safe to remove from both sets\n"
+            + "  redis.call('zrem', KEYS[2], ARGV[1])\n"
+            + "  return {removedFromWorking, 0}\n"
+            + "end\n");
+
+    // --- Batch operations ---
+
+    // addAgents: Add single or multiple agents to the waiting set (consolidated from addAgent +
+    // batch add).
+    // Invariants:
+    // - Same as addAgent but batched; returns {count, [added...]} for observability.
     // Handles both single [agent, score] and batch [agent1, score1, agent2, score2, ...] operations
     // Track added agents and the count of successful additions.
     bodies.put(
@@ -301,14 +354,14 @@ public class RedisScriptManager {
             + "end\n"
             + "return {count, added}\n");
 
-    // --- AGENT STATE TRANSITION SCRIPTS ---
+    // --- Agent state transition scripts ---
 
-    // MOVE_AGENTS: Unconditionally move agent waiting → working for acquisition (single agent).
+    // moveAgents: Unconditionally move agent waiting -> working for acquisition (single agent).
     // Invariants:
     // - Returns newScore if moved; nil if not waiting. Used by acquisition flows.
-    // ARGS: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=newScore
-    // RETURNS: newScore if successful, nil if agent not in the waiting set
-    // USAGE: Agent acquisition (WAITING → WORKING transition)
+    // Args: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=newScore
+    // Returns: newScore if successful, nil if agent not in the waiting set
+    // Usage: Agent acquisition (waiting -> working transition)
     bodies.put(
         MOVE_AGENTS,
         "-- Attempt to remove agent from the waiting set\n"
@@ -321,14 +374,14 @@ public class RedisScriptManager {
             + "  return nil\n"
             + "end\n");
 
-    // MOVE_AGENTS_CONDITIONAL: Conditionally move working → waiting with ownership verification.
+    // moveAgentsConditional: Conditionally move working -> waiting with ownership verification.
     // Invariants:
     // - Score encodes lock ownership. Only the owning scorer may requeue.
     // - Used by graceful shutdown and local zombie/orphan cleanup.
-    // ARGS: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=expectedScore,
+    // Args: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=expectedScore,
     // ARGV[3]=newScore
-    // RETURNS: 'swapped' if agent moved successfully, nil if ownership verification failed
-    // USAGE: Graceful shutdown re-queuing, ensures only owning pod moves its agents
+    // Returns: 'swapped' if agent moved successfully, nil if ownership verification failed
+    // Usage: Graceful shutdown re-queuing, ensures only owning pod moves its agents
     bodies.put(
         MOVE_AGENTS_CONDITIONAL,
         "local score = redis.call('zscore', KEYS[1], ARGV[1])\n"
@@ -338,9 +391,9 @@ public class RedisScriptManager {
             + "  return 'swapped'\n"
             + "else return nil end\n");
 
-    // --- ADVANCED CLEANUP SCRIPTS ---
+    // --- Advanced cleanup scripts ---
 
-    // REMOVE_AGENTS_CONDITIONAL: Remove single or multiple agents with score validation.
+    // removeAgentsConditional: Remove single or multiple agents with score validation.
     // Invariants:
     // - Used for orphan cleanup (cross-instance) and zombie cleanup (local instance).
     // - Only removes entries whose scores match expectations, preventing races.
@@ -363,7 +416,7 @@ public class RedisScriptManager {
             + "end\n"
             + "return {count, removed}\n");
 
-    // ACQUIRE_AGENTS: Batch atomic acquisition waiting → working.
+    // acquireAgents: Batch atomic acquisition waiting -> working.
     // Invariants:
     // - For each candidate, if it is still in waiting, atomically move and track acquired list.
     // - Combined with ready-scan limit, keeps acquisition O(N) per cycle.
@@ -387,9 +440,9 @@ public class RedisScriptManager {
             + "end\n"
             + "return {count, acquired}\n");
 
-    // --- QUERY SCRIPTS ---
+    // --- Query scripts ---
 
-    // ZMSCORE_AGENTS: Batch presence check across working and waiting sets.
+    // zmscoreAgents: Batch presence check across working and waiting sets.
     // Invariants:
     // - Atomically evaluates both sets within one script execution per batch
     // - Returns [1|0, 1|0, ...] aligned with ARGV order (1 if present in either set)
@@ -414,7 +467,7 @@ public class RedisScriptManager {
             + "end\n"
             + "return presence\n");
 
-    // SCORE_AGENTS: Batch score lookup for multiple agents.
+    // scoreAgents: Batch score lookup for multiple agents.
     // Invariants:
     // - Returns [agent, workScore|'null', waitScore|'null', ...] for diagnostics/observability.
     bodies.put(
@@ -434,9 +487,9 @@ public class RedisScriptManager {
             + "end\n"
             + "return results\n");
 
-    // --- LEADERSHIP MANAGEMENT ---
+    // --- Leadership management ---
 
-    // RELEASE_LEADERSHIP: Release leadership only if we own it (atomic check-and-delete).
+    // releaseLeadership: Release leadership only if we own it (atomic check-and-delete).
     // Invariants:
     // - Prevents another node from releasing a lock it does not own.
     bodies.put(
@@ -451,8 +504,8 @@ public class RedisScriptManager {
     scriptBodies.clear();
     scriptBodies.putAll(bodies);
     scriptShas.clear();
-    for (Map.Entry<String, String> e : bodies.entrySet()) {
-      scriptShas.put(e.getKey(), jedis.scriptLoad(e.getValue()));
+    for (Map.Entry<String, String> entry : bodies.entrySet()) {
+      scriptShas.put(entry.getKey(), jedis.scriptLoad(entry.getValue()));
     }
 
     log.debug("Loaded Redis Lua scripts: {}", scriptShas.keySet());

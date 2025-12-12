@@ -28,16 +28,34 @@ package com.netflix.spinnaker.cats.redis.cluster.support;
 public final class CadenceGuard {
   private CadenceGuard() {}
 
-  /** Return current wall-clock time in milliseconds. */
+  /**
+   * Returns current wall-clock time in milliseconds.
+   *
+   * @return current time in milliseconds since epoch
+   */
   public static long nowMs() {
     return System.currentTimeMillis();
   }
 
+  /**
+   * Checks if a given period has elapsed since the last epoch timestamp.
+   *
+   * @param lastEpochMs last recorded timestamp in milliseconds
+   * @param periodMs minimum period that must elapse (clamped to at least 1ms)
+   * @return true if the period has elapsed, false otherwise
+   */
   public static boolean isPeriodElapsed(long lastEpochMs, long periodMs) {
     long now = nowMs();
     return now - lastEpochMs >= Math.max(1L, periodMs);
   }
 
+  /**
+   * Checks if an operation has exceeded its time budget.
+   *
+   * @param startEpochMs operation start time in milliseconds
+   * @param budgetMs maximum allowed duration (0 or negative disables budget checking)
+   * @return true if budget is exceeded, false otherwise
+   */
   public static boolean overBudget(long startEpochMs, long budgetMs) {
     return budgetMs > 0 && (nowMs() - startEpochMs) > budgetMs;
   }

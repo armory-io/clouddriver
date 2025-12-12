@@ -28,27 +28,63 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisPoolConfig;
 
 /**
- * Test suite for RedisScriptManager using testcontainers.
+ * Tests for {@link RedisScriptManager}, which manages Redis Lua scripts for the Priority Agent
+ * Scheduler.
  *
- * <p>Tests cover:
+ * <h3>Architecture Overview</h3>
+ *
+ * <p>RedisScriptManager provides atomic Redis operations via Lua scripts, ensuring agent state
+ * transitions between WAITING and WORKING sets are race-free. Scripts are loaded once at startup
+ * and executed via EVALSHA for efficiency.
+ *
+ * <h3>Script Categories</h3>
  *
  * <ul>
- *   <li>Script initialization and caching
- *   <li>Thread safety of script loading
- *   <li>Error handling for Redis failures
- *   <li>Performance characteristics
- *   <li>All script constants and operations
+ *   <li><b>Basic Operations:</b> ADD_AGENT, REMOVE_AGENT, REMOVE_AGENT_COMPLETION - single agent
+ *       state management
+ *   <li><b>Batch Operations:</b> ADD_AGENTS, ACQUIRE_AGENTS, REMOVE_AGENTS_CONDITIONAL - efficient
+ *       bulk processing
+ *   <li><b>State Transitions:</b> MOVE_AGENTS (waiting->working), MOVE_AGENTS_CONDITIONAL
+ *       (working->waiting with ownership verification)
+ *   <li><b>Queries:</b> SCORE_AGENTS, ZMSCORE_AGENTS - batch score lookups and presence checks
+ *   <li><b>Coordination:</b> RELEASE_LEADERSHIP - distributed leadership management
+ * </ul>
+ *
+ * <h3>Self-Healing Behavior</h3>
+ *
+ * <p>The evalshaWithSelfHeal() method handles Redis failover scenarios where scripts are evicted.
+ * On NOSCRIPT errors, it automatically reloads scripts and retries, falling back to direct EVAL if
+ * reload fails. This ensures scheduler resilience during Redis cluster operations.
+ *
+ * <h3>Score Format Convention</h3>
+ *
+ * <p>All scores use Unix timestamps in <b>seconds</b> (not milliseconds). This is critical for
+ * consistent timeout detection and score comparisons across the scheduler.
+ *
+ * <h3>Test Organization</h3>
+ *
+ * <ul>
+ *   <li>{@link ScriptInitializationTests} - script loading, idempotency, SHA caching
+ *   <li>{@link ThreadSafetyTests} - concurrent initialization safety
+ *   <li>{@link ErrorHandlingTests} - uninitialized access, unknown scripts, connection failures
+ *   <li>{@link ScriptExecutionTests} - individual script behavior verification
+ *   <li>{@link IndividualScriptTests} - ADD_AGENT, REMOVE_AGENT, REMOVE_AGENT_COMPLETION
+ *   <li>{@link BatchScriptTests} - batch operations and leadership release
+ *   <li>{@link PerformanceTests} - high-volume execution efficiency
+ *   <li>{@link SelfHealAndSingleSourceBodyTests} - NOSCRIPT recovery and EVAL fallback
+ *   <li>{@link TimestampFormatConsistencyTests} - seconds format validation
+ *   <li>{@link UnitTests} - isolated unit tests with FakeJedis
+ *   <li>{@link IntegrationTests} - metrics recording verification
  * </ul>
  */
 @Testcontainers
 @DisplayName("RedisScriptManager Tests")
+@SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
 class RedisScriptManagerTest {
 
   @Container
-  @SuppressWarnings("resource")
   static GenericContainer<?> redis =
       new GenericContainer<>("redis:7-alpine")
           .withExposedPorts(6379)
@@ -60,24 +96,19 @@ class RedisScriptManagerTest {
 
   @BeforeEach
   void setUp() {
-    JedisPoolConfig config = new JedisPoolConfig();
-    config.setMaxTotal(10);
-    config.setMaxIdle(5);
-    config.setMinIdle(1);
-    config.setTestOnBorrow(true);
+    jedisPool = TestFixtures.createTestJedisPool(redis);
 
-    jedisPool = new JedisPool(config, redis.getHost(), redis.getMappedPort(6379), 2000, "testpass");
-
-    scriptManager =
-        new RedisScriptManager(
-            jedisPool,
-            new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
+    scriptManager = new RedisScriptManager(jedisPool, TestFixtures.createTestMetrics());
   }
 
   @Nested
   @DisplayName("Script Initialization Tests")
   class ScriptInitializationTests {
 
+    /**
+     * Tests that initializeScripts() successfully loads all Lua scripts into Redis. Verifies the
+     * initialized flag is set and the expected script count (11) is loaded.
+     */
     @Test
     @DisplayName("Should successfully initialize all scripts")
     void shouldInitializeAllScripts() {
@@ -86,9 +117,14 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(11);
     }
 
+    /**
+     * Tests that all script constants (ADD_AGENT, REMOVE_AGENT, REMOVE_AGENT_COMPLETION,
+     * ADD_AGENTS, MOVE_AGENTS, MOVE_AGENTS_CONDITIONAL, ACQUIRE_AGENTS, SCORE_AGENTS,
+     * REMOVE_AGENTS_CONDITIONAL, RELEASE_LEADERSHIP) are loaded with non-empty SHA hashes.
+     */
     @Test
     @DisplayName("Should load all expected script constants")
     void shouldLoadAllExpectedScriptConstants() {
@@ -99,6 +135,8 @@ class RedisScriptManagerTest {
       // Individual scripts
       assertThat(scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT)).isNotEmpty();
       assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT)).isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_COMPLETION))
+          .isNotEmpty();
 
       // Batch scripts
       assertThat(scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS)).isNotEmpty();
@@ -112,6 +150,10 @@ class RedisScriptManagerTest {
       assertThat(scriptManager.getScriptSha(RedisScriptManager.RELEASE_LEADERSHIP)).isNotEmpty();
     }
 
+    /**
+     * Tests that initializeScripts() is idempotent: multiple calls return the same script SHAs and
+     * do not reload scripts unnecessarily.
+     */
     @Test
     @DisplayName("Should be idempotent when called multiple times")
     void shouldBeIdempotentWhenCalledMultipleTimes() {
@@ -124,7 +166,7 @@ class RedisScriptManagerTest {
 
       // Then
       assertThat(firstSha).isEqualTo(secondSha);
-      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(11);
     }
   }
 
@@ -132,6 +174,10 @@ class RedisScriptManagerTest {
   @DisplayName("Thread Safety Tests")
   class ThreadSafetyTests {
 
+    /**
+     * Tests that concurrent calls to initializeScripts() from multiple threads are handled safely
+     * without exceptions and result in correct initialization state.
+     */
     @Test
     @DisplayName("Should handle concurrent initialization safely")
     void shouldHandleConcurrentInitializationSafely() throws InterruptedException {
@@ -161,7 +207,7 @@ class RedisScriptManagerTest {
       // Then
       assertThat(threadException[0]).isNull();
       assertThat(scriptManager.isInitialized()).isTrue();
-      assertThat(scriptManager.getScriptCount()).isEqualTo(10);
+      assertThat(scriptManager.getScriptCount()).isEqualTo(11);
     }
   }
 
@@ -169,6 +215,10 @@ class RedisScriptManagerTest {
   @DisplayName("Error Handling Tests")
   class ErrorHandlingTests {
 
+    /**
+     * Tests that getScriptSha() throws IllegalStateException with "Scripts not initialized" message
+     * when scripts have not been initialized.
+     */
     @Test
     @DisplayName("Should throw exception when accessing uninitialized scripts")
     void shouldThrowExceptionWhenAccessingUninitializedScripts() {
@@ -178,6 +228,10 @@ class RedisScriptManagerTest {
           .hasMessageContaining("Scripts not initialized");
     }
 
+    /**
+     * Tests that getScriptSha() throws IllegalArgumentException with "Unknown script" message for
+     * unrecognized script names.
+     */
     @Test
     @DisplayName("Should throw exception for unknown script names")
     void shouldThrowExceptionForUnknownScriptNames() {
@@ -190,6 +244,26 @@ class RedisScriptManagerTest {
           .hasMessageContaining("Unknown script");
     }
 
+    /**
+     * Tests that getScriptSha rejects null script names with IllegalArgumentException. This
+     * validates the null-check guard clause in getScriptSha().
+     */
+    @Test
+    @DisplayName("Should throw exception for null script name")
+    void shouldThrowExceptionForNullScriptName() {
+      // Given
+      scriptManager.initializeScripts();
+
+      // When & Then
+      assertThatThrownBy(() -> scriptManager.getScriptSha(null))
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining("cannot be null");
+    }
+
+    /**
+     * Tests that initializeScripts() throws RuntimeException with "Failed to initialize Redis
+     * scripts" message when the Redis connection pool is closed.
+     */
     @Test
     @DisplayName("Should handle Redis connection failures gracefully")
     void shouldHandleRedisConnectionFailuresGracefully() {
@@ -212,6 +286,10 @@ class RedisScriptManagerTest {
       scriptManager.initializeScripts();
     }
 
+    /**
+     * Tests that ADD_AGENTS script adds an agent to the waiting set with correct score, returning
+     * [count, [addedAgents]] format.
+     */
     @Test
     @DisplayName("Should execute ADD_AGENTS_SCRIPT correctly")
     void shouldExecuteAddAgentsScriptCorrectly() {
@@ -241,6 +319,10 @@ class RedisScriptManagerTest {
       }
     }
 
+    /**
+     * Tests that MOVE_AGENTS script atomically moves an agent from waiting to working set, removes
+     * it from waiting, and returns the new score.
+     */
     @Test
     @DisplayName("Should execute MOVE_AGENTS_SCRIPT correctly")
     void shouldExecuteMoveAgentsScriptCorrectly() {
@@ -260,27 +342,43 @@ class RedisScriptManagerTest {
         // Then - MOVE_AGENTS returns the score on success
         assertThat(result).isEqualTo(newScore);
         assertThat(jedis.zscore("working", "test-agent")).isEqualTo(200.0);
-        assertThat(jedis.zscore("waiting", "test-agent")).isNull();
+        TestFixtures.assertAgentNotInSet(jedis, "waiting", "test-agent");
       }
     }
 
+    /**
+     * Tests that MOVE_AGENTS_CONDITIONAL script correctly handles numeric score conversion using
+     * tonumber(), succeeding only when the expected score matches and failing otherwise.
+     *
+     * <p>The score encodes ownership: only the pod that acquired an agent (and knows its score) can
+     * release it. This prevents unauthorized pods from moving agents during graceful shutdown or
+     * cleanup operations.
+     *
+     * <p>The Lua script uses tonumber() to compare scores because:
+     *
+     * <ul>
+     *   <li>Redis stores sorted set scores as doubles (12345 -> 12345.0)
+     *   <li>Java passes scores as strings via Jedis ("12345")
+     *   <li>Without tonumber(), "12345" != 12345.0 would fail the comparison
+     * </ul>
+     */
     @Test
     @DisplayName("Should handle numeric score conversion correctly in conditional swap")
     void shouldHandleNumericScoreConversionInConditionalSwap() {
-      // Given - Agent in WORKING set with numeric score
+      // Given - Agent in WORKING set with numeric score (encodes ownership)
       String agentType = "test-agent";
-      long workingScore = 12345L; // Redis will store this as 12345.0 (double)
+      long workingScore = 12345L; // Redis stores as 12345.0 (double)
       long newScore = 67890L;
 
       try (Jedis jedis = jedisPool.getResource()) {
         // Add agent to WORKING set
         jedis.zadd("working", workingScore, agentType);
 
-        // Verify Redis stores it as double but we can retrieve as long
+        // Redis stores as double, Java retrieves as Double
         Double retrievedScore = jedis.zscore("working", agentType);
-        assertThat(retrievedScore).isEqualTo(12345.0); // Redis returns double
+        assertThat(retrievedScore).isEqualTo(12345.0);
 
-        // When - Execute conditional swap with string representation (how Java passes it)
+        // When - Execute conditional swap with string representation (Java passes strings)
         Object result =
             jedis.evalsha(
                 scriptManager.getScriptSha(RedisScriptManager.MOVE_AGENTS_CONDITIONAL),
@@ -293,7 +391,7 @@ class RedisScriptManagerTest {
 
         // Then - Should succeed thanks to tonumber() conversion
         assertThat(result).isEqualTo("swapped");
-        assertThat(jedis.zscore("working", agentType)).isNull();
+        TestFixtures.assertAgentNotInSet(jedis, "working", agentType);
         assertThat(jedis.zscore("waiting", agentType)).isEqualTo(newScore);
 
         // Cleanup for next test
@@ -314,10 +412,14 @@ class RedisScriptManagerTest {
         // Should fail - ownership verification failed
         assertThat(result).isNull();
         assertThat(jedis.zscore("working", agentType)).isEqualTo(workingScore); // Still in working
-        assertThat(jedis.zscore("waiting", agentType)).isNull();
+        TestFixtures.assertAgentNotInSet(jedis, "waiting", agentType);
       }
     }
 
+    /**
+     * Tests that ZMSCORE_AGENTS script returns correct presence mapping: 1 for agents in either
+     * set, 0 for agents in neither set.
+     */
     @Test
     @DisplayName("Should execute ZMSCORE_AGENTS script correctly for presence mapping")
     void shouldExecuteZmscoreAgentsScriptCorrectly() {
@@ -357,6 +459,10 @@ class RedisScriptManagerTest {
       scriptManager.initializeScripts();
     }
 
+    /**
+     * Tests that ADD_AGENT script returns 1 on successful add and 0 if agent already exists,
+     * demonstrating idempotent behavior with unchanged scores on duplicate additions.
+     */
     @Test
     @DisplayName("Should execute ADD_AGENT script correctly")
     void shouldExecuteAddAgentScriptCorrectly() {
@@ -388,6 +494,10 @@ class RedisScriptManagerTest {
       }
     }
 
+    /**
+     * Tests that REMOVE_AGENT script removes an agent from both working and waiting sets, leaving
+     * other agents untouched.
+     */
     @Test
     @DisplayName("Should execute REMOVE_AGENT script correctly")
     void shouldExecuteRemoveAgentScriptCorrectly() {
@@ -405,9 +515,96 @@ class RedisScriptManagerTest {
 
         // Then - Returns 1 and removes from both sets
         assertThat(result).isEqualTo(1L);
-        assertThat(jedis.zscore("working", "agent1")).isNull();
-        assertThat(jedis.zscore("waiting", "agent1")).isNull();
+        TestFixtures.assertAgentNotInSet(jedis, "working", "agent1");
+        TestFixtures.assertAgentNotInSet(jedis, "waiting", "agent1");
         assertThat(jedis.zscore("waiting", "agent2")).isEqualTo(200.0); // Other agent untouched
+      }
+    }
+
+    /**
+     * Tests that REMOVE_AGENT_COMPLETION script atomically removes from working while preserving
+     * waiting entries. Covers three scenarios: agent in working only, agent in both sets, and agent
+     * in waiting only.
+     *
+     * <p>This script prevents a race condition during agent completion:
+     *
+     * <ol>
+     *   <li>Agent completes execution -> Worker thread calls removeActiveAgent()
+     *   <li>Worker queues completion (in-memory, not Redis yet)
+     *   <li>Worker reads WAITING set -> finds null (agent not rescheduled yet)
+     *   <li>[RACE WINDOW] Scheduler thread adds agent to WAITING set
+     *   <li>Worker calls removeAgent -> would remove the just-added WAITING entry!
+     * </ol>
+     *
+     * <p>The atomic check-and-remove in this script ensures the waiting entry is preserved if it
+     * was added between the check and removal.
+     */
+    @Test
+    @DisplayName("Should execute REMOVE_AGENT_COMPLETION script correctly")
+    void shouldExecuteRemoveAgentCompletionScriptCorrectly() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Scenario 1: Agent in working set only (no race - simple removal)
+        jedis.zadd("working", 100, "agent1");
+        jedis.zrem("waiting", "agent1"); // Ensure not in waiting
+
+        // When - Remove agent (no waiting entry)
+        Object result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_COMPLETION),
+                java.util.Arrays.asList("working", "waiting"),
+                java.util.Arrays.asList("agent1"));
+
+        // Then - Returns {removedFromWorking, preservedWaiting} where preservedWaiting=0
+        assertThat(result).isInstanceOf(java.util.List.class);
+        @SuppressWarnings("unchecked")
+        java.util.List<Object> resultList = (java.util.List<Object>) result;
+        assertThat(resultList.size()).isEqualTo(2);
+        assertThat(resultList.get(0)).isEqualTo(1L); // Removed from working
+        assertThat(resultList.get(1)).isEqualTo(0L); // Not preserved (wasn't in waiting)
+        TestFixtures.assertAgentNotInSet(jedis, "working", "agent1");
+        TestFixtures.assertAgentNotInSet(jedis, "waiting", "agent1");
+
+        // Given - Agent in both working and waiting sets
+        jedis.zadd("working", 100, "agent2");
+        jedis.zadd("waiting", 200, "agent2");
+
+        // When - Remove agent (waiting entry exists)
+        result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_COMPLETION),
+                java.util.Arrays.asList("working", "waiting"),
+                java.util.Arrays.asList("agent2"));
+
+        // Then - Returns {removedFromWorking, preservedWaiting} where preservedWaiting=1
+        assertThat(result).isInstanceOf(java.util.List.class);
+        @SuppressWarnings("unchecked")
+        java.util.List<Object> resultList2 = (java.util.List<Object>) result;
+        assertThat(resultList2.size()).isEqualTo(2);
+        assertThat(resultList2.get(0)).isEqualTo(1L); // Removed from working
+        assertThat(resultList2.get(1)).isEqualTo(1L); // Preserved waiting entry
+        TestFixtures.assertAgentNotInSet(jedis, "working", "agent2");
+        assertThat(jedis.zscore("waiting", "agent2")).isEqualTo(200.0); // Waiting entry preserved
+
+        // Given - Agent only in waiting set (not in working)
+        jedis.zrem("waiting", "agent3");
+        jedis.zadd("waiting", 300, "agent3");
+
+        // When - Remove agent (not in working)
+        result =
+            jedis.evalsha(
+                scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_COMPLETION),
+                java.util.Arrays.asList("working", "waiting"),
+                java.util.Arrays.asList("agent3"));
+
+        // Then - Returns {removedFromWorking=0, preservedWaiting=1} since waiting exists
+        assertThat(result).isInstanceOf(java.util.List.class);
+        @SuppressWarnings("unchecked")
+        java.util.List<Object> resultList3 = (java.util.List<Object>) result;
+        assertThat(resultList3.size()).isEqualTo(2);
+        assertThat(resultList3.get(0)).isEqualTo(0L); // Not removed from working (wasn't there)
+        assertThat(resultList3.get(1)).isEqualTo(1L); // Preserved waiting entry
+        TestFixtures.assertAgentNotInSet(jedis, "working", "agent3");
+        assertThat(jedis.zscore("waiting", "agent3")).isEqualTo(300.0); // Waiting entry preserved
       }
     }
   }
@@ -421,10 +618,18 @@ class RedisScriptManagerTest {
       scriptManager.initializeScripts();
     }
 
+    /**
+     * Tests that ADD_AGENTS script adds multiple agents in batch, returning [count, [addedAgents]]
+     * format with correct scores for each agent.
+     */
     @Test
     @DisplayName("Should execute ADD_AGENTS_SCRIPT correctly for batch")
     void shouldExecuteAddAgentsScriptCorrectlyForBatch() {
       try (Jedis jedis = jedisPool.getResource()) {
+        // Given - Clean up any existing agents to ensure clean test state
+        jedis.zrem("working", "agent1", "agent2", "agent3");
+        jedis.zrem("waiting", "agent1", "agent2", "agent3");
+
         // When - Execute batch add with multiple agents
         Object result =
             jedis.evalsha(
@@ -446,6 +651,19 @@ class RedisScriptManagerTest {
       }
     }
 
+    /**
+     * Tests that REMOVE_AGENTS_CONDITIONAL script removes agents from the working set only when
+     * their scores match the expected values.
+     *
+     * <p>This script is used for cleanup operations where score verification prevents races:
+     *
+     * <ul>
+     *   <li><b>Orphan cleanup:</b> Cross-pod cleanup of agents whose owning pod died. Score must
+     *       match to avoid removing agents that were re-acquired by a live pod.
+     *   <li><b>Zombie cleanup:</b> Local cleanup of long-running agents. Score verification ensures
+     *       we only remove our own zombies, not agents acquired by another thread.
+     * </ul>
+     */
     @Test
     @DisplayName("Should execute REMOVE_AGENTS_CONDITIONAL_SCRIPT correctly")
     void shouldExecuteRemoveAgentsConditionalScriptCorrectly() {
@@ -469,11 +687,15 @@ class RedisScriptManagerTest {
         assertThat(resultList.get(0)).isEqualTo(2L); // Count of removed agents
 
         // Verify agents were removed
-        assertThat(jedis.zscore("working", "orphan1")).isNull();
-        assertThat(jedis.zscore("working", "orphan2")).isNull();
+        TestFixtures.assertAgentNotInSet(jedis, "working", "orphan1");
+        TestFixtures.assertAgentNotInSet(jedis, "working", "orphan2");
       }
     }
 
+    /**
+     * Tests that RELEASE_LEADERSHIP script deletes the leadership key when called with the correct
+     * ownership ID.
+     */
     @Test
     @DisplayName("Should execute RELEASE_LEADERSHIP_SCRIPT correctly")
     void shouldExecuteReleaseLeadershipScriptCorrectly() {
@@ -496,6 +718,10 @@ class RedisScriptManagerTest {
       }
     }
 
+    /**
+     * Tests that RELEASE_LEADERSHIP script rejects release attempts with wrong ownership ID,
+     * preserving the leadership key for the correct owner.
+     */
     @Test
     @DisplayName("Should not release leadership with wrong ownership ID")
     void shouldNotReleaseLeadershipWithWrongOwnershipId() {
@@ -519,6 +745,97 @@ class RedisScriptManagerTest {
         assertThat(jedis.get(leadershipKey)).isEqualTo(correctOwnerId);
       }
     }
+
+    /**
+     * Tests that ACQUIRE_AGENTS script atomically moves agents from waiting to working. Verifies
+     * batch acquisition behavior: only agents in waiting are acquired, agents not in waiting are
+     * skipped, and the result contains correct count and list of acquired agents.
+     *
+     * <p>The batch acquisition pattern enables efficient agent scheduling: scan WAITING for ready
+     * agents, then atomically acquire the batch. Agents already acquired by another pod (no longer
+     * in WAITING) are silently skipped, avoiding race conditions.
+     */
+    @Test
+    @DisplayName("Should execute ACQUIRE_AGENTS script correctly for batch acquisition")
+    void shouldExecuteAcquireAgentsScriptCorrectly() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Given - Add some agents to waiting, leave some missing
+        jedis.flushAll();
+        jedis.zadd("waiting", 100, "agent1");
+        jedis.zadd("waiting", 200, "agent2");
+        // agent3 not in waiting (should be skipped)
+
+        long newScore = TestFixtures.nowSeconds() + 3600; // 1 hour from now
+
+        // When - Execute ACQUIRE_AGENTS
+        @SuppressWarnings("unchecked")
+        java.util.List<Object> result =
+            (java.util.List<Object>)
+                jedis.evalsha(
+                    scriptManager.getScriptSha(RedisScriptManager.ACQUIRE_AGENTS),
+                    java.util.Arrays.asList("working", "waiting"),
+                    java.util.Arrays.asList(
+                        "agent1", String.valueOf(newScore),
+                        "agent2", String.valueOf(newScore),
+                        "agent3", String.valueOf(newScore))); // agent3 not in waiting
+
+        // Then - Should acquire only agents that were in waiting
+        assertThat(result.get(0)).isEqualTo(2L); // Count of acquired agents
+        @SuppressWarnings("unchecked")
+        java.util.List<String> acquiredList = (java.util.List<String>) result.get(1);
+        assertThat(acquiredList).containsExactlyInAnyOrder("agent1", "agent2");
+
+        // Verify state transitions
+        assertThat(jedis.zscore("working", "agent1")).isEqualTo((double) newScore);
+        assertThat(jedis.zscore("working", "agent2")).isEqualTo((double) newScore);
+        TestFixtures.assertAgentNotInSet(jedis, "waiting", "agent1");
+        TestFixtures.assertAgentNotInSet(jedis, "waiting", "agent2");
+        TestFixtures.assertAgentNotInSet(jedis, "working", "agent3"); // Not acquired
+      }
+    }
+
+    /**
+     * Tests that SCORE_AGENTS script returns correct score information for multiple agents.
+     * Verifies the script returns [agent, workingScore|'null', waitingScore|'null'] for each agent.
+     */
+    @Test
+    @DisplayName("Should execute SCORE_AGENTS script correctly for batch score lookup")
+    void shouldExecuteScoreAgentsScriptCorrectly() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        // Given - Set up agents in different states
+        jedis.flushAll();
+        jedis.zadd("working", 1000, "working-agent");
+        jedis.zadd("waiting", 2000, "waiting-agent");
+        // missing-agent not in either set
+
+        // When - Execute SCORE_AGENTS
+        @SuppressWarnings("unchecked")
+        java.util.List<Object> result =
+            (java.util.List<Object>)
+                jedis.evalsha(
+                    scriptManager.getScriptSha(RedisScriptManager.SCORE_AGENTS),
+                    java.util.Arrays.asList("working", "waiting"),
+                    java.util.Arrays.asList("working-agent", "waiting-agent", "missing-agent"));
+
+        // Then - Should return [agent, workScore, waitScore, agent, workScore, waitScore, ...]
+        assertThat(result).hasSize(9); // 3 agents * 3 values each
+
+        // working-agent: in working with score 1000, not in waiting
+        assertThat(result.get(0)).isEqualTo("working-agent");
+        assertThat(result.get(1)).isEqualTo("1000"); // Redis returns score as string
+        assertThat(result.get(2)).isEqualTo("null");
+
+        // waiting-agent: not in working, in waiting with score 2000
+        assertThat(result.get(3)).isEqualTo("waiting-agent");
+        assertThat(result.get(4)).isEqualTo("null");
+        assertThat(result.get(5)).isEqualTo("2000");
+
+        // missing-agent: not in either set
+        assertThat(result.get(6)).isEqualTo("missing-agent");
+        assertThat(result.get(7)).isEqualTo("null");
+        assertThat(result.get(8)).isEqualTo("null");
+      }
+    }
   }
 
   @Nested
@@ -530,6 +847,10 @@ class RedisScriptManagerTest {
       scriptManager.initializeScripts();
     }
 
+    /**
+     * Tests that 1000 script executions complete within 5 seconds and all agents are correctly
+     * added to the waiting set.
+     */
     @Test
     @DisplayName("Should handle high volume script executions efficiently")
     void shouldHandleHighVolumeScriptExecutionsEfficiently() {
@@ -573,6 +894,27 @@ class RedisScriptManagerTest {
       }
     }
 
+    /**
+     * Tests that evalshaWithSelfHeal detects NOSCRIPT errors after script flush, reloads scripts,
+     * and successfully retries the operation.
+     *
+     * <p>NOSCRIPT errors occur when Redis evicts cached scripts due to:
+     *
+     * <ul>
+     *   <li>Redis failover (new primary doesn't have scripts)
+     *   <li>Manual SCRIPT FLUSH command
+     *   <li>Memory pressure causing script cache eviction
+     * </ul>
+     *
+     * <p>The self-heal flow:
+     *
+     * <ol>
+     *   <li>EVALSHA fails with NOSCRIPT
+     *   <li>Reload all scripts via SCRIPT LOAD
+     *   <li>Retry EVALSHA with fresh SHA
+     *   <li>If reload fails, fallback to EVAL with script body
+     * </ol>
+     */
     @Test
     @DisplayName("Should self-heal on NOSCRIPT by reloading scripts")
     void shouldSelfHealOnNOSCRIPTByReloadingScripts() {
@@ -616,6 +958,10 @@ class RedisScriptManagerTest {
       }
     }
 
+    /**
+     * Tests that all scripts have non-null, non-empty bodies accessible via reflection and that
+     * bodies are directly executable via EVAL, verifying the single-source-of-truth pattern.
+     */
     @Test
     @DisplayName("Should expose non-null bodies for all scripts and bodies are executable")
     void shouldExposeBodiesForAllScriptsAndBodiesAreExecutable() throws Exception {
@@ -627,11 +973,13 @@ class RedisScriptManagerTest {
       String[] scriptNames = {
         RedisScriptManager.ADD_AGENT,
         RedisScriptManager.REMOVE_AGENT,
+        RedisScriptManager.REMOVE_AGENT_COMPLETION,
         RedisScriptManager.ADD_AGENTS,
         RedisScriptManager.MOVE_AGENTS,
         RedisScriptManager.MOVE_AGENTS_CONDITIONAL,
         RedisScriptManager.REMOVE_AGENTS_CONDITIONAL,
         RedisScriptManager.ACQUIRE_AGENTS,
+        RedisScriptManager.ZMSCORE_AGENTS,
         RedisScriptManager.SCORE_AGENTS,
         RedisScriptManager.RELEASE_LEADERSHIP
       };
@@ -659,6 +1007,20 @@ class RedisScriptManagerTest {
     }
   }
 
+  /**
+   * Tests for timestamp format consistency across all Redis score operations.
+   *
+   * <p>The scheduler uses Unix timestamps as scores in sorted sets. Using <b>seconds</b> (not
+   * milliseconds) is critical because:
+   *
+   * <ul>
+   *   <li>Zombie/orphan detection uses score thresholds (e.g., 30 minutes stale)
+   *   <li>Mixed formats cause incorrect timeout detection (ms scores appear 1000x older)
+   *   <li>Score comparisons in Lua scripts assume consistent format
+   * </ul>
+   *
+   * <p>These tests validate the format convention and provide detection logic for debugging.
+   */
   @Nested
   @DisplayName("Timestamp Format Consistency Tests")
   class TimestampFormatConsistencyTests {
@@ -671,12 +1033,16 @@ class RedisScriptManagerTest {
       }
     }
 
+    /**
+     * Tests that Redis scores are stored in seconds format (not milliseconds) with validation
+     * checks on score ranges.
+     */
     @Test
     @DisplayName("All Redis scores should be in seconds format")
     void shouldUseConsistentSecondsTimestampFormat() {
       try (Jedis jedis = jedisPool.getResource()) {
         // Directly add agents to WAITING set using current time in seconds (correct format)
-        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+        long currentTimeSeconds = TestFixtures.nowSeconds();
 
         jedis.zadd("waiting", currentTimeSeconds, "test-agent-1");
         jedis.zadd("waiting", currentTimeSeconds + 10, "test-agent-2");
@@ -711,18 +1077,19 @@ class RedisScriptManagerTest {
                   "Agent %s score %d is in milliseconds format, should be seconds",
                   agentName, score)
               .isLessThan(1700000000000L);
-
-          System.out.println(
-              String.format("\u2705 Agent %s has correct seconds score: %d", agentName, score));
         }
       }
     }
 
+    /**
+     * Tests that mixed seconds/milliseconds formats can be detected by examining score ranges,
+     * validating the detection logic used for format consistency checks.
+     */
     @Test
     @DisplayName("Mixed format detection test - should fail if milliseconds are used")
     void shouldDetectMillisecondsFormatInconsistency() {
       try (Jedis jedis = jedisPool.getResource()) {
-        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+        long currentTimeSeconds = TestFixtures.nowSeconds();
         long currentTimeMillis = System.currentTimeMillis();
 
         // Add agent with correct seconds format
@@ -752,11 +1119,134 @@ class RedisScriptManagerTest {
         assertThat(hasMillisecondsFormat)
             .withFailMessage("Should detect milliseconds format (simulated bug)")
             .isTrue();
-
-        // In a live environment, this mixed state should never occur
-        System.out.println(
-            "\u26a0\ufe0f  Mixed format detected - this demonstrates the bug we're preventing");
       }
+    }
+  }
+
+  @Nested
+  @DisplayName("Unit Tests")
+  class UnitTests {
+
+    private static class FakePool extends JedisPool {
+      private final Jedis jedis;
+
+      FakePool(Jedis j) {
+        this.jedis = j;
+      }
+
+      @Override
+      public Jedis getResource() {
+        return jedis;
+      }
+    }
+
+    /**
+     * Tests that evalshaWithSelfHeal falls back to EVAL when EVALSHA fails with NOSCRIPT and reload
+     * fails, using a FakeJedis to simulate the failure scenario. Verifies metrics are recorded.
+     */
+    @Test
+    @DisplayName(
+        "evalshaWithSelfHeal records reloads and eval metrics on NOSCRIPT, falls back to EVAL")
+    void evalshaSelfHealAndEvalFallback() {
+      // Fake Jedis: scriptLoad loads; evalsha throws NOSCRIPT; eval succeeds
+      class FakeJedis extends Jedis {
+        @Override
+        public String scriptLoad(String script) {
+          return "sha";
+        }
+
+        @Override
+        public Object evalsha(
+            String sha1, java.util.List<String> keys, java.util.List<String> args) {
+          throw new redis.clients.jedis.exceptions.JedisDataException(
+              "NOSCRIPT No matching script");
+        }
+
+        @Override
+        public Object eval(
+            String script, java.util.List<String> keys, java.util.List<String> args) {
+          return 1L;
+        }
+      }
+
+      FakeJedis j = new FakeJedis();
+      com.netflix.spectator.api.Registry registry = new com.netflix.spectator.api.DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+      RedisScriptManager mgr = new RedisScriptManager(new FakePool(j), metrics);
+
+      // Ensure initialized so getScriptSha works after loadAllScripts
+      mgr.initializeScripts();
+
+      Object r =
+          mgr.evalshaWithSelfHeal(
+              j,
+              RedisScriptManager.ADD_AGENT,
+              java.util.Arrays.asList("working", "waiting"),
+              java.util.Arrays.asList("a", "1"));
+      assertThat(r).isEqualTo(1L);
+
+      // Verify at least latency timer recorded (sum across tags)
+      long timerSum = 0L;
+      for (com.netflix.spectator.api.Meter meter : registry) {
+        if (meter.id().name().equals("cats.priorityScheduler.scripts.latency")) {
+          for (com.netflix.spectator.api.Measurement ms : meter.measure()) {
+            timerSum += (long) ms.value();
+          }
+        }
+      }
+      assertThat(timerSum).isGreaterThanOrEqualTo(1L);
+    }
+  }
+
+  @Nested
+  @DisplayName("Integration Tests")
+  class IntegrationTests {
+
+    /**
+     * Tests that evalshaWithSelfHeal records eval and reload metrics correctly. Verifies eval
+     * counter increments on script execution and reload counter increments after script flush.
+     */
+    @Test
+    void recordsEvalAndReloadMetrics() {
+      JedisPool pool = TestFixtures.createTestJedisPool(redis);
+      com.netflix.spectator.api.Registry registry = new com.netflix.spectator.api.DefaultRegistry();
+      PrioritySchedulerMetrics metrics = new PrioritySchedulerMetrics(registry);
+      RedisScriptManager manager = new RedisScriptManager(pool, metrics);
+
+      try (Jedis j = pool.getResource()) {
+        manager.initializeScripts();
+        // Call a small script to record eval
+        manager.evalshaWithSelfHeal(
+            j,
+            RedisScriptManager.SCORE_AGENTS,
+            java.util.Arrays.asList("working", "waiting"),
+            java.util.Arrays.asList("agentA"));
+        // Force flush to drive reload
+        j.scriptFlush();
+        manager.evalshaWithSelfHeal(
+            j,
+            RedisScriptManager.SCORE_AGENTS,
+            java.util.Arrays.asList("working", "waiting"),
+            java.util.Arrays.asList("agentB"));
+      }
+
+      long evalCount =
+          registry
+              .counter(
+                  registry
+                      .createId("cats.priorityScheduler.scripts.eval")
+                      .withTag("scheduler", "priority")
+                      .withTag("script", RedisScriptManager.SCORE_AGENTS))
+              .count();
+      assertThat(evalCount).isGreaterThanOrEqualTo(1);
+      assertThat(
+              registry
+                  .counter(
+                      registry
+                          .createId("cats.priorityScheduler.scripts.reloads")
+                          .withTag("scheduler", "priority"))
+                  .count())
+          .isGreaterThanOrEqualTo(1);
     }
   }
 }
