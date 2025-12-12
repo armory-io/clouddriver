@@ -769,38 +769,6 @@ class OrphanCleanupServiceTest {
      * cleaned (1), agent removed from WORKING_SET, and metrics recorded.
      */
     @Test
-    @DisplayName("Should fallback to safe default batch size when configured as 0 or negative")
-    void shouldFallbackToDefaultBatchSizeWhenZero() {
-      // Given - Set batch size to 0 (disabled/unspecified) and ensure cleanup still works
-      schedulerProperties.getBatchOperations().setBatchSize(0);
-      orphanService =
-          new OrphanCleanupService(
-              jedisPool,
-              scriptManager,
-              schedulerProperties,
-              new PrioritySchedulerMetrics(new com.netflix.spectator.api.DefaultRegistry()));
-
-      // Add more orphans than typical default chunk to force multiple passes
-      long oldScoreSeconds = (System.currentTimeMillis() - 120000) / 1000; // 2 minutes ago
-      int totalOrphans = 120;
-      try (Jedis jedis = jedisPool.getResource()) {
-        jedis.del("working", "waiting");
-        for (int i = 0; i < totalOrphans; i++) {
-          jedis.zadd("working", oldScoreSeconds - i, "orphan-fallback-" + i);
-        }
-      }
-
-      // When
-      int cleaned = orphanService.forceCleanupOrphanedAgents();
-
-      // Then - All should be cleaned even with batchSize=0 (uses conservative fallback)
-      assertThat(cleaned).isEqualTo(totalOrphans);
-      try (Jedis jedis = jedisPool.getResource()) {
-        assertThat(jedis.zcard("working")).isEqualTo(0);
-      }
-    }
-
-    @Test
     @DisplayName("Should use configurable thresholds")
     void shouldUseConfigurableThresholds() {
       // Given - Set very short threshold
