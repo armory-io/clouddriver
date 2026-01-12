@@ -96,9 +96,7 @@ class PrioritySchedulerStressTest {
 
   @AfterEach
   void tearDown() {
-    if (jedisPool != null) {
-      jedisPool.close();
-    }
+    TestFixtures.closePoolSafely(jedisPool);
   }
 
   /**
@@ -446,8 +444,8 @@ class PrioritySchedulerStressTest {
           .isLessThanOrEqualTo(completing + active);
     }
     // Shutdown pools
-    agentWorkPool.shutdownNow();
-    testThreads.shutdownNow();
+    TestFixtures.shutdownExecutorSafely(agentWorkPool);
+    TestFixtures.shutdownExecutorSafely(testThreads);
 
     return new StressResult(new ArrayList<>(violations.violations), zifAfter);
   }
@@ -675,8 +673,8 @@ class PrioritySchedulerStressTest {
     }
 
     // Shutdown pools
-    agentWorkPool.shutdownNow();
-    testThreads.shutdownNow();
+    TestFixtures.shutdownExecutorSafely(agentWorkPool);
+    TestFixtures.shutdownExecutorSafely(testThreads);
 
     return new StressResult(new ArrayList<>(violations.violations), zifAfter);
   }
@@ -950,8 +948,8 @@ class PrioritySchedulerStressTest {
     }
 
     // Shutdown pools
-    agentWorkPool.shutdownNow();
-    testThreads.shutdownNow();
+    TestFixtures.shutdownExecutorSafely(agentWorkPool);
+    TestFixtures.shutdownExecutorSafely(testThreads);
 
     return new StressResult(new ArrayList<>(violations.violations), zifAfter);
   }

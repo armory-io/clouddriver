@@ -41,6 +41,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -107,6 +108,7 @@ import redis.clients.jedis.JedisPoolConfig;
 @Testcontainers
 @DisplayName("Batch Operations Tests")
 @SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+@Timeout(60)
 class BatchOperationsTest {
 
   @Container
@@ -665,11 +667,7 @@ class BatchOperationsTest {
             .describedAs("Zombies should be cleaned (confirms batch cleanup worked)")
             .isGreaterThan(initialCleanupCleanedCount);
       } finally {
-        // Cleanup executor service
-        executorService.shutdownNow();
-        if (!executorService.awaitTermination(2, TimeUnit.SECONDS)) {
-          executorService.shutdownNow();
-        }
+        TestFixtures.shutdownExecutorSafely(executorService);
       }
     }
 
@@ -1064,11 +1062,7 @@ class BatchOperationsTest {
             .describedAs("incrementCleanupCleaned('zombie', count) should be called")
             .isGreaterThan(initialCleanupCleanedCount);
       } finally {
-        // Cleanup executor service
-        executorService.shutdownNow();
-        if (!executorService.awaitTermination(2, TimeUnit.SECONDS)) {
-          executorService.shutdownNow();
-        }
+        TestFixtures.shutdownExecutorSafely(executorService);
       }
     }
 
@@ -2433,7 +2427,7 @@ class BatchOperationsTest {
 
         // Should complete without exceptions
         Integer totalAcquired = acquisitionFuture.get(10, TimeUnit.SECONDS);
-        acquisitionExecutor.shutdownNow();
+        TestFixtures.shutdownExecutorSafely(acquisitionExecutor);
         assertThat(totalAcquired).isGreaterThanOrEqualTo(0);
         assertThat(testAcquisitionService.getRegisteredAgentCount()).isEqualTo(10);
 

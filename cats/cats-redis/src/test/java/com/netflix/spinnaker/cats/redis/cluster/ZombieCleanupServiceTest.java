@@ -160,16 +160,8 @@ class ZombieCleanupServiceTest {
 
   @AfterEach
   void tearDown() {
-    // Clean up Redis state after each test to ensure test isolation
-    if (jedisPool != null) {
-      try (Jedis jedis = jedisPool.getResource()) {
-        jedis.flushAll();
-      } catch (Exception e) {
-        // Ignore cleanup errors - test container will be reset anyway
-      }
-    }
-    // Note: jedisPool, scriptManager, and zombieService are recreated in setUp(),
-    // so no explicit cleanup needed here
+    // Close pool safely (flushes and releases connections)
+    TestFixtures.closePoolSafely(jedisPool);
   }
 
   // Helper methods for common assertions

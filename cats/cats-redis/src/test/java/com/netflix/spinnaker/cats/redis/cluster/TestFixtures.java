@@ -30,6 +30,8 @@ import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
@@ -229,11 +231,15 @@ public final class TestFixtures {
     private volatile CountDownLatch completionLatch;
     private volatile long fixedDurationMs = 0;
     private volatile boolean shouldFail = false;
+    private volatile Runnable startCallback;
 
     @Override
     public void executeAgent(Agent agent) {
       executing.set(true);
       executionCount.incrementAndGet();
+      if (startCallback != null) {
+        startCallback.run();
+      }
       try {
         if (completionLatch != null) {
           try {
@@ -291,6 +297,17 @@ public final class TestFixtures {
      */
     public ControllableAgentExecution withFailure() {
       this.shouldFail = true;
+      return this;
+    }
+
+    /**
+     * Sets a callback to run when execution starts. Useful for tracking when agents begin executing.
+     *
+     * @param callback The callback to run on start
+     * @return This instance for method chaining
+     */
+    public ControllableAgentExecution withStartCallback(Runnable callback) {
+      this.startCallback = callback;
       return this;
     }
 
@@ -832,5 +849,101 @@ public final class TestFixtures {
    */
   public static JedisPool createLocalhostJedisPool() {
     return new JedisPool(new JedisPoolConfig(), "localhost");
+  }
+
+  // ============================================================================
+  // TEST CLEANUP UTILITIES
+  // ============================================================================
+  // Safe cleanup methods for test teardown to prevent resource leaks and flakiness.
+
+  /** Generous timeout for CI environments where operations may be slow. */
+  public static final long CI_GENEROUS_TIMEOUT_MS = 30_000;
+
+  /** Short timeout for quick operations in CI. */
+  public static final long CI_SHORT_TIMEOUT_MS = 5_000;
+
+  /** Default timeout for executor shutdown in tests. */
+  public static final long EXECUTOR_SHUTDOWN_TIMEOUT_MS = 5_000;
+
+  /**
+   * Safely shuts down an ExecutorService and waits for termination.
+   *
+   * <p>This method prevents test flakiness by ensuring all submitted tasks complete before the next
+   * test runs. It uses shutdownNow() to interrupt running tasks, then awaits termination.
+   *
+   * @param executor The executor service to shut down (may be null)
+   * @param timeoutMs Maximum time to wait for termination in milliseconds
+   */
+  public static void shutdownExecutorSafely(ExecutorService executor, long timeoutMs) {
+    if (executor == null) {
+      return;
+    }
+    executor.shutdownNow();
+    try {
+      if (!executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)) {
+        // Log but don't fail - CI environments may be slow
+        org.slf4j.LoggerFactory.getLogger(TestFixtures.class)
+            .warn("Executor did not terminate within {}ms", timeoutMs);
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  /**
+   * Safely shuts down an ExecutorService with default timeout.
+   *
+   * @param executor The executor service to shut down (may be null)
+   */
+  public static void shutdownExecutorSafely(ExecutorService executor) {
+    shutdownExecutorSafely(executor, EXECUTOR_SHUTDOWN_TIMEOUT_MS);
+  }
+
+  /**
+   * Safely closes a JedisPool after flushing all data.
+   *
+   * <p>This method prevents connection leaks by properly closing the pool. It first attempts to
+   * flush all Redis data to ensure test isolation, then closes the pool to release connections.
+   *
+   * @param pool The JedisPool to close (may be null or already closed)
+   */
+  public static void closePoolSafely(JedisPool pool) {
+    if (pool == null || pool.isClosed()) {
+      return;
+    }
+    try {
+      try (Jedis jedis = pool.getResource()) {
+        jedis.flushAll();
+      }
+    } catch (Exception ignored) {
+      // Ignore flush errors - pool may already be in bad state
+    }
+    try {
+      pool.close();
+    } catch (Exception ignored) {
+      // Ignore close errors
+    }
+  }
+
+  /**
+   * Waits for a thread to complete with timeout.
+   *
+   * <p>Use this instead of Thread.join() without timeout to prevent hung tests.
+   *
+   * @param thread The thread to wait for (may be null)
+   * @param timeoutMs Maximum time to wait in milliseconds
+   * @return true if thread completed, false if timeout or interrupted
+   */
+  public static boolean joinThreadSafely(Thread thread, long timeoutMs) {
+    if (thread == null || !thread.isAlive()) {
+      return true;
+    }
+    try {
+      thread.join(timeoutMs);
+      return !thread.isAlive();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return false;
+    }
   }
 }

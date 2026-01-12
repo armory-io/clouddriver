@@ -975,6 +975,14 @@ public class OrphanCleanupService {
           }
 
           if (isStillValid) {
+            // Shard-aware gating: Only this shard should rescue its own orphaned valid agents.
+            // Other shards' active agents in WORKZ should be handled by their respective pods;
+            // moving them here would cause thrashing as the owning pod re-acquires immediately.
+            if (!belongsToThisShard) {
+              log.debug("Skipping valid working agent {} - belongs to different shard", agentName);
+              continue;
+            }
+
             // For valid agents in working (truly orphaned due to crashes), move them to waiting
             // and preserve their original ready time to maintain queue fairness.
             // workingScore = acquire_time + timeout; originalReady = acquire_time

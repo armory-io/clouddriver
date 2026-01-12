@@ -771,19 +771,22 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
               // Diagnostics only – continue with acquisition attempt.
             }
           }
-        } catch (Exception ignore) {
-          // Any failure falls back to the safe "no ready agents" path.
+        } catch (Exception e) {
+          // Log diagnostic failures to aid debugging stall scenarios.
+          // Acquisition must proceed regardless of diagnostic errors - diagnostics are for
+          // observability only, not for controlling acquisition behavior.
+          log.debug("Diagnostic readiness check failed, proceeding with acquisition anyway", e);
           readyCountForDiagnostics = 0L;
           earliestRunnableLocalScore = null;
-          earlyEmptyReady = true;
+          // Important: earlyEmptyReady is NOT set here - acquisition must always proceed
         }
 
-        if (earlyEmptyReady) {
-          if (log.isDebugEnabled()) {
-            log.debug("No locally eligible agents ready for execution");
-          }
-          metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
-          return 0;
+        // Diagnostics are for observability only. The diagnostic window (max 64 agents) may not
+        // reflect actual eligibility due to timing, exceptions, or queue ordering. The acquisition
+        // phase scans the full queue with proper filtering and must always run.
+        if (earlyEmptyReady && log.isDebugEnabled()) {
+          log.debug(
+              "Diagnostic window shows no locally eligible agents; acquisition will proceed to scan full queue");
         }
       }
 
@@ -2034,10 +2037,42 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     // agents)
     failureStreaks.remove(agentType);
 
-    // Clean up active tracking
-    if (activeAgents.remove(agentType) != null) {
+    // Clean up active tracking - capture whether agent was active (had permit acquired)
+    boolean wasActive = activeAgents.remove(agentType) != null;
+    if (wasActive) {
       activeAgentMapSize.decrementAndGet();
     }
+
+    // Clean up in-flight execution state when agent is unregistered due to sharding changes.
+    // This prevents permit leaks when reconciliation unregisters agents that are still executing.
+    //
+    // Key insight: Use earlyReleasePermitIfHeld() which reads RunState from the map and handles
+    // CAS-protected release. Do NOT remove RunState here - let the worker's finally block handle
+    // cleanup and zombiesInFlight decrement. Removing RunState early would prevent the worker
+    // from properly decrementing zombiesInFlight when it exits.
+    Future<?> future = activeAgentsFutures.remove(agentType);
+    RunState runState = runStates.get(agentType);
+
+    if (runState != null) {
+      // Agent has RunState - use CAS-protected release. Worker finally will clean up RunState.
+      if (future != null) {
+        future.cancel(false);
+      }
+      earlyReleasePermitIfHeld(agentType);
+      log.debug(
+          "Cleaned up in-flight state for unregistered agent {} (permit released via CAS, future={})",
+          agentType,
+          future != null);
+    } else if (future != null) {
+      // Future exists but no RunState - this is unexpected (RunState created before submission).
+      // Cancel future but log warning - permit accounting may be inconsistent.
+      future.cancel(false);
+      log.warn(
+          "Unexpected state: agent {} has future but no RunState during unregistration", agentType);
+    }
+    // If neither RunState nor future exists, the agent was either:
+    // 1. Never acquired (wasActive = false) - no cleanup needed
+    // 2. Acquired but not yet submitted - brief window, let normal error handling clean up
 
     log.debug("Unregistered agent {} from scheduling", agentType);
 

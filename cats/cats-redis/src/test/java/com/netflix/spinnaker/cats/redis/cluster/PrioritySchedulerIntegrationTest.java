@@ -56,6 +56,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.slf4j.LoggerFactory;
@@ -114,6 +115,7 @@ import redis.clients.jedis.JedisPool;
 @Testcontainers
 @DisplayName("PriorityAgentScheduler Tests")
 @SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+@Timeout(60)
 public class PrioritySchedulerIntegrationTest {
 
   @Container
@@ -3125,9 +3127,7 @@ public class PrioritySchedulerIntegrationTest {
 
     @AfterEach
     void tearDownOptimizationsTests() {
-      if (optimizationsJedisPool != null) {
-        optimizationsJedisPool.close();
-      }
+      TestFixtures.closePoolSafely(optimizationsJedisPool);
     }
 
     /**
@@ -3635,7 +3635,7 @@ public class PrioritySchedulerIntegrationTest {
             .isEqualTo(5);
       }
 
-      pool.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
@@ -3794,8 +3794,8 @@ public class PrioritySchedulerIntegrationTest {
         assertThat(intersection).isEmpty();
       }
 
-      pool.shutdownNow();
-      testThreads.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(pool);
+      TestFixtures.shutdownExecutorSafely(testThreads);
     }
   }
 
@@ -4730,7 +4730,7 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(semaphore.availablePermits()).isEqualTo(1);
       assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
-      pool.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
@@ -4827,7 +4827,7 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
       assertThat(semaphore.availablePermits()).isEqualTo(1);
 
-      pool.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
@@ -4889,7 +4889,7 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(semaphore.availablePermits()).isEqualTo(1);
       assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
-      pool.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
@@ -4969,7 +4969,7 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(semaphore.availablePermits()).isEqualTo(1);
       assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
-      pool.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
@@ -5071,7 +5071,7 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(semaphore.availablePermits()).isEqualTo(1);
       assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
-      pool.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
@@ -5208,7 +5208,7 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(semaphore.availablePermits()).isEqualTo(2);
       assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
-      pool.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(pool);
     }
   }
 
@@ -5237,9 +5237,7 @@ public class PrioritySchedulerIntegrationTest {
 
     @AfterEach
     void tearDownKeyNamespacingTests() {
-      if (namespacingJedisPool != null) {
-        namespacingJedisPool.close();
-      }
+      TestFixtures.closePoolSafely(namespacingJedisPool);
     }
 
     @Nested
@@ -6182,9 +6180,9 @@ public class PrioritySchedulerIntegrationTest {
       }
 
       // Shutdown pools
-      agentWorkPool1.shutdownNow();
-      agentWorkPool2.shutdownNow();
-      testThreads.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(agentWorkPool1);
+      TestFixtures.shutdownExecutorSafely(agentWorkPool2);
+      TestFixtures.shutdownExecutorSafely(testThreads);
     }
 
     private void drainWorkers(AgentAcquisitionService acquisitionService, ExecutorService pool)
@@ -6197,10 +6195,7 @@ public class PrioritySchedulerIntegrationTest {
       }
 
       // Wait for pool to drain
-      pool.shutdown();
-      if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
-        pool.shutdownNow();
-      }
+      TestFixtures.shutdownExecutorSafely(pool);
     }
 
     private Agent mockAgent(String name, String provider) {

@@ -44,6 +44,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -69,6 +70,7 @@ import redis.clients.jedis.JedisPool;
 @Testcontainers
 @DisplayName("Permit Safety Tests")
 @SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+@Timeout(60)
 class PermitSafetyTest {
 
   @Container
@@ -100,9 +102,7 @@ class PermitSafetyTest {
 
   @AfterEach
   void tearDown() {
-    if (jedisPool != null) {
-      jedisPool.close();
-    }
+    TestFixtures.closePoolSafely(jedisPool);
   }
 
   @Nested
@@ -550,7 +550,7 @@ class PermitSafetyTest {
       } finally {
         executor.shutdown();
         if (!executor.awaitTermination(3, TimeUnit.SECONDS)) {
-          executor.shutdownNow();
+          TestFixtures.shutdownExecutorSafely(executor);
         }
       }
     }
@@ -723,8 +723,322 @@ class PermitSafetyTest {
     } finally {
       executor.shutdown();
       if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
-        executor.shutdownNow();
+        TestFixtures.shutdownExecutorSafely(executor);
       }
+    }
+  }
+
+  // ============================================================================
+  // PERMIT ACCOUNTING CONSISTENCY TESTS
+  // Tests for permit invariants and map synchronization under various conditions
+  // ============================================================================
+
+  @Nested
+  @DisplayName("Permit Accounting Consistency Tests")
+  class PermitAccountingConsistencyTests {
+
+    private AgentAcquisitionService acquisitionService;
+    private Semaphore semaphore;
+    private ExecutorService executor;
+    private CountDownLatch executionLatch;
+
+    @BeforeEach
+    void setup() {
+      PriorityAgentProperties agentProps = new PriorityAgentProperties();
+      agentProps.setMaxConcurrentAgents(10);
+      agentProps.setEnabledPattern(".*");
+      agentProps.setDisabledPattern("");
+
+      PrioritySchedulerProperties schedulerProps = new PrioritySchedulerProperties();
+      schedulerProps.setIntervalMs(1000L);
+      schedulerProps.setRefreshPeriodSeconds(30);
+      schedulerProps.getKeys().setWaitingSet("waiting");
+      schedulerProps.getKeys().setWorkingSet("working");
+      schedulerProps.getKeys().setCleanupLeaderKey("cleanup-leader");
+      schedulerProps.getBatchOperations().setEnabled(false);
+
+      semaphore = new Semaphore(10);
+
+      acquisitionService =
+          new AgentAcquisitionService(
+              jedisPool,
+              scriptManager,
+              intervalProvider,
+              shardingFilter,
+              agentProps,
+              schedulerProps,
+              metrics);
+
+      executor = Executors.newFixedThreadPool(10);
+      executionLatch = new CountDownLatch(1);
+
+      // Clean Redis state
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.del("waiting", "working");
+      }
+    }
+
+    @AfterEach
+    void tearDown() {
+      executionLatch.countDown(); // Release any blocked agents
+      TestFixtures.shutdownExecutorSafely(executor);
+    }
+
+    /**
+     * Verifies the permit accounting invariant: held permits must equal active agents plus zombies
+     * in flight. This tests the core formula: permitMismatch = heldPermits - (activeAgents +
+     * zombiesInFlight) == 0
+     */
+    @Test
+    @DisplayName("Permit accounting should remain consistent: held = active + zombiesInFlight")
+    void permitAccountingShouldRemainConsistent() throws Exception {
+      // Given - Create blocking execution so we can observe intermediate state
+      AgentExecution blockingExecution = mock(AgentExecution.class);
+      doAnswer(
+              invocation -> {
+                executionLatch.await(5, TimeUnit.SECONDS);
+                return null;
+              })
+          .when(blockingExecution)
+          .executeAgent(any(Agent.class));
+
+      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
+
+      // Register multiple agents
+      for (int i = 0; i < 5; i++) {
+        Agent agent = TestFixtures.createMockAgent("permit-test-agent-" + i, "test-provider");
+        acquisitionService.registerAgent(agent, blockingExecution, instrumentation);
+      }
+
+      // Add all agents to Redis with ready score
+      long nowSeconds = TestFixtures.nowSeconds();
+      try (Jedis jedis = jedisPool.getResource()) {
+        for (int i = 0; i < 5; i++) {
+          jedis.zadd("waiting", nowSeconds - 100, "permit-test-agent-" + i);
+        }
+      }
+
+      // When - Acquire agents
+      int acquired = acquisitionService.saturatePool(1L, semaphore, executor);
+      assertThat(acquired).describedAs("Should acquire multiple agents").isGreaterThan(0);
+
+      // Wait for agents to be in activeAgents
+      TestFixtures.waitForBackgroundTask(
+          () -> acquisitionService.getActiveAgentCount() > 0, 2000L, 50L);
+
+      // Then - Verify permit accounting invariant
+      int maxConcurrent = 10;
+      int availablePermits = semaphore.availablePermits();
+      int heldPermits = maxConcurrent - availablePermits;
+      int activeAgents = acquisitionService.getActiveAgentCount();
+      int zombiesInFlight = acquisitionService.getZombiesInFlight();
+
+      int accounted = activeAgents + zombiesInFlight;
+      int permitMismatch = heldPermits - accounted;
+
+      assertThat(permitMismatch)
+          .describedAs(
+              "Permit mismatch should be 0 (held=%d, active=%d, zombies=%d)",
+              heldPermits, activeAgents, zombiesInFlight)
+          .isEqualTo(0);
+
+      // Cleanup - release latch to let agents complete
+      executionLatch.countDown();
+    }
+
+    /**
+     * Verifies that futures map and activeAgents map remain synchronized. The invariant:
+     * futures.size() == activeAgents.size() (futures drift == 0)
+     */
+    @Test
+    @DisplayName("Futures map and activeAgents map should remain synchronized")
+    void futuresAndActiveAgentsShouldRemainSynchronized() throws Exception {
+      // Given - Create blocking execution
+      AgentExecution blockingExecution = mock(AgentExecution.class);
+      doAnswer(
+              invocation -> {
+                executionLatch.await(5, TimeUnit.SECONDS);
+                return null;
+              })
+          .when(blockingExecution)
+          .executeAgent(any(Agent.class));
+
+      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
+
+      // Register agents
+      for (int i = 0; i < 3; i++) {
+        Agent agent = TestFixtures.createMockAgent("futures-test-agent-" + i, "test-provider");
+        acquisitionService.registerAgent(agent, blockingExecution, instrumentation);
+      }
+
+      // Add to Redis
+      long nowSeconds = TestFixtures.nowSeconds();
+      try (Jedis jedis = jedisPool.getResource()) {
+        for (int i = 0; i < 3; i++) {
+          jedis.zadd("waiting", nowSeconds - 100, "futures-test-agent-" + i);
+        }
+      }
+
+      // When - Acquire agents
+      int acquired = acquisitionService.saturatePool(1L, semaphore, executor);
+      assertThat(acquired).isGreaterThan(0);
+
+      // Wait for processing
+      TestFixtures.waitForBackgroundTask(
+          () -> acquisitionService.getActiveAgentCount() > 0, 2000L, 50L);
+
+      // Then - Verify futures synchronization
+      int activeAgents = acquisitionService.getActiveAgentCount();
+      int futuresCount = acquisitionService.getActiveAgentsFuturesSnapshot().size();
+
+      int futuresDrift = futuresCount - activeAgents;
+
+      assertThat(futuresDrift)
+          .describedAs(
+              "Futures drift should be 0 (futures=%d, active=%d)", futuresCount, activeAgents)
+          .isEqualTo(0);
+
+      // Cleanup
+      executionLatch.countDown();
+    }
+
+    /**
+     * Tests permit accounting after graceful agent completion. Verifies that completing agents
+     * release permits correctly without leaving orphaned state.
+     */
+    @Test
+    @DisplayName("Permit accounting should be correct after agent completion")
+    void permitAccountingShouldBeCorrectAfterAgentCompletion() throws Exception {
+      // Given - Create fast-completing execution
+      CountDownLatch agentCompletedLatch = new CountDownLatch(1);
+      AgentExecution fastExecution = mock(AgentExecution.class);
+      doAnswer(
+              invocation -> {
+                agentCompletedLatch.countDown();
+                return null;
+              })
+          .when(fastExecution)
+          .executeAgent(any(Agent.class));
+
+      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
+
+      Agent agent = TestFixtures.createMockAgent("completion-test-agent", "test-provider");
+      acquisitionService.registerAgent(agent, fastExecution, instrumentation);
+
+      // Add to Redis
+      long nowSeconds = TestFixtures.nowSeconds();
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("waiting", nowSeconds - 100, "completion-test-agent");
+      }
+
+      int initialPermits = semaphore.availablePermits();
+
+      // When - Acquire and let it complete
+      int acquired = acquisitionService.saturatePool(1L, semaphore, executor);
+      assertThat(acquired).isEqualTo(1);
+
+      // Wait for completion
+      boolean completed = agentCompletedLatch.await(2, TimeUnit.SECONDS);
+      assertThat(completed).describedAs("Agent should complete execution").isTrue();
+
+      // Give permit release time to process
+      TestFixtures.waitForBackgroundTask(
+          () -> semaphore.availablePermits() == initialPermits, 2000, 50);
+
+      // Then - All permits should be returned
+      assertThat(semaphore.availablePermits())
+          .describedAs("All permits should be returned after completion")
+          .isEqualTo(initialPermits);
+
+      // Verify no orphaned state
+      assertThat(acquisitionService.getActiveAgentCount())
+          .describedAs("No agents should be active after completion")
+          .isEqualTo(0);
+      assertThat(acquisitionService.getZombiesInFlight())
+          .describedAs("No zombies should be in flight after normal completion")
+          .isEqualTo(0);
+    }
+
+    /**
+     * Tests permit accounting under zombie cleanup scenario. Verifies that zombiesInFlight counter
+     * correctly compensates for early permit release.
+     */
+    @Test
+    @DisplayName("Zombie cleanup should maintain permit accounting via zombiesInFlight")
+    void zombieCleanupShouldMaintainPermitAccounting() throws Exception {
+      // Given - Create long-running execution that will be zombified
+      CountDownLatch zombieExecutionStarted = new CountDownLatch(1);
+      AgentExecution zombieExecution = mock(AgentExecution.class);
+      doAnswer(
+              invocation -> {
+                zombieExecutionStarted.countDown();
+                executionLatch.await(60, TimeUnit.SECONDS); // Long wait
+                return null;
+              })
+          .when(zombieExecution)
+          .executeAgent(any(Agent.class));
+
+      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
+
+      Agent agent = TestFixtures.createMockAgent("zombie-test-agent", "test-provider");
+      acquisitionService.registerAgent(agent, zombieExecution, instrumentation);
+
+      // Add to Redis
+      long nowSeconds = TestFixtures.nowSeconds();
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("waiting", nowSeconds - 100, "zombie-test-agent");
+      }
+
+      // When - Acquire agent
+      int acquired = acquisitionService.saturatePool(1L, semaphore, executor);
+      assertThat(acquired).isEqualTo(1);
+
+      // Wait for execution to start
+      boolean started = zombieExecutionStarted.await(2, TimeUnit.SECONDS);
+      assertThat(started).describedAs("Zombie agent should start execution").isTrue();
+
+      // Record state before zombie cleanup
+      int permitsBeforeCleanup = semaphore.availablePermits();
+      int activeBeforeCleanup = acquisitionService.getActiveAgentCount();
+
+      // Simulate zombie cleanup: early release permit
+      acquisitionService.earlyReleasePermitIfHeld("zombie-test-agent");
+
+      // Then - Verify zombiesInFlight counter compensates
+      // After early release: permit returned to semaphore, zombiesInFlight incremented
+      TestFixtures.waitForBackgroundTask(
+          () -> semaphore.availablePermits() > permitsBeforeCleanup, 1000L, 50L);
+
+      int permitsAfterCleanup = semaphore.availablePermits();
+      int zombiesInFlight = acquisitionService.getZombiesInFlight();
+
+      // Permit should be released
+      assertThat(permitsAfterCleanup)
+          .describedAs("Permit should be released by early release")
+          .isGreaterThan(permitsBeforeCleanup);
+
+      // zombiesInFlight should compensate (prevents double counting capacity)
+      assertThat(zombiesInFlight)
+          .describedAs("zombiesInFlight should be incremented after early release")
+          .isGreaterThanOrEqualTo(1);
+
+      // Verify accounting still valid
+      int maxConcurrent = 10;
+      int heldPermits = maxConcurrent - permitsAfterCleanup;
+      int activeAgents = acquisitionService.getActiveAgentCount();
+      int accounted = activeAgents + zombiesInFlight;
+
+      // Note: After early release, activeAgents may still be > 0 (agent still in activeAgents map)
+      // But heldPermits is reduced. zombiesInFlight compensates for this gap.
+      // The formula may show held < accounted when zombie is in-flight (this is expected)
+
+      // Just verify no permit leak (heldPermits should not exceed accounted)
+      assertThat(heldPermits)
+          .describedAs("Held permits should not exceed accounted (active + zombies)")
+          .isLessThanOrEqualTo(accounted);
+
+      // Cleanup
+      executionLatch.countDown();
     }
   }
 }

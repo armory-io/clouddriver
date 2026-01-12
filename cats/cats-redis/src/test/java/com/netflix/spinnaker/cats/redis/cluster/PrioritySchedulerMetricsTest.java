@@ -46,6 +46,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -69,6 +70,7 @@ import redis.clients.jedis.JedisPool;
 @Testcontainers
 @DisplayName("PrioritySchedulerMetrics Tests")
 @SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+@Timeout(60)
 class PrioritySchedulerMetricsTest {
 
   // Shared container for all integration tests
@@ -388,7 +390,7 @@ class PrioritySchedulerMetricsTest {
         Thread.currentThread().interrupt();
         throw new RuntimeException(e);
       } finally {
-        executor.shutdownNow();
+        TestFixtures.shutdownExecutorSafely(executor);
       }
     }
 
@@ -981,9 +983,7 @@ class PrioritySchedulerMetricsTest {
 
     @AfterEach
     void tearDown() {
-      if (pool != null) {
-        pool.close();
-      }
+      TestFixtures.closePoolSafely(pool);
     }
 
     /**
@@ -1033,7 +1033,7 @@ class PrioritySchedulerMetricsTest {
               2000,
               25);
 
-      exec.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(exec);
 
       assertThat(permitsReturned)
           .describedAs("Permits should be fully returned after mid-cycle unregister")

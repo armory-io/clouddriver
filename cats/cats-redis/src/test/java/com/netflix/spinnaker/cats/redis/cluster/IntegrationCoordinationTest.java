@@ -49,6 +49,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -73,6 +74,7 @@ import redis.clients.jedis.JedisPool;
 @Testcontainers
 @DisplayName("Integration and Coordination Tests")
 @SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+@Timeout(60)
 class IntegrationCoordinationTest {
 
   @Container
@@ -97,14 +99,7 @@ class IntegrationCoordinationTest {
 
   @AfterEach
   void tearDown() {
-    if (jedisPool != null) {
-      try (Jedis j = jedisPool.getResource()) {
-        j.flushAll();
-      } catch (Exception ignore) {
-        // Ignore cleanup errors
-      }
-      jedisPool.close();
-    }
+    TestFixtures.closePoolSafely(jedisPool);
   }
 
   @Nested
@@ -186,7 +181,7 @@ class IntegrationCoordinationTest {
 
       // Note: Metrics verification is omitted; focus is on repopulation behavior (local agents
       // added, non-local preserved), not specific metric values.
-      agentWorkPool.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(agentWorkPool);
     }
   }
 
@@ -505,7 +500,7 @@ class IntegrationCoordinationTest {
         // Note: Cleanup/acquisition metrics and Redis WORKING_SET verification are omitted;
         // focus is on zombiesInFlight counter tracking (fairness accounting), not metrics or
         // detailed Redis state.
-        pool.shutdownNow();
+        TestFixtures.shutdownExecutorSafely(pool);
       }
     }
   }
@@ -600,8 +595,8 @@ class IntegrationCoordinationTest {
       // Note: Cleanup metrics and Redis WORKING_SET verification are omitted; focus is on
       // coordination behavior (only one service processes agent, permit released once),
       // not specific metric values or detailed Redis state.
-      cleaners.shutdownNow();
-      pool.shutdownNow();
+      TestFixtures.shutdownExecutorSafely(cleaners);
+      TestFixtures.shutdownExecutorSafely(pool);
     }
   }
 }

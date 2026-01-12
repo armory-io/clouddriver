@@ -19,10 +19,12 @@ package com.netflix.spinnaker.cats.redis.cluster;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -82,6 +84,7 @@ import redis.clients.jedis.JedisPool;
 @Testcontainers
 @DisplayName("RedisScriptManager Tests")
 @SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+@Timeout(60)
 class RedisScriptManagerTest {
 
   @Container
@@ -99,6 +102,11 @@ class RedisScriptManagerTest {
     jedisPool = TestFixtures.createTestJedisPool(redis);
 
     scriptManager = new RedisScriptManager(jedisPool, TestFixtures.createTestMetrics());
+  }
+
+  @AfterEach
+  void tearDown() {
+    TestFixtures.closePoolSafely(jedisPool);
   }
 
   @Nested

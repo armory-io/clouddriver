@@ -19,7 +19,8 @@ package com.netflix.spinnaker.cats.redis.cluster;
 import static com.netflix.spinnaker.cats.redis.cluster.TestFixtures.createTestScriptManager;
 import static com.netflix.spinnaker.cats.redis.cluster.TestFixtures.waitForCondition;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.any;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.reset;
@@ -45,6 +46,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -80,6 +82,7 @@ import redis.clients.jedis.params.SetParams;
 @Testcontainers
 @DisplayName("OrphanCleanupService Tests")
 @SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+@Timeout(60)
 class OrphanCleanupServiceTest {
 
   @Container
@@ -116,6 +119,11 @@ class OrphanCleanupServiceTest {
 
     orphanService =
         new OrphanCleanupService(jedisPool, scriptManager, schedulerProperties, metrics);
+  }
+
+  @AfterEach
+  void tearDown() {
+    TestFixtures.closePoolSafely(jedisPool);
   }
 
   /**
@@ -1505,6 +1513,7 @@ class OrphanCleanupServiceTest {
       // Reset the mock to use spy to track method calls
       reset(mockAcquisitionService);
       when(mockAcquisitionService.getRegisteredAgent("valid-agent")).thenReturn(mockValidAgent);
+      when(mockAcquisitionService.belongsToThisShard("valid-agent")).thenReturn(true);
       doNothing().when(mockAcquisitionService).removeActiveAgent("valid-agent");
 
       try (Jedis jedis = jedisPool.getResource()) {
@@ -1567,9 +1576,7 @@ class OrphanCleanupServiceTest {
 
     @AfterEach
     void tearDownRaceConditionTests() {
-      if (testExecutor != null) {
-        testExecutor.shutdownNow();
-      }
+      TestFixtures.shutdownExecutorSafely(testExecutor);
     }
 
     /**
@@ -2728,5 +2735,257 @@ class OrphanCleanupServiceTest {
 
     // The hang guard mechanism (TTL expiry) allows service2 to acquire leadership
     // even though service1 didn't explicitly release it, preventing leadership monopolization
+  }
+
+  // ============================================================================
+  // CROSS-POD ORPHAN CLEANUP TESTS
+  // Tests for shard-aware orphan cleanup behavior in multi-pod deployments
+  // ============================================================================
+
+  @Nested
+  @DisplayName("Cross-Pod Orphan Cleanup Tests")
+  class CrossPodOrphanCleanupTests {
+
+    private AgentAcquisitionService mockAcquisitionService;
+
+    @BeforeEach
+    void setup() {
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.del("working", "waiting");
+      }
+      mockAcquisitionService = mock(AgentAcquisitionService.class);
+    }
+
+    @AfterEach
+    void cleanup() {
+      orphanService.setAcquisitionService(null);
+    }
+
+    /**
+     * Tests that orphan cleanup skips agents that are in the local activeAgents map. This protects
+     * against the race condition where orphan cleanup runs while an agent is actively running on
+     * this pod.
+     *
+     * <p>Scenario: Agent is running locally (in activeAgents), deadline has passed (appears
+     * orphaned by score), but locallyActive check should skip it.
+     */
+    @Test
+    @DisplayName("Should skip agents present in local activeAgents map (locallyActive check)")
+    void shouldSkipLocallyActiveAgents() {
+      // Given - Agent is in working set with old deadline (appears orphaned)
+      long nowSeconds = TestFixtures.nowSeconds();
+      long oldDeadline = nowSeconds - 120L; // 120 seconds past deadline
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("working", oldDeadline, "locally-active-agent");
+      }
+
+      // Create mock agent before stubbing to avoid nested mock creation
+      Agent mockAgent = TestFixtures.createMockAgent("locally-active-agent");
+
+      // Mock: Agent is locally active (in activeAgents map)
+      java.util.Map<String, String> activeAgentsMap = new java.util.HashMap<>();
+      activeAgentsMap.put("locally-active-agent", String.valueOf(oldDeadline));
+      when(mockAcquisitionService.getActiveAgentsMap()).thenReturn(activeAgentsMap);
+      when(mockAcquisitionService.getRegisteredAgent("locally-active-agent")).thenReturn(mockAgent);
+      when(mockAcquisitionService.belongsToThisShard("locally-active-agent")).thenReturn(true);
+
+      orphanService.setAcquisitionService(mockAcquisitionService);
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Agent should NOT be cleaned (skipped due to locallyActive check)
+      assertThat(cleaned)
+          .describedAs("Locally active agents should be skipped by orphan cleanup")
+          .isEqualTo(0);
+
+      // Verify agent still in working set
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("working"))
+            .describedAs("Agent should remain in working set")
+            .isEqualTo(1);
+      }
+    }
+
+    /**
+     * Tests that orphan cleanup skips valid working agents that belong to a different shard. This
+     * is the key protection against cross-pod orphan cleanup causing permit leaks.
+     *
+     * <p>Scenario: Pod B is orphan cleanup leader, sees agent X in WORKING with old deadline, but
+     * agent X belongs to Pod A's shard. Pod B should NOT process it.
+     *
+     * <p>This test verifies the uncommitted change at OrphanCleanupService.java:981-985.
+     */
+    @Test
+    @DisplayName("Should skip valid working agents belonging to other shards (shard-aware gating)")
+    void shouldSkipValidWorkingAgentsFromOtherShards() {
+      // Given - Agent in working set with old deadline (appears orphaned)
+      long nowSeconds = TestFixtures.nowSeconds();
+      long oldDeadline = nowSeconds - 120L; // Well past 60s threshold
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("working", oldDeadline, "other-shard-agent");
+      }
+
+      // Create mock agent before stubbing
+      Agent mockAgent = TestFixtures.createMockAgent("other-shard-agent");
+
+      // Mock: Agent is NOT locally active (running on different pod)
+      when(mockAcquisitionService.getActiveAgentsMap())
+          .thenReturn(java.util.Collections.emptyMap());
+      // Mock: Agent is still valid (registered in cluster)
+      when(mockAcquisitionService.getRegisteredAgent("other-shard-agent")).thenReturn(mockAgent);
+      // Mock: Agent belongs to DIFFERENT shard (this is the key check)
+      when(mockAcquisitionService.belongsToThisShard("other-shard-agent")).thenReturn(false);
+
+      orphanService.setAcquisitionService(mockAcquisitionService);
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Agent should NOT be cleaned (belongs to different shard)
+      assertThat(cleaned)
+          .describedAs("Agents belonging to other shards should be skipped")
+          .isEqualTo(0);
+
+      // Verify agent still in working set (not moved to waiting)
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("working"))
+            .describedAs("Agent should remain in working set")
+            .isEqualTo(1);
+        assertThat(jedis.zcard("waiting"))
+            .describedAs("Agent should NOT be moved to waiting")
+            .isEqualTo(0);
+      }
+    }
+
+    /**
+     * Tests that orphan cleanup correctly processes valid working agents that DO belong to this
+     * shard (the normal orphan recovery case for crashed pods).
+     */
+    @Test
+    @DisplayName("Should rescue valid working agents belonging to this shard")
+    void shouldRescueValidWorkingAgentsFromThisShard() {
+      // Given - Agent in working set with old deadline (orphaned from crashed pod in our shard)
+      long nowSeconds = TestFixtures.nowSeconds();
+      long oldDeadline = nowSeconds - 120L;
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("working", oldDeadline, "our-shard-orphan");
+      }
+
+      // Create mock agent before stubbing
+      Agent mockAgent = TestFixtures.createMockAgent("our-shard-orphan");
+
+      // Mock: Agent is NOT locally active (the owning pod crashed)
+      when(mockAcquisitionService.getActiveAgentsMap())
+          .thenReturn(java.util.Collections.emptyMap());
+      // Mock: Agent is still valid
+      when(mockAcquisitionService.getRegisteredAgent("our-shard-orphan")).thenReturn(mockAgent);
+      // Mock: Agent DOES belong to this shard (we should rescue it)
+      when(mockAcquisitionService.belongsToThisShard("our-shard-orphan")).thenReturn(true);
+      // Mock: Score preservation
+      when(mockAcquisitionService.computeOriginalReadySecondsFromWorkingScore(
+              eq("our-shard-orphan"), any()))
+          .thenReturn(String.valueOf(nowSeconds - 90L));
+
+      orphanService.setAcquisitionService(mockAcquisitionService);
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Agent should be rescued (moved to waiting)
+      assertThat(cleaned).describedAs("Our shard's orphaned agents should be rescued").isEqualTo(1);
+
+      // Verify agent moved from working to waiting
+      try (Jedis jedis = jedisPool.getResource()) {
+        assertThat(jedis.zcard("working"))
+            .describedAs("Agent should be removed from working set")
+            .isEqualTo(0);
+        assertThat(jedis.zcard("waiting"))
+            .describedAs("Agent should be moved to waiting set")
+            .isEqualTo(1);
+      }
+    }
+
+    /**
+     * Tests mixed scenario: multiple agents, some locally active, some from other shards, some
+     * valid orphans from this shard. Only this shard's valid orphans should be processed.
+     */
+    @Test
+    @DisplayName("Should correctly handle mixed agents: local, other-shard, and valid orphans")
+    void shouldHandleMixedAgentsCorrectly() {
+      // Given - Three agents with old deadlines
+      long nowSeconds = TestFixtures.nowSeconds();
+      long oldDeadline = nowSeconds - 120L;
+
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("working", oldDeadline, "local-active");
+        jedis.zadd("working", oldDeadline, "other-shard");
+        jedis.zadd("working", oldDeadline, "valid-orphan");
+      }
+
+      // Create mock agents before stubbing to avoid nested mock creation
+      Agent localActiveAgent = TestFixtures.createMockAgent("local-active");
+      Agent otherShardAgent = TestFixtures.createMockAgent("other-shard");
+      Agent validOrphanAgent = TestFixtures.createMockAgent("valid-orphan");
+
+      // Mock: One agent is locally active
+      java.util.Map<String, String> activeAgentsMap = new java.util.HashMap<>();
+      activeAgentsMap.put("local-active", String.valueOf(oldDeadline));
+      when(mockAcquisitionService.getActiveAgentsMap()).thenReturn(activeAgentsMap);
+
+      // Mock: All agents are valid (registered)
+      when(mockAcquisitionService.getRegisteredAgent("local-active")).thenReturn(localActiveAgent);
+      when(mockAcquisitionService.getRegisteredAgent("other-shard")).thenReturn(otherShardAgent);
+      when(mockAcquisitionService.getRegisteredAgent("valid-orphan")).thenReturn(validOrphanAgent);
+
+      // Mock: Shard ownership
+      when(mockAcquisitionService.belongsToThisShard("local-active")).thenReturn(true);
+      when(mockAcquisitionService.belongsToThisShard("other-shard"))
+          .thenReturn(false); // Different shard
+      when(mockAcquisitionService.belongsToThisShard("valid-orphan")).thenReturn(true);
+
+      // Mock: Score preservation for the valid orphan
+      when(mockAcquisitionService.computeOriginalReadySecondsFromWorkingScore(
+              eq("valid-orphan"), any()))
+          .thenReturn(String.valueOf(nowSeconds - 90L));
+
+      orphanService.setAcquisitionService(mockAcquisitionService);
+
+      // When
+      int cleaned = orphanService.forceCleanupOrphanedAgents();
+
+      // Then - Only valid-orphan should be processed
+      // local-active: skipped (locallyActive check)
+      // other-shard: skipped (belongsToThisShard check)
+      // valid-orphan: rescued (moved to waiting)
+      assertThat(cleaned)
+          .describedAs("Only valid orphans from this shard should be processed")
+          .isEqualTo(1);
+
+      // Verify final state
+      try (Jedis jedis = jedisPool.getResource()) {
+        // local-active and other-shard still in working
+        assertThat(jedis.zcard("working"))
+            .describedAs("Two agents should remain in working")
+            .isEqualTo(2);
+        assertThat(jedis.zscore("working", "local-active"))
+            .describedAs("local-active should still be in working")
+            .isNotNull();
+        assertThat(jedis.zscore("working", "other-shard"))
+            .describedAs("other-shard should still be in working")
+            .isNotNull();
+
+        // valid-orphan moved to waiting
+        assertThat(jedis.zcard("waiting"))
+            .describedAs("One agent should be in waiting")
+            .isEqualTo(1);
+        assertThat(jedis.zscore("waiting", "valid-orphan"))
+            .describedAs("valid-orphan should be in waiting")
+            .isNotNull();
+      }
+    }
   }
 }

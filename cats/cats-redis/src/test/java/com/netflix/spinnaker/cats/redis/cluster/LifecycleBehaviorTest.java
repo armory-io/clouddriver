@@ -41,6 +41,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -64,6 +65,7 @@ import redis.clients.jedis.JedisPool;
 @Testcontainers
 @DisplayName("Agent Lifecycle and Behavior Tests")
 @SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+@Timeout(60)
 class LifecycleBehaviorTest {
 
   @Container
@@ -124,17 +126,8 @@ class LifecycleBehaviorTest {
 
   @AfterEach
   void tearDown() {
-    try (Jedis jedis = jedisPool.getResource()) {
-      jedis.flushAll();
-    } catch (Exception e) {
-      // Ignore cleanup errors
-    }
-    if (executorService != null) {
-      executorService.shutdownNow();
-    }
-    if (jedisPool != null) {
-      jedisPool.close();
-    }
+    TestFixtures.shutdownExecutorSafely(executorService);
+    TestFixtures.closePoolSafely(jedisPool);
   }
 
   private Agent createMockAgent(String agentType) {
@@ -968,10 +961,7 @@ class LifecycleBehaviorTest {
       completionLatch.countDown();
       // Metrics verification omitted; focus is on cadence preservation calculation during shutdown
     } finally {
-      executor.shutdown();
-      if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
-        executor.shutdownNow();
-      }
+      TestFixtures.shutdownExecutorSafely(executor);
     }
   }
 }

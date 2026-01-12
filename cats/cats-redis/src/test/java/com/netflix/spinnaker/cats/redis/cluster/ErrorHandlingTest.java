@@ -54,6 +54,7 @@ import redis.clients.jedis.JedisPool;
 @Testcontainers
 @DisplayName("Error Handling Tests")
 @SuppressWarnings("resource") // GenericContainer lifecycle managed by @Testcontainers
+@Timeout(60)
 public class ErrorHandlingTest {
 
   @Container
@@ -107,12 +108,8 @@ public class ErrorHandlingTest {
 
   @AfterEach
   void tearDown() {
-    if (executorService != null) {
-      executorService.shutdown();
-    }
-    if (jedisPool != null) {
-      jedisPool.close();
-    }
+    TestFixtures.shutdownExecutorSafely(executorService);
+    TestFixtures.closePoolSafely(jedisPool);
   }
 
   @Nested
