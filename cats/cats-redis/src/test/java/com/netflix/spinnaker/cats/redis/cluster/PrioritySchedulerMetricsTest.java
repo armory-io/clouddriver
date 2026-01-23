@@ -100,7 +100,7 @@ class PrioritySchedulerMetricsTest {
       Supplier<Number> s1 = () -> 1;
 
       // First registration - sets internal gaugesRegistered = true
-      m.registerGauges(null, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0);
+      m.registerGauges(null, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0, s0);
 
       // Verify via reflection: gaugesRegistered flag guards against duplicate PolledMeter
       // registrations
@@ -113,7 +113,7 @@ class PrioritySchedulerMetricsTest {
       // guard.
       // This is important for scheduler restarts where registerGauges() may be called multiple
       // times.
-      m.registerGauges(null, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1);
+      m.registerGauges(null, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1);
       boolean second = (boolean) f.get(m);
       assertThat(second).isTrue();
     }
@@ -199,11 +199,10 @@ class PrioritySchedulerMetricsTest {
     }
 
     /**
-     * Tests that permit accounting metrics (CAS contention, zombiesInFlight negative, permit
-     * mismatch, zombiesInFlight high-water) are recorded correctly.
+     * Tests that permit accounting metrics (CAS contention, permit mismatch) are recorded
+     * correctly.
      *
-     * <p>Verifies: CAS contention counter increments with location tag, zombiesInFlight negative
-     * counter increments, permit mismatch gauge records value, zombiesInFlight high-water gauge
+     * <p>Verifies: CAS contention counter increments with location tag, permit mismatch gauge
      * records value.
      */
     @Test
@@ -216,10 +215,7 @@ class PrioritySchedulerMetricsTest {
       metrics.incrementCasContention("zombie_cleanup");
       metrics.incrementCasContention("worker_completion");
       metrics.incrementCasContention("zombie_cleanup"); // Second increment for same location
-      metrics.incrementZombiesInFlightNegative();
-      metrics.incrementZombiesInFlightNegative();
       metrics.recordPermitMismatch(3);
-      metrics.recordZombiesInFlightHighWater(5);
 
       // Verify CAS contention counters with location tags
       assertThat(
@@ -241,16 +237,6 @@ class PrioritySchedulerMetricsTest {
                   .count())
           .isEqualTo(1);
 
-      // Verify zombiesInFlight negative counter
-      assertThat(
-              registry
-                  .counter(
-                      registry
-                          .createId("cats.priorityScheduler.scheduler.zombiesInFlight.negative")
-                          .withTag("scheduler", "priority"))
-                  .count())
-          .isEqualTo(2);
-
       // Verify permit mismatch gauge (last value wins for gauges)
       assertThat(
               registry
@@ -260,16 +246,6 @@ class PrioritySchedulerMetricsTest {
                           .withTag("scheduler", "priority"))
                   .value())
           .isEqualTo(3.0);
-
-      // Verify zombiesInFlight high-water gauge
-      assertThat(
-              registry
-                  .gauge(
-                      registry
-                          .createId("cats.priorityScheduler.scheduler.zombiesInFlight.highWater")
-                          .withTag("scheduler", "priority"))
-                  .value())
-          .isEqualTo(5.0);
     }
 
     /**
@@ -578,8 +554,7 @@ class PrioritySchedulerMetricsTest {
           zero, // semaphoreAvailable
           zero, // completionQueueSize
           zero, // timeOffsetMs
-          ratio, // readyToCapacityRatio
-          zero // zombiesInFlight
+          ratio // readyToCapacityRatio
           );
 
       double v = gaugeValue(registry, "cats.priorityScheduler.scheduler.readyToCapacityRatio");
@@ -600,8 +575,7 @@ class PrioritySchedulerMetricsTest {
       JedisPool pool = createLocalhostJedisPool();
       try {
         Supplier<Number> zero = () -> 0;
-        m.registerGauges(
-            pool, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero);
+        m.registerGauges(pool, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero);
 
         double active = gaugeValue(registry, "cats.priorityScheduler.redisPool.active");
         double idle = gaugeValue(registry, "cats.priorityScheduler.redisPool.idle");
@@ -653,7 +627,7 @@ class PrioritySchedulerMetricsTest {
      *
      * <p>Verifies: first call logs health summary, second call (within 10m) is throttled, log
      * contains expected fields (health, backlog ready, oldest_overdue, capacity_per_cycle, permits,
-     * zombies_in_flight, agents registered, scripts, queue_depth).
+     * agents registered, scripts, queue_depth).
      *
      * <p>Uses logback ListAppender for log capture. Run-cycle metrics verification omitted; focus
      * is on health logging cadence and content.
@@ -690,7 +664,6 @@ class PrioritySchedulerMetricsTest {
         assertThat(msg).contains("oldest_overdue=");
         assertThat(msg).contains("capacity_per_cycle=");
         assertThat(msg).contains("[permits ");
-        assertThat(msg).contains("zombies_in_flight=");
         assertThat(msg).contains("[agents registered=");
         assertThat(msg).contains("scripts=");
         assertThat(msg).contains("queue_depth=");

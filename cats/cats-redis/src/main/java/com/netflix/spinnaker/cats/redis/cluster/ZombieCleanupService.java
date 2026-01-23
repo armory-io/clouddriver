@@ -37,9 +37,9 @@ import redis.clients.jedis.JedisPool;
  * service scans locally active agents, cancels stuck executions, and removes them from Redis to
  * allow rescheduling.
  *
- * <p><b>Scope:</b> Locally active agents only (with RunState on this pod). Calls {@link
- * AgentAcquisitionService#earlyReleasePermitIfHeld} (CAS-protected), cancels Future, increments
- * zIF. See {@link OrphanCleanupService} for agents from crashed pods (Redis-only, no permits).
+ * <p><b>Scope:</b> Locally active agents only (with RunState on this pod). Cancels the Future (via
+ * interrupt), removes from local tracking. Permit is released when thread exits in worker finally
+ * block. See {@link OrphanCleanupService} for agents from crashed pods (Redis-only, no permits).
  */
 @Component
 @Slf4j
@@ -103,22 +103,8 @@ public class ZombieCleanupService {
     this.WORKING_SET = prefix + keysCfg.getWorkingSet() + brace;
   }
 
-  // Optional fairness wiring to acquisition service.
-  //
-  // Meaning of optional:
-  // - Not required for correctness: if this reference is not set, zombie cleanup still cancels
-  //   running futures and removes entries from Redis; the scheduler continues to function.
-  // - When set (wired by the scheduler), zombie cleanup also performs early permit release using an
-  //   exactly-once handshake and increments a zombiesInFlight counter in the acquisition service.
-  //   This avoids temporary under-filling when a cancelled thread lingers before exiting.
-  // - When omitted, only the fairness step is skipped: a cancelled zombie may hold its semaphore
-  //   permit until the worker thread exits, which can temporarily reduce effective concurrency on
-  //   this pod. There is no oversubscription risk either way; the capacity guard remains intact.
-  //
-  // Tests or alternate constructors may omit the wiring for simplicity; the main scheduler wires
-  // it in to enable the fairness behavior in production.
+  // Reference to acquisition service for coordinating with active agent tracking.
   private AgentAcquisitionService acquisitionService;
-  private PermitFairnessHandler fairnessHandler;
 
   /**
    * Sets the acquisition service for coordinating with active agent tracking.
@@ -128,18 +114,6 @@ public class ZombieCleanupService {
   @VisibleForTesting
   void setAcquisitionService(AgentAcquisitionService acquisitionService) {
     this.acquisitionService = acquisitionService;
-    // Backward-compatible default: wire acquisition service as fairness handler
-    this.fairnessHandler = acquisitionService;
-  }
-
-  /**
-   * Sets a custom fairness handler for early permit release during zombie cancellation.
-   *
-   * @param fairnessHandler the fairness handler to use for permit release
-   */
-  @VisibleForTesting
-  void setFairnessHandler(PermitFairnessHandler fairnessHandler) {
-    this.fairnessHandler = fairnessHandler;
   }
 
   /**
@@ -638,15 +612,7 @@ public class ZombieCleanupService {
                     log.debug("Cancelled zombie agent {} future: {}", agentType, cancelled);
                   }
                 }
-                // Early permit release first to minimize transient permit/accounting skew
-                if (fairnessHandler != null) {
-                  try {
-                    fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight(
-                        agentType);
-                  } catch (Exception e) {
-                    log.debug("Fairness handshake during zombie cleanup failed; continuing", e);
-                  }
-                }
+                // Permit is released when thread exits in worker finally block
                 if (acquisitionService != null) {
                   try {
                     acquisitionService.removeActiveAgent(agentType);
@@ -840,16 +806,7 @@ public class ZombieCleanupService {
       // Do not perform an unconditional fallback ZREM here. If the conditional removal failed,
       // ownership likely changed or the agent was already removed. Proceed with local cleanup
       // regardless to avoid race conditions that could orphan a legitimately re-acquired agent.
-
-      // Perform fairness early release first to minimize transient permit mismatch windows
-      if (fairnessHandler != null) {
-        try {
-          fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight(agentType);
-        } catch (Exception e) {
-          log.debug(
-              "Failed early-permit release during individual zombie cleanup for {}", agentType, e);
-        }
-      }
+      // Permit is released when thread exits in worker finally block.
 
       // Always clean local state regardless of Redis outcome to prevent leaks
       if (acquisitionService != null) {

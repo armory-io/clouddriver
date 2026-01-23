@@ -177,6 +177,10 @@ public class RedisScriptManager {
       if (msg != null && msg.contains("NOSCRIPT")) {
         try {
           // Script evicted from Redis - reload all scripts
+          log.warn(
+              "NOSCRIPT detected for script '{}' - reloading all scripts "
+                  + "(possible Redis failover, restart, or SCRIPT FLUSH)",
+              scriptName);
           metrics.incrementScriptsReload();
           loadAllScripts(jedis);
           // Retry with reloaded SHA
@@ -187,6 +191,11 @@ public class RedisScriptManager {
           return result;
         } catch (Exception retry) {
           // Fallback: execute script body directly via EVAL
+          log.warn(
+              "EVALSHA retry failed for script '{}' after reload - "
+                  + "falling back to EVAL (degraded performance mode)",
+              scriptName,
+              retry);
           String body = getScriptBody(scriptName);
           if (body != null) {
             long evalStart = System.nanoTime();
@@ -202,6 +211,10 @@ public class RedisScriptManager {
     } catch (ClassCastException cce) {
       // Defensive: result type mismatch (e.g., Redis/Jedis returns a different shape)
       // Attempt one-time reload of scripts and retry this call
+      log.warn(
+          "Script result type mismatch for '{}' - reloading scripts (possible Redis/Jedis version issue)",
+          scriptName,
+          cce);
       try {
         metrics.incrementScriptResultTypeError(scriptName);
       } catch (Exception ignoreMetric) {
@@ -217,6 +230,11 @@ public class RedisScriptManager {
         return result;
       } catch (Exception retry) {
         // Fall back to EVAL body
+        log.warn(
+            "EVALSHA retry failed for script '{}' after reload - "
+                + "falling back to EVAL (degraded performance mode)",
+            scriptName,
+            retry);
         String body = getScriptBody(scriptName);
         if (body != null) {
           long evalStart = System.nanoTime();

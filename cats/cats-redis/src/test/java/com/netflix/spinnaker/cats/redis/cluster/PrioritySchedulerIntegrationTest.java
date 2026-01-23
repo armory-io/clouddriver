@@ -2525,43 +2525,43 @@ public class PrioritySchedulerIntegrationTest {
         for (int i = 0; i < 3; i++) {
           scheduler.evaluateWatchdog(
               0.0d, // permitsFreeRatio < 1%
-              0.0d, 1.0d, 5, 0, 1, false, 10, 0, 0, 10, 0);
+              0.0d, 1.0d, 5, 0, 1, false, 10, 0, 10, 0);
         }
         long leakWarnings =
             TestFixtures.countLogsAtLevelContaining(appender, Level.WARN, "PERMIT_LEAK_SUSPECT");
         assertThat(leakWarnings).isEqualTo(0);
 
         // Reset streaks with a healthy sample
-        scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 0, 10, 10);
+        scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 10, 10);
 
         // Zero progress streak
         appender.list.clear();
         for (int i = 0; i < 3; i++) {
-          scheduler.evaluateWatchdog(0.5d, 0.0d, 0.0d, 5, 0, 0, false, 10, 0, 0, 10, 10);
+          scheduler.evaluateWatchdog(0.5d, 0.0d, 0.0d, 5, 0, 0, false, 10, 0, 10, 10);
         }
         long zeroProgressWarnings =
             TestFixtures.countLogsAtLevelContaining(appender, Level.WARN, "ZERO_PROGRESS");
         assertThat(zeroProgressWarnings).isEqualTo(0);
 
         // Reset
-        scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 0, 10, 10);
+        scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 10, 10);
 
         // Skew streak
         appender.list.clear();
         for (int i = 0; i < 3; i++) {
-          scheduler.evaluateWatchdog(0.95d, 0.0d, 0.05d, 5, 0, 1, false, 10, 0, 1, 10, 10);
+          scheduler.evaluateWatchdog(0.95d, 0.0d, 0.05d, 5, 0, 1, false, 10, 0, 10, 10);
         }
         long skewWarnings =
-            TestFixtures.countLogsAtLevelContaining(appender, Level.WARN, "CAPACITY_SKEW_ZIF");
+            TestFixtures.countLogsAtLevelContaining(appender, Level.WARN, "CAPACITY_SKEW");
         assertThat(skewWarnings).isEqualTo(0);
 
         // Reset
-        scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 0, 10, 10);
+        scheduler.evaluateWatchdog(1.0d, 1.0d, 1.0d, 0, 1, 1, false, 10, 10, 10, 10);
 
         // Redis stall streak
         appender.list.clear();
         for (int i = 0; i < 3; i++) {
-          scheduler.evaluateWatchdog(0.5d, 0.5d, 0.5d, 0, 0, 0, true, 10, 0, 0, 10, 10);
+          scheduler.evaluateWatchdog(0.5d, 0.5d, 0.5d, 0, 0, 0, true, 10, 0, 10, 10);
         }
         long stallWarnings =
             TestFixtures.countLogsAtLevelContaining(appender, Level.WARN, "REDIS_STALL");
@@ -3548,11 +3548,9 @@ public class PrioritySchedulerIntegrationTest {
       // Wait for workers to finish and process completion queue using polling
       waitForCondition(
           () -> {
-            // Check if workers have finished (zombiesInFlight should be 0, permits released)
-            int zif = Math.max(0, acquisitionService.getZombiesInFlight());
+            // Check if workers have finished (permits released)
             int availablePermits = semaphore.availablePermits();
-            // Workers finished when zombiesInFlight is 0 and permits are available
-            return zif == 0 && availablePermits == 5;
+            return availablePermits == 5;
           },
           5000,
           100);
@@ -3575,18 +3573,8 @@ public class PrioritySchedulerIntegrationTest {
           .describedAs("Completion processing should run long enough to exercise rescheduling")
           .isTrue();
 
-      // Final wait for state to settle
-      waitForCondition(
-          () -> {
-            int zif = Math.max(0, acquisitionService.getZombiesInFlight());
-            return zif == 0;
-          },
-          2000,
-          100);
-
       // THEN: Scheduler continues operating, poison agent isolated
       assertThat(semaphore.availablePermits()).isEqualTo(5);
-      assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
       // Poison agent should be rescheduled (not lost) - check both sets with deterministic polling
       String waitingSet = schedProps.getKeys().getWaitingSet();
@@ -3641,7 +3629,7 @@ public class PrioritySchedulerIntegrationTest {
     /**
      * Chaos test that verifies dynamic agent population handling. Tests rapid
      * registration/unregistration under load and verifies scheduler remains stable (semaphore
-     * permits = 5, zombiesInFlight = 0) with disjoint waiting/working sets.
+     * permits = 5) with disjoint waiting/working sets.
      */
     @Test
     @DisplayName("Dynamic agent population: Rapid registration/unregistration under load")
@@ -3760,10 +3748,7 @@ public class PrioritySchedulerIntegrationTest {
       // Allow workers to finish using deterministic polling
       boolean workersDrained =
           waitForCondition(
-              () -> {
-                int zif = Math.max(0, acquisitionService.getZombiesInFlight());
-                return zif == 0 && semaphore.availablePermits() == 5;
-              },
+              () -> semaphore.availablePermits() == 5,
               5000,
               100,
               () -> {
@@ -3779,7 +3764,6 @@ public class PrioritySchedulerIntegrationTest {
 
       // THEN: Scheduler remains stable, no agent loss
       assertThat(semaphore.availablePermits()).isEqualTo(5);
-      assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
       // Verify agents are properly tracked
       try (Jedis j = chaosJedisPool.getResource()) {
@@ -4676,7 +4660,7 @@ public class PrioritySchedulerIntegrationTest {
 
     /**
      * Edge case test: Agent completes before acquisition tracking finishes. Verifies permit
-     * accounting balanced (semaphore permits = 1, zombiesInFlight = 0).
+     * accounting balanced (semaphore permits = 1).
      */
     @Test
     @DisplayName("EC-1: Agent completes before acquisition tracking finishes")
@@ -4728,14 +4712,13 @@ public class PrioritySchedulerIntegrationTest {
 
       // THEN: Permit accounting balanced, agent count preserved
       assertThat(semaphore.availablePermits()).isEqualTo(1);
-      assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
       TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
-     * Edge case test: Zombie cleanup runs before worker marks started. Verifies zombiesInFlight
-     * remains at 0 (symmetric no-ops) and permit accounting balanced (semaphore permits = 1).
+     * Edge case test: Zombie cleanup runs before worker marks started. Verifies permit accounting
+     * balanced (semaphore permits = 1).
      */
     @Test
     @DisplayName("EC-2: Zombie cleanup runs before worker marks started")
@@ -4768,7 +4751,6 @@ public class PrioritySchedulerIntegrationTest {
           new ZombieCleanupService(
               edgeCasesJedisPool, edgeCasesScriptManager, schedProps, edgeCasesMetrics);
       zombieCleanup.setAcquisitionService(acquisitionService);
-      zombieCleanup.setFairnessHandler(acquisitionService);
 
       // Slow agent that blocks before marking started
       Agent slowAgent = TestFixtures.createMockAgent("slow-agent", "test");
@@ -4823,8 +4805,7 @@ public class PrioritySchedulerIntegrationTest {
           2000,
           50);
 
-      // THEN: zombiesInFlight should remain at 0 (symmetric no-ops)
-      assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
+      // No permit leak
       assertThat(semaphore.availablePermits()).isEqualTo(1);
 
       TestFixtures.shutdownExecutorSafely(pool);
@@ -4832,7 +4813,7 @@ public class PrioritySchedulerIntegrationTest {
 
     /**
      * Edge case test: Agent re-registered while completing. Verifies permit accounting balanced
-     * (semaphore permits = 1, zombiesInFlight = 0) without duplicates.
+     * (semaphore permits = 1) without duplicates.
      */
     @Test
     @DisplayName("EC-4: Agent re-registered while completing")
@@ -4875,26 +4856,17 @@ public class PrioritySchedulerIntegrationTest {
       acquisitionService.registerAgent(testAgent, exec, instr);
 
       // Wait for completion using polling
-      waitForCondition(
-          () -> {
-            // Check if permit released and zombiesInFlight cleared (completion processed)
-            return semaphore.availablePermits() == 1
-                && Math.max(0, acquisitionService.getZombiesInFlight()) == 0;
-          },
-          1000,
-          50,
-          null);
+      waitForCondition(() -> semaphore.availablePermits() == 1, 1000, 50, null);
 
       // THEN: Agent count preserved, no duplicates
       assertThat(semaphore.availablePermits()).isEqualTo(1);
-      assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
       TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
      * Edge case test: Agent failure during shutdown. Verifies failed agent preserved in WAITZ for
-     * retry and permit accounting balanced (semaphore permits = 1, zombiesInFlight = 0).
+     * retry and permit accounting balanced (semaphore permits = 1).
      */
     @Test
     @DisplayName("EC-8: Agent failure during shutdown")
@@ -4945,15 +4917,13 @@ public class PrioritySchedulerIntegrationTest {
       // Wait for failure to process using polling
       waitForCondition(
           () -> {
-            // Check if failure processed: agent in waiting set, permit released, zombiesInFlight
-            // cleared
+            // Check if failure processed: agent in waiting set, permit released
             try (Jedis j = edgeCasesJedisPool.getResource()) {
               String waitingSet = schedProps.getKeys().getWaitingSet();
               Set<String> waiting = j.zrange(waitingSet, 0, -1);
               return waiting != null
                   && waiting.contains("failing-agent")
-                  && semaphore.availablePermits() == 1
-                  && Math.max(0, acquisitionService.getZombiesInFlight()) == 0;
+                  && semaphore.availablePermits() == 1;
             }
           },
           1000,
@@ -4967,14 +4937,13 @@ public class PrioritySchedulerIntegrationTest {
         assertThat(waiting).contains("failing-agent");
       }
       assertThat(semaphore.availablePermits()).isEqualTo(1);
-      assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
       TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
      * Edge case test: Worker interrupted before started=true. Verifies permit accounting balanced
-     * (semaphore permits = 1, zombiesInFlight = 0).
+     * (semaphore permits = 1).
      */
     @Test
     @DisplayName("EC-10: Worker interrupted before started=true")
@@ -5007,7 +4976,6 @@ public class PrioritySchedulerIntegrationTest {
           new ZombieCleanupService(
               edgeCasesJedisPool, edgeCasesScriptManager, schedProps, edgeCasesMetrics);
       zombieCleanup.setAcquisitionService(acquisitionService);
-      zombieCleanup.setFairnessHandler(acquisitionService);
 
       // Agent that blocks before marking started
       Agent blockingAgent = TestFixtures.createMockAgent("blocking-agent", "test");
@@ -5057,26 +5025,17 @@ public class PrioritySchedulerIntegrationTest {
       zombieCleanup.cleanupZombieAgents(active, futures);
 
       // Wait for interruption to process using polling
-      waitForCondition(
-          () -> {
-            // Check if interruption processed: permit released, zombiesInFlight cleared
-            return semaphore.availablePermits() == 1
-                && Math.max(0, acquisitionService.getZombiesInFlight()) == 0;
-          },
-          1000,
-          50,
-          null);
+      waitForCondition(() -> semaphore.availablePermits() == 1, 1000, 50, null);
 
-      // THEN: Permit accounting balanced, zombiesInFlight=0
+      // THEN: Permit accounting balanced
       assertThat(semaphore.availablePermits()).isEqualTo(1);
-      assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
       TestFixtures.shutdownExecutorSafely(pool);
     }
 
     /**
      * Edge case test: Dead-man timer fires simultaneously with completion. Verifies permit released
-     * exactly once via CAS protection (semaphore permits = 1, zombiesInFlight = 0).
+     * exactly once via CAS protection (semaphore permits = 1).
      */
     @Test
     @DisplayName("EC-11: Dead-man timer fires simultaneously with completion")
@@ -5134,26 +5093,17 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(completionLatch.await(5, TimeUnit.SECONDS)).isTrue();
 
       // Wait for race to resolve using polling
-      waitForCondition(
-          () -> {
-            // Check if race resolved: permit released, zombiesInFlight cleared
-            return semaphore.availablePermits() == 1
-                && Math.max(0, acquisitionService.getZombiesInFlight()) == 0;
-          },
-          1000,
-          50,
-          null);
+      waitForCondition(() -> semaphore.availablePermits() == 1, 1000, 50, null);
 
       // THEN: Permit released exactly once (CAS protection)
       assertThat(semaphore.availablePermits()).isEqualTo(1);
-      assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
       pool.shutdownNow();
     }
 
     /**
      * Edge case test: Double-release protection verification. Verifies permit count correct
-     * (semaphore permits = 2, zombiesInFlight = 0) via CAS protection.
+     * (semaphore permits = 2) via CAS protection.
      */
     @Test
     @DisplayName("EC-12: Double-release protection verification")
@@ -5194,19 +5144,10 @@ public class PrioritySchedulerIntegrationTest {
       assertThat(acquired).isEqualTo(1);
 
       // Wait for completion using polling
-      waitForCondition(
-          () -> {
-            // Check if completion processed: permit released, zombiesInFlight cleared
-            return semaphore.availablePermits() == 2
-                && Math.max(0, acquisitionService.getZombiesInFlight()) == 0;
-          },
-          1000,
-          50,
-          null);
+      waitForCondition(() -> semaphore.availablePermits() == 2, 1000, 50, null);
 
       // THEN: Permit count correct (no double-release despite potential bugs)
       assertThat(semaphore.availablePermits()).isEqualTo(2);
-      assertThat(Math.max(0, acquisitionService.getZombiesInFlight())).isEqualTo(0);
 
       TestFixtures.shutdownExecutorSafely(pool);
     }
@@ -5929,7 +5870,6 @@ public class PrioritySchedulerIntegrationTest {
               schedProps1,
               multiInstanceMetrics);
       zombieCleanup1.setAcquisitionService(acquisitionService1);
-      zombieCleanup1.setFairnessHandler(acquisitionService1);
 
       ZombieCleanupService zombieCleanup2 =
           new ZombieCleanupService(
@@ -5938,7 +5878,6 @@ public class PrioritySchedulerIntegrationTest {
               schedProps2,
               multiInstanceMetrics);
       zombieCleanup2.setAcquisitionService(acquisitionService2);
-      zombieCleanup2.setFairnessHandler(acquisitionService2);
 
       OrphanCleanupService orphanCleanup1 =
           new OrphanCleanupService(
@@ -6104,17 +6043,6 @@ public class PrioritySchedulerIntegrationTest {
       drainWorkers(acquisitionService1, agentWorkPool1);
       drainWorkers(acquisitionService2, agentWorkPool2);
 
-      // Allow zombiesInFlight to settle using polling helper
-      waitForCondition(
-          () -> {
-            int zif1 = Math.max(0, acquisitionService1.getZombiesInFlight());
-            int zif2 = Math.max(0, acquisitionService2.getZombiesInFlight());
-            return zif1 == 0 && zif2 == 0;
-          },
-          5000,
-          50);
-      // Note: May timeout if zombiesInFlight doesn't settle, but we continue with assertions
-
       // THEN: Assert eventual consistency invariants
       try (Jedis j = multiInstanceJedisPool.getResource()) {
         String WAITING_KEY = schedProps1.getKeys().getWaitingSet();
@@ -6168,15 +6096,6 @@ public class PrioritySchedulerIntegrationTest {
         assertThat(semaphore2.availablePermits())
             .describedAs("All permits must be returned on scheduler 2")
             .isGreaterThanOrEqualTo(5);
-
-        // Invariant 3: zombiesInFlight == 0 (allow small tolerance for concurrent state
-        // transitions)
-        assertThat(Math.max(0, acquisitionService1.getZombiesInFlight()))
-            .describedAs("zombiesInFlight must be 0 on scheduler 1")
-            .isLessThanOrEqualTo(1);
-        assertThat(Math.max(0, acquisitionService2.getZombiesInFlight()))
-            .describedAs("zombiesInFlight must be 0 on scheduler 2")
-            .isLessThanOrEqualTo(1);
       }
 
       // Shutdown pools

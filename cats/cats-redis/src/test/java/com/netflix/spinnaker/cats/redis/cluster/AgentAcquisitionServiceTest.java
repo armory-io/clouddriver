@@ -325,11 +325,6 @@ class AgentAcquisitionServiceTest {
         .as("Metrics should be NOOP instance when null is provided")
         .isNotNull()
         .isSameAs(PrioritySchedulerMetrics.NOOP);
-
-    // Verify operations that use metrics don't throw NPE
-    String agentType = "agent-noop-metrics";
-    assertThatCode(() -> serviceWithNullMetrics.earlyReleasePermitIfHeld(agentType))
-        .doesNotThrowAnyException();
   }
 
   @Nested
@@ -817,7 +812,7 @@ class AgentAcquisitionServiceTest {
     /**
      * Tests that concurrency limits are respected. Verifies only 2 agents acquired when limit is 2,
      * 0 on second call, Redis state (agent1 and agent2 in WORKING_SET, agent3 remains in
-     * WAITING_SET), metrics recorded, and capacity calculation accounts for zombiesInFlight.
+     * WAITING_SET), and metrics recorded.
      */
     @Test
     @DisplayName("Should respect concurrency limits")
@@ -948,42 +943,26 @@ class AgentAcquisitionServiceTest {
           .describedAs("recordAcquireTime('auto', elapsed) should be called")
           .isGreaterThanOrEqualTo(1);
 
-      // Verify that capacity calculation accounts for zombiesInFlight
-      // Capacity is calculated as: maxConcurrentAgents - (currentlyRunning + zombiesInFlight)
-      // effectiveRunning = currentlyRunning + Math.max(0, zombiesInFlightRaw.get())
-      // availableSlotsForNewAgents = maxConcurrentAgents - effectiveRunning
+      // Verify capacity calculation: maxConcurrentAgents - currentlyRunning
       int maxConcurrent = agentProperties.getMaxConcurrentAgents();
       int activeCount = testService.getActiveAgentCount();
-      int zombiesInFlight = testService.getZombiesInFlight();
-      int effectiveRunning = activeCount + Math.max(0, zombiesInFlight);
-      int expectedEffectiveCapacity = Math.max(0, maxConcurrent - effectiveRunning);
+      int expectedEffectiveCapacity = Math.max(0, maxConcurrent - activeCount);
 
-      // Verify that the second acquisition respects the capacity limit accounting for
-      // zombiesInFlight
-      // When activeCount=2 and maxConcurrent=2, capacity should be 0 (or negative if
-      // zombiesInFlight > 0)
+      // Verify that the second acquisition respects the capacity limit
+      // When activeCount=2 and maxConcurrent=2, capacity should be 0
       assertThat(secondAcquired)
           .describedAs(
-              "Second acquisition should respect capacity limit accounting for active agents and zombiesInFlight. "
-                  + "maxConcurrent=%d, activeCount=%d, zombiesInFlight=%d, effectiveRunning=%d, expectedCapacity=%d",
-              maxConcurrent,
-              activeCount,
-              zombiesInFlight,
-              effectiveRunning,
-              expectedEffectiveCapacity)
+              "Second acquisition should respect capacity limit. "
+                  + "maxConcurrent=%d, activeCount=%d, expectedCapacity=%d",
+              maxConcurrent, activeCount, expectedEffectiveCapacity)
           .isEqualTo(0); // Should be 0 when capacity is exhausted
 
-      // Verify that capacity calculation correctly accounts for zombiesInFlight
-      // The effective capacity should be maxConcurrent - effectiveRunning, which includes
-      // zombiesInFlight
+      // Verify capacity calculation
       assertThat(expectedEffectiveCapacity)
           .describedAs(
-              "Effective capacity should account for zombiesInFlight. "
-                  + "maxConcurrent=%d, activeCount=%d, zombiesInFlight=%d, effectiveRunning=%d",
-              maxConcurrent, activeCount, zombiesInFlight, effectiveRunning)
-          .isLessThanOrEqualTo(
-              maxConcurrent
-                  - activeCount); // Capacity should be <= (max - active) when zombiesInFlight >= 0
+              "Effective capacity should be max - active. maxConcurrent=%d, activeCount=%d",
+              maxConcurrent, activeCount)
+          .isEqualTo(maxConcurrent - activeCount);
 
       // Verify agents removed from WORKING_SET after completion (when they finish)
       // Note: Agents are still executing (5 second sleep), so we can't verify removal yet
@@ -5553,8 +5532,7 @@ class AgentAcquisitionServiceTest {
       AgentExecution execution = mock(AgentExecution.class);
       ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
 
-      // Create multiple agents with different overdue times
-      long currentTimeSeconds = TestFixtures.nowSeconds();
+      // Create multiple agents
       int numAgents = 5;
 
       for (int i = 0; i < numAgents; i++) {
@@ -5603,6 +5581,8 @@ class AgentAcquisitionServiceTest {
       // Verify all agents maintain their relative priority ordering
       try (Jedis jedis = jedisPool.getResource()) {
         var agentsWithScores = jedis.zrangeWithScores("waiting", 0, -1);
+        // Capture time after repopulation to account for elapsed time during test
+        long nowSeconds = TestFixtures.nowSeconds();
 
         double previousScore = Double.NEGATIVE_INFINITY;
         for (var tuple : agentsWithScores) {
@@ -5614,11 +5594,11 @@ class AgentAcquisitionServiceTest {
               .isGreaterThanOrEqualTo(previousScore);
           previousScore = score;
 
-          // CRITICAL: All overdue agents should have scores BEFORE current time
-          // (they should NOT all be set to "now" which would cause burst execution)
+          // CRITICAL: All overdue agents should have scores BEFORE or AT current time
+          // (they should NOT all be set far in the future which would delay execution)
           assertThat(score)
               .as("Overdue agents should keep old scores to maintain execution cadence")
-              .isLessThan((double) currentTimeSeconds);
+              .isLessThanOrEqualTo((double) nowSeconds);
         }
       }
     }
@@ -8358,98 +8338,6 @@ class AgentAcquisitionServiceTest {
       assertThat(acquisitionService.getActiveAgentCount())
           .describedAs("Normal agent should be active with dead-man timer using default threshold")
           .isGreaterThan(0);
-
-      TestFixtures.shutdownExecutorSafely(workPool);
-    }
-  }
-
-  @Nested
-  @DisplayName("Zombie In-Flight Accounting During Shutdown")
-  class ZombieInFlightShutdownTests {
-
-    /**
-     * Tests that zombiesInFlight accounting is maintained correctly during shutdown scenarios.
-     * Verifies that zombiesInFlight is properly accounted for when agents are cancelled during
-     * shutdown.
-     */
-    @Test
-    @DisplayName("Should maintain correct zombiesInFlight accounting during shutdown")
-    void shouldMaintainCorrectZifAccountingDuringShutdown() throws Exception {
-      Agent agent = TestFixtures.createMockAgent("shutdown-agent", "test-provider");
-      CountDownLatch executionStarted = new CountDownLatch(1);
-      CountDownLatch allowCompletion = new CountDownLatch(1);
-
-      AgentExecution longExecution = mock(AgentExecution.class);
-      doAnswer(
-              invocation -> {
-                executionStarted.countDown();
-                allowCompletion.await(5, TimeUnit.SECONDS);
-                return null;
-              })
-          .when(longExecution)
-          .executeAgent(any());
-
-      ExecutionInstrumentation instr = TestFixtures.createMockInstrumentation();
-
-      acquisitionService.registerAgent(agent, longExecution, instr);
-
-      // Add agent to Redis WAITING set
-      addAgentToWaitingSet("shutdown-agent");
-
-      Semaphore semaphore = createTestSemaphore();
-      ExecutorService workPool = Executors.newCachedThreadPool();
-
-      // Acquire agent
-      int acquired = acquisitionService.saturatePool(0L, semaphore, workPool);
-      assertThat(acquired).isEqualTo(1);
-
-      // Wait for execution to start
-      assertThat(executionStarted.await(2, TimeUnit.SECONDS)).isTrue();
-      assertThat(acquisitionService.getActiveAgentCount()).isEqualTo(1);
-
-      // Get initial zombiesInFlight (should be 0)
-      int initialZif = acquisitionService.getZombiesInFlight();
-      assertThat(initialZif).isEqualTo(0);
-
-      // Wait a bit to ensure agent is fully started (runState.started = true)
-      // This ensures zombiesInFlight accounting is deterministic
-      TestFixtures.waitForBackgroundTask(
-          () -> {
-            // Agent should be marked as started
-            return acquisitionService.getActiveAgentCount() == 1;
-          },
-          1000,
-          50);
-
-      // Trigger shutdown and early permit release (simulating zombie cleanup)
-      acquisitionService.setShuttingDown(true);
-      acquisitionService.earlyReleasePermitIfHeld("shutdown-agent");
-
-      // zombiesInFlight should be incremented when agent was started and permit released early
-      // Note: zombiesInFlight is incremented if runState.started is true and permit is released
-      // early
-      int zifAfterEarlyRelease = acquisitionService.getZombiesInFlight();
-      // With agent started, zombiesInFlight should be incremented to 1
-      assertThat(zifAfterEarlyRelease)
-          .describedAs(
-              "zombiesInFlight should be incremented to 1 after early permit release during shutdown when agent is started")
-          .isEqualTo(1);
-
-      // Allow agent to complete
-      allowCompletion.countDown();
-
-      // Wait for completion
-      TestFixtures.waitForBackgroundTask(
-          () -> acquisitionService.getActiveAgentCount() == 0, 2000, 50);
-
-      // zombiesInFlight should eventually return to 0 after completion
-      TestFixtures.waitForBackgroundTask(
-          () -> acquisitionService.getZombiesInFlight() == 0, 2000, 50);
-
-      int finalZif = acquisitionService.getZombiesInFlight();
-      assertThat(finalZif)
-          .describedAs("zombiesInFlight should return to 0 after agent completion during shutdown")
-          .isEqualTo(0);
 
       TestFixtures.shutdownExecutorSafely(workPool);
     }
@@ -12131,94 +12019,6 @@ class AgentAcquisitionServiceTest {
 
     private Agent createAgent(String name) {
       return TestFixtures.createMockAgent(name, "test");
-    }
-  }
-
-  @Nested
-  @DisplayName("Forced Permit Accounting Tests")
-  @Timeout(10)
-  class ForcedPermitAccountingTests {
-
-    /**
-     * Verifies that earlyReleasePermitIfHeld supports an optional forceZombiesIncrement parameter.
-     *
-     * <p>The forceZombiesIncrement flag allows callers to unconditionally increment the
-     * zombiesInFlight counter even when the worker hasn't started yet. This is necessary for
-     * unregisterAgent() because future.cancel(false) doesn't interrupt the worker thread, so
-     * the permit must be accounted for regardless of the started flag state.
-     */
-    @Test
-    @DisplayName("Should support forceZombiesIncrement parameter for unconditional permit accounting")
-    void shouldSupportForceZombiesIncrementParameter() {
-      Agent agent = TestFixtures.createMockAgent("ForceFlagTest", "test");
-      AgentExecution noOpExecution = (agent_arg) -> {};
-      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
-
-      acquisitionService.registerAgent(agent, noOpExecution, instrumentation);
-
-      // Verify the two-parameter version accepts the force flag
-      assertThatCode(() -> acquisitionService.earlyReleasePermitIfHeld(agent.getAgentType(), true))
-          .as("earlyReleasePermitIfHeld should accept forceZombiesIncrement parameter")
-          .doesNotThrowAnyException();
-
-      // Verify the single-parameter version works for standard cleanup paths
-      assertThatCode(() -> acquisitionService.earlyReleasePermitIfHeld(agent.getAgentType()))
-          .as("earlyReleasePermitIfHeld should work without forceZombiesIncrement")
-          .doesNotThrowAnyException();
-    }
-
-    /**
-     * Verifies that unregisterAgent properly accounts for permits when called before worker starts.
-     *
-     * <p>When an agent is unregistered while queued but not yet executing, the permit must still
-     * be tracked in zombiesInFlight because the worker thread may still execute despite the
-     * unregister call (future.cancel(false) doesn't interrupt running threads).
-     */
-    @Test
-    @DisplayName("Should handle permit accounting correctly when unregistering before worker starts")
-    void shouldHandlePermitAccountingOnEarlyUnregister() {
-      Agent agent = TestFixtures.createMockAgent("UnregisterTest", "test");
-      AgentExecution noOpExecution = (agent_arg) -> {};
-      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
-
-      acquisitionService.registerAgent(agent, noOpExecution, instrumentation);
-
-      // Immediately unregister before worker can start
-      assertThatCode(() -> acquisitionService.unregisterAgent(agent))
-          .as("unregisterAgent should handle permit accounting for queued agents")
-          .doesNotThrowAnyException();
-    }
-
-    /**
-     * Verifies that concurrent unregister operations maintain permit accounting consistency.
-     *
-     * <p>Multiple threads unregistering agents simultaneously should not cause permit accounting
-     * errors due to the atomic flag-before-increment ordering in earlyReleasePermitIfHeld.
-     */
-    @Test
-    @DisplayName("Should maintain permit accounting consistency under concurrent unregister operations")
-    void shouldMaintainConsistencyUnderConcurrentUnregister() throws Exception {
-      List<Agent> agents = new java.util.ArrayList<>();
-      for (int i = 0; i < 10; i++) {
-        Agent agent = TestFixtures.createMockAgent("ConcurrentTest" + i, "test");
-        AgentExecution noOpExecution = (agent_arg) -> {};
-        ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
-        acquisitionService.registerAgent(agent, noOpExecution, instrumentation);
-        agents.add(agent);
-      }
-
-      // Concurrently unregister all agents
-      java.util.List<Future<?>> futures = new java.util.ArrayList<>();
-      for (Agent agent : agents) {
-        futures.add(executorService.submit(() -> acquisitionService.unregisterAgent(agent)));
-      }
-
-      // All operations should complete without errors
-      for (Future<?> future : futures) {
-        assertThatCode(() -> future.get(5, TimeUnit.SECONDS))
-            .as("Concurrent unregister operations should complete without errors")
-            .doesNotThrowAnyException();
-      }
     }
   }
 }

@@ -190,9 +190,8 @@ public class PriorityAgentScheduler extends CatsModuleAware
 
     // Set up service references for advanced cleanup processing
     this.orphanService.setAcquisitionService(this.acquisitionService);
-    // Provide acquisition service and fairness handler without reflection
+    // Provide acquisition service for zombie cleanup coordination
     this.zombieService.setAcquisitionService(this.acquisitionService);
-    this.zombieService.setFairnessHandler(this.acquisitionService);
 
     // Store external dependencies
     this.nodeStatusProvider = nodeStatusProvider;
@@ -257,8 +256,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
             double cap = acquisitionService.getCapacityPerCycleSnapshot();
             double ready = acquisitionService.getReadyCountSnapshot();
             return cap > 0 ? (ready / cap) : 0;
-          },
-          () -> (double) Math.max(0, acquisitionService.getZombiesInFlight()));
+          });
     } catch (Exception e) {
       log.debug("Failed to register scheduler gauges", e);
     }
@@ -362,8 +360,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
         java.util.concurrent.Semaphore maxConcurrentSemaphore = config.getMaxConcurrentSemaphore();
         int availablePermitsNow =
             maxConcurrentSemaphore != null ? maxConcurrentSemaphore.availablePermits() : -1;
-        // Read zombiesInFlight immediately after permits to reduce diagnostic skew
-        int zombiesInFlightCount = Math.max(0, acquisitionService.getZombiesInFlight());
         int poolActive = 0;
         if (config.getAgentWorkPool() instanceof java.util.concurrent.ThreadPoolExecutor) {
           poolActive =
@@ -376,8 +372,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
                 : 0;
         int activeCount = acquisitionService.getActiveAgentCount();
         long ready = acquisitionService.getReadyCountSnapshot();
-        // Allow zero capacity visibility (do not clamp to 1)
-        int effectiveCapacity = Math.max(0, maxConcurrent - (activeCount + zombiesInFlightCount));
+        int effectiveCapacity = Math.max(0, maxConcurrent - activeCount);
         double permitsFreeRatio =
             maxConcurrent > 0
                 ? Math.max(0d, Math.min(1d, (double) availablePermitsNow / (double) maxConcurrent))
@@ -411,7 +406,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
             redisStall,
             maxConcurrent,
             activeCount,
-            zombiesInFlightCount,
             effectiveCapacity,
             availablePermitsNow);
 
@@ -421,13 +415,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
         // execution.
         try {
           int consecutive = permitStarvationConsecutive.get();
-          // Consider starvation only when zombies are not consuming most capacity
-          boolean zombiesSmallFraction =
-              (maxConcurrent <= 0) || (zombiesInFlightCount < (maxConcurrent * 0.1));
-          if (maxConcurrentSemaphore != null
-              && availablePermitsNow == 0
-              && poolActive == 0
-              && zombiesSmallFraction) {
+          if (maxConcurrentSemaphore != null && availablePermitsNow == 0 && poolActive == 0) {
             consecutive = permitStarvationConsecutive.incrementAndGet();
           } else {
             permitStarvationConsecutive.set(0);
@@ -689,7 +677,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
    *   <li>`[backlog ...]`: queued work snapshot (ready count, oldest overdue seconds, and
    *       `capacityPerCycle`).
    *   <li>`[permits ...]`: semaphore availability rendered as `available/max (percent)` when the
-   *       semaphore is enabled, or `n/a` when disabled, along with `zombiesInFlight`.
+   *       semaphore is enabled, or `n/a` when disabled.
    *   <li>`[cleanup ...]`: zombie/orphan cleanup totals to track maintenance work.
    *   <li>Tail segments contain queue depth, active watchdog triggers, and optional starvation
    *       annotations.
@@ -721,18 +709,16 @@ public class PriorityAgentScheduler extends CatsModuleAware
         maxConcurrentSemaphore != null ? maxConcurrentSemaphore.availablePermits() : -1;
     int maxConcurrent = acquisitionService.getAgentProperties().getMaxConcurrentAgents();
     int activeCount = acquisitionService.getActiveAgentCount();
-    int zombiesInFlight = Math.max(0, acquisitionService.getZombiesInFlight());
     long readySnapshot = acquisitionService.getReadyCountSnapshot();
     long oldestOverdueSecondsNow = acquisitionService.getOldestOverdueSeconds();
     double capacityPerCycle = acquisitionService.getCapacityPerCycleSnapshot();
 
-    // Permit reconciliation: warn and mark degraded if heldPermits > active + zombiesInFlight
+    // Permit reconciliation: warn and mark degraded if heldPermits > active
     boolean permitMismatch = false;
     int permitMismatchValue = 0;
     if (maxConcurrentSemaphore != null && maxConcurrent > 0) {
       int heldPermits = Math.max(0, maxConcurrent - availablePermits);
-      int accounted = activeCount + zombiesInFlight;
-      permitMismatchValue = heldPermits - accounted;
+      permitMismatchValue = heldPermits - activeCount;
       if (permitMismatchValue > 0) {
         permitMismatch = true;
         // Do not emit immediate WARN; include in periodic summary instead
@@ -740,8 +726,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
       // Record permit accounting metrics for production observability
       metrics.recordPermitMismatch(permitMismatchValue);
     }
-    // Record zombiesInFlight high-water mark (current snapshot; ideally track max across period)
-    metrics.recordZombiesInFlightHighWater(zombiesInFlight);
 
     // Set consistency check: verify no agent exists in both waiting and working sets
     AgentAcquisitionService.ConsistencyCheckResult consistencyResult =
@@ -813,17 +797,14 @@ public class PriorityAgentScheduler extends CatsModuleAware
             formatDouble(capacityPerCycle)));
 
     if (maxConcurrentSemaphore == null || maxConcurrent <= 0) {
-      msg.append(String.format(" [permits n/a zombies_in_flight=%s]", formatLong(zombiesInFlight)));
+      msg.append(" [permits n/a]");
     } else {
       double freeRatio =
           Math.max(0d, Math.min(1d, (double) availablePermits / (double) maxConcurrent));
       msg.append(
           String.format(
-              " [permits %s/%s (%.1f%%) zombies_in_flight=%s]",
-              formatLong(availablePermits),
-              formatLong(maxConcurrent),
-              freeRatio * 100d,
-              formatLong(zombiesInFlight)));
+              " [permits %s/%s (%.1f%%)]",
+              formatLong(availablePermits), formatLong(maxConcurrent), freeRatio * 100d));
     }
 
     msg.append(
@@ -1191,14 +1172,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
               log.debug("Interrupted agent {} during shutdown", agentType);
             }
 
-            // Prefer exactly-once early-release handshake to avoid double releases when a
-            // completion listener also handles cancellation before start.
-            try {
-              acquisitionService.earlyReleasePermitIfHeld(agentType);
-              log.debug("Requested early permit release for interrupted agent {}", agentType);
-            } catch (Exception e) {
-              log.debug("Early-release during shutdown failed for {}", agentType, e);
-            }
+            // Permit is released when thread exits in worker finally block
           }
         } catch (Exception e) {
           log.debug("Failed to interrupt agent {}", agentType, e);
@@ -1434,7 +1408,6 @@ public class PriorityAgentScheduler extends CatsModuleAware
       boolean redisStall,
       int maxConcurrent,
       int activeCount,
-      int zombiesInFlight,
       int effectiveCapacity,
       int permitsAvailable) {
 
@@ -1451,7 +1424,7 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogLeakStreak = 0;
     }
 
-    // Capacity skew (zombiesInFlight): lots of free permits but we barely acquired anything
+    // Capacity skew: lots of free permits but we barely acquired anything
     if (ready > 0 && permitsFreeRatio > 0.90 && acquiredFillRatio < 0.10) {
       watchdogSkewStreak++;
     } else {

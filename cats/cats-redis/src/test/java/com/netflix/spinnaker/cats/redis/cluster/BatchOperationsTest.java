@@ -431,7 +431,6 @@ class BatchOperationsTest {
       ZombieCleanupService zombieService =
           new ZombieCleanupService(jedisPool, scriptManager, zombieProps, testMetrics);
       zombieService.setAcquisitionService(acquisitionService);
-      zombieService.setFairnessHandler(acquisitionService);
 
       // Register agents with blocking execution to keep them in activeAgents map
       // Use CountDownLatch for test-controlled completion
@@ -878,7 +877,6 @@ class BatchOperationsTest {
       ZombieCleanupService zombieService =
           new ZombieCleanupService(jedisPool, scriptManager, exceptionalProps, testMetrics);
       zombieService.setAcquisitionService(acquisitionService);
-      zombieService.setFairnessHandler(acquisitionService);
 
       // Register agents: one exceptional (BigQuery) and one regular
       CountDownLatch completionLatch = new CountDownLatch(1);
@@ -1114,7 +1112,6 @@ class BatchOperationsTest {
       ZombieCleanupService zombieService =
           new ZombieCleanupService(jedisPool, scriptManager, props, testMetrics);
       zombieService.setAcquisitionService(acquisitionService);
-      zombieService.setFairnessHandler(acquisitionService);
 
       // Create agents that match and don't match the pattern
       Agent bigQueryAgent = TestFixtures.createMockAgent("BigQueryCachingAgent", "gcp-provider");

@@ -44,8 +44,8 @@ import redis.clients.jedis.params.SetParams;
  * those); move valid working orphans back to waiting.
  *
  * <p><b>Scope:</b> Agents from other pods only (no local RunState). Manipulates Redis and
- * activeAgents map; <b>never</b> touches permits or zIF. See {@link ZombieCleanupService} for
- * locally stuck agents.
+ * activeAgents map; <b>never</b> touches permits. See {@link ZombieCleanupService} for locally
+ * stuck agents.
  */
 @Component
 @Slf4j

@@ -104,8 +104,7 @@ import redis.clients.jedis.JedisPool;
  *   <li><b>FUTURES:</b> future.cancel(true) called for zombie agents
  *   <li><b>ACTIVE TRACKING:</b> activeAgents removed, activeAgentMapSize decremented,
  *       activeAgentsFutures removed
- *   <li><b>PERMIT RELEASE:</b>
- *       fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight() called
+ *   <li><b>PERMIT RELEASE:</b> Permit released when thread exits in worker finally block
  *   <li><b>ERROR PATHS:</b> Budget exceeded, thread interrupted, invalid scores, batch failures
  * </ul>
  *
@@ -283,11 +282,7 @@ class ZombieCleanupServiceTest {
       // Verify future cancelled
       verify(mockFuture, times(1)).cancel(true);
 
-      // Verify permit released (if fairnessHandler used)
-      // Note: Permit release happens via
-      // fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight()
-      // which is called during cleanup. We verify cleanup succeeded, which implies permit release
-      // occurred (cleanup wouldn't succeed if permit release failed critically).
+      // Permit is released when thread exits in worker finally block (not during cleanup).
 
       // Verify agent NOT in WAITING_SET (cleanup only removes from working set)
       try (Jedis jedis = jedisPool.getResource()) {
@@ -1690,11 +1685,7 @@ class ZombieCleanupServiceTest {
       verify(mockFuture1, times(1)).cancel(true);
       verify(mockFuture2, times(1)).cancel(true);
 
-      // Verify permits released for all agents (if semaphore used)
-      // Permit release happens via
-      // fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight()
-      // which is called during cleanup. We verify cleanup succeeded, which implies permit release
-      // occurred.
+      // Permits are released when threads exit in worker finally block (not during cleanup).
 
       // Verify agents NOT in WAITING_SET (cleanup only removes from working set)
       try (Jedis jedis = jedisPool.getResource()) {
@@ -1764,11 +1755,7 @@ class ZombieCleanupServiceTest {
             .isNull();
       }
 
-      // Verify permit released (if semaphore used)
-      // Permit release happens via
-      // fairnessHandler.tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight()
-      // which is called during cleanup. We verify cleanup succeeded, which implies permit release
-      // occurred (cleanup wouldn't succeed if permit release failed critically).
+      // Permit is released when thread exits in worker finally block (not during cleanup).
 
       // Verify metrics calls (recordCleanupTime, incrementCleanupCleaned)
       // Metrics are recorded during cleanup, verified indirectly via getZombiesCleanedUp() counter
@@ -1861,9 +1848,8 @@ class ZombieCleanupServiceTest {
      * permanently reduced, causing under-filling where fewer agents can run than configured. This
      * test verifies the critical invariant: permits MUST be released regardless of Redis state.
      *
-     * <p>Verifies future cancelled, local tracking cleared (removeActiveAgent called), permit
-     * released (tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight called), metrics incremented,
-     * and agent not in WAITING_SET.
+     * <p>Verifies future cancelled, local tracking cleared (removeActiveAgent called), metrics
+     * incremented, and agent not in WAITING_SET. Permit release happens when thread exits.
      */
     @Test
     @DisplayName("Should release permit and remove local tracking even if Redis remove returns 0")
@@ -1898,11 +1884,11 @@ class ZombieCleanupServiceTest {
       int cleaned = zombieService.cleanupZombieAgents(activeAgents, activeAgentsFutures);
 
       // Then: counted as cleaned even if not in Redis; we cancel local future
-      // and delegate local tracking + permit release to acquisitionService
+      // and delegate local tracking cleanup to acquisitionService
+      // Permit release happens when thread exits in worker finally block
       assertThat(cleaned).isEqualTo(1);
       verify(mockFuture).cancel(true);
       verify(acquisition).removeActiveAgent(agentType);
-      verify(acquisition).tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight(agentType);
 
       // Verify metrics counter incremented (confirms recordCleanupTime and incrementCleanupCleaned
       // called)

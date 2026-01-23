@@ -62,8 +62,8 @@ import redis.clients.jedis.JedisPool;
  * windows that help expose timing-dependent bugs.
  *
  * <p><b>Verification Approach:</b> Tests verify invariants (disjoint sets, permit accounting) and
- * eventual consistency (zombiesInFlight settles to 0) rather than deterministic outcomes. Metrics
- * verification confirms code paths were exercised.
+ * eventual consistency rather than deterministic outcomes. Metrics verification confirms code paths
+ * were exercised.
  */
 @Testcontainers
 @DisplayName("Priority Scheduler Stress Tests")
@@ -105,8 +105,7 @@ class PrioritySchedulerStressTest {
    * <p>Runs 20 agents with 5 max concurrent for 10 seconds. Exercises concurrent acquisition,
    * zombie cleanup, orphan cleanup, and shutdown toggles with randomized execution timing.
    *
-   * <p>Verifies: zombiesInFlight settles to 0 after stress (eventual consistency), no thread
-   * exceptions, end-of-run invariants (disjoint sets, sum <= registered).
+   * <p>Verifies: No thread exceptions, end-of-run invariants (disjoint sets, sum <= registered).
    */
   @Test
   @Timeout(180)
@@ -116,9 +115,6 @@ class PrioritySchedulerStressTest {
     StressResult result = runStress(params);
 
     // Verify invariants
-    assertThat(Math.max(0, result.zifAfterSettling))
-        .describedAs("zombiesInFlight must settle back to 0 within 2s")
-        .isEqualTo(0);
     assertThat(result.violations).as("No thread exceptions").isEmpty();
 
     // Verify metrics were recorded during stress
@@ -131,8 +127,7 @@ class PrioritySchedulerStressTest {
    * <p>Runs 50 agents with 10 max concurrent for 10 seconds. Higher agent count exercises
    * concurrent acquisition, zombie cleanup, orphan cleanup, and shutdown toggles.
    *
-   * <p>Verifies: zombiesInFlight settles to 0 or <= 1 (small tolerance for concurrent transitions),
-   * no thread exceptions.
+   * <p>Verifies: No thread exceptions.
    */
   @Test
   @Timeout(180)
@@ -141,10 +136,7 @@ class PrioritySchedulerStressTest {
     StressParams params = new StressParams(50, 10, Duration.ofSeconds(10));
     StressResult result = runStress(params);
 
-    // Verify invariants (small tolerance for concurrent state transitions)
-    assertThat(Math.max(0, result.zifAfterSettling))
-        .describedAs("zombiesInFlight must settle back to 0")
-        .isLessThanOrEqualTo(1);
+    // Verify invariants
     assertThat(result.violations).as("No thread exceptions").isEmpty();
 
     // Verify metrics were recorded during stress
@@ -157,8 +149,7 @@ class PrioritySchedulerStressTest {
    * <p>Runs 80 agents with 10 max concurrent for 30 seconds. Extended duration exercises zombie and
    * orphan cleanup coordination under sustained concurrent operations.
    *
-   * <p>Verifies: zombiesInFlight settles to 0 or <= 1 (small tolerance), no invariant violations or
-   * exceptions.
+   * <p>Verifies: No invariant violations or exceptions.
    */
   @Test
   @Timeout(300)
@@ -167,10 +158,7 @@ class PrioritySchedulerStressTest {
     StressParams params = new StressParams(80, 10, Duration.ofSeconds(30));
     StressResult result = runStress(params);
 
-    // Verify invariants (small tolerance for concurrent state transitions)
-    assertThat(Math.max(0, result.zifAfterSettling))
-        .describedAs("zombiesInFlight must settle back to 0")
-        .isLessThanOrEqualTo(1);
+    // Verify invariants
     assertThat(result.violations).as("No invariant violations or exceptions").isEmpty();
 
     // Verify metrics were recorded during stress
@@ -183,7 +171,7 @@ class PrioritySchedulerStressTest {
    * <p>Runs 40 agents with 8 max concurrent for 8 seconds with 20 shutdown toggles. Includes
    * invariant checker thread monitoring permit accounting throughout.
    *
-   * <p>Verifies: zombiesInFlight settles to 0 after stress, no invariant violations or exceptions.
+   * <p>Verifies: No invariant violations or exceptions.
    */
   @Test
   @Timeout(300)
@@ -193,9 +181,6 @@ class PrioritySchedulerStressTest {
     StressResult result = runShutdownPreservation(params, 20);
 
     // Verify invariants
-    assertThat(Math.max(0, result.zifAfterSettling))
-        .describedAs("zombiesInFlight must settle back to 0 within 2s")
-        .isEqualTo(0);
     assertThat(result.violations).as("No invariant violations or exceptions").isEmpty();
 
     // Verify metrics were recorded during stress
@@ -208,8 +193,7 @@ class PrioritySchedulerStressTest {
    * <p>Runs 60 agents with 12 max concurrent for 60 seconds. Combines acquisition, zombie cleanup,
    * orphan cleanup, shutdown toggles, and invariant checking under extended stress.
    *
-   * <p>Verifies: zombiesInFlight settles to 0 or <= 1 (small tolerance), no invariant violations or
-   * exceptions.
+   * <p>Verifies: No invariant violations or exceptions.
    */
   @Test
   @Timeout(180)
@@ -218,10 +202,7 @@ class PrioritySchedulerStressTest {
     StressParams params = new StressParams(60, 12, Duration.ofSeconds(60));
     StressResult result = runCombinedStress(params);
 
-    // Verify invariants (small tolerance for concurrent state transitions)
-    assertThat(Math.max(0, result.zifAfterSettling))
-        .describedAs("zombiesInFlight must settle back to 0")
-        .isLessThanOrEqualTo(1);
+    // Verify invariants
     assertThat(result.violations).as("No invariant violations or exceptions").isEmpty();
 
     // Verify metrics were recorded during stress
@@ -264,7 +245,6 @@ class PrioritySchedulerStressTest {
     ZombieCleanupService zombieCleanup =
         new ZombieCleanupService(jedisPool, scriptManager, schedProps, metrics);
     zombieCleanup.setAcquisitionService(acquisitionService);
-    zombieCleanup.setFairnessHandler(acquisitionService);
 
     OrphanCleanupService orphanCleanup =
         new OrphanCleanupService(jedisPool, scriptManager, schedProps, metrics);
@@ -374,10 +354,10 @@ class PrioritySchedulerStressTest {
       }
     }
 
-    // Poll for zombiesInFlight to settle (should be quick now that all workers finished)
-    long zifDeadline = System.currentTimeMillis() + 2000L;
-    while (System.currentTimeMillis() < zifDeadline
-        && Math.max(0, acquisitionService.getZombiesInFlight()) > 0) {
+    // Wait for active agents to settle (should be quick now that all workers finished)
+    long activeDeadline = System.currentTimeMillis() + 2000L;
+    while (System.currentTimeMillis() < activeDeadline
+        && acquisitionService.getActiveAgentCount() > 0) {
       try {
         Thread.sleep(50);
       } catch (InterruptedException ie) {
@@ -385,7 +365,6 @@ class PrioritySchedulerStressTest {
         break;
       }
     }
-    int zifAfter = Math.max(0, acquisitionService.getZombiesInFlight());
 
     // Process any remaining completion queue items after threads have stopped
     // This ensures agents that completed just before shutdown are properly rescheduled
@@ -447,7 +426,7 @@ class PrioritySchedulerStressTest {
     TestFixtures.shutdownExecutorSafely(agentWorkPool);
     TestFixtures.shutdownExecutorSafely(testThreads);
 
-    return new StressResult(new ArrayList<>(violations.violations), zifAfter);
+    return new StressResult(new ArrayList<>(violations.violations));
   }
 
   private StressResult runShutdownPreservation(StressParams params, int toggles) throws Exception {
@@ -486,7 +465,6 @@ class PrioritySchedulerStressTest {
     ZombieCleanupService zombieCleanup =
         new ZombieCleanupService(jedisPool, scriptManager, schedProps, metrics);
     zombieCleanup.setAcquisitionService(acquisitionService);
-    zombieCleanup.setFairnessHandler(acquisitionService);
 
     OrphanCleanupService orphanCleanup =
         new OrphanCleanupService(jedisPool, scriptManager, schedProps, metrics);
@@ -583,38 +561,30 @@ class PrioritySchedulerStressTest {
                     // Intentionally skip mid-run set checks to avoid sampling races
 
                     // Permit mismatch (aligned with scheduler health summary):
-                    // heldPermits must not exceed active + zombiesInFlight (allow small tolerance
-                    // for
+                    // heldPermits must not exceed active agents (allow small tolerance for
                     // concurrent state transitions)
                     int totalPermits = params.maxConcurrent;
                     int available = semaphore.availablePermits();
                     int held = Math.max(0, totalPermits - available);
-                    int zif = Math.max(0, acquisitionService.getZombiesInFlight());
                     int active = acquisitionService.getActiveAgentsMap().size();
                     // Allow tolerance of 1 permit for concurrent state transitions;
                     // Semaphore.release() can also overshoot
-                    if (held > active + zif + 1) {
+                    if (held > active + 1) {
                       long now = System.currentTimeMillis();
                       if (mismatchSince[0] == 0L) {
                         mismatchSince[0] = now;
                       } else if (now - mismatchSince[0] > 500L) {
                         violations.add(
-                            "Invariant violated: permits held>active+zif+1 held="
+                            "Invariant violated: permits held>active+1 held="
                                 + held
                                 + " active="
                                 + active
-                                + " zif="
-                                + zif
                                 + " total="
                                 + totalPermits);
                         mismatchSince[0] = 0L; // record at most once per persistent window
                       }
                     } else {
                       mismatchSince[0] = 0L;
-                    }
-
-                    if (zif < 0) {
-                      violations.add("Invariant violated: zombiesInFlight negative: " + zif);
                     }
 
                     Thread.sleep(ThreadLocalRandom.current().nextInt(25, 51));
@@ -651,10 +621,10 @@ class PrioritySchedulerStressTest {
       }
     }
 
-    // Poll for zombiesInFlight to settle (should be quick now that all workers finished)
-    long zifDeadline = System.currentTimeMillis() + 2000L;
-    while (System.currentTimeMillis() < zifDeadline
-        && Math.max(0, acquisitionService.getZombiesInFlight()) > 0) {
+    // Wait for active agents to settle (should be quick now that all workers finished)
+    long activeDeadline = System.currentTimeMillis() + 2000L;
+    while (System.currentTimeMillis() < activeDeadline
+        && acquisitionService.getActiveAgentCount() > 0) {
       try {
         Thread.sleep(50);
       } catch (InterruptedException ie) {
@@ -662,7 +632,6 @@ class PrioritySchedulerStressTest {
         break;
       }
     }
-    int zifAfter = Math.max(0, acquisitionService.getZombiesInFlight());
 
     // Process any remaining completion queue items after threads have stopped
     // This ensures agents that completed just before shutdown are properly rescheduled
@@ -676,7 +645,7 @@ class PrioritySchedulerStressTest {
     TestFixtures.shutdownExecutorSafely(agentWorkPool);
     TestFixtures.shutdownExecutorSafely(testThreads);
 
-    return new StressResult(new ArrayList<>(violations.violations), zifAfter);
+    return new StressResult(new ArrayList<>(violations.violations));
   }
 
   private StressResult runCombinedStress(StressParams params) throws Exception {
@@ -715,7 +684,6 @@ class PrioritySchedulerStressTest {
     ZombieCleanupService zombieCleanup =
         new ZombieCleanupService(jedisPool, scriptManager, schedProps, metrics);
     zombieCleanup.setAcquisitionService(acquisitionService);
-    zombieCleanup.setFairnessHandler(acquisitionService);
 
     OrphanCleanupService orphanCleanup =
         new OrphanCleanupService(jedisPool, scriptManager, schedProps, metrics);
@@ -815,32 +783,25 @@ class PrioritySchedulerStressTest {
                     int totalPermits = params.maxConcurrent;
                     int available = semaphore.availablePermits();
                     int held = Math.max(0, totalPermits - available);
-                    int zif = Math.max(0, acquisitionService.getZombiesInFlight());
                     int active = acquisitionService.getActiveAgentsMap().size();
                     // Allow tolerance of 1 permit for concurrent state transitions;
                     // Semaphore.release() can also overshoot
-                    if (held > active + zif + 1) {
+                    if (held > active + 1) {
                       long now = System.currentTimeMillis();
                       if (mismatchSince[0] == 0L) {
                         mismatchSince[0] = now;
                       } else if (now - mismatchSince[0] > 500L) {
                         violations.add(
-                            "Invariant violated: permits held>active+zif+1 held="
+                            "Invariant violated: permits held>active+1 held="
                                 + held
                                 + " active="
                                 + active
-                                + " zif="
-                                + zif
                                 + " total="
                                 + totalPermits);
                         mismatchSince[0] = 0L;
                       }
                     } else {
                       mismatchSince[0] = 0L;
-                    }
-
-                    if (zif < 0) {
-                      violations.add("Invariant violated: zombiesInFlight negative: " + zif);
                     }
 
                     Thread.sleep(ThreadLocalRandom.current().nextInt(25, 51));
@@ -877,10 +838,10 @@ class PrioritySchedulerStressTest {
       }
     }
 
-    // Poll for zombiesInFlight to settle (should be quick now that all workers finished)
-    long zifDeadline = System.currentTimeMillis() + 2000L;
-    while (System.currentTimeMillis() < zifDeadline
-        && Math.max(0, acquisitionService.getZombiesInFlight()) > 0) {
+    // Wait for active agents to settle (should be quick now that all workers finished)
+    long activeDeadline = System.currentTimeMillis() + 2000L;
+    while (System.currentTimeMillis() < activeDeadline
+        && acquisitionService.getActiveAgentCount() > 0) {
       try {
         Thread.sleep(50);
       } catch (InterruptedException ie) {
@@ -888,7 +849,6 @@ class PrioritySchedulerStressTest {
         break;
       }
     }
-    int zifAfter = Math.max(0, acquisitionService.getZombiesInFlight());
 
     // Process any remaining completion queue items after threads have stopped
     // This ensures agents that completed just before shutdown are properly rescheduled
@@ -951,7 +911,7 @@ class PrioritySchedulerStressTest {
     TestFixtures.shutdownExecutorSafely(agentWorkPool);
     TestFixtures.shutdownExecutorSafely(testThreads);
 
-    return new StressResult(new ArrayList<>(violations.violations), zifAfter);
+    return new StressResult(new ArrayList<>(violations.violations));
   }
 
   private static Agent mockAgent(String name, String provider) {
@@ -1024,11 +984,9 @@ class PrioritySchedulerStressTest {
 
   private static final class StressResult {
     final List<String> violations;
-    final int zifAfterSettling;
 
-    StressResult(List<String> violations, int zifAfterSettling) {
+    StressResult(List<String> violations) {
       this.violations = violations != null ? violations : Collections.emptyList();
-      this.zifAfterSettling = zifAfterSettling;
     }
   }
 

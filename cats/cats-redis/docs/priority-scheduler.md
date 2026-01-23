@@ -48,7 +48,7 @@ redis:
 | **waiting** | Next execution time (epoch seconds) | Agents ready to run. Lower scores = higher priority |
 | **working** | Completion deadline (acquire_time + timeout) | Agents currently executing. Used for zombie detection |
 
-All operations use atomic Lua scripts to prevent race conditions. Scripts self-heal on NOSCRIPT errors by transparently reloading and retrying.
+All operations use atomic Lua scripts to prevent race conditions. Scripts self-heal on NOSCRIPT errors by logging a warning and transparently reloading and retrying. If retry fails, falls back to EVAL with a degraded performance warning.
 
 ### Key Features
 
@@ -125,7 +125,7 @@ When zombie cleanup is enabled, each acquired agent schedules a proactive cancel
 On shutdown (`@PreDestroy`), the scheduler:
 
 1. Signals shutdown to prevent new work acquisition
-2. Interrupts running agent futures and releases permits early
+2. Interrupts running agent futures (permits released when threads exit)
 3. Conditionally moves owned working-set entries back to waiting (with optional jitter)
 4. Waits for executor termination with configurable timeouts
 
@@ -309,7 +309,7 @@ The pool configuration is typically managed by the hosting framework (e.g., `red
 
 Health summary logged at `health-summary-period-seconds` interval (default: 10 minutes):
 ```
-Scheduler health | health=HEALTHY | [agents registered=500 active=futures=45 scripts=11] [backlog ready=10 oldest_overdue=0s capacity_per_cycle=50] [permits 55/100 (55.0%) zombies_in_flight=0] [cleanup zombies_cleaned=2 orphans_cleaned=0] queue_depth=5
+Scheduler health | health=HEALTHY | [agents registered=500 active=futures=45 scripts=11] [backlog ready=10 oldest_overdue=0s capacity_per_cycle=50] [permits 55/100 (55.0%)] [cleanup zombies_cleaned=2 orphans_cleaned=0] queue_depth=5
 ```
 
 ### Key Metrics
@@ -321,9 +321,6 @@ Scheduler health | health=HEALTHY | [agents registered=500 active=futures=45 scr
 | `cats.priorityScheduler.acquire.acquired` | Agents acquired per cycle | < expected rate |
 | `cats.priorityScheduler.scheduler.readyCount` | Locally eligible agents (pod-scoped) | > 10x capacity |
 | `cats.priorityScheduler.scripts.errors` | Lua script failures | > 0 |
-| `cats.priorityScheduler.scheduler.zombiesInFlight` | Cancelled but unwinding workers (see below) | Sustained high values |
-
-**zombiesInFlight explained**: When zombie cleanup cancels an agent, the semaphore permit is released immediately to allow new work, but the cancelled thread may linger before exiting. This counter tracks those "unwinding" threads and reduces effective capacity to prevent oversubscription. A sustained high value suggests agents aren't responding to interrupts promptly.
 
 Additional metrics:
 - `cats.priorityScheduler.circuitBreaker.trip` / `.blocked` / `.recovery`
@@ -339,7 +336,7 @@ Additional metrics:
 | Signal | Meaning | Action |
 |--------|---------|--------|
 | permit_leak_suspect | Few permits, idle pool, backlog | Thread dump; consider restart |
-| capacity_skew | Free permits but low acquisition | Check zombiesInFlight gauge |
+| capacity_skew | Free permits but low acquisition | Check running agents vs permits |
 | zero_progress | Ready agents but none acquired | Check filters/patterns |
 | redis_stall | Circuit breaker not CLOSED | Check Redis connectivity |
 
@@ -402,7 +399,7 @@ For cancellation to work correctly, agent implementations should:
 3. **Use interruptible I/O**: Prefer NIO channels over blocking streams where possible
 4. **Handle blocking calls**: Operations like `Object.wait()`, `Thread.sleep()`, and `BlockingQueue.take()` throw `InterruptedException`—handle them appropriately
 
-Agents that ignore interrupts will continue running after cancellation, consuming resources and potentially causing permit accounting issues (tracked via `zombiesInFlight` metric).
+Agents that ignore interrupts will continue running after cancellation, consuming resources until the thread exits and releases the permit.
 
 ## FAQ
 

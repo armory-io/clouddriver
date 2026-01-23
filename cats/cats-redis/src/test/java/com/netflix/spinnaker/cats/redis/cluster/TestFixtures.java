@@ -301,7 +301,8 @@ public final class TestFixtures {
     }
 
     /**
-     * Sets a callback to run when execution starts. Useful for tracking when agents begin executing.
+     * Sets a callback to run when execution starts. Useful for tracking when agents begin
+     * executing.
      *
      * @param callback The callback to run on start
      * @return This instance for method chaining

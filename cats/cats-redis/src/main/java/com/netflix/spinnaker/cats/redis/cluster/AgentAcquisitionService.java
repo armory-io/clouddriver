@@ -60,16 +60,16 @@ import redis.clients.jedis.Tuple;
  * handling, and periodic repopulation for recovery.
  *
  * <p><b>Cleanup coordination:</b> {@link ZombieCleanupService} handles locally-stuck agents
- * (releases permits via CAS, increments zIF). {@link OrphanCleanupService} handles agents from
- * crashed pods (Redis-only, never touches permits). Worker finally is the ultimate authority for
- * cleanup. CAS on {@link RunState#permitHeld} ensures exactly-once permit release when multiple
- * threads race.
+ * (cancels/interrupts threads). {@link OrphanCleanupService} handles agents from crashed pods
+ * (Redis-only, never touches permits). Worker finally is the ultimate authority for permit release.
+ * CAS on {@link RunState#permitHeld} ensures exactly-once permit release when multiple threads
+ * race.
  *
  * @see RunState for per-agent CAS-protected execution state
  */
 @Component
 @Slf4j
-public class AgentAcquisitionService implements PermitFairnessHandler {
+public class AgentAcquisitionService {
 
   // Redis key names (injected via properties)
   private final String WAITING_SET;
@@ -88,23 +88,6 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   private final Map<String, String> activeAgents = new ConcurrentHashMap<>();
   private final Map<String, java.util.concurrent.Future<?>> activeAgentsFutures =
       new ConcurrentHashMap<>();
-
-  // Zombies-in-flight tracking: set-based design for fairness during zombie cancellation.
-  //
-  // Problem: When zombie cleanup cancels a stuck agent, the semaphore permit is released early
-  // (to allow new work), but the cancelled thread may linger before exiting. Without compensation,
-  // the scheduler would see extra permits and oversubscribe beyond maxConcurrentAgents.
-  //
-  // Solution: A concurrent set tracks agents whose permits were released early but threads are
-  // still running. Operations are idempotent and order-independent:
-  // - add(agentType) when permit is early-released (zombie cleanup)
-  // - remove(agentType) when thread exits (worker finally)
-  // - size() for capacity calculations
-  //
-  // Unlike the previous counter-based design, set-based tracking cannot drift due to race
-  // conditions between add and remove operations. No reconciliation or clamping is needed.
-  private final java.util.Set<String> zombiesInFlightSet =
-      java.util.concurrent.ConcurrentHashMap.newKeySet();
 
   // Redis TIME synchronization for multi-instance coordination
   private static final AtomicLong lastTimeCheck = new AtomicLong(0);
@@ -129,15 +112,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   private volatile java.util.regex.Pattern zombieExceptionalAgentsPattern;
 
   /**
-   * Per-agent state for exactly-once permit release handshake during zombie cancellation.
+   * Per-agent state for exactly-once permit release handshake.
    *
    * <p>This class tracks the lifecycle of a semaphore permit through agent execution:
    *
    * <ul>
    *   <li>{@code permitHeld} - true if the semaphore permit has not yet been released; CAS to false
-   *       ensures exactly-once release whether by normal completion or early cancellation
-   *   <li>{@code started} - true once the agent's execution has actually begun; prevents
-   *       zombies-in-flight tracking for tasks cancelled before they started
+   *       ensures exactly-once release whether by normal completion or cancellation
+   *   <li>{@code started} - true once the agent's execution has actually begun
    *   <li>{@code deadmanHandle} - scheduled future for the dead-man timeout that auto-cancels stuck
    *       agents; cancelled on normal completion to prevent spurious interrupts
    * </ul>
@@ -146,12 +128,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * deadmanHandle is volatile for visibility. A RunState instance is created when an agent is
    * submitted and removed when execution completes (normal or cancelled).
    *
-   * <p><b>Coordination with cleanup:</b> Zombie cleanup reads RunState and calls {@link
-   * #earlyReleasePermitIfHeld} (CAS on permitHeld). Orphan cleanup never accesses RunState (only
-   * handles agents from crashed pods). Shutdown may race with worker finally (safe via CAS).
-   *
-   * <p><b>Note:</b> zombiesInFlight tracking now uses a Set<String> instead of a counter flag.
-   * Set membership (add/remove) replaces the previous zombiesInFlightIncremented flag.
+   * <p><b>Coordination with cleanup:</b> Orphan cleanup never accesses RunState (only handles
+   * agents from crashed pods). Shutdown may race with worker finally (safe via CAS).
    */
   private static final class RunState {
     final java.util.concurrent.atomic.AtomicBoolean permitHeld =
@@ -159,80 +137,6 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     final java.util.concurrent.atomic.AtomicBoolean started =
         new java.util.concurrent.atomic.AtomicBoolean(false);
     volatile java.util.concurrent.ScheduledFuture<?> deadmanHandle;
-  }
-
-  /**
-   * Early release the semaphore permit for a running agent if still held, and track in
-   * zombies-in-flight set. This enables fairness when zombie cleanup cancels a task whose
-   * thread may linger.
-   *
-   * <p>Exactly-once semantics are enforced via the per-agent {@code RunState.permitHeld} flag.
-   *
-   * @param agentType the agent whose permit should be pre-released if still held
-   * @param forceZombiesTracking if true, add to zombiesInFlight set regardless of started flag.
-   *     This is necessary for unregisterAgent() path where future.cancel(false) doesn't interrupt
-   *     the thread - the worker WILL execute despite the unregister call, so the permit must be
-   *     accounted for unconditionally.
-   */
-  public void earlyReleasePermitIfHeld(String agentType, boolean forceZombiesTracking) {
-    try {
-      RunState runStateForAgent = runStates.get(agentType);
-      if (runStateForAgent == null) {
-        return;
-      }
-
-      if (runStateForAgent.permitHeld.compareAndSet(true, false)) {
-        if (maxConcurrentSemaphoreRef != null) {
-          maxConcurrentSemaphoreRef.release();
-        }
-
-        // Add to zombiesInFlight set if:
-        // 1. Thread has already started execution (normal zombie cleanup), OR
-        // 2. forceZombiesTracking=true (unregisterAgent path - thread may still execute)
-        boolean started = runStateForAgent.started.get();
-        if (started || forceZombiesTracking) {
-          // Set-based tracking: add is idempotent and order-independent
-          // No race condition possible - worker finally will call remove()
-          zombiesInFlightSet.add(agentType);
-          log.debug(
-              "Early permit release for {}: started={} forceTracking={} zombies_in_flight={}",
-              agentType,
-              started,
-              forceZombiesTracking,
-              zombiesInFlightSet.size());
-        } else {
-          log.debug(
-              "Early permit release for {}: started=false forceTracking=false, skipping zombiesInFlight tracking",
-              agentType);
-        }
-      } else {
-        // CAS failed: permit was already released by worker completion or another cleanup path
-        metrics.incrementCasContention("zombie_cleanup");
-        log.debug(
-            "Early permit release for {}: CAS failed (permit already released)", agentType);
-      }
-    } catch (Exception e) {
-      // Best-effort; do not propagate exceptions to callers in cleanup paths
-      log.debug("earlyReleasePermitIfHeld failed for {}", agentType, e);
-    }
-  }
-
-  /**
-   * Early release the semaphore permit for an agent, without forcing zombiesInFlight increment.
-   *
-   * <p>This variant only increments zombiesInFlight if the worker has already started execution
-   * (started flag is true). Use {@link #earlyReleasePermitIfHeld(String, boolean)} with
-   * forceZombiesIncrement=true when the worker may still execute despite cancellation.
-   *
-   * @param agentType the agent whose permit should be pre-released if still held
-   */
-  public void earlyReleasePermitIfHeld(String agentType) {
-    earlyReleasePermitIfHeld(agentType, false);
-  }
-
-  @Override
-  public void tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight(String agentType) {
-    earlyReleasePermitIfHeld(agentType);
   }
 
   /** Determine zombie threshold for the agent, honoring exceptional agents config. */
@@ -249,7 +153,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     }
   }
 
-  /** Dead-man timeout action: interrupt and perform fairness early-release. */
+  /** Dead-man timeout action: interrupt the stuck agent's thread. */
   private void onDeadmanTimeout(String agentType) {
     // Skip dead-man processing during shutdown to avoid racing with gracefullyReleaseActiveAgents()
     if (shuttingDown.get()) {
@@ -261,9 +165,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       if (future != null && !future.isDone()) {
         boolean cancelled = future.cancel(true);
         if (cancelled) {
-          tryEarlyPermitReleaseAndMaybeIncrementZombiesInFlight(agentType);
-          log.warn(
-              "Dead-man timeout fired for {}: future cancelled and permit released", agentType);
+          // Permit is released when thread exits in worker finally block
+          log.warn("Dead-man timeout fired for {}: future cancelled", agentType);
         } else {
           log.debug("Dead-man timeout fired for {}: cancel returned false", agentType);
         }
@@ -271,29 +174,6 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     } catch (Exception e) {
       log.debug("Dead-man timeout handling failed for {}", agentType, e);
     }
-  }
-
-  /**
-   * Returns the number of zombies whose permits were pre-released but threads are still running.
-   *
-   * <p>With set-based tracking, this is always accurate and non-negative (set.size()).
-   *
-   * @return count of in-flight zombies
-   */
-  public int getZombiesInFlight() {
-    return zombiesInFlightSet.size();
-  }
-
-  /**
-   * Returns the raw zombies-in-flight value for diagnostics.
-   *
-   * <p>With set-based tracking, this is always the same as getZombiesInFlight() since there's no
-   * counter drift possible. Kept for API compatibility.
-   *
-   * @return count of in-flight zombies (same as getZombiesInFlight())
-   */
-  int getZombiesInFlightRaw() {
-    return zombiesInFlightSet.size();
   }
 
   // Backlog/health snapshots and rate-limiting
@@ -592,7 +472,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    */
   public int saturatePool(
       long runCount, Semaphore maxConcurrentSemaphore, ExecutorService agentWorkPool) {
-    // Store reference for fairness bookkeeping (zombie in-flight compensation)
+    // Store reference for permit accounting
     this.maxConcurrentSemaphoreRef = maxConcurrentSemaphore;
     log.debug("Starting agent acquisition cycle {}, known agents: {}", runCount, agents.size());
     metrics.incrementAcquireAttempts();
@@ -644,11 +524,6 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         metrics.recordAcquireTime("auto", System.currentTimeMillis() - acquireStartMs);
         return 0;
       }
-
-      // Note: With set-based zombiesInFlight tracking, no reconciliation is needed.
-      // Set operations (add/remove) are idempotent and order-independent, so counter drift
-      // cannot occur. The previous counter-based design required periodic reconciliation
-      // to fix race conditions between flag-set and counter-increment operations.
 
       // Phase 1: Process queued agent completions
       processQueuedCompletions(jedis, nowMsCached);
@@ -824,9 +699,8 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       java.util.Set<String> attemptedThisCycle = new java.util.HashSet<>();
 
       // Calculate how many new agents this pod can try to acquire
-      int effectiveRunning = currentlyRunning + zombiesInFlightSet.size();
       int availableSlotsForNewAgents =
-          unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - effectiveRunning);
+          unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - currentlyRunning);
 
       if (!unbounded && availableSlotsForNewAgents <= 0) {
         if (log.isDebugEnabled()) {
@@ -885,7 +759,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       }
       log.debug(
           "Attempting to acquire agents ({} running, {} max capacity, {} ready in Redis, up to {} slots this cycle, queue_depth={})",
-          effectiveRunning,
+          currentlyRunning,
           maxConcurrentAgents,
           readyCount,
           availableSlotsForNewAgents,
@@ -2033,28 +1907,18 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
     }
 
     // Clean up in-flight execution state when agent is unregistered due to sharding changes.
-    // This prevents permit leaks when reconciliation unregisters agents that are still executing.
-    //
-    // Key insight: Use earlyReleasePermitIfHeld() which reads RunState from the map and handles
-    // CAS-protected release. Do NOT remove RunState here - let the worker's finally block handle
-    // cleanup and zombiesInFlight decrement. Removing RunState early would prevent the worker
-    // from properly decrementing zombiesInFlight when it exits.
+    // Cancel the future if running; permit will be released when thread exits in finally block.
     Future<?> future = activeAgentsFutures.remove(agentType);
     RunState runState = runStates.get(agentType);
 
     if (runState != null) {
-      // Agent has RunState - use CAS-protected release. Worker finally will clean up RunState.
+      // Agent has RunState - cancel future, let worker finally release permit
       if (future != null) {
         future.cancel(false);
       }
-      // Use forceZombiesIncrement=true because future.cancel(false) doesn't interrupt the thread.
-      // The worker WILL execute despite the unregister call, so unconditionally account for the
-      // permit in zombiesInFlight to prevent counter drift.
-      earlyReleasePermitIfHeld(agentType, true);
       log.debug(
-          "Cleaned up in-flight state for unregistered agent {} (permit released via CAS, future={}, forceZombiesIncrement=true)",
-          agentType,
-          future != null);
+          "Cancelled in-flight agent {} for unregistration (permit released on thread exit)",
+          agentType);
     } else if (future != null) {
       // Future exists but no RunState - this is unexpected (RunState created before submission).
       // Cancel future but log warning - permit accounting may be inconsistent.
@@ -4626,23 +4490,19 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
             log.debug("Released permit for {} (no run-state)", agentType);
           }
         } else {
+          // Release permit via CAS - ensures exactly-once release
           if (runStateForAgent.permitHeld.compareAndSet(true, false)) {
             if (maxConcurrentSemaphore != null) {
               maxConcurrentSemaphore.release();
               log.debug("Released permit for {}", agentType);
             }
           } else {
-            // CAS failed: permit was pre-released by cleanup (zombie or shutdown)
+            // CAS failed - should not happen with simplified design (no early release)
+            // Log for diagnostics but don't fail
             acquisitionService.metrics.incrementCasContention("worker_completion");
-            // Permit was pre-released by cleanup. Remove from zombiesInFlight set.
-            // Set-based tracking: remove is idempotent, no race conditions possible
-            boolean wasInSet = acquisitionService.zombiesInFlightSet.remove(agentType);
-            if (wasInSet) {
-              log.debug(
-                  "Permit for {} was pre-released by cleanup, removed from zombiesInFlight set (size={})",
-                  agentType,
-                  acquisitionService.zombiesInFlightSet.size());
-            }
+            log.debug(
+                "Permit for {} already released (CAS failed) - unexpected with simplified design",
+                agentType);
           }
         }
 

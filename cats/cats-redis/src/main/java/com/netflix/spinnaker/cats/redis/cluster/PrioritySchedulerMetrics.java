@@ -138,13 +138,7 @@ public class PrioritySchedulerMetrics {
         public void incrementCasContention(String location) {}
 
         @Override
-        public void incrementZombiesInFlightNegative() {}
-
-        @Override
         public void recordPermitMismatch(int mismatch) {}
-
-        @Override
-        public void recordZombiesInFlightHighWater(int highWater) {}
 
         @Override
         public void incrementScheduleRetryExhausted() {}
@@ -165,8 +159,7 @@ public class PrioritySchedulerMetrics {
             Supplier<Number> semaphoreAvailable,
             Supplier<Number> completionQueueSize,
             Supplier<Number> timeOffsetMs,
-            Supplier<Number> readyToCapacityRatio,
-            Supplier<Number> zombiesInFlight) {}
+            Supplier<Number> readyToCapacityRatio) {}
 
         @Override
         public void registerExecutorGauges(ThreadPoolExecutor executor) {}
@@ -228,7 +221,6 @@ public class PrioritySchedulerMetrics {
 
   // Permit accounting metrics
   private final Id casContentionId;
-  private final Id zombiesInFlightNegativeId;
 
   // Schedule metrics
   private final Id scheduleRetryExhaustedId;
@@ -277,7 +269,6 @@ public class PrioritySchedulerMetrics {
       this.redisPoolErrorsId = null;
       this.removeAgentFallbackId = null;
       this.casContentionId = null;
-      this.zombiesInFlightNegativeId = null;
       this.scheduleRetryExhaustedId = null;
       this.scheduleRecoveryId = null;
       return;
@@ -332,7 +323,6 @@ public class PrioritySchedulerMetrics {
 
     // Permit accounting
     this.casContentionId = createId("cas.contention");
-    this.zombiesInFlightNegativeId = createId("scheduler.zombiesInFlight.negative");
 
     // Schedule metrics
     this.scheduleRetryExhaustedId = createId("schedule.retryExhausted");
@@ -658,32 +648,13 @@ public class PrioritySchedulerMetrics {
   }
 
   /**
-   * Increments counter when zombiesInFlight decrement would go negative. This indicates an
-   * accounting bug where more decrements occurred than increments. The counter is clamped to 0, but
-   * this metric tracks occurrences for debugging.
-   */
-  public void incrementZombiesInFlightNegative() {
-    registry.counter(zombiesInFlightNegativeId).increment();
-  }
-
-  /**
    * Records the permit mismatch gauge value. Expected value is 0; non-zero indicates accounting
-   * drift. Calculated as: (permitsHeld + availablePermits + zombiesInFlight) - totalPermits
+   * drift. Calculated as: (permitsHeld + availablePermits) - totalPermits
    *
    * @param mismatch the calculated mismatch value
    */
   public void recordPermitMismatch(int mismatch) {
     registry.gauge(createId("scheduler.permitMismatch")).set(mismatch);
-  }
-
-  /**
-   * Records the high-water mark for zombiesInFlight since last reporting period. Helps identify
-   * peak zombie accumulation that may not be visible in point-in-time gauges.
-   *
-   * @param highWater the maximum zombiesInFlight value observed
-   */
-  public void recordZombiesInFlightHighWater(int highWater) {
-    registry.gauge(createId("scheduler.zombiesInFlight.highWater")).set(highWater);
   }
 
   /**
@@ -718,7 +689,6 @@ public class PrioritySchedulerMetrics {
    * @param completionQueueSize supplier for completion queue size
    * @param timeOffsetMs supplier for Redis/local clock offset in milliseconds
    * @param readyToCapacityRatio supplier for ready-to-capacity ratio
-   * @param zombiesInFlight supplier for zombies-in-flight count
    */
   public synchronized void registerGauges(
       JedisPool jedisPool,
@@ -732,8 +702,7 @@ public class PrioritySchedulerMetrics {
       Supplier<Number> semaphoreAvailable,
       Supplier<Number> completionQueueSize,
       Supplier<Number> timeOffsetMs,
-      Supplier<Number> readyToCapacityRatio,
-      Supplier<Number> zombiesInFlight) {
+      Supplier<Number> readyToCapacityRatio) {
 
     if (gaugesRegistered) {
       return;
@@ -751,7 +720,6 @@ public class PrioritySchedulerMetrics {
     registerGauge("scheduler.completionQueueSize", completionQueueSize);
     registerGauge("scheduler.timeOffsetMs", timeOffsetMs);
     registerGauge("scheduler.readyToCapacityRatio", readyToCapacityRatio);
-    registerGauge("scheduler.zombiesInFlight", zombiesInFlight);
 
     // JedisPool gauges
     if (jedisPool != null) {
