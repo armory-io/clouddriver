@@ -266,16 +266,19 @@ class IntegrationCoordinationTest {
           acq::getZombiesInFlight);
 
       acq.earlyReleasePermitIfHeld("agent/zif-test");
-      assertThat(Math.max(0, acq.getZombiesInFlight())).isEqualTo(1);
+      assertThat(acq.getZombiesInFlight()).isEqualTo(1);
       assertThat(sem.availablePermits()).isEqualTo(1);
       assertThat(gaugeValue(registry, "cats.priorityScheduler.scheduler.zombiesInFlight"))
           .isEqualTo(1.0d);
 
-      Field zifField = AgentAcquisitionService.class.getDeclaredField("zombiesInFlight");
-      zifField.setAccessible(true);
-      ((java.util.concurrent.atomic.AtomicInteger) zifField.get(acq)).decrementAndGet();
+      // With set-based tracking, directly access the set to simulate worker exit
+      Field zifSetField = AgentAcquisitionService.class.getDeclaredField("zombiesInFlightSet");
+      zifSetField.setAccessible(true);
+      @SuppressWarnings("unchecked")
+      java.util.Set<String> zifSet = (java.util.Set<String>) zifSetField.get(acq);
+      zifSet.remove("agent/zif-test");
 
-      assertThat(Math.max(0, acq.getZombiesInFlight())).isEqualTo(0);
+      assertThat(acq.getZombiesInFlight()).isEqualTo(0);
       assertThat(gaugeValue(registry, "cats.priorityScheduler.scheduler.zombiesInFlight"))
           .isEqualTo(0.0d);
     }

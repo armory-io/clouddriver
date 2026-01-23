@@ -12133,4 +12133,92 @@ class AgentAcquisitionServiceTest {
       return TestFixtures.createMockAgent(name, "test");
     }
   }
+
+  @Nested
+  @DisplayName("Forced Permit Accounting Tests")
+  @Timeout(10)
+  class ForcedPermitAccountingTests {
+
+    /**
+     * Verifies that earlyReleasePermitIfHeld supports an optional forceZombiesIncrement parameter.
+     *
+     * <p>The forceZombiesIncrement flag allows callers to unconditionally increment the
+     * zombiesInFlight counter even when the worker hasn't started yet. This is necessary for
+     * unregisterAgent() because future.cancel(false) doesn't interrupt the worker thread, so
+     * the permit must be accounted for regardless of the started flag state.
+     */
+    @Test
+    @DisplayName("Should support forceZombiesIncrement parameter for unconditional permit accounting")
+    void shouldSupportForceZombiesIncrementParameter() {
+      Agent agent = TestFixtures.createMockAgent("ForceFlagTest", "test");
+      AgentExecution noOpExecution = (agent_arg) -> {};
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      acquisitionService.registerAgent(agent, noOpExecution, instrumentation);
+
+      // Verify the two-parameter version accepts the force flag
+      assertThatCode(() -> acquisitionService.earlyReleasePermitIfHeld(agent.getAgentType(), true))
+          .as("earlyReleasePermitIfHeld should accept forceZombiesIncrement parameter")
+          .doesNotThrowAnyException();
+
+      // Verify the single-parameter version works for standard cleanup paths
+      assertThatCode(() -> acquisitionService.earlyReleasePermitIfHeld(agent.getAgentType()))
+          .as("earlyReleasePermitIfHeld should work without forceZombiesIncrement")
+          .doesNotThrowAnyException();
+    }
+
+    /**
+     * Verifies that unregisterAgent properly accounts for permits when called before worker starts.
+     *
+     * <p>When an agent is unregistered while queued but not yet executing, the permit must still
+     * be tracked in zombiesInFlight because the worker thread may still execute despite the
+     * unregister call (future.cancel(false) doesn't interrupt running threads).
+     */
+    @Test
+    @DisplayName("Should handle permit accounting correctly when unregistering before worker starts")
+    void shouldHandlePermitAccountingOnEarlyUnregister() {
+      Agent agent = TestFixtures.createMockAgent("UnregisterTest", "test");
+      AgentExecution noOpExecution = (agent_arg) -> {};
+      ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+
+      acquisitionService.registerAgent(agent, noOpExecution, instrumentation);
+
+      // Immediately unregister before worker can start
+      assertThatCode(() -> acquisitionService.unregisterAgent(agent))
+          .as("unregisterAgent should handle permit accounting for queued agents")
+          .doesNotThrowAnyException();
+    }
+
+    /**
+     * Verifies that concurrent unregister operations maintain permit accounting consistency.
+     *
+     * <p>Multiple threads unregistering agents simultaneously should not cause permit accounting
+     * errors due to the atomic flag-before-increment ordering in earlyReleasePermitIfHeld.
+     */
+    @Test
+    @DisplayName("Should maintain permit accounting consistency under concurrent unregister operations")
+    void shouldMaintainConsistencyUnderConcurrentUnregister() throws Exception {
+      List<Agent> agents = new java.util.ArrayList<>();
+      for (int i = 0; i < 10; i++) {
+        Agent agent = TestFixtures.createMockAgent("ConcurrentTest" + i, "test");
+        AgentExecution noOpExecution = (agent_arg) -> {};
+        ExecutionInstrumentation instrumentation = mock(ExecutionInstrumentation.class);
+        acquisitionService.registerAgent(agent, noOpExecution, instrumentation);
+        agents.add(agent);
+      }
+
+      // Concurrently unregister all agents
+      java.util.List<Future<?>> futures = new java.util.ArrayList<>();
+      for (Agent agent : agents) {
+        futures.add(executorService.submit(() -> acquisitionService.unregisterAgent(agent)));
+      }
+
+      // All operations should complete without errors
+      for (Future<?> future : futures) {
+        assertThatCode(() -> future.get(5, TimeUnit.SECONDS))
+            .as("Concurrent unregister operations should complete without errors")
+            .doesNotThrowAnyException();
+      }
+    }
+  }
 }

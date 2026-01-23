@@ -40,7 +40,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.regex.Pattern;
@@ -90,23 +89,22 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   private final Map<String, java.util.concurrent.Future<?>> activeAgentsFutures =
       new ConcurrentHashMap<>();
 
-  // Zombies-in-flight tracking: dual-counter design for fairness during zombie cancellation.
+  // Zombies-in-flight tracking: set-based design for fairness during zombie cancellation.
   //
   // Problem: When zombie cleanup cancels a stuck agent, the semaphore permit is released early
   // (to allow new work), but the cancelled thread may linger before exiting. Without compensation,
   // the scheduler would see extra permits and oversubscribe beyond maxConcurrentAgents.
   //
-  // Solution: Two counters track this transient state:
-  // - zombiesInFlight (effective): Clamped to >= 0, used by capacity calculations to reduce
-  //   available slots. Decremented when the cancelled thread actually exits.
-  // - zombiesInFlightRaw (diagnostic): Unclamped raw value that may go negative if decrement
-  //   races occur. Used only for debugging and health logging; never affects scheduling.
+  // Solution: A concurrent set tracks agents whose permits were released early but threads are
+  // still running. Operations are idempotent and order-independent:
+  // - add(agentType) when permit is early-released (zombie cleanup)
+  // - remove(agentType) when thread exits (worker finally)
+  // - size() for capacity calculations
   //
-  // The separation ensures correct capacity accounting (effective) while preserving diagnostic
-  // visibility into edge cases (raw). Reconciliation in saturatePool() caps the raw counter
-  // if it exceeds the theoretical maximum (held permits - active agents).
-  private final AtomicInteger zombiesInFlight = new AtomicInteger(0);
-  private final AtomicInteger zombiesInFlightRaw = new AtomicInteger(0);
+  // Unlike the previous counter-based design, set-based tracking cannot drift due to race
+  // conditions between add and remove operations. No reconciliation or clamping is needed.
+  private final java.util.Set<String> zombiesInFlightSet =
+      java.util.concurrent.ConcurrentHashMap.newKeySet();
 
   // Redis TIME synchronization for multi-instance coordination
   private static final AtomicLong lastTimeCheck = new AtomicLong(0);
@@ -139,9 +137,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    *   <li>{@code permitHeld} - true if the semaphore permit has not yet been released; CAS to false
    *       ensures exactly-once release whether by normal completion or early cancellation
    *   <li>{@code started} - true once the agent's execution has actually begun; prevents
-   *       zombies-in-flight increment for tasks cancelled before they started
-   *   <li>{@code zombiesInFlightIncremented} - true if this agent contributed to the
-   *       zombiesInFlight counter; ensures decrement happens exactly once when the thread exits
+   *       zombies-in-flight tracking for tasks cancelled before they started
    *   <li>{@code deadmanHandle} - scheduled future for the dead-man timeout that auto-cancels stuck
    *       agents; cancelled on normal completion to prevent spurious interrupts
    * </ul>
@@ -153,27 +149,32 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
    * <p><b>Coordination with cleanup:</b> Zombie cleanup reads RunState and calls {@link
    * #earlyReleasePermitIfHeld} (CAS on permitHeld). Orphan cleanup never accesses RunState (only
    * handles agents from crashed pods). Shutdown may race with worker finally (safe via CAS).
+   *
+   * <p><b>Note:</b> zombiesInFlight tracking now uses a Set<String> instead of a counter flag.
+   * Set membership (add/remove) replaces the previous zombiesInFlightIncremented flag.
    */
   private static final class RunState {
     final java.util.concurrent.atomic.AtomicBoolean permitHeld =
         new java.util.concurrent.atomic.AtomicBoolean(true);
     final java.util.concurrent.atomic.AtomicBoolean started =
         new java.util.concurrent.atomic.AtomicBoolean(false);
-    final java.util.concurrent.atomic.AtomicBoolean zombiesInFlightIncremented =
-        new java.util.concurrent.atomic.AtomicBoolean(false);
     volatile java.util.concurrent.ScheduledFuture<?> deadmanHandle;
   }
 
   /**
-   * Early release the semaphore permit for a running agent if still held, and increment
-   * zombies-in-flight compensation. This enables fairness when zombie cleanup cancels a task whose
+   * Early release the semaphore permit for a running agent if still held, and track in
+   * zombies-in-flight set. This enables fairness when zombie cleanup cancels a task whose
    * thread may linger.
    *
    * <p>Exactly-once semantics are enforced via the per-agent {@code RunState.permitHeld} flag.
    *
    * @param agentType the agent whose permit should be pre-released if still held
+   * @param forceZombiesTracking if true, add to zombiesInFlight set regardless of started flag.
+   *     This is necessary for unregisterAgent() path where future.cancel(false) doesn't interrupt
+   *     the thread - the worker WILL execute despite the unregister call, so the permit must be
+   *     accounted for unconditionally.
    */
-  public void earlyReleasePermitIfHeld(String agentType) {
+  public void earlyReleasePermitIfHeld(String agentType, boolean forceZombiesTracking) {
     try {
       RunState runStateForAgent = runStates.get(agentType);
       if (runStateForAgent == null) {
@@ -185,31 +186,48 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           maxConcurrentSemaphoreRef.release();
         }
 
+        // Add to zombiesInFlight set if:
+        // 1. Thread has already started execution (normal zombie cleanup), OR
+        // 2. forceZombiesTracking=true (unregisterAgent path - thread may still execute)
         boolean started = runStateForAgent.started.get();
-        if (started) {
-          int raw = zombiesInFlightRaw.incrementAndGet();
-          zombiesInFlight.incrementAndGet();
-          runStateForAgent.zombiesInFlightIncremented.set(true);
+        if (started || forceZombiesTracking) {
+          // Set-based tracking: add is idempotent and order-independent
+          // No race condition possible - worker finally will call remove()
+          zombiesInFlightSet.add(agentType);
           log.debug(
-              "Early permit release for {}: started={} zombies_in_flight_raw={} zombies_in_flight_effective={}",
+              "Early permit release for {}: started={} forceTracking={} zombies_in_flight={}",
               agentType,
-              true,
-              raw,
-              zombiesInFlight.get());
+              started,
+              forceZombiesTracking,
+              zombiesInFlightSet.size());
         } else {
           log.debug(
-              "Early permit release for {}: started=false, skipping zombiesInFlight increment",
+              "Early permit release for {}: started=false forceTracking=false, skipping zombiesInFlight tracking",
               agentType);
         }
       } else {
         // CAS failed: permit was already released by worker completion or another cleanup path
         metrics.incrementCasContention("zombie_cleanup");
-        log.debug("Early permit release for {}: CAS failed (permit already released)", agentType);
+        log.debug(
+            "Early permit release for {}: CAS failed (permit already released)", agentType);
       }
     } catch (Exception e) {
       // Best-effort; do not propagate exceptions to callers in cleanup paths
       log.debug("earlyReleasePermitIfHeld failed for {}", agentType, e);
     }
+  }
+
+  /**
+   * Early release the semaphore permit for an agent, without forcing zombiesInFlight increment.
+   *
+   * <p>This variant only increments zombiesInFlight if the worker has already started execution
+   * (started flag is true). Use {@link #earlyReleasePermitIfHeld(String, boolean)} with
+   * forceZombiesIncrement=true when the worker may still execute despite cancellation.
+   *
+   * @param agentType the agent whose permit should be pre-released if still held
+   */
+  public void earlyReleasePermitIfHeld(String agentType) {
+    earlyReleasePermitIfHeld(agentType, false);
   }
 
   @Override
@@ -256,30 +274,32 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
   }
 
   /**
-   * Returns the effective number of zombies whose permits were pre-released but threads are still
-   * running.
+   * Returns the number of zombies whose permits were pre-released but threads are still running.
    *
-   * @return non-negative count of in-flight zombies (clamped to zero)
+   * <p>With set-based tracking, this is always accurate and non-negative (set.size()).
+   *
+   * @return count of in-flight zombies
    */
   public int getZombiesInFlight() {
-    return Math.max(0, zombiesInFlight.get());
+    return zombiesInFlightSet.size();
   }
 
   /**
-   * Returns the raw zombies-in-flight counter value for diagnostics. May be negative if
-   * mis-accounting occurs.
+   * Returns the raw zombies-in-flight value for diagnostics.
    *
-   * @return raw counter value (may be negative)
+   * <p>With set-based tracking, this is always the same as getZombiesInFlight() since there's no
+   * counter drift possible. Kept for API compatibility.
+   *
+   * @return count of in-flight zombies (same as getZombiesInFlight())
    */
   int getZombiesInFlightRaw() {
-    return zombiesInFlightRaw.get();
+    return zombiesInFlightSet.size();
   }
 
   // Backlog/health snapshots and rate-limiting
   private final AtomicLong lastBacklogWarnEpochMs = new AtomicLong(0);
   private final AtomicLong lastStallWarnEpochMs = new AtomicLong(0);
   private final AtomicLong lastBatchParsingMismatchWarnEpochMs = new AtomicLong(0);
-  private final AtomicLong lastZifNegativeErrorEpochMs = new AtomicLong(0);
   private final AtomicLong lastDiagEpochMs = new AtomicLong(0);
   private final AtomicLong lastOldestOverdueSeconds = new AtomicLong(0);
   private final AtomicLong lastReadyCount = new AtomicLong(0);
@@ -625,41 +645,10 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
         return 0;
       }
 
-      // Defensive reconciliation: cap zombiesInFlight to real headroom so capacity accounting
-      // cannot be skewed by cancelled-but-never-started tasks.
-      if (!unbounded && maxConcurrentSemaphore != null) {
-        try {
-          int availablePermits = maxConcurrentSemaphore.availablePermits();
-          int heldPermits = Math.max(0, maxConcurrentAgents - availablePermits);
-          int cap = Math.max(0, heldPermits - currentlyRunning);
-          int rawBefore = zombiesInFlightRaw.get();
-          if (rawBefore > cap) {
-            int delta = cap - rawBefore; // negative
-            int rawAfter = zombiesInFlightRaw.addAndGet(delta);
-            if (rawAfter < 0) {
-              log.warn(
-                  "zombiesInFlight raw negative after reconciliation: raw={} delta={} held={} active={}",
-                  rawAfter,
-                  delta,
-                  heldPermits,
-                  currentlyRunning);
-            }
-            zombiesInFlight.set(Math.max(0, rawAfter));
-            if (log.isDebugEnabled()) {
-              log.debug(
-                  "Reconciled zombiesInFlight raw from {} to {} (effective={} held={} active={})",
-                  rawBefore,
-                  rawAfter,
-                  Math.max(0, zombiesInFlightRaw.get()),
-                  heldPermits,
-                  currentlyRunning);
-            }
-          }
-        } catch (Exception e) {
-          log.debug(
-              "zombiesInFlight reconciliation skipped due to error; keeping previous values", e);
-        }
-      }
+      // Note: With set-based zombiesInFlight tracking, no reconciliation is needed.
+      // Set operations (add/remove) are idempotent and order-independent, so counter drift
+      // cannot occur. The previous counter-based design required periodic reconciliation
+      // to fix race conditions between flag-set and counter-increment operations.
 
       // Phase 1: Process queued agent completions
       processQueuedCompletions(jedis, nowMsCached);
@@ -835,7 +824,7 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       java.util.Set<String> attemptedThisCycle = new java.util.HashSet<>();
 
       // Calculate how many new agents this pod can try to acquire
-      int effectiveRunning = currentlyRunning + Math.max(0, zombiesInFlightRaw.get());
+      int effectiveRunning = currentlyRunning + zombiesInFlightSet.size();
       int availableSlotsForNewAgents =
           unbounded ? Integer.MAX_VALUE : Math.max(0, maxConcurrentAgents - effectiveRunning);
 
@@ -2058,9 +2047,12 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
       if (future != null) {
         future.cancel(false);
       }
-      earlyReleasePermitIfHeld(agentType);
+      // Use forceZombiesIncrement=true because future.cancel(false) doesn't interrupt the thread.
+      // The worker WILL execute despite the unregister call, so unconditionally account for the
+      // permit in zombiesInFlight to prevent counter drift.
+      earlyReleasePermitIfHeld(agentType, true);
       log.debug(
-          "Cleaned up in-flight state for unregistered agent {} (permit released via CAS, future={})",
+          "Cleaned up in-flight state for unregistered agent {} (permit released via CAS, future={}, forceZombiesIncrement=true)",
           agentType,
           future != null);
     } else if (future != null) {
@@ -4642,47 +4634,14 @@ public class AgentAcquisitionService implements PermitFairnessHandler {
           } else {
             // CAS failed: permit was pre-released by cleanup (zombie or shutdown)
             acquisitionService.metrics.incrementCasContention("worker_completion");
-            // Permit was pre-released by cleanup. Decrement raw zombiesInFlight if it was
-            // incremented.
-            if (runStateForAgent.zombiesInFlightIncremented.get()) {
-              int raw = acquisitionService.zombiesInFlightRaw.decrementAndGet();
-              int effectiveBefore = acquisitionService.zombiesInFlight.get();
-              int effectiveAfter =
-                  acquisitionService.zombiesInFlight.updateAndGet(
-                      current -> {
-                        int result = current - 1;
-                        if (result < 0) {
-                          // Track negative zombiesInFlight occurrences for production observability
-                          acquisitionService.metrics.incrementZombiesInFlightNegative();
-                          // Log ERROR when negative value detected (rate-limited to avoid flooding)
-                          if (shouldWarnNow(
-                              acquisitionService.lastZifNegativeErrorEpochMs, 60_000)) {
-                            log.error(
-                                "zombiesInFlight effective counter went negative: current={}, would be={}. "
-                                    + "This indicates incorrect accounting in permit/zombiesInFlight tracking. "
-                                    + "Permit accounting may be incorrect, allowing over-subscription.",
-                                current,
-                                result);
-                          } else if (log.isDebugEnabled()) {
-                            log.debug(
-                                "zombiesInFlight effective counter went negative (suppressed ERROR): current={}, would be={}",
-                                current,
-                                result);
-                          }
-                          return 0; // Clamp to 0 (defensive)
-                        }
-                        return result;
-                      });
-              if (raw < 0) {
-                log.warn("zombiesInFlight raw went negative during worker finally: raw={}", raw);
-              }
-              // Do not set the separate effective counter; clamp only at behavior read sites.
+            // Permit was pre-released by cleanup. Remove from zombiesInFlight set.
+            // Set-based tracking: remove is idempotent, no race conditions possible
+            boolean wasInSet = acquisitionService.zombiesInFlightSet.remove(agentType);
+            if (wasInSet) {
               log.debug(
-                  "Permit for {} was pre-released by cleanup, zombies_in_flight_raw={} zombies_in_flight_effective={}->{}",
+                  "Permit for {} was pre-released by cleanup, removed from zombiesInFlight set (size={})",
                   agentType,
-                  raw,
-                  effectiveBefore,
-                  effectiveAfter);
+                  acquisitionService.zombiesInFlightSet.size());
             }
           }
         }

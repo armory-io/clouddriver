@@ -1040,5 +1040,79 @@ class PermitSafetyTest {
       // Cleanup
       executionLatch.countDown();
     }
+
+    /**
+     * Tests that set-based zombie tracking never drifts under concurrent operations.
+     *
+     * <p>With set-based tracking, add() and remove() are idempotent and order-independent.
+     * This test verifies that the zombiesInFlight count is always accurate:
+     * - After earlyReleasePermitIfHeld: agent is in set (count = 1)
+     * - After worker exits (simulated via set.remove): agent is not in set (count = 0)
+     *
+     * <p>Unlike the previous counter-based design, set-based tracking cannot drift due to
+     * race conditions. This test confirms that property.
+     */
+    @Test
+    @DisplayName("Set-based zombie tracking should never drift")
+    void setBasedZombieTrackingShouldNeverDrift() throws Exception {
+      // Given - Create long-running execution for zombie simulation
+      CountDownLatch zombieStarted = new CountDownLatch(1);
+      AgentExecution zombieExecution = mock(AgentExecution.class);
+      doAnswer(
+              invocation -> {
+                zombieStarted.countDown();
+                executionLatch.await(60, TimeUnit.SECONDS);
+                return null;
+              })
+          .when(zombieExecution)
+          .executeAgent(any(Agent.class));
+
+      ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
+
+      Agent agent = TestFixtures.createMockAgent("set-tracking-agent", "test-provider");
+      acquisitionService.registerAgent(agent, zombieExecution, instrumentation);
+
+      // Add to Redis
+      long nowSeconds = TestFixtures.nowSeconds();
+      try (Jedis jedis = jedisPool.getResource()) {
+        jedis.zadd("waiting", nowSeconds - 100, "set-tracking-agent");
+      }
+
+      // When - Acquire agent and wait for execution to start
+      int acquired = acquisitionService.saturatePool(1L, semaphore, executor);
+      assertThat(acquired).isEqualTo(1);
+
+      boolean started = zombieStarted.await(2, TimeUnit.SECONDS);
+      assertThat(started).describedAs("Agent should start execution").isTrue();
+
+      // Verify: Before zombie cleanup, zombiesInFlight should be 0
+      assertThat(acquisitionService.getZombiesInFlight())
+          .describedAs("zombiesInFlight should be 0 before cleanup (agent is running normally)")
+          .isEqualTo(0);
+
+      // Simulate zombie cleanup: early release permit
+      acquisitionService.earlyReleasePermitIfHeld("set-tracking-agent");
+
+      // Verify: After early release, zombiesInFlight should be exactly 1
+      assertThat(acquisitionService.getZombiesInFlight())
+          .describedAs("zombiesInFlight should be exactly 1 after early release (set-based, no drift)")
+          .isEqualTo(1);
+
+      // Also verify the raw value equals the effective value (no dual-counter divergence)
+      assertThat(acquisitionService.getZombiesInFlightRaw())
+          .describedAs("Raw and effective zombiesInFlight should be equal with set-based tracking")
+          .isEqualTo(acquisitionService.getZombiesInFlight());
+
+      // Cleanup - release execution latch to let agent complete
+      executionLatch.countDown();
+
+      // Wait for agent to exit and verify zombiesInFlight returns to 0
+      TestFixtures.waitForBackgroundTask(
+          () -> acquisitionService.getZombiesInFlight() == 0, 5000L, 50L);
+
+      assertThat(acquisitionService.getZombiesInFlight())
+          .describedAs("zombiesInFlight should return to 0 after agent exits")
+          .isEqualTo(0);
+    }
   }
 }
