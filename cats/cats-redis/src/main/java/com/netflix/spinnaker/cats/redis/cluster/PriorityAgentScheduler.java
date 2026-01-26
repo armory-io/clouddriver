@@ -705,25 +705,45 @@ public class PriorityAgentScheduler extends CatsModuleAware
           ((java.util.concurrent.ThreadPoolExecutor) config.getAgentWorkPool()).getQueue().size();
     }
     java.util.concurrent.Semaphore maxConcurrentSemaphore = config.getMaxConcurrentSemaphore();
+    int maxConcurrent = acquisitionService.getAgentProperties().getMaxConcurrentAgents();
+
+    // IMPORTANT: Read order matters for accurate permit leak detection.
+    // Read runStates FIRST, then semaphore. This ensures:
+    // - If worker completes between reads: runStates stale (high), semaphore accurate (low)
+    //   → held < withPermit (safe, not a false positive)
+    // - Real leak: semaphore holds permit without RunState → held > withPermit (true positive)
+    // Previous order (semaphore first) caused false positives when workers completed between reads.
+    int runStatesCount = acquisitionService.getRunStatesCount();
+    int runStatesWithPermitHeld = acquisitionService.getRunStatesWithPermitHeldCount();
     int availablePermits =
         maxConcurrentSemaphore != null ? maxConcurrentSemaphore.availablePermits() : -1;
-    int maxConcurrent = acquisitionService.getAgentProperties().getMaxConcurrentAgents();
+
     int activeCount = acquisitionService.getActiveAgentCount();
     long readySnapshot = acquisitionService.getReadyCountSnapshot();
     long oldestOverdueSecondsNow = acquisitionService.getOldestOverdueSeconds();
     double capacityPerCycle = acquisitionService.getCapacityPerCycleSnapshot();
 
-    // Permit reconciliation: warn and mark degraded if heldPermits > active
-    boolean permitMismatch = false;
+    // Permit accounting: track difference between held permits and active agents.
+    // Small mismatches are EXPECTED during in-flight acquisition because permits are
+    // acquired before runStates/activeAgents are populated. This is NOT a leak - it's a
+    // transient timing window. Only heldPermits > runStatesWithPermitHeld indicates a true leak.
     int permitMismatchValue = 0;
+    int heldPermits = 0;
     if (maxConcurrentSemaphore != null && maxConcurrent > 0) {
-      int heldPermits = Math.max(0, maxConcurrent - availablePermits);
+      heldPermits = Math.max(0, maxConcurrent - availablePermits);
       permitMismatchValue = heldPermits - activeCount;
-      if (permitMismatchValue > 0) {
-        permitMismatch = true;
-        // Do not emit immediate WARN; include in periodic summary instead
+      // Log diagnostic details at DEBUG level for investigation
+      if (permitMismatchValue > 0 && log.isDebugEnabled()) {
+        log.debug(
+            "Permit accounting: held={} active={} mismatch={} (expected during in-flight acquisition). "
+                + "Leak suspected only if held > runStatesWithPermit: held={} vs withPermit={}",
+            heldPermits,
+            activeCount,
+            permitMismatchValue,
+            heldPermits,
+            runStatesWithPermitHeld);
       }
-      // Record permit accounting metrics for production observability
+      // Record metric for observability (not used for health status)
       metrics.recordPermitMismatch(permitMismatchValue);
     }
 
@@ -750,13 +770,13 @@ public class PriorityAgentScheduler extends CatsModuleAware
       watchdogs.add("redis_stall");
     }
 
-    boolean warnLevel = (stats.isDegraded() || permitMismatch || setOverlap);
+    // Note: permitMismatch is NOT included in warnLevel because small mismatches are expected
+    // during in-flight acquisition (permits acquired before runStates created). The diagnostic
+    // data is still included in the log for investigation if needed.
+    boolean warnLevel = (stats.isDegraded() || setOverlap);
     String healthLabel = warnLevel ? "DEGRADED" : "HEALTHY";
 
     java.util.List<String> reasonTokens = new java.util.ArrayList<>();
-    if (permitMismatch) {
-      reasonTokens.add("permit_mismatch");
-    }
     if (setOverlap) {
       reasonTokens.add("set_overlap");
     }
@@ -806,6 +826,15 @@ public class PriorityAgentScheduler extends CatsModuleAware
               " [permits %s/%s (%.1f%%)]",
               formatLong(availablePermits), formatLong(maxConcurrent), freeRatio * 100d));
     }
+
+    // Add runStates diagnostic to help identify permit_mismatch root cause
+    // Key invariant: heldPermits should equal runStatesWithPermit (no leak)
+    // If heldPermits > runStatesWithPermit: actual permit leak
+    // If heldPermits == runStatesWithPermit but > activeCount: timing difference only
+    msg.append(
+        String.format(
+            " [runStates=%d withPermit=%d held=%d]",
+            runStatesCount, runStatesWithPermitHeld, heldPermits));
 
     msg.append(
         String.format(
@@ -1283,8 +1312,20 @@ public class PriorityAgentScheduler extends CatsModuleAware
           String scoreString = entry.getValue();
           boolean numeric = scoreString != null && scoreString.matches("^\\d+$");
           if (acquisitionService.getRegisteredAgent(agentType) == null || !numeric) {
-            // Inconsistent local tracking; clean it up to avoid leaks
-            acquisitionService.removeActiveAgent(agentType);
+            // Check if agent is still executing (has RunState with permit held).
+            // If so, skip cleanup - the worker's finally block will handle it.
+            // This prevents race where watchdog removes RunState while worker is running,
+            // causing "no RunState" warnings in worker's finally block.
+            if (acquisitionService.isAgentCurrentlyExecuting(agentType)) {
+              log.debug(
+                  "Skipping reconcile cleanup for {} - agent still executing with permit held",
+                  agentType);
+              continue;
+            }
+            // Inconsistent local tracking; clean it up with permit release to avoid leaks.
+            // Use removeActiveAgentWithPermitRelease to ensure the permit is also released,
+            // preventing permit_mismatch where heldPermits > activeAgents.size().
+            acquisitionService.removeActiveAgentWithPermitRelease(agentType);
             metrics.incrementStateInconsistentActive();
           }
         }

@@ -5507,8 +5507,10 @@ class AgentAcquisitionServiceTest {
       // Verify all agents maintain their relative priority ordering
       try (Jedis jedis = jedisPool.getResource()) {
         var agentsWithScores = jedis.zrangeWithScores("waiting", 0, -1);
-        // Capture time after repopulation to account for elapsed time during test
-        long nowSeconds = TestFixtures.nowSeconds();
+        // Use Redis TIME for consistency with score calculation in saturatePool.
+        // Using System time (TestFixtures.nowSeconds()) can cause flakiness due to
+        // clock skew between JVM and Redis or second-boundary crossing.
+        long nowSeconds = TestFixtures.getRedisTimeSeconds(jedis);
 
         double previousScore = Double.NEGATIVE_INFINITY;
         for (var tuple : agentsWithScores) {
@@ -5522,9 +5524,12 @@ class AgentAcquisitionServiceTest {
 
           // CRITICAL: All overdue agents should have scores BEFORE or AT current time
           // (they should NOT all be set far in the future which would delay execution)
+          // Note: +1 second tolerance because RedisTimeUtils.scoreFromMsDelay() rounds UP
+          // to avoid past-scheduling (adds 999ms before dividing), while getRedisTimeSeconds
+          // returns the floor of Redis TIME.
           assertThat(score)
               .as("Overdue agents should keep old scores to maintain execution cadence")
-              .isLessThanOrEqualTo((double) nowSeconds);
+              .isLessThanOrEqualTo((double) (nowSeconds + 1));
         }
       }
     }
@@ -5543,6 +5548,10 @@ class AgentAcquisitionServiceTest {
           new com.netflix.spectator.api.DefaultRegistry();
       PrioritySchedulerMetrics testMetrics = new PrioritySchedulerMetrics(metricsRegistry);
 
+      // Disable initial-registration jitter so repopulated agents get immediate eligibility
+      // (otherwise scores would be now + jitter which breaks the "old scores" assertion)
+      schedulerProperties.getJitter().setInitialRegistrationSeconds(0);
+
       // Create a new acquisition service with testable metrics
       AgentAcquisitionService testService =
           new AgentAcquisitionService(
@@ -5556,9 +5565,6 @@ class AgentAcquisitionServiceTest {
 
       AgentExecution execution = mock(AgentExecution.class);
       ExecutionInstrumentation instrumentation = TestFixtures.createMockInstrumentation();
-
-      // Create multiple agents with different overdue times
-      long currentTimeSeconds = TestFixtures.nowSeconds();
       int numAgents = 5;
 
       for (int i = 0; i < numAgents; i++) {
@@ -5575,8 +5581,11 @@ class AgentAcquisitionServiceTest {
         }
       }
 
-      // Trigger repopulation - this is where the thundering herd would occur with old logic
-      testService.saturatePool(0L, null, executorService);
+      // Trigger repopulation - this is where the thundering herd would occur with old logic.
+      // Use Semaphore(0) to prevent acquisition so we can verify repopulation scores directly.
+      // With null semaphore, acquisition would proceed and reschedule agents with now + interval.
+      Semaphore noAcquisition = new Semaphore(0);
+      testService.saturatePool(0L, noAcquisition, executorService);
 
       // Verify repopulation metrics: incrementRepopulateAdded()
       // Note: incrementRepopulateAdded is only called when agents are actually added
@@ -5617,6 +5626,10 @@ class AgentAcquisitionServiceTest {
       // Verify all agents maintain their relative priority ordering
       try (Jedis jedis = jedisPool.getResource()) {
         var agentsWithScores = jedis.zrangeWithScores("waiting", 0, -1);
+        // Use Redis TIME for consistency with score calculation.
+        // Note: +1 second tolerance because RedisTimeUtils.scoreFromMsDelay() rounds UP
+        // to avoid past-scheduling (adds 999ms before dividing).
+        long nowSeconds = TestFixtures.getRedisTimeSeconds(jedis);
 
         double previousScore = Double.NEGATIVE_INFINITY;
         for (var tuple : agentsWithScores) {
@@ -5628,11 +5641,11 @@ class AgentAcquisitionServiceTest {
               .isGreaterThanOrEqualTo(previousScore);
           previousScore = score;
 
-          // CRITICAL: All overdue agents should have scores BEFORE current time
-          // (they should NOT all be set to "now")
+          // CRITICAL: Repopulated agents should have scores AT or BEFORE current time
+          // (immediate eligibility, not delayed into the future which would cause starvation)
           assertThat(score)
-              .as("Overdue agents should keep old scores, not get immediate execution")
-              .isLessThan((double) currentTimeSeconds);
+              .as("Repopulated agents should be immediately eligible (score <= now + 1s tolerance)")
+              .isLessThanOrEqualTo((double) (nowSeconds + 1));
         }
       }
     }

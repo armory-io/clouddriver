@@ -951,23 +951,17 @@ public class AgentAcquisitionService {
         }
       }
 
-      // Update final degradation status combining both issues
+      // Update degradation status based on backlog issues only.
+      // Note: slotFillingIssue is NOT included in DEGRADED because with sharding enabled,
+      // high filter rates are expected (agents belong to other pods). Slot filling issues
+      // are tracked as watchdogs for observability but don't affect health status.
       if (emitDiag) {
-        boolean finalDegraded = initialDegraded || slotFillingIssue;
-        String finalDegradedReason;
+        boolean finalDegraded = initialDegraded;
+        String finalDegradedReason = initialDegraded ? initialDegradedReason : "";
 
-        if (initialDegraded && slotFillingIssue) {
-          // Both issues present
-          finalDegradedReason = initialDegradedReason + "; " + slotFillingReason;
-        } else if (initialDegraded) {
-          // Only backlog issue
-          finalDegradedReason = initialDegradedReason;
-        } else if (slotFillingIssue) {
-          // Only slot filling issue
-          finalDegradedReason = slotFillingReason;
-        } else {
-          // No issues
-          finalDegradedReason = "";
+        // Log slot filling issue separately if present (for debugging, not health status)
+        if (slotFillingIssue && log.isDebugEnabled()) {
+          log.debug("Slot filling watchdog: {}", slotFillingReason);
         }
 
         lastDegraded.set(finalDegraded);
@@ -978,10 +972,12 @@ public class AgentAcquisitionService {
       // Phase 7: Submit all acquired agents for execution
       // Submit each agent individually to handle rejections properly
       for (AgentWorker worker : workersToSubmit) {
+        String agentType = worker.getAgent().getAgentType();
+
         // Critical: Set semaphore before execution so it can be released when done
         worker.setMaxConcurrentSemaphore(maxConcurrentSemaphore);
         // Initialize run-state for exactly-once permit release
-        runStates.put(worker.getAgent().getAgentType(), new RunState());
+        runStates.put(agentType, new RunState());
 
         // Submit with proper rejection handling
         java.util.concurrent.Future<?> future =
@@ -991,7 +987,6 @@ public class AgentAcquisitionService {
           // Schedule dead-man cancellation exactly at (completion deadline + threshold)
           try {
             if (schedulerProperties.getZombieCleanup().isEnabled()) {
-              String agentType = worker.getAgent().getAgentType();
               if (worker.deadlineScore != null && worker.deadlineScore.matches("^\\d+$")) {
                 long thresholdMs = getZombieThresholdForAgent(agentType);
                 // deadlineScore encodes the completion deadline in epoch seconds
@@ -1311,32 +1306,29 @@ public class AgentAcquisitionService {
         break;
       }
 
-      if (maxConcurrentSemaphore != null && !maxConcurrentSemaphore.tryAcquire()) {
-        log.debug("Semaphore limit reached at {} agents", candidateCount);
-        break;
-      }
-
       AgentWorker worker = registrySnapshot.get(agentType);
       if (worker == null) {
         log.warn(
             "Agent {} not found in local registry, skipping (may have been dynamically removed)",
             agentType);
-        if (maxConcurrentSemaphore != null) {
-          maxConcurrentSemaphore.release();
-        }
         continue;
       }
 
-      // Sharding/enablement gating at acquisition time (dynamic-safe)
+      // Double-check sharding/enablement gating before acquiring permit to prevent permit mismatch
+      // This ensures we don't acquire permits for agents that will be filtered out by sharding
       if (!isAgentEnabled(worker.getAgent())) {
         log.debug(
-            "Skipping candidate agent {} due to sharding/enablement filter during acquisition",
+            "Skipping candidate agent {} due to sharding/enablement filter before permit acquisition",
             agentType);
-        if (maxConcurrentSemaphore != null) {
-          maxConcurrentSemaphore.release();
-        }
         continue;
       }
+
+      if (maxConcurrentSemaphore != null && !maxConcurrentSemaphore.tryAcquire()) {
+        log.debug("Semaphore limit reached at {} agents", candidateCount);
+        break;
+      }
+
+      // At this point, we have the permit and the agent passed all filters
 
       candidateAgents.add(agentType);
       candidateWorkers.add(worker);
@@ -1696,36 +1688,29 @@ public class AgentAcquisitionService {
         break;
       }
 
+      // Check worker existence and sharding/enablement before acquiring permit to prevent permit
+      // mismatch
+      AgentWorker worker = registrySnapshot.get(agentType);
+      if (worker == null) {
+        log.warn("Ready agent {} not found in local agents map, skipping.", agentType);
+        continue;
+      }
+
+      // Double-check sharding/enablement gating before acquiring permit to prevent permit mismatch
+      if (!isAgentEnabled(worker.getAgent())) {
+        log.debug(
+            "Skipping ready agent {} due to sharding/enablement filter before permit acquisition",
+            agentType);
+        continue;
+      }
+
       if (maxConcurrentSemaphore != null && !maxConcurrentSemaphore.tryAcquire()) {
         log.debug(
             "Instance concurrent agent limit reached (no permits from 'maxConcurrentSemaphore' semaphore). Cannot acquire more agents this cycle.");
         break; // Stop trying if semaphore is full
       }
 
-      // Semaphore permit acquired
-      // Note: Individual acquisition processes agents sequentially, making it more resilient
-      // to concurrent external modifications that can corrupt batch operation indices
-      AgentWorker worker = registrySnapshot.get(agentType);
-      if (worker == null) {
-        log.warn(
-            "Ready agent {} not found in local agents map, releasing semaphore permit and skipping.",
-            agentType);
-        if (maxConcurrentSemaphore != null) {
-          maxConcurrentSemaphore.release();
-        }
-        continue;
-      }
-
-      // Sharding/enablement gating at acquisition time (dynamic-safe)
-      if (!isAgentEnabled(worker.getAgent())) {
-        log.debug(
-            "Skipping ready agent {} due to sharding/enablement filter during acquisition",
-            agentType);
-        if (maxConcurrentSemaphore != null) {
-          maxConcurrentSemaphore.release();
-        }
-        continue;
-      }
+      // Semaphore permit acquired - agent passed all filters
 
       // Try to acquire this agent from Redis
       String agentAcquireScore = tryAcquireAgent(jedis, worker.getAgent(), nowMsCached);
@@ -1899,35 +1884,40 @@ public class AgentAcquisitionService {
     // agents)
     failureStreaks.remove(agentType);
 
-    // Clean up active tracking - capture whether agent was active (had permit acquired)
-    boolean wasActive = activeAgents.remove(agentType) != null;
-    if (wasActive) {
-      activeAgentMapSize.decrementAndGet();
-    }
-
-    // Clean up in-flight execution state when agent is unregistered due to sharding changes.
-    // Cancel the future if running; permit will be released when thread exits in finally block.
+    // Check if agent has an active RunState (meaning it's currently executing with a permit).
+    // We must NOT remove from activeAgents if a permit is held, otherwise permit_mismatch occurs
+    // (heldPermits > activeAgents.size). The worker's finally block will handle cleanup when
+    // the permit is actually released.
     Future<?> future = activeAgentsFutures.remove(agentType);
     RunState runState = runStates.get(agentType);
 
-    if (runState != null) {
-      // Agent has RunState - cancel future, let worker finally release permit
+    if (runState != null && runState.permitHeld.get()) {
+      // Agent is currently executing with a permit held - cancel future but DEFER activeAgents
+      // cleanup to the worker's finally block. This prevents permit_mismatch where we remove
+      // from activeAgents before the permit is released.
       if (future != null) {
         future.cancel(false);
       }
       log.debug(
-          "Cancelled in-flight agent {} for unregistration (permit released on thread exit)",
+          "Unregister deferred: agent {} has permit held, cleanup deferred to worker finally",
           agentType);
-    } else if (future != null) {
-      // Future exists but no RunState - this is unexpected (RunState created before submission).
-      // Cancel future but log warning - permit accounting may be inconsistent.
-      future.cancel(false);
-      log.warn(
-          "Unexpected state: agent {} has future but no RunState during unregistration", agentType);
+    } else {
+      // No permit held - safe to remove from activeAgents immediately
+      boolean wasActive = activeAgents.remove(agentType) != null;
+      if (wasActive) {
+        activeAgentMapSize.decrementAndGet();
+      }
+
+      if (future != null) {
+        // Future exists but no RunState or permit not held - cancel and log
+        future.cancel(false);
+        if (runState == null) {
+          log.warn(
+              "Unexpected state: agent {} has future but no RunState during unregistration",
+              agentType);
+        }
+      }
     }
-    // If neither RunState nor future exists, the agent was either:
-    // 1. Never acquired (wasActive = false) - no cleanup needed
-    // 2. Acquired but not yet submitted - brief window, let normal error handling clean up
 
     log.debug("Unregistered agent {} from scheduling", agentType);
 
@@ -1972,6 +1962,58 @@ public class AgentAcquisitionService {
   }
 
   /**
+   * Removes an agent from active tracking AND releases its permit via CAS.
+   *
+   * <p>This method should be used by cleanup paths (reconcile validation, state consistency checks)
+   * that need to remove agents that may still be holding permits. It uses the same CAS mechanism as
+   * the worker's finally block to ensure exactly-once permit release.
+   *
+   * <p>Unlike {@link #removeActiveAgent(String)}, this method:
+   *
+   * <ul>
+   *   <li>Removes the RunState and releases the permit via CAS (if held)
+   *   <li>Cancels any associated future (non-interrupt to allow graceful cleanup)
+   *   <li>Removes from activeAgents and activeAgentsFutures
+   * </ul>
+   *
+   * @param agentType The type identifier of the agent to remove
+   * @return true if the agent was found and removed, false if not present
+   */
+  public boolean removeActiveAgentWithPermitRelease(String agentType) {
+    // Step 1: Release permit via CAS (exactly-once, same pattern as worker finally block)
+    RunState runState = runStates.remove(agentType);
+    if (runState != null && runState.permitHeld.compareAndSet(true, false)) {
+      if (maxConcurrentSemaphoreRef != null) {
+        maxConcurrentSemaphoreRef.release();
+        log.debug("Released permit for {} during cleanup with permit release", agentType);
+      }
+      // Cancel dead-man timer if present
+      if (runState.deadmanHandle != null) {
+        try {
+          runState.deadmanHandle.cancel(false);
+        } catch (Exception ignore) {
+        }
+      }
+    }
+
+    // Step 2: Cancel future (non-interrupt to allow worker's finally block to run if in progress)
+    Future<?> future = activeAgentsFutures.remove(agentType);
+    if (future != null && !future.isDone()) {
+      future.cancel(false);
+    }
+
+    // Step 3: Remove from activeAgents map
+    String removedScore = activeAgents.remove(agentType);
+    if (removedScore != null) {
+      activeAgentMapSize.decrementAndGet();
+      log.debug("Removed agent {} from active tracking with permit release", agentType);
+      return true;
+    }
+
+    return runState != null; // Return true if we found RunState even if not in activeAgents
+  }
+
+  /**
    * Get the number of currently active agents.
    *
    * @return number of active agents
@@ -2012,6 +2054,45 @@ public class AgentAcquisitionService {
   public Agent getRegisteredAgent(String agentType) {
     AgentWorker worker = agents.get(agentType);
     return worker != null ? worker.getAgent() : null;
+  }
+
+  /**
+   * Check if an agent is currently executing (has a RunState with permitHeld=true).
+   *
+   * <p>This is used by cleanup paths to avoid racing with the worker's finally block. If this
+   * returns true, the cleanup should be skipped and left to the worker's finally block.
+   *
+   * @param agentType The agent type to check
+   * @return true if the agent has a RunState with permitHeld=true, false otherwise
+   */
+  public boolean isAgentCurrentlyExecuting(String agentType) {
+    RunState runState = runStates.get(agentType);
+    return runState != null && runState.permitHeld.get();
+  }
+
+  /**
+   * Get the count of RunState entries (diagnostic for permit_mismatch investigation).
+   *
+   * @return number of entries in runStates map
+   */
+  public int getRunStatesCount() {
+    return runStates.size();
+  }
+
+  /**
+   * Get the count of RunState entries that still have permitHeld=true (diagnostic for
+   * permit_mismatch investigation).
+   *
+   * @return number of RunState entries with permitHeld=true
+   */
+  public int getRunStatesWithPermitHeldCount() {
+    int count = 0;
+    for (RunState rs : runStates.values()) {
+      if (rs.permitHeld.get()) {
+        count++;
+      }
+    }
+    return count;
   }
 
   /**
@@ -3175,11 +3256,6 @@ public class AgentAcquisitionService {
     }
   }
 
-  // Backward-compatible overload used by tests via reflection
-  private String tryAcquireAgent(Jedis jedis, Agent agent) {
-    return tryAcquireAgent(jedis, agent, null);
-  }
-
   /**
    * Get the current score of an agent in the working or waiting set.
    *
@@ -4031,15 +4107,27 @@ public class AgentAcquisitionService {
       log.warn(
           "Agent {} submission rejected by thread pool (queue full or pool shutdown)", agentType);
 
-      // Critical: Release the semaphore permit since the agent won't be executed
-      try {
-        Semaphore semaphoreToRelease =
-            maxConcurrentSemaphore != null ? maxConcurrentSemaphore : maxConcurrentSemaphoreRef;
-        if (semaphoreToRelease != null) {
-          semaphoreToRelease.release();
-          log.debug("Released semaphore permit for rejected agent {}", agentType);
+      // Critical: Clean up RunState and release permit via CAS to maintain consistency.
+      // RunState was created in the submit loop before calling this method.
+      RunState runStateToClean = runStates.remove(agentType);
+      if (runStateToClean != null && runStateToClean.permitHeld.compareAndSet(true, false)) {
+        try {
+          Semaphore semaphoreToRelease =
+              maxConcurrentSemaphore != null ? maxConcurrentSemaphore : maxConcurrentSemaphoreRef;
+          if (semaphoreToRelease != null) {
+            semaphoreToRelease.release();
+            log.debug("Released semaphore permit for rejected agent {}", agentType);
+          }
+        } catch (Exception ignore) {
         }
-      } catch (Exception ignore) {
+      }
+
+      // Critical: Remove from activeAgents to prevent permit_mismatch.
+      // activeAgents entry was added before submission attempt.
+      String removed = activeAgents.remove(agentType);
+      if (removed != null) {
+        activeAgentMapSize.decrementAndGet();
+        log.debug("Cleaned up activeAgents for rejected agent {}", agentType);
       }
 
       // Track rejection metric
@@ -4058,15 +4146,27 @@ public class AgentAcquisitionService {
       // Handle other submission errors
       log.error("Failed to submit agent {} due to unexpected error", agentType, e);
 
-      // Critical: Release the semaphore permit for any submission failure
-      try {
-        Semaphore semaphoreToRelease =
-            maxConcurrentSemaphore != null ? maxConcurrentSemaphore : maxConcurrentSemaphoreRef;
-        if (semaphoreToRelease != null) {
-          semaphoreToRelease.release();
-          log.debug("Released semaphore permit for failed submission of agent {}", agentType);
+      // Critical: Clean up RunState and release permit via CAS to maintain consistency.
+      // RunState was created in the submit loop before calling this method.
+      RunState runStateToClean = runStates.remove(agentType);
+      if (runStateToClean != null && runStateToClean.permitHeld.compareAndSet(true, false)) {
+        try {
+          Semaphore semaphoreToRelease =
+              maxConcurrentSemaphore != null ? maxConcurrentSemaphore : maxConcurrentSemaphoreRef;
+          if (semaphoreToRelease != null) {
+            semaphoreToRelease.release();
+            log.debug("Released semaphore permit for failed submission of agent {}", agentType);
+          }
+        } catch (Exception ignore) {
         }
-      } catch (Exception ignore) {
+      }
+
+      // Critical: Remove from activeAgents to prevent permit_mismatch.
+      // activeAgents entry was added before submission attempt.
+      String removed = activeAgents.remove(agentType);
+      if (removed != null) {
+        activeAgentMapSize.decrementAndGet();
+        log.debug("Cleaned up activeAgents for failed submission of agent {}", agentType);
       }
 
       // Track generic submission failure
@@ -4327,9 +4427,12 @@ public class AgentAcquisitionService {
         // Critical: Exactly-once permit release (perform BEFORE Redis cleanup)
         RunState runStateForAgent = acquisitionService.runStates.remove(agentType);
         if (runStateForAgent == null) {
+          // Unexpected: RunState should exist - may indicate double cleanup or unregister race
           if (maxConcurrentSemaphore != null) {
             maxConcurrentSemaphore.release();
-            log.debug("Released permit for {} (no run-state)", agentType);
+            log.warn(
+                "Released permit for {} with no RunState (unexpected - possible double cleanup)",
+                agentType);
           }
         } else {
           // Release permit via CAS - ensures exactly-once release
@@ -4339,11 +4442,12 @@ public class AgentAcquisitionService {
               log.debug("Released permit for {}", agentType);
             }
           } else {
-            // CAS failed - should not happen with simplified design (no early release)
-            // Log for diagnostics but don't fail
+            // CAS failed - permit already released by another path (e.g.,
+            // removeActiveAgentWithPermitRelease)
+            // This is unexpected in normal flow but valid if cleanup raced with worker completion
             acquisitionService.metrics.incrementCasContention("worker_completion");
-            log.debug(
-                "Permit for {} already released (CAS failed) - unexpected with simplified design",
+            log.warn(
+                "Permit for {} already released (CAS failed) - cleanup raced with worker completion",
                 agentType);
           }
         }

@@ -5433,9 +5433,9 @@ public class PrioritySchedulerIntegrationTest {
           // Use reflection to call private tryAcquireAgent to move waiting -> working
           Method tryAcquireAgent =
               AgentAcquisitionService.class.getDeclaredMethod(
-                  "tryAcquireAgent", Jedis.class, Agent.class);
+                  "tryAcquireAgent", Jedis.class, Agent.class, Long.class);
           tryAcquireAgent.setAccessible(true);
-          Object score = tryAcquireAgent.invoke(acquisitionService, jedis, agent);
+          Object score = tryAcquireAgent.invoke(acquisitionService, jedis, agent, null);
           assertThat(score).isNotNull();
 
           // Verify keys affected are the namespaced ones
