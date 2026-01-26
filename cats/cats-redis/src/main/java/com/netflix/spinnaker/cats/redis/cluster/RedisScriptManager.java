@@ -54,8 +54,8 @@ public class RedisScriptManager {
   public static final String ADD_AGENT = "addAgent"; // Single agent addition
   public static final String ADD_AGENTS = "addAgents"; // Batch agent addition
   public static final String REMOVE_AGENT = "removeAgent"; // Single agent removal
-  public static final String REMOVE_AGENT_COMPLETION =
-      "removeAgentCompletion"; // Atomic removal preserving waiting entries during completion
+  public static final String RESCHEDULE_AGENT =
+      "rescheduleAgent"; // Atomic completion: working→waiting transition by worker thread
 
   // === State transitions ===
   public static final String MOVE_AGENTS =
@@ -302,47 +302,38 @@ public class RedisScriptManager {
             + "redis.call('zrem', KEYS[2], ARGV[1])\n"
             + "return 1  -- Always successful: Redis ZREM is idempotent\n");
 
-    // removeAgentCompletion: Atomically remove agent from working set, preserving waiting
-    // entry if present.
-    //
-    // Race condition context:
-    // The agent is NOT in both sets simultaneously. The race occurs during the transition:
-    //
-    // Timeline:
-    // 1. Agent completes execution -> Worker thread calls removeActiveAgent()
-    // 2. Worker: conditionalReleaseAgent() queues completion (in-memory queue, not Redis yet)
-    // 3. Worker: removeActiveAgent() reads WAITING_SET -> finds null (agent not rescheduled yet)
-    // 4. [RACE WINDOW] Scheduler thread: processQueuedCompletions() adds agent to WAITING_SET
-    // 5. Worker: removeActiveAgent() calls removeAgent script -> removes from both sets
-    //    -> This removes the just-added WAITING entry, causing agent loss!
-    //
-    // This script prevents the race by atomically checking-and-removing in a single Redis
-    // operation.
-    // If completion processing added the agent to WAITING between the check and removal, the
-    // waiting entry is preserved, preventing agent loss.
+    // rescheduleAgent: Atomically reschedule agent upon completion.
+    // This script is called by the worker thread immediately after agent execution completes,
+    // performing the working→waiting transition atomically. This eliminates the race condition
+    // that existed when completion processing was deferred to the scheduler thread.
     //
     // Invariants:
-    // - Atomically checks for waiting entry before removing to prevent race conditions.
-    // - Used by removeActiveAgent() to prevent losing agents that were just rescheduled.
-    // - If waiting entry exists, only removes from working; otherwise removes from both sets.
-    // Args: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName
-    // Returns: {removedFromWorking, preservedWaiting} where preservedWaiting=1 if waiting entry
-    // existed
-    // Usage: Worker completion cleanup to prevent race with completion queue processing
+    // - Atomically moves agent from working→waiting in a single Redis operation.
+    // - If agent is in working set: remove from working, add to waiting with new score.
+    // - If agent is in neither set: add to waiting (defensive, handles concurrent cleanup).
+    // - If agent is already in waiting: no-op (already rescheduled by another path).
+    // Args: KEYS[1]=working, KEYS[2]=waiting, ARGV[1]=agentName, ARGV[2]=newScore
+    // Returns: 'moved' if moved from working, 'added' if added (was in neither), 'exists' if
+    // already in waiting
+    // Usage: Worker thread calls this in conditionalReleaseAgent() via atomicRescheduleInRedis()
     bodies.put(
-        REMOVE_AGENT_COMPLETION,
-        "-- Atomically check if agent exists in waiting set\n"
+        RESCHEDULE_AGENT,
+        "-- Check if already in waiting set (already rescheduled, no-op)\n"
             + "local waitingScore = redis.call('zscore', KEYS[2], ARGV[1])\n"
-            + "-- Remove from working set (always attempt)\n"
-            + "local removedFromWorking = redis.call('zrem', KEYS[1], ARGV[1])\n"
             + "if waitingScore then\n"
-            + "  -- Waiting entry exists: preserve it (only remove from working)\n"
-            + "  return {removedFromWorking, 1}\n"
-            + "else\n"
-            + "  -- No waiting entry: safe to remove from both sets\n"
-            + "  redis.call('zrem', KEYS[2], ARGV[1])\n"
-            + "  return {removedFromWorking, 0}\n"
-            + "end\n");
+            + "  return 'exists'\n"
+            + "end\n"
+            + "-- Check if in working set (race: completion queued before removeActiveAgent)\n"
+            + "local workingScore = redis.call('zscore', KEYS[1], ARGV[1])\n"
+            + "if workingScore then\n"
+            + "  -- Move from working to waiting\n"
+            + "  redis.call('zrem', KEYS[1], ARGV[1])\n"
+            + "  redis.call('zadd', KEYS[2], ARGV[2], ARGV[1])\n"
+            + "  return 'moved'\n"
+            + "end\n"
+            + "-- Not in either set: add to waiting\n"
+            + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[1])\n"
+            + "return 'added'\n");
 
     // --- Batch operations ---
 

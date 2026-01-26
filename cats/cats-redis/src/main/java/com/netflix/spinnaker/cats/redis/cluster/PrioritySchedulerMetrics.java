@@ -129,6 +129,9 @@ public class PrioritySchedulerMetrics {
         public void incrementRemoveAgentFallback() {}
 
         @Override
+        public void incrementAtomicRescheduleFailed() {}
+
+        @Override
         public void incrementCleanupSkipped(String type) {}
 
         @Override
@@ -218,6 +221,7 @@ public class PrioritySchedulerMetrics {
 
   // Agent removal metrics
   private final Id removeAgentFallbackId;
+  private final Id atomicRescheduleFailedId;
 
   // Permit accounting metrics
   private final Id casContentionId;
@@ -268,6 +272,7 @@ public class PrioritySchedulerMetrics {
       this.scriptsReloadsId = null;
       this.redisPoolErrorsId = null;
       this.removeAgentFallbackId = null;
+      this.atomicRescheduleFailedId = null;
       this.casContentionId = null;
       this.scheduleRetryExhaustedId = null;
       this.scheduleRecoveryId = null;
@@ -318,8 +323,9 @@ public class PrioritySchedulerMetrics {
     // Redis pool health
     this.redisPoolErrorsId = createId("redisPool.errors");
 
-    // Agent removal
+    // Agent removal / rescheduling
     this.removeAgentFallbackId = createId("removeAgent.fallbackUsed");
+    this.atomicRescheduleFailedId = createId("atomicReschedule.failed");
 
     // Permit accounting
     this.casContentionId = createId("cas.contention");
@@ -612,6 +618,15 @@ public class PrioritySchedulerMetrics {
    */
   public void incrementRemoveAgentFallback() {
     registry.counter(removeAgentFallbackId).increment();
+  }
+
+  /**
+   * Increments counter when atomic reschedule (working→waiting) fails. This indicates Redis errors
+   * during agent completion. The agent will be recovered by zombie/orphan cleanup, but a sustained
+   * high rate warrants investigation of Redis connectivity or script issues.
+   */
+  public void incrementAtomicRescheduleFailed() {
+    registry.counter(atomicRescheduleFailedId).increment();
   }
 
   /**

@@ -25,7 +25,6 @@ import com.netflix.spinnaker.cats.agent.AgentExecution;
 import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation;
 import com.netflix.spinnaker.cats.cluster.AgentIntervalProvider;
 import com.netflix.spinnaker.cats.cluster.ShardingFilter;
-import com.netflix.spinnaker.cats.redis.cluster.support.ScriptResults;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -525,8 +524,8 @@ public class AgentAcquisitionService {
         return 0;
       }
 
-      // Phase 1: Process queued agent completions
-      processQueuedCompletions(jedis, nowMsCached);
+      // Phase 1: Process queued agent completions (metrics/observability only)
+      processQueuedCompletions();
 
       // Phase 2: Process recovery queue for agents that failed Redis scheduling
       processRecoveryQueue(jedis);
@@ -1956,6 +1955,10 @@ public class AgentAcquisitionService {
    */
   @VisibleForTesting
   void removeActiveAgent(String agentType) {
+    // Redis work (working→waiting transition) is now handled atomically by
+    // conditionalReleaseAgent() via atomicRescheduleInRedis(). This method only cleans up local
+    // in-memory tracking.
+    //
     // Critical: Capture removed value to ensure atomic consistency between map and counter
     String removedScore = activeAgents.remove(agentType);
     if (removedScore != null) {
@@ -1963,98 +1966,8 @@ public class AgentAcquisitionService {
       activeAgentMapSize.decrementAndGet();
       // Remove future tracking - this cleanup is non-critical if it fails
       activeAgentsFutures.remove(agentType);
-
-      // Critical: Remove from Redis sets - behavior depends on shutdown state
-      try (Jedis jedis = jedisPool.getResource()) {
-        if (shuttingDown.get()) {
-          // During shutdown: Only remove from working to preserve waiting entries
-          jedis.zrem(WORKING_SET, agentType);
-          log.debug(
-              "Removed agent {} from active tracking and working (preserving waiting during shutdown)",
-              agentType);
-        } else {
-          // Normal operation: Use atomic script to preserve waiting entry if present
-          //
-          // Race condition context:
-          // The agent is NOT in both sets simultaneously. The race occurs during the transition:
-          //
-          // Timeline:
-          // 1. Agent completes execution -> Worker thread calls removeActiveAgent()
-          // 2. Worker: conditionalReleaseAgent() queues completion (in-memory queue, not Redis yet)
-          // 3. Worker: removeActiveAgent() reads WAITING_SET -> finds null (agent not rescheduled
-          // yet)
-          // 4. [RACE WINDOW] Scheduler thread: processQueuedCompletions() adds agent to WAITING_SET
-          // 5. Worker: removeActiveAgent() calls removeAgent script -> removes from both sets
-          //    -> This removes the just-added WAITING entry, causing agent loss!
-          //
-          // removeAgentCompletion atomically checks-and-removes in a single Redis
-          // operation. If completion processing added the agent to WAITING between the check and
-          // removal, the waiting entry is preserved, preventing agent loss.
-          // Attempt atomic script with one retry before falling back to non-atomic path
-          Exception lastScriptException = null;
-          boolean scriptSucceeded = false;
-          for (int attempt = 0; attempt < 2 && !scriptSucceeded; attempt++) {
-            try {
-              Object result =
-                  scriptManager.evalshaWithSelfHeal(
-                      jedis,
-                      RedisScriptManager.REMOVE_AGENT_COMPLETION,
-                      java.util.Arrays.asList(WORKING_SET, WAITING_SET),
-                      java.util.Collections.singletonList(agentType));
-
-              // Parse result: {removedFromWorking, preservedWaiting}
-              boolean preservedWaiting = false;
-              if (result instanceof java.util.List) {
-                java.util.List<?> resultList = (java.util.List<?>) result;
-                if (resultList.size() >= 2
-                    && resultList.get(1) instanceof Number
-                    && ((Number) resultList.get(1)).intValue() == 1) {
-                  preservedWaiting = true;
-                }
-              }
-
-              log.debug(
-                  "Removed agent {} from active tracking and Redis (preserved_waiting={}, attempt={})",
-                  agentType,
-                  preservedWaiting,
-                  attempt + 1);
-              scriptSucceeded = true;
-            } catch (Exception scriptEx) {
-              lastScriptException = scriptEx;
-              if (attempt == 0) {
-                log.debug(
-                    "Atomic removal script failed for {} on first attempt, retrying",
-                    agentType,
-                    scriptEx);
-              }
-            }
-          }
-
-          // Fallback to non-atomic removal if both script attempts fail (should be very rare)
-          if (!scriptSucceeded) {
-            log.error(
-                "Atomic removal script failed for {} after retry, falling back to non-atomic removal. "
-                    + "This fallback has a race condition that may cause agent loss.",
-                agentType,
-                lastScriptException);
-            metrics.incrementRemoveAgentFallback();
-            try {
-              jedis.zrem(WORKING_SET, agentType);
-              // Best-effort: check if in waiting before removing
-              // This is still a race, but better than removing blindly
-              Double waitingScore = jedis.zscore(WAITING_SET, agentType);
-              if (waitingScore == null) {
-                jedis.zrem(WAITING_SET, agentType);
-              }
-            } catch (Exception fallbackEx) {
-              log.error(
-                  "Fallback removal also failed for agent {} from Redis", agentType, fallbackEx);
-            }
-          }
-        }
-      } catch (Exception e) {
-        log.error("Failed to remove agent {} from Redis", agentType, e);
-      }
+      log.debug(
+          "Removed agent {} from active tracking (Redis handled by atomicReschedule)", agentType);
     }
   }
 
@@ -2937,43 +2850,45 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Process queued agent completions using the shared Redis connection. Processes agent completions
-   * that were queued during previous execution cycles.
+   * Process queued agent completions for metrics and observability only.
+   *
+   * <p>Redis state transitions (working→waiting) are now handled atomically by the worker thread in
+   * conditionalReleaseAgent(). This method only drains the completion queue for metrics tracking
+   * and observability - no Redis writes occur here.
+   *
+   * <p>The completion queue is retained for:
+   *
+   * <ul>
+   *   <li>Metrics: count of completions per cycle
+   *   <li>Observability: queue depth monitoring
+   *   <li>Debugging: completion details logging
+   * </ul>
    */
-  private void processQueuedCompletions(Jedis jedis, Long nowMsCached) {
+  private void processQueuedCompletions() {
     List<AgentCompletion> completions = drainCompletionQueue();
     if (completions.isEmpty()) {
       return;
     }
 
-    log.debug("Processing {} queued agent completions", completions.size());
-
-    try {
-      // Group completions by scheduling offset for batch efficiency
-      Map<Long, List<AgentCompletion>> groupedCompletions =
-          completions.stream().collect(Collectors.groupingBy(this::getSchedulingOffset));
-
-      int totalProcessed = 0;
-      // Process each group with shared connection
-      for (Map.Entry<Long, List<AgentCompletion>> entry : groupedCompletions.entrySet()) {
-        long offset = entry.getKey();
-        List<AgentCompletion> group = entry.getValue();
-
-        if (schedulerProperties.getBatchOperations().isEnabled()) {
-          totalProcessed += batchScheduleCompletions(jedis, group, offset, nowMsCached);
-        } else {
-          totalProcessed += individualScheduleCompletions(jedis, group, offset, nowMsCached);
-        }
-      }
-
-      log.debug("Processed {} agent completions with shared connection", totalProcessed);
-    } finally {
-      // Drop references to completion payloads early to allow GC before next drain
-      completions.clear();
-      if (completions instanceof java.util.ArrayList) {
-        ((java.util.ArrayList<?>) completions).trimToSize();
+    // Metrics only - Redis work already done by atomicRescheduleInRedis()
+    int successCount = 0;
+    int failureCount = 0;
+    for (AgentCompletion completion : completions) {
+      if (completion.success) {
+        successCount++;
+      } else {
+        failureCount++;
       }
     }
+
+    log.debug(
+        "Drained {} completions for metrics (success={}, failures={}) - Redis handled by workers",
+        completions.size(),
+        successCount,
+        failureCount);
+
+    // Drop references to completion payloads early to allow GC
+    completions.clear();
   }
 
   /**
@@ -3098,146 +3013,6 @@ public class AgentAcquisitionService {
   }
 
   /**
-   * Calculate scheduling offset based on completion success and shutdown state. Maintains the same
-   * logic as the original conditionalReleaseAgent method.
-   */
-  /**
-   * Compute the scheduling offset for a completed agent run.
-   *
-   * <p>Success: attempts to preserve cadence relative to the original acquire time; falls back to
-   * scheduling after the agent's interval.
-   *
-   * <p>Failure: delegates to {@link #computeFailureOffsetAndUpdateStreak(AgentCompletion)} which
-   * applies class-based backoff when enabled; otherwise uses the agent's {@code errorInterval}.
-   */
-  private long getSchedulingOffset(AgentCompletion completion) {
-    if (!completion.success) {
-      return computeFailureOffsetAndUpdateStreak(completion);
-    }
-
-    // Compute next schedule based on original acquire score when possible to preserve cadence.
-    try {
-      AgentIntervalProvider.Interval interval = intervalProvider.getInterval(completion.agent);
-      long intervalMs = interval.getInterval();
-
-      // Reset failure streak on success
-      failureStreaks.remove(completion.agent.getAgentType());
-
-      if (completion.deadlineScore != null) {
-        try {
-          long deadlineScoreSeconds = Long.parseLong(completion.deadlineScore);
-          long agentTimeoutMs = interval.getTimeout();
-          long originalAcquireMs = (deadlineScoreSeconds * 1000L) - agentTimeoutMs;
-          long desiredNextRunMs = originalAcquireMs + intervalMs;
-          long nowMs = System.currentTimeMillis() + serverClientOffset.get();
-          long offsetMs = desiredNextRunMs - nowMs;
-          return Math.max(offsetMs, 0L);
-        } catch (NumberFormatException ignored) {
-          // Fall through to simple interval scheduling when parsing fails
-        }
-      }
-
-      // Fallback – schedule for intervalMs from now
-      return intervalMs;
-    } catch (Exception e) {
-      log.warn(
-          "Failed to calculate scheduling offset for agent {}, using default interval",
-          completion.agent.getAgentType(),
-          e);
-      try {
-        return intervalProvider.getInterval(completion.agent).getInterval();
-      } catch (Exception ignored) {
-        return 0L;
-      }
-    }
-  }
-
-  /**
-   * Compute the delay for a failed run and update the local failure streak.
-   *
-   * <p>Behavior: - If failure-aware backoff is disabled, returns {@code errorInterval}. -
-   * PERMANENT_FORBIDDEN -> fixed long backoff (configured). - THROTTLED -> exponential backoff
-   * (base * multiplier^(streak-1), capped). - TRANSIENT/SERVER_ERROR -> immediate retry for the
-   * first N attempts (config), else {@code errorInterval}. - UNKNOWN -> {@code errorInterval}.
-   *
-   * <p>Applies jitter to non-zero delays when configured.
-   */
-  private long computeFailureOffsetAndUpdateStreak(AgentCompletion completion) {
-    final String agentType = completion.agent.getAgentType();
-    final FailureBackoffProperties backoffCfg = schedulerProperties.getFailureBackoff();
-
-    FailureClass fclass =
-        completion.failureClass != null ? completion.failureClass : FailureClass.UNKNOWN;
-
-    // Increment streak locally
-    int streak = failureStreaks.merge(agentType, 1, Integer::sum);
-
-    long offsetMs = 0L;
-    try {
-      AgentIntervalProvider.Interval interval = intervalProvider.getInterval(completion.agent);
-
-      if (!backoffCfg.isEnabled()) {
-        // Minimal safe behavior: use errorInterval for any failure
-        offsetMs = interval.getErrorInterval();
-      } else {
-        switch (fclass) {
-          case PERMANENT_FORBIDDEN:
-            offsetMs = backoffCfg.getPermanentForbiddenBackoffMs();
-            break;
-          case THROTTLED:
-            offsetMs = computeExponentialBackoffMs(backoffCfg, streak);
-            break;
-          case SERVER_ERROR:
-          case TRANSIENT:
-            if (streak <= backoffCfg.getMaxImmediateRetries()) {
-              offsetMs = 0L;
-            } else {
-              offsetMs = interval.getErrorInterval();
-            }
-            break;
-          case UNKNOWN:
-          default:
-            offsetMs = interval.getErrorInterval();
-        }
-      }
-
-      // Apply jitter if configured and offset > 0
-      if (offsetMs > 0L) {
-        offsetMs = applyJitter(offsetMs, schedulerProperties.getJitter().getFailureBackoffRatio());
-        // Enforce whole-second scheduling for failure backoff to avoid undershooting by truncation
-        offsetMs = ((offsetMs + 999L) / 1000L) * 1000L; // ceil to nearest second
-      }
-    } catch (Exception e) {
-      log.warn(
-          "Failed to compute failure backoff for agent {} (class: {}, streak: {}), defaulting to 0",
-          agentType,
-          fclass,
-          streak,
-          e);
-      offsetMs = 0L;
-    }
-
-    if (completion.throwableClassName != null) {
-      log.warn(
-          "Agent {} failed with {} -> applying backoff {} ms (class={}, streak={})",
-          agentType,
-          completion.throwableClassName,
-          offsetMs,
-          fclass,
-          streak);
-    } else {
-      log.warn(
-          "Agent {} failed -> applying backoff {} ms (class={}, streak={})",
-          agentType,
-          offsetMs,
-          fclass,
-          streak);
-    }
-
-    return Math.max(0L, offsetMs);
-  }
-
-  /**
    * Compute exponential backoff for throttled failures.
    *
    * @param backoffCfg throttled policy (base, multiplier, cap)
@@ -3274,123 +3049,6 @@ public class AgentAcquisitionService {
     }
     long result = (long) Math.round(jittered);
     return result == 0L ? 1L : result;
-  }
-
-  /**
-   * Fast backoff computation for fallback paths (queueing failure). Uses a conservative mapping
-   * without streaks and without jitter.
-   */
-  private long computeFailureOffsetFast(Agent agent, FailureClass failureClass) {
-    try {
-      AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
-      FailureBackoffProperties backoffCfg = schedulerProperties.getFailureBackoff();
-      if (!backoffCfg.isEnabled()) {
-        return interval.getErrorInterval();
-      }
-      switch (failureClass != null ? failureClass : FailureClass.UNKNOWN) {
-        case PERMANENT_FORBIDDEN:
-          return backoffCfg.getPermanentForbiddenBackoffMs();
-        case THROTTLED:
-          return backoffCfg.getThrottled().getBaseMs();
-        case SERVER_ERROR:
-        case TRANSIENT:
-          return interval.getErrorInterval();
-        case UNKNOWN:
-        default:
-          return interval.getErrorInterval();
-      }
-    } catch (Exception e) {
-      return 0L;
-    }
-  }
-
-  /**
-   * Batch schedule multiple completions with the same offset using batch Redis operations. This
-   * method is called by processQueuedCompletions after grouping completions by their scheduling
-   * offset. It uses the ADD_AGENTS Lua script for efficient multi-agent scheduling.
-   *
-   * @param jedis Redis connection to use for operations
-   * @param completions List of agent completions with the same offset to schedule
-   * @param offset Time offset in milliseconds for agent scheduling
-   * @return Number of agents successfully scheduled
-   */
-  private int batchScheduleCompletions(
-      Jedis jedis, List<AgentCompletion> completions, long offset, Long nowMsCached) {
-    try {
-      List<String> batchArgs = new ArrayList<>();
-      for (AgentCompletion completion : completions) {
-        String agentType = completion.agent.getAgentType();
-        String completionScore = score(jedis, offset, nowMsCached);
-        if (!validateAgentScorePair(agentType, completionScore, "completion_batch")) {
-          continue;
-        }
-        batchArgs.add(agentType);
-        batchArgs.add(completionScore);
-      }
-
-      List<?> result =
-          (List<?>)
-              scriptManager.evalshaWithSelfHeal(
-                  jedis,
-                  RedisScriptManager.ADD_AGENTS,
-                  Arrays.asList(WORKING_SET, WAITING_SET),
-                  batchArgs);
-
-      int scheduled = ScriptResults.parseAddAgentsCount(result);
-      log.debug("Batch scheduled {} completions with offset {}ms", scheduled, offset);
-      return scheduled;
-
-    } catch (Exception e) {
-      log.warn("Batch completion scheduling failed, using individual mode", e);
-      return individualScheduleCompletions(jedis, completions, offset, nowMsCached);
-    }
-  }
-
-  /**
-   * Schedule completions individually for agents with the same time offset. Used as a fallback when
-   * batch operations fail or when processing small groups of agents. Schedules each agent
-   * separately using the ADD_AGENT Lua script.
-   *
-   * @param jedis Redis connection to use for operations
-   * @param completions List of agent completions with the same offset to schedule
-   * @param offset Time offset in milliseconds for agent scheduling
-   * @return Number of agents successfully scheduled
-   */
-  private int individualScheduleCompletions(
-      Jedis jedis, List<AgentCompletion> completions, long offset, Long nowMsCached) {
-    int scheduled = 0;
-    String offsetScore =
-        score(jedis, offset, nowMsCached); // Calculate once for all agents with same offset
-
-    for (AgentCompletion completion : completions) {
-      try {
-        if (!validateAgentScorePair(
-            completion.agent.getAgentType(), offsetScore, "completion_fallback")) {
-          continue;
-        }
-        Object result =
-            scriptManager.evalshaWithSelfHeal(
-                jedis,
-                RedisScriptManager.ADD_AGENT,
-                Arrays.asList(WORKING_SET, WAITING_SET),
-                Arrays.asList(completion.agent.getAgentType(), offsetScore));
-
-        if (result != null && ((Long) result).intValue() == 1) {
-          scheduled++;
-        }
-
-        log.debug(
-            "Scheduled completion for agent {} with offset {}ms",
-            completion.agent.getAgentType(),
-            offset);
-
-      } catch (Exception e) {
-        log.warn(
-            "Failed to schedule completion for agent {}: {}", completion.agent.getAgentType(), e);
-      }
-    }
-
-    return scheduled;
   }
 
   /**
@@ -3775,80 +3433,211 @@ public class AgentAcquisitionService {
       FailureClass failureClass,
       Throwable cause) {
     String agentType = agent.getAgentType();
+    String throwableClassName = cause != null ? cause.getClass().getName() : null;
 
     try {
-      // During shutdown, schedule using cadence-based next when possible; fallback to
-      // configured shutdown jitter (whole seconds) to avoid bursts.
+      // Log OOM diagnostics if applicable
+      if (!success && cause instanceof java.lang.OutOfMemoryError) {
+        String msg = String.valueOf(cause.getMessage());
+        String oomType = "unknown";
+        if (msg != null) {
+          String lower = msg.toLowerCase(java.util.Locale.ROOT);
+          if (lower.contains("heap") || lower.contains("gc overhead")) {
+            oomType = "heap";
+          } else if (lower.contains("direct buffer")) {
+            oomType = "direct";
+          } else if (lower.contains("metaspace")) {
+            oomType = "metaspace";
+          } else if (lower.contains("unable to create new native thread")) {
+            oomType = "native-thread";
+          }
+        }
+        log.warn(
+            "Agent {} encountered OutOfMemoryError (type={}) — applying throttled backoff",
+            agentType,
+            oomType);
+      }
+
+      // Compute scheduling offset (handles success/failure, backoff, streaks)
+      long offsetMs;
       if (shuttingDown.get()) {
-        long shutdownOffsetMs = computeShutdownRescheduleOffsetMs(agent, deadlineScore);
+        offsetMs = computeShutdownRescheduleOffsetMs(agent, deadlineScore);
         log.debug(
             "Shutdown re-queue agent {} with offset {} ms (deadline_score={})",
             agentType,
-            shutdownOffsetMs,
+            offsetMs,
             deadlineScore);
-        scheduleAgentInRedis(agent, Math.max(0L, shutdownOffsetMs));
-        return;
+      } else {
+        offsetMs =
+            computeRescheduleOffset(
+                agent, deadlineScore, success, failureClass, throwableClassName);
       }
 
-      // Queue completion for batch processing in next scheduler cycle
+      // ATOMIC RESCHEDULE: Move from working to waiting in a single Redis operation.
+      // This eliminates the race condition between completion queue processing and
+      // worker cleanup that previously caused agent loss.
+      atomicRescheduleInRedis(agent, Math.max(0L, offsetMs));
+
+      // Queue completion for metrics/observability only (no longer used for Redis state)
       if (!success) {
-        // If failure is due to an OutOfMemoryError, emit additional diagnostics
-        if (cause instanceof java.lang.OutOfMemoryError) {
-          String msg = String.valueOf(cause.getMessage());
-          String oomType = "unknown";
-          if (msg != null) {
-            String lower = msg.toLowerCase(java.util.Locale.ROOT);
-            if (lower.contains("heap") || lower.contains("gc overhead")) {
-              oomType = "heap";
-            } else if (lower.contains("direct buffer")) {
-              oomType = "direct";
-            } else if (lower.contains("metaspace")) {
-              oomType = "metaspace";
-            } else if (lower.contains("unable to create new native thread")) {
-              oomType = "native-thread";
-            }
-          }
-          log.warn(
-              "Agent {} encountered OutOfMemoryError (type={}) — applying throttled backoff",
-              agentType,
-              oomType);
-        }
         completionQueue.offer(
             new AgentCompletion(
                 agent,
                 deadlineScore,
                 false,
                 failureClass != null ? failureClass : FailureClass.UNKNOWN,
-                cause != null ? cause.getClass().getName() : null));
+                throwableClassName));
       } else {
         completionQueue.offer(new AgentCompletion(agent, deadlineScore, true));
       }
+
       log.debug(
-          "Queued completion for agent {}: success={}, failure_class={}",
+          "Atomically rescheduled agent {}: success={}, offset_ms={}, failure_class={}",
           agentType,
           success,
+          offsetMs,
           failureClass);
 
     } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
-      log.warn("Redis connection error while queueing completion for {}", agentType, e);
+      log.warn("Redis connection error during atomic reschedule for {}", agentType, e);
+      // Agent will be recovered by zombie/orphan cleanup
     } catch (Exception e) {
       log.error(
-          "Failed to queue agent completion for {}, falling back to immediate scheduling",
+          "Failed atomic reschedule for agent {} - will rely on cleanup services for recovery",
           agentType,
           e);
-      // Fallback to immediate scheduling on queue failure
+    }
+  }
+
+  /**
+   * Compute reschedule offset for a completed agent run. This method is called directly from the
+   * worker thread during completion to enable atomic rescheduling.
+   *
+   * <p>Success: attempts to preserve cadence relative to the original acquire time; falls back to
+   * scheduling after the agent's interval.
+   *
+   * <p>Failure: applies class-based backoff when enabled; otherwise uses the agent's {@code
+   * errorInterval}. Updates failure streaks atomically.
+   *
+   * @param agent the agent that completed
+   * @param deadlineScore the working set score (acquire time + timeout) from acquisition
+   * @param success whether the execution succeeded
+   * @param failureClass failure classification (ignored on success)
+   * @param throwableClassName original exception class name for logging (may be null)
+   * @return offset in milliseconds from now for next scheduling
+   */
+  private long computeRescheduleOffset(
+      Agent agent,
+      String deadlineScore,
+      boolean success,
+      FailureClass failureClass,
+      String throwableClassName) {
+
+    String agentType = agent.getAgentType();
+
+    if (success) {
+      // Reset failure streak on success
+      failureStreaks.remove(agentType);
+
+      // Compute next schedule based on original acquire score when possible to preserve cadence
       try {
-        if (!success) {
-          long fallbackOffset = computeFailureOffsetFast(agent, failureClass);
-          scheduleAgentInRedis(agent, Math.max(0L, fallbackOffset));
-        } else {
-          AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
-          scheduleAgentInRedis(agent, interval.getInterval());
+        AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
+        long intervalMs = interval.getInterval();
+
+        if (deadlineScore != null) {
+          try {
+            long deadlineScoreSeconds = Long.parseLong(deadlineScore);
+            long agentTimeoutMs = interval.getTimeout();
+            long originalAcquireMs = (deadlineScoreSeconds * 1000L) - agentTimeoutMs;
+            long desiredNextRunMs = originalAcquireMs + intervalMs;
+            long nowMs = System.currentTimeMillis() + serverClientOffset.get();
+            long offsetMs = desiredNextRunMs - nowMs;
+            return Math.max(offsetMs, 0L);
+          } catch (NumberFormatException ignored) {
+            // Fall through to simple interval scheduling
+          }
         }
-      } catch (Exception fallbackException) {
-        log.error("Failed fallback scheduling for agent {}", agentType, fallbackException);
+        return intervalMs;
+      } catch (Exception e) {
+        log.warn(
+            "Failed to calculate success offset for agent {}, using default interval",
+            agentType,
+            e);
+        try {
+          return intervalProvider.getInterval(agent).getInterval();
+        } catch (Exception ignored) {
+          return 0L;
+        }
       }
     }
+
+    // Failure path: compute backoff with streak tracking
+    FailureClass fclass = failureClass != null ? failureClass : FailureClass.UNKNOWN;
+    int streak = failureStreaks.merge(agentType, 1, Integer::sum);
+    FailureBackoffProperties backoffCfg = schedulerProperties.getFailureBackoff();
+
+    long offsetMs = 0L;
+    try {
+      AgentIntervalProvider.Interval interval = intervalProvider.getInterval(agent);
+
+      if (!backoffCfg.isEnabled()) {
+        offsetMs = interval.getErrorInterval();
+      } else {
+        switch (fclass) {
+          case PERMANENT_FORBIDDEN:
+            offsetMs = backoffCfg.getPermanentForbiddenBackoffMs();
+            break;
+          case THROTTLED:
+            offsetMs = computeExponentialBackoffMs(backoffCfg, streak);
+            break;
+          case SERVER_ERROR:
+          case TRANSIENT:
+            if (streak <= backoffCfg.getMaxImmediateRetries()) {
+              offsetMs = 0L;
+            } else {
+              offsetMs = interval.getErrorInterval();
+            }
+            break;
+          case UNKNOWN:
+          default:
+            offsetMs = interval.getErrorInterval();
+        }
+      }
+
+      // Apply jitter if configured and offset > 0
+      if (offsetMs > 0L) {
+        offsetMs = applyJitter(offsetMs, schedulerProperties.getJitter().getFailureBackoffRatio());
+        // Enforce whole-second scheduling to avoid undershooting by truncation
+        offsetMs = ((offsetMs + 999L) / 1000L) * 1000L;
+      }
+    } catch (Exception e) {
+      log.warn(
+          "Failed to compute failure backoff for agent {} (class: {}, streak: {}), defaulting to 0",
+          agentType,
+          fclass,
+          streak,
+          e);
+      offsetMs = 0L;
+    }
+
+    if (throwableClassName != null) {
+      log.warn(
+          "Agent {} failed with {} -> applying backoff {} ms (class={}, streak={})",
+          agentType,
+          throwableClassName,
+          offsetMs,
+          fclass,
+          streak);
+    } else {
+      log.warn(
+          "Agent {} failed -> applying backoff {} ms (class={}, streak={})",
+          agentType,
+          offsetMs,
+          fclass,
+          streak);
+    }
+
+    return Math.max(0L, offsetMs);
   }
 
   /**
@@ -3982,6 +3771,59 @@ public class AgentAcquisitionService {
           }
         }
       }
+    }
+  }
+
+  /**
+   * Atomically reschedule an agent from working set to waiting set. This is the core operation for
+   * The worker thread completes the full Redis state transition, eliminating the race condition
+   * between completion queue processing and worker cleanup.
+   *
+   * <p>This method uses the RESCHEDULE_AGENT script which handles all cases:
+   *
+   * <ul>
+   *   <li>Agent in working set: remove from working, add to waiting with new score
+   *   <li>Agent in neither set: add to waiting (defensive, handles concurrent cleanup)
+   *   <li>Agent already in waiting: no-op (already rescheduled by another path)
+   * </ul>
+   *
+   * @param agent the agent to reschedule
+   * @param offsetMs offset from current time for the new waiting score
+   */
+  private void atomicRescheduleInRedis(Agent agent, long offsetMs) {
+    String agentType = agent.getAgentType();
+
+    try (Jedis jedis = jedisPool.getResource()) {
+      String nextScore = score(jedis, offsetMs);
+
+      if (!validateAgentScorePair(agentType, nextScore, "atomic_reschedule")) {
+        log.warn("Invalid agent/score pair for atomic reschedule: agent={}", agentType);
+        return;
+      }
+
+      Object result =
+          scriptManager.evalshaWithSelfHeal(
+              jedis,
+              RedisScriptManager.RESCHEDULE_AGENT,
+              java.util.Arrays.asList(WORKING_SET, WAITING_SET),
+              java.util.Arrays.asList(agentType, nextScore));
+
+      String resultStr = result != null ? result.toString() : "null";
+      log.debug(
+          "Atomic reschedule for agent {}: result={}, score={}", agentType, resultStr, nextScore);
+
+      // Log based on result for observability
+      if ("added".equals(resultStr)) {
+        // Agent was already removed from working (concurrent cleanup) - log for visibility
+        log.debug("Agent {} was not in working during reschedule (concurrent cleanup)", agentType);
+      }
+      // "moved" = normal completion, "exists" = already in waiting (no-op)
+
+    } catch (Exception e) {
+      log.error("Failed atomic reschedule for agent {}: {}", agentType, e.getMessage(), e);
+      metrics.incrementAtomicRescheduleFailed();
+      // Agent will be recovered by zombie/orphan cleanup - no recovery queue needed
+      // since the agent is still in working set and will be detected as stuck
     }
   }
 

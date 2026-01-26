@@ -44,8 +44,8 @@ import redis.clients.jedis.JedisPool;
  * <h3>Script Categories</h3>
  *
  * <ul>
- *   <li><b>Basic Operations:</b> ADD_AGENT, REMOVE_AGENT, REMOVE_AGENT_COMPLETION - single agent
- *       state management
+ *   <li><b>Basic Operations:</b> ADD_AGENT, REMOVE_AGENT, RESCHEDULE_AGENT - single agent state
+ *       management
  *   <li><b>Batch Operations:</b> ADD_AGENTS, ACQUIRE_AGENTS, REMOVE_AGENTS_CONDITIONAL - efficient
  *       bulk processing
  *   <li><b>State Transitions:</b> MOVE_AGENTS (waiting->working), MOVE_AGENTS_CONDITIONAL
@@ -72,7 +72,7 @@ import redis.clients.jedis.JedisPool;
  *   <li>{@link ThreadSafetyTests} - concurrent initialization safety
  *   <li>{@link ErrorHandlingTests} - uninitialized access, unknown scripts, connection failures
  *   <li>{@link ScriptExecutionTests} - individual script behavior verification
- *   <li>{@link IndividualScriptTests} - ADD_AGENT, REMOVE_AGENT, REMOVE_AGENT_COMPLETION
+ *   <li>{@link IndividualScriptTests} - ADD_AGENT, REMOVE_AGENT, RESCHEDULE_AGENT
  *   <li>{@link BatchScriptTests} - batch operations and leadership release
  *   <li>{@link PerformanceTests} - high-volume execution efficiency
  *   <li>{@link SelfHealAndSingleSourceBodyTests} - NOSCRIPT recovery and EVAL fallback
@@ -129,9 +129,10 @@ class RedisScriptManagerTest {
     }
 
     /**
-     * Tests that all script constants (ADD_AGENT, REMOVE_AGENT, REMOVE_AGENT_COMPLETION,
-     * ADD_AGENTS, MOVE_AGENTS, MOVE_AGENTS_CONDITIONAL, ACQUIRE_AGENTS, SCORE_AGENTS,
-     * REMOVE_AGENTS_CONDITIONAL, RELEASE_LEADERSHIP) are loaded with non-empty SHA hashes.
+     * Tests that all script constants (ADD_AGENT, REMOVE_AGENT, RESCHEDULE_AGENT, ADD_AGENTS,
+     * MOVE_AGENTS, MOVE_AGENTS_CONDITIONAL, ACQUIRE_AGENTS, SCORE_AGENTS,
+     * REMOVE_AGENTS_CONDITIONAL, RELEASE_LEADERSHIP, ZMSCORE_AGENTS) are loaded with non-empty SHA
+     * hashes.
      */
     @Test
     @DisplayName("Should load all expected script constants")
@@ -143,8 +144,7 @@ class RedisScriptManagerTest {
       // Individual scripts
       assertThat(scriptManager.getScriptSha(RedisScriptManager.ADD_AGENT)).isNotEmpty();
       assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT)).isNotEmpty();
-      assertThat(scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_COMPLETION))
-          .isNotEmpty();
+      assertThat(scriptManager.getScriptSha(RedisScriptManager.RESCHEDULE_AGENT)).isNotEmpty();
 
       // Batch scripts
       assertThat(scriptManager.getScriptSha(RedisScriptManager.ADD_AGENTS)).isNotEmpty();
@@ -530,89 +530,56 @@ class RedisScriptManagerTest {
     }
 
     /**
-     * Tests that REMOVE_AGENT_COMPLETION script atomically removes from working while preserving
-     * waiting entries. Covers three scenarios: agent in working only, agent in both sets, and agent
-     * in waiting only.
+     * Tests that RESCHEDULE_AGENT script atomically moves an agent from working to waiting, or adds
+     * to waiting if not in either set.
      *
-     * <p>This script prevents a race condition during agent completion:
-     *
-     * <ol>
-     *   <li>Agent completes execution -> Worker thread calls removeActiveAgent()
-     *   <li>Worker queues completion (in-memory, not Redis yet)
-     *   <li>Worker reads WAITING set -> finds null (agent not rescheduled yet)
-     *   <li>[RACE WINDOW] Scheduler thread adds agent to WAITING set
-     *   <li>Worker calls removeAgent -> would remove the just-added WAITING entry!
-     * </ol>
-     *
-     * <p>The atomic check-and-remove in this script ensures the waiting entry is preserved if it
-     * was added between the check and removal.
+     * <p>This script lets the worker thread handle the full Redis state transition upon agent
+     * completion, eliminating race conditions.
      */
     @Test
-    @DisplayName("Should execute REMOVE_AGENT_COMPLETION script correctly")
-    void shouldExecuteRemoveAgentCompletionScriptCorrectly() {
+    @DisplayName("Should execute RESCHEDULE_AGENT script correctly")
+    void shouldExecuteRescheduleAgentScriptCorrectly() {
       try (Jedis jedis = jedisPool.getResource()) {
-        // Scenario 1: Agent in working set only (no race - simple removal)
+        // Scenario 1: Agent in working set - should move to waiting
         jedis.zadd("working", 100, "agent1");
-        jedis.zrem("waiting", "agent1"); // Ensure not in waiting
+        jedis.zrem("waiting", "agent1");
 
-        // When - Remove agent (no waiting entry)
         Object result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_COMPLETION),
+                scriptManager.getScriptSha(RedisScriptManager.RESCHEDULE_AGENT),
                 java.util.Arrays.asList("working", "waiting"),
-                java.util.Arrays.asList("agent1"));
+                java.util.Arrays.asList("agent1", "200"));
 
-        // Then - Returns {removedFromWorking, preservedWaiting} where preservedWaiting=0
-        assertThat(result).isInstanceOf(java.util.List.class);
-        @SuppressWarnings("unchecked")
-        java.util.List<Object> resultList = (java.util.List<Object>) result;
-        assertThat(resultList.size()).isEqualTo(2);
-        assertThat(resultList.get(0)).isEqualTo(1L); // Removed from working
-        assertThat(resultList.get(1)).isEqualTo(0L); // Not preserved (wasn't in waiting)
+        assertThat(result).isEqualTo("moved");
         TestFixtures.assertAgentNotInSet(jedis, "working", "agent1");
-        TestFixtures.assertAgentNotInSet(jedis, "waiting", "agent1");
+        assertThat(jedis.zscore("waiting", "agent1")).isEqualTo(200.0);
 
-        // Given - Agent in both working and waiting sets
-        jedis.zadd("working", 100, "agent2");
-        jedis.zadd("waiting", 200, "agent2");
+        // Scenario 2: Agent in neither set - should add to waiting
+        jedis.zrem("working", "agent2");
+        jedis.zrem("waiting", "agent2");
 
-        // When - Remove agent (waiting entry exists)
         result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_COMPLETION),
+                scriptManager.getScriptSha(RedisScriptManager.RESCHEDULE_AGENT),
                 java.util.Arrays.asList("working", "waiting"),
-                java.util.Arrays.asList("agent2"));
+                java.util.Arrays.asList("agent2", "300"));
 
-        // Then - Returns {removedFromWorking, preservedWaiting} where preservedWaiting=1
-        assertThat(result).isInstanceOf(java.util.List.class);
-        @SuppressWarnings("unchecked")
-        java.util.List<Object> resultList2 = (java.util.List<Object>) result;
-        assertThat(resultList2.size()).isEqualTo(2);
-        assertThat(resultList2.get(0)).isEqualTo(1L); // Removed from working
-        assertThat(resultList2.get(1)).isEqualTo(1L); // Preserved waiting entry
+        assertThat(result).isEqualTo("added");
         TestFixtures.assertAgentNotInSet(jedis, "working", "agent2");
-        assertThat(jedis.zscore("waiting", "agent2")).isEqualTo(200.0); // Waiting entry preserved
+        assertThat(jedis.zscore("waiting", "agent2")).isEqualTo(300.0);
 
-        // Given - Agent only in waiting set (not in working)
-        jedis.zrem("waiting", "agent3");
-        jedis.zadd("waiting", 300, "agent3");
+        // Scenario 3: Agent already in waiting - should be no-op
+        jedis.zrem("working", "agent3");
+        jedis.zadd("waiting", 400, "agent3");
 
-        // When - Remove agent (not in working)
         result =
             jedis.evalsha(
-                scriptManager.getScriptSha(RedisScriptManager.REMOVE_AGENT_COMPLETION),
+                scriptManager.getScriptSha(RedisScriptManager.RESCHEDULE_AGENT),
                 java.util.Arrays.asList("working", "waiting"),
-                java.util.Arrays.asList("agent3"));
+                java.util.Arrays.asList("agent3", "500"));
 
-        // Then - Returns {removedFromWorking=0, preservedWaiting=1} since waiting exists
-        assertThat(result).isInstanceOf(java.util.List.class);
-        @SuppressWarnings("unchecked")
-        java.util.List<Object> resultList3 = (java.util.List<Object>) result;
-        assertThat(resultList3.size()).isEqualTo(2);
-        assertThat(resultList3.get(0)).isEqualTo(0L); // Not removed from working (wasn't there)
-        assertThat(resultList3.get(1)).isEqualTo(1L); // Preserved waiting entry
-        TestFixtures.assertAgentNotInSet(jedis, "working", "agent3");
-        assertThat(jedis.zscore("waiting", "agent3")).isEqualTo(300.0); // Waiting entry preserved
+        assertThat(result).isEqualTo("exists");
+        assertThat(jedis.zscore("waiting", "agent3")).isEqualTo(400.0); // Score unchanged
       }
     }
   }
@@ -981,7 +948,7 @@ class RedisScriptManagerTest {
       String[] scriptNames = {
         RedisScriptManager.ADD_AGENT,
         RedisScriptManager.REMOVE_AGENT,
-        RedisScriptManager.REMOVE_AGENT_COMPLETION,
+        RedisScriptManager.RESCHEDULE_AGENT,
         RedisScriptManager.ADD_AGENTS,
         RedisScriptManager.MOVE_AGENTS,
         RedisScriptManager.MOVE_AGENTS_CONDITIONAL,
