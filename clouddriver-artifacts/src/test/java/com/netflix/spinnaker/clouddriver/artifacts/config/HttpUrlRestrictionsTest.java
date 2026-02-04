@@ -3,8 +3,8 @@ package com.netflix.spinnaker.clouddriver.artifacts.config;
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-import java.net.URI;
 import java.util.List;
+import okhttp3.HttpUrl;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -19,10 +19,10 @@ public class HttpUrlRestrictionsTest {
             .build();
     assertThrows(
         IllegalArgumentException.class,
-        () -> restrictions.validateURI(URI.create("http://192.168.0.1")));
+        () -> restrictions.validateURI(HttpUrl.parse("http://192.168.0.1")));
     assertThrows(
         IllegalArgumentException.class,
-        () -> restrictions.validateURI(URI.create("http://10.2.3.4")));
+        () -> restrictions.validateURI(HttpUrl.parse("http://10.2.3.4")));
   }
 
   @Test
@@ -31,10 +31,10 @@ public class HttpUrlRestrictionsTest {
         HttpUrlRestrictions.builder().rejectVerbatimIps(true).rejectedIps(List.of()).build();
     assertThrows(
         IllegalArgumentException.class,
-        () -> restrictions.validateURI(URI.create("http://192.168.0.1")));
+        () -> restrictions.validateURI(HttpUrl.parse("http://192.168.0.1")));
     assertThrows(
         IllegalArgumentException.class,
-        () -> restrictions.validateURI(URI.create("http://10.2.3.4")));
+        () -> restrictions.validateURI(HttpUrl.parse("http://10.2.3.4")));
   }
 
   @Test
@@ -44,17 +44,18 @@ public class HttpUrlRestrictionsTest {
             .allowedHostnamesRegex("")
             .allowedDomains(List.of("google.com"))
             .build();
-    assertThat(restrictions.validateURI(URI.create("http://google.com"))).hasHost("google.com");
+    assertThat(restrictions.validateURI(HttpUrl.parse("http://google.com"))).hasHost("google.com");
     assertThrows(
         IllegalArgumentException.class,
-        () -> restrictions.validateURI(URI.create("http://microsoft.com")));
+        () -> restrictions.validateURI(HttpUrl.parse("http://microsoft.com")));
   }
 
   @Test
   public void allowIpsWhenVerbatimIpsIsFalse() {
     var restrictions =
         HttpUrlRestrictions.builder().rejectVerbatimIps(false).rejectedIps(List.of()).build();
-    assertThat(restrictions.validateURI(URI.create("http://192.168.0.1"))).hasHost("192.168.0.1");
+    assertThat(restrictions.validateURI(HttpUrl.parse("http://192.168.0.1")))
+        .hasHost("192.168.0.1");
   }
 
   @Test
@@ -68,11 +69,11 @@ public class HttpUrlRestrictionsTest {
         IllegalArgumentException.class,
         () ->
             restrictions.validateURI(
-                URI.create(
+                HttpUrl.parse(
                     "http://0a010203.0a010204.rbndr.us"))); // Make sure a host lookup that returns
     // a 10. address ALSO fails when
     // restricted.
-    assertThat(restrictions.validateURI(URI.create("http://google.com"))).hasHost("google.com");
+    assertThat(restrictions.validateURI(HttpUrl.parse("http://google.com"))).hasHost("google.com");
   }
 
   @Test
@@ -80,8 +81,9 @@ public class HttpUrlRestrictionsTest {
     var restrictions = HttpUrlRestrictions.builder().allowedDomains(List.of("example.com")).build();
     assertThrows(
         IllegalArgumentException.class,
-        () -> restrictions.validateURI(URI.create("http://google.com")));
-    assertThat(restrictions.validateURI(URI.create("http://example.com"))).hasHost("example.com");
+        () -> restrictions.validateURI(HttpUrl.parse("http://google.com")));
+    assertThat(restrictions.validateURI(HttpUrl.parse("http://example.com")))
+        .hasHost("example.com");
   }
 
   @Test
@@ -91,9 +93,9 @@ public class HttpUrlRestrictionsTest {
             .rejectVerbatimIps(true)
             .rejectedIps(List.of("192.168.0.0/16"))
             .build();
-    assertThat(restrictions.validateURI(URI.create("http://0a010203.0a010204.rbndr.us")))
+    assertThat(restrictions.validateURI(HttpUrl.parse("http://0a010203.0a010204.rbndr.us")))
         .hasHost("0a010203.0a010204.rbndr.us");
-    assertThat(restrictions.validateURI(URI.create("http://google.com"))).hasHost("google.com");
+    assertThat(restrictions.validateURI(HttpUrl.parse("http://google.com"))).hasHost("google.com");
   }
 
   @Test
@@ -112,11 +114,37 @@ public class HttpUrlRestrictionsTest {
     invalidDomains.forEach(
         domain -> {
           Assertions.assertThrows(
-              IllegalArgumentException.class, () -> restrictions.validateURI(URI.create(domain)));
+              IllegalArgumentException.class,
+              () -> restrictions.validateURI(HttpUrl.parse(domain)));
         });
 
-    assertThat(restrictions.validateURI(URI.create("http://example.com"))).hasHost("example.com");
-    assertThat(restrictions.validateURI(URI.create("http://0a010203.0a010204.rbndr.us")))
+    assertThat(restrictions.validateURI(HttpUrl.parse("http://example.com")))
+        .hasHost("example.com");
+    assertThat(restrictions.validateURI(HttpUrl.parse("http://0a010203.0a010204.rbndr.us")))
         .hasHost("0a010203.0a010204.rbndr.us");
+  }
+
+  @Test
+  public void rejectAuthorityBypassAttempt() {
+    // Test that URLs with userinfo (username:password@) in authority don't bypass validation
+    // The old vulnerable code would extract "example.com" from userinfo instead of the actual host
+    var restrictions = HttpUrlRestrictions.builder().allowedDomains(List.of("example.com")).build();
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            restrictions.validateURI(
+                HttpUrl.parse("http://example.com:password@some_underscore_host.com")));
+  }
+
+  @Test
+  public void allowLegitimateUnderscoreHostsWhenAllowed() {
+    // Test that when the actual target host IS in the allowed domains list,
+    // the URL passes validation (proves HttpUrl correctly extracts the real host)
+    var restrictions = HttpUrlRestrictions.builder().allowedDomains(List.of("google.com")).build();
+    // With HttpUrl, the actual host is correctly extracted as google.com (not "example.com" from
+    // userinfo)
+    // This URL has userinfo "example.com:badpassword" but actual host is "google.com"
+    assertThat(restrictions.validateURI(HttpUrl.parse("http://example.com:badpassword@google.com")))
+        .hasHost("google.com");
   }
 }
