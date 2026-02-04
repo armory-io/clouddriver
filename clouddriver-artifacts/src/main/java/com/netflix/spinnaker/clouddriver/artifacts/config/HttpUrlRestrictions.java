@@ -31,8 +31,11 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.HttpUrl;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.security.web.util.matcher.IpAddressMatcher;
+import org.springframework.util.ObjectUtils;
 
 /**
  * A set of restrictions and validations of the restrictions. These in combination provide some
@@ -56,6 +59,7 @@ import org.springframework.security.web.util.matcher.IpAddressMatcher;
 // should move that code (and this) to maybe a common area, and possibly an OKHTTP interceptor
 // INSTEAD of URL validation.  This would catch more easily rebind attacks and similar where it can
 // get the resolved IP on a request.
+@Slf4j
 @Builder
 @Data
 @AllArgsConstructor
@@ -152,9 +156,9 @@ public class HttpUrlRestrictions {
         .noneMatch(restriction -> new IpAddressMatcher(restriction).matches(host));
   }
 
-  public URI validateURI(URI url) throws IllegalArgumentException {
+  public URI validateURI(HttpUrl url) throws IllegalArgumentException {
     try {
-      URI u = url.normalize();
+      URI u = url.uri().normalize();
       if (!u.isAbsolute()) {
         throw new IllegalArgumentException("non absolute URI " + url);
       }
@@ -162,23 +166,11 @@ public class HttpUrlRestrictions {
         throw new IllegalArgumentException("unsupported URI scheme " + url);
       }
 
-      // fallback to `getAuthority()` in the event that the hostname contains an underscore and
-      // `getHost()` returns null
-      String host = u.getHost();
-      if (host == null) {
-        String authority = u.getAuthority();
-        if (authority != null) {
-          // Don't attempt to colon-substring ipv6 addresses
-          if (InetAddresses.isInetAddress(authority)) {
-            host = authority;
-          } else {
-            int portIndex = authority.indexOf(":");
-            host = (portIndex > -1) ? authority.substring(0, portIndex) : authority;
-          }
-        }
-      }
+      // FIXED: Use HttpUrl.host() instead of vulnerable getAuthority() fallback
+      // HttpUrl properly parses URLs per RFC 3986, correctly handling userinfo in authority
+      String host = url.host();
 
-      if (host == null || host.isEmpty()) {
+      if (ObjectUtils.isEmpty(host)) {
         throw new IllegalArgumentException("Unable to determine host for the url provided " + url);
       }
 
@@ -187,9 +179,7 @@ public class HttpUrlRestrictions {
             "Allowed Hostnames are not set, external HTTP requests are not enabled. Please configure the account with 'url-restrictions.allowedHostnamesRegex' to allow access.");
       }
 
-      // Strip ipv6 brackets if present
-      // InetAddress.getHost() retains them, but other code doesn't quite understand
-      host = host.replace("[", "").replace("]", "");
+      // Note: IPv6 bracket stripping removed - HttpUrl.host() already handles this correctly
 
       if (InetAddresses.isInetAddress(host) && rejectVerbatimIps) {
         throw new IllegalArgumentException("Verbatim IP addresses are not allowed");
