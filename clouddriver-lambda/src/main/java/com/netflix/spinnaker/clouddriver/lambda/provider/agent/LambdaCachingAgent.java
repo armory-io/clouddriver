@@ -49,6 +49,7 @@ import com.netflix.spinnaker.clouddriver.core.limits.ServiceLimitConfiguration;
 import com.netflix.spinnaker.clouddriver.lambda.cache.Keys;
 import com.netflix.spinnaker.clouddriver.lambda.names.LambdaResource;
 import com.netflix.spinnaker.clouddriver.lambda.names.LambdaResourceFunction;
+import com.netflix.spinnaker.clouddriver.lambda.names.LambdaTagNamer;
 import com.netflix.spinnaker.clouddriver.lambda.service.LambdaService;
 import com.netflix.spinnaker.clouddriver.names.NamerRegistry;
 import com.netflix.spinnaker.config.LambdaServiceConfig;
@@ -93,10 +94,7 @@ public class LambdaCachingAgent implements CachingAgent, AccountAware, OnDemandA
         region,
         lambdaServiceConfig,
         serviceLimitConfiguration,
-        NamerRegistry.lookup()
-            .withProvider(AmazonCloudProvider.ID)
-            .withAccount(account.getName())
-            .withResource(LambdaResource.class));
+        new LambdaTagNamer()));
   }
 
   @VisibleForTesting
