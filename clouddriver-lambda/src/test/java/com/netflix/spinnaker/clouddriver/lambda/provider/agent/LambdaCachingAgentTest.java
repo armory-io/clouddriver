@@ -69,8 +69,7 @@ public class LambdaCachingAgentTest {
             netflixAmazonCredentials,
             REGION,
             config,
-            serviceLimitConfiguration,
-            new LambdaTagNamer());
+            serviceLimitConfiguration);
   }
 
   @Test
