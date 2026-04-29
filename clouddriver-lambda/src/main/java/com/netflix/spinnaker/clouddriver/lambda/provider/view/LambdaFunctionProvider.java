@@ -16,7 +16,7 @@
 
 package com.netflix.spinnaker.clouddriver.lambda.provider.view;
 
-import static com.netflix.spinnaker.clouddriver.core.provider.agent.Namespace.APPLICATIONS;
+import static com.netflix.spinnaker.clouddriver.lambda.cache.Keys.Namespace.LAMBDA_APPLICATIONS;
 import static com.netflix.spinnaker.clouddriver.lambda.cache.Keys.Namespace.LAMBDA_FUNCTIONS;
 
 import com.amazonaws.services.lambda.model.FunctionConfiguration;
@@ -35,7 +35,7 @@ import org.springframework.stereotype.Component;
 
 @Component
 public class LambdaFunctionProvider implements FunctionProvider {
-  private LambdaCacheClient awsLambdaCacheClient;
+  private final LambdaCacheClient awsLambdaCacheClient;
   private final Cache cacheView;
 
   @Autowired
@@ -57,9 +57,7 @@ public class LambdaFunctionProvider implements FunctionProvider {
   public Set<Function> getApplicationFunctions(String applicationName) {
 
     CacheData application =
-        cacheView.get(
-            APPLICATIONS.ns,
-            com.netflix.spinnaker.clouddriver.aws.data.Keys.getApplicationKey(applicationName));
+        cacheView.get(LAMBDA_APPLICATIONS.ns, Keys.getApplicationKey(applicationName));
 
     Set<Function> appFunctions = new HashSet<>();
     if (null != application && null != application.getRelationships()) {
@@ -75,7 +73,7 @@ public class LambdaFunctionProvider implements FunctionProvider {
       }
     } else {
       getAllFunctions().stream()
-          .filter(f -> f instanceof FunctionConfiguration)
+          .filter(FunctionConfiguration.class::isInstance)
           .map(f -> (FunctionConfiguration) f)
           .filter(f -> f.getFunctionName() != null)
           .filter(f -> f.getFunctionName().startsWith(applicationName))
