@@ -94,7 +94,7 @@ public class LambdaCachingAgent implements CachingAgent, AccountAware, OnDemandA
         region,
         lambdaServiceConfig,
         serviceLimitConfiguration,
-        new LambdaTagNamer()));
+        new LambdaTagNamer());
   }
 
   @VisibleForTesting
