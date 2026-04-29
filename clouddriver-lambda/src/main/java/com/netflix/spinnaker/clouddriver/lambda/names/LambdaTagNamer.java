@@ -39,10 +39,10 @@ public class LambdaTagNamer implements NamingStrategy<LambdaResource> {
   public static void applyIfNeeded(
       LambdaResource description, String applicationName, boolean autoApplyTags) {
     if (autoApplyTags) {
-      Moniker moniker = getMoniker(description);
       if (description.getResourceTags() == null) {
         description.setResourceTags(new HashMap<>());
       }
+      Moniker moniker = getMoniker(description);
       // Make sure to set the app name REGARDLESS derived value in the case where an app has not
       // previously been set
       if (!description.getResourceTags().containsKey(LambdaTagNamer.APPLICATION)) {
