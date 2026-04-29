@@ -32,7 +32,6 @@ import com.netflix.spinnaker.clouddriver.aws.security.AmazonClientProvider;
 import com.netflix.spinnaker.clouddriver.aws.security.NetflixAmazonCredentials;
 import com.netflix.spinnaker.clouddriver.core.limits.ServiceLimitConfiguration;
 import com.netflix.spinnaker.clouddriver.lambda.cache.Keys;
-import com.netflix.spinnaker.clouddriver.lambda.names.LambdaTagNamer;
 import com.netflix.spinnaker.clouddriver.lambda.service.LambdaService;
 import com.netflix.spinnaker.config.LambdaServiceConfig;
 import java.util.Collection;
