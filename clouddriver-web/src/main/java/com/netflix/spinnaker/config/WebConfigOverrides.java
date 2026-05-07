@@ -25,19 +25,19 @@ import org.springframework.security.config.annotation.web.configuration.WebSecur
 import org.springframework.security.web.header.HeaderWriterFilter;
 
 @Configuration
-@Order(Ordered.HIGHEST_PRECEDENCE+5)
+@Order(Ordered.HIGHEST_PRECEDENCE + 5)
 public class WebConfigOverrides extends WebSecurityConfigurerAdapter {
 
   @Override
   protected void configure(HttpSecurity http) throws Exception {
-    http
-      .headers()
-      .addObjectPostProcessor(new ObjectPostProcessor<HeaderWriterFilter>() {
-        @Override
-        public HeaderWriterFilter postProcess(HeaderWriterFilter filter) {
-          filter.setShouldWriteHeadersEagerly(true);
-          return filter;
-        }
-      });
+    http.headers()
+        .addObjectPostProcessor(
+            new ObjectPostProcessor<HeaderWriterFilter>() {
+              @Override
+              public HeaderWriterFilter postProcess(HeaderWriterFilter filter) {
+                filter.setShouldWriteHeadersEagerly(true);
+                return filter;
+              }
+            });
   }
 }
