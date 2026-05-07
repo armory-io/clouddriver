@@ -1,0 +1,39 @@
+clouddriver-web/src/main/java/com/netflix/spinnaker/config/WebConfigOverrides.java
+  human 1-43
+---
+{
+  "attestations": [
+    {
+      "entries": [
+        {
+          "accepted_lines": 43,
+          "added_lines": 43,
+          "deleted_lines": 0,
+          "hash": "human",
+          "lines": "1-43",
+          "overridden_lines": 0
+        }
+      ],
+      "file": "clouddriver-web/src/main/java/com/netflix/spinnaker/config/WebConfigOverrides.java"
+    }
+  ],
+  "base_commit_sha": "88226a4b1f441970e91f9cf15cea0d62176f50a7",
+  "branch": "fixcve-2026-22732",
+  "commit_sha": "e3f582c6f1bfb3232ec00acd0c76063cb1d28bd6",
+  "commit_time": "2026-05-07T16:15:43-05:00",
+  "commit_type": "direct_commit",
+  "git_ai_version": "1.4.2",
+  "prompts": {
+    "human": {
+      "accepted_lines": 43,
+      "agent_id": null,
+      "human_author": "Jason McIntosh <jason.mcintosh@harness.io>",
+      "messages": [],
+      "overriden_lines": 0,
+      "total_additions": 43,
+      "total_deletions": 0
+    }
+  },
+  "repo": "git@github.com:armory-io/clouddriver.git",
+  "schema_version": "authorship/3.0.0"
+}
