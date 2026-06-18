@@ -17,6 +17,10 @@
 package com.netflix.spinnaker.clouddriver.aws.security.config
 
 import com.amazonaws.auth.AWSCredentialsProvider
+import com.amazonaws.services.ec2.AmazonEC2
+import com.amazonaws.services.ec2.model.DescribeRegionsResult
+import com.amazonaws.services.ec2.model.DescribeAvailabilityZonesResult
+import com.amazonaws.services.ec2.model.AvailabilityZone
 import com.netflix.spinnaker.clouddriver.aws.security.AWSAccountInfoLookup
 import com.netflix.spinnaker.clouddriver.aws.security.AmazonClientProvider
 import com.netflix.spinnaker.clouddriver.aws.security.AmazonCredentials
@@ -340,5 +344,124 @@ class CredentialsLoaderSpec extends Specification {
       cred.sessionName == 'spinnaker'
     }
     0 * _
+  }
+
+  // ---------------------------------------------------------------------------
+  // useAccountRegions tests
+  // ---------------------------------------------------------------------------
+
+  def 'useAccountRegions=false (default) uses shared lookup for listRegions'() {
+    given: 'flag is off — existing behaviour: shared lookup drives everything'
+    def config = new CredentialsConfig(
+      useAccountRegions: false,
+      defaultRegions: [new Region(name: 'us-east-1'), new Region(name: 'us-west-2')]
+    )
+    def accountsConfig = new AccountsConfiguration(accounts: [
+      new Account(name: 'test', accountId: '111')
+    ])
+    AWSCredentialsProvider provider = Mock(AWSCredentialsProvider)
+    AWSAccountInfoLookup lookup = Mock(AWSAccountInfoLookup)
+    AmazonCredentialsParser<Account, NetflixAmazonCredentials> ci = new AmazonCredentialsParser<>(
+      provider, lookup, NetflixAmazonCredentials.class, config, accountsConfig)
+
+    when:
+    List<NetflixAmazonCredentials> creds = ci.load(config)
+
+    then: 'listRegions called on the shared lookup — no per-account lookup created'
+    1 * lookup.listRegions(['us-east-1', 'us-west-2']) >> [
+      new AmazonCredentials.AWSRegion('us-east-1', ['us-east-1a']),
+      new AmazonCredentials.AWSRegion('us-west-2', ['us-west-2a'])
+    ]
+    0 * lookup.findAccountId()
+    creds.size() == 1
+    creds[0].regions.size() == 2
+  }
+
+  def 'useAccountRegions=true uses first defaultRegion for shared listRegions lookup'() {
+    given: 'flag is on; account regions are fully specified (AZs present) so no AWS call needed'
+    def config = new CredentialsConfig(
+      useAccountRegions: true,
+      defaultRegions: [
+        new Region(name: 'eu-west-1', availabilityZones: ['eu-west-1a', 'eu-west-1b']),
+        new Region(name: 'eu-central-1', availabilityZones: ['eu-central-1a'])
+      ]
+    )
+    def accountsConfig = new AccountsConfiguration(accounts: [
+      new Account(name: 'eu-account', accountId: '222')
+    ])
+    AWSCredentialsProvider provider = Mock(AWSCredentialsProvider)
+    AmazonClientProvider clientProvider = Mock(AmazonClientProvider)
+    AmazonCredentialsParser<Account, NetflixAmazonCredentials> ci = new AmazonCredentialsParser<>(
+      provider, clientProvider, NetflixAmazonCredentials.class, config, accountsConfig)
+
+    when:
+    List<NetflixAmazonCredentials> creds = ci.load(config)
+
+    then: 'all region AZs are in config so no AWS calls are made at all'
+    0 * clientProvider.getAmazonEC2(_, _)
+    creds.size() == 1
+    creds[0].regions.size() == 2
+    creds[0].regions.find { it.name == 'eu-west-1' }.availabilityZones == ['eu-west-1a', 'eu-west-1b']
+  }
+
+  def 'useAccountRegions=true uses first account region for findAccountId when account has regions'() {
+    given: 'flag is on; account has explicit regions; accountId must be auto-discovered'
+    def config = new CredentialsConfig(
+      useAccountRegions: true,
+      defaultRegions: [new Region(name: 'us-east-1', availabilityZones: ['us-east-1a'])]
+    )
+    def accountsConfig = new AccountsConfiguration(accounts: [
+      new Account(
+        name: 'auto-id-account',
+        // no accountId — triggers findAccountId()
+        regions: [new Region(name: 'ap-southeast-1', availabilityZones: ['ap-southeast-1a'])]
+      )
+    ])
+    AWSCredentialsProvider provider = Mock(AWSCredentialsProvider)
+    AmazonClientProvider clientProvider = Mock(AmazonClientProvider)
+    AmazonEC2 apEc2 = Mock(AmazonEC2)
+    AmazonCredentialsParser<Account, NetflixAmazonCredentials> ci = new AmazonCredentialsParser<>(
+      provider, clientProvider, NetflixAmazonCredentials.class, config, accountsConfig)
+
+    when:
+    List<NetflixAmazonCredentials> creds = ci.load(config)
+
+    then: 'findAccountId uses ap-southeast-1 (account first region), not the host region'
+    1 * clientProvider.getAmazonEC2(provider, 'ap-southeast-1') >> apEc2
+    // Simulate AccessDenied — the code extracts account ID from the IAM ARN in the error message
+    1 * apEc2.describeVpcs() >> {
+      def ex = new com.amazonaws.AmazonServiceException('AccessDenied')
+      ex.setErrorCode('AccessDenied')
+      ex.setErrorMessage('User: arn:aws:iam::333333333333:user/test is not authorized to perform: ec2:DescribeVpcs')
+      throw ex
+    }
+    0 * clientProvider.getAmazonEC2(provider, 'us-east-1')
+    creds.size() == 1
+    creds[0].accountId == '333333333333'
+  }
+
+  def 'useAccountRegions=true falls back to shared lookup for findAccountId when account has no regions'() {
+    given: 'flag is on but account has no per-account regions — must fall back to shared lookup'
+    def config = new CredentialsConfig(
+      useAccountRegions: true,
+      // defaultRegions with no AZs so a listRegions lookup is still triggered
+      defaultRegions: [new Region(name: 'us-east-1')]
+    )
+    def accountsConfig = new AccountsConfiguration(accounts: [
+      new Account(name: 'no-region-account') // no accountId, no regions
+    ])
+    AWSCredentialsProvider provider = Mock(AWSCredentialsProvider)
+    AWSAccountInfoLookup lookup = Mock(AWSAccountInfoLookup)
+    AmazonCredentialsParser<Account, NetflixAmazonCredentials> ci = new AmazonCredentialsParser<>(
+      provider, lookup, NetflixAmazonCredentials.class, config, accountsConfig)
+
+    when:
+    List<NetflixAmazonCredentials> creds = ci.load(config)
+
+    then: 'shared lookup is used for both findAccountId and listRegions'
+    1 * lookup.findAccountId() >> '444'
+    1 * lookup.listRegions(['us-east-1']) >> [new AmazonCredentials.AWSRegion('us-east-1', ['us-east-1a'])]
+    creds.size() == 1
+    creds[0].accountId == '444'
   }
 }

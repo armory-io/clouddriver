@@ -49,6 +49,9 @@ public class AmazonCredentialsParser<
   private final ObjectMapper objectMapper;
   private final CredentialsConfig credentialsConfig;
   private final AccountsConfiguration accountsConfig;
+  // Only set when constructed via the AmazonClientProvider constructor; used for per-account
+  // findAccountId lookups when useAccountRegions is true.
+  private final AmazonClientProvider amazonClientProvider;
   // this is used to cache all the regions found while parsing the accounts. This helps in
   // reducing the number of API calls made since known regions are already cached.
   private final ConcurrentMap<String, Region> regionCache;
@@ -66,10 +69,16 @@ public class AmazonCredentialsParser<
       AccountsConfiguration accountsConfig) {
     this(
         credentialsProvider,
-        new DefaultAWSAccountInfoLookup(credentialsProvider, amazonClientProvider),
+        new DefaultAWSAccountInfoLookup(
+            credentialsProvider,
+            amazonClientProvider,
+            credentialsConfig.isUseAccountRegions()
+                ? firstRegionNameOf(credentialsConfig.getDefaultRegions())
+                : null),
         credentialsType,
         credentialsConfig,
-        accountsConfig);
+        accountsConfig,
+        amazonClientProvider);
   }
 
   public AmazonCredentialsParser(
@@ -78,6 +87,22 @@ public class AmazonCredentialsParser<
       Class<V> credentialsType,
       CredentialsConfig credentialsConfig,
       AccountsConfiguration accountsConfig) {
+    this(
+        credentialsProvider,
+        awsAccountInfoLookup,
+        credentialsType,
+        credentialsConfig,
+        accountsConfig,
+        null);
+  }
+
+  private AmazonCredentialsParser(
+      AWSCredentialsProvider credentialsProvider,
+      AWSAccountInfoLookup awsAccountInfoLookup,
+      Class<V> credentialsType,
+      CredentialsConfig credentialsConfig,
+      AccountsConfiguration accountsConfig,
+      AmazonClientProvider amazonClientProvider) {
     this.credentialsProvider = Objects.requireNonNull(credentialsProvider, "credentialsProvider");
     this.awsAccountInfoLookup = awsAccountInfoLookup;
     this.templateValues = Collections.emptyMap();
@@ -85,6 +110,7 @@ public class AmazonCredentialsParser<
     this.credentialTranslator = findTranslator(credentialsType, this.objectMapper);
     this.credentialsConfig = credentialsConfig;
     this.accountsConfig = accountsConfig;
+    this.amazonClientProvider = amazonClientProvider;
     this.regionCache = Maps.newConcurrentMap();
     this.defaultRegionNames = new ArrayList<>();
 
@@ -321,7 +347,7 @@ public class AmazonCredentialsParser<
         throw new IllegalArgumentException(
             "accountId is required and not resolvable for this credentials type");
       }
-      account.setAccountId(awsAccountInfoLookup.findAccountId());
+      account.setAccountId(findAccountId(account));
     }
 
     if (account.getEnvironment() == null) {
@@ -386,6 +412,37 @@ public class AmazonCredentialsParser<
       }
     }
     return credentialTranslator.translate(credentialsProvider, account);
+  }
+
+  /**
+   * Returns the name of the first region in the list, or null if the list is null/empty. Used to
+   * pick an explicit region for bootstrapping SDK calls when useAccountRegions is true.
+   */
+  private static String firstRegionNameOf(List<Region> regions) {
+    if (regions != null && !regions.isEmpty()) {
+      return regions.get(0).getName();
+    }
+    return null;
+  }
+
+  /**
+   * Resolves the account ID for the given account.
+   *
+   * <p>When {@code useAccountRegions} is enabled and the account has at least one region
+   * configured, a dedicated lookup is created that targets that region so the bootstrapping EC2
+   * call does not depend on the host's AWS region. Otherwise the shared lookup (which may fall back
+   * to {@link com.netflix.spinnaker.clouddriver.aws.security.sdkclient.SpinnakerAwsRegionProvider})
+   * is used.
+   */
+  private String findAccountId(Account account) {
+    if (credentialsConfig.isUseAccountRegions()
+        && amazonClientProvider != null
+        && !CollectionUtils.isNullOrEmpty(account.getRegions())) {
+      String region = firstRegionNameOf(account.getRegions());
+      return new DefaultAWSAccountInfoLookup(credentialsProvider, amazonClientProvider, region)
+          .findAccountId();
+    }
+    return awsAccountInfoLookup.findAccountId();
   }
 
   private static String templateFirstNonNull(Map<String, String> substitutions, String... values) {

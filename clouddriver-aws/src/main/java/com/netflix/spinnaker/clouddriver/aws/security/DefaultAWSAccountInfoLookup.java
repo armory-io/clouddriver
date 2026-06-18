@@ -37,17 +37,26 @@ public class DefaultAWSAccountInfoLookup implements AWSAccountInfoLookup {
 
   private final AWSCredentialsProvider credentialsProvider;
   private final AmazonClientProvider amazonClientProvider;
+  // When non-null, used instead of AmazonClientProvider.DEFAULT_REGION for bootstrapping calls.
+  private final String firstRegion;
 
   public DefaultAWSAccountInfoLookup(
       AWSCredentialsProvider credentialsProvider, AmazonClientProvider amazonClientProvider) {
+    this(credentialsProvider, amazonClientProvider, null);
+  }
+
+  public DefaultAWSAccountInfoLookup(
+      AWSCredentialsProvider credentialsProvider,
+      AmazonClientProvider amazonClientProvider,
+      String firstRegion) {
     this.credentialsProvider = credentialsProvider;
     this.amazonClientProvider = amazonClientProvider;
+    this.firstRegion = firstRegion;
   }
 
   @Override
   public String findAccountId() {
-    AmazonEC2 ec2 =
-        amazonClientProvider.getAmazonEC2(credentialsProvider, AmazonClientProvider.DEFAULT_REGION);
+    AmazonEC2 ec2 = amazonClientProvider.getAmazonEC2(credentialsProvider, firstRegion);
     try {
       List<Vpc> vpcs = ec2.describeVpcs().getVpcs();
       boolean supportsByName = false;
@@ -106,8 +115,7 @@ public class DefaultAWSAccountInfoLookup implements AWSAccountInfoLookup {
   @Override
   public List<AWSRegion> listRegions(Collection<String> regionNames) {
     Set<String> nameSet = new HashSet<>(regionNames);
-    AmazonEC2 ec2 =
-        amazonClientProvider.getAmazonEC2(credentialsProvider, AmazonClientProvider.DEFAULT_REGION);
+    AmazonEC2 ec2 = amazonClientProvider.getAmazonEC2(credentialsProvider, firstRegion);
 
     DescribeRegionsRequest request = new DescribeRegionsRequest();
     if (!nameSet.isEmpty()) {
