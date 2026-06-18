@@ -404,6 +404,46 @@ class CredentialsLoaderSpec extends Specification {
     creds[0].regions.find { it.name == 'eu-west-1' }.availabilityZones == ['eu-west-1a', 'eu-west-1b']
   }
 
+  def 'useAccountRegions=true skips describeRegions and calls describeAvailabilityZones directly'() {
+    given: 'flag is on; defaultRegions have no AZs so a lookup is needed'
+    def config = new CredentialsConfig(
+      useAccountRegions: true,
+      defaultRegions: [
+        new Region(name: 'eu-west-1'),   // no AZs — would normally trigger describeRegions
+        new Region(name: 'eu-central-1')
+      ]
+    )
+    def accountsConfig = new AccountsConfiguration(accounts: [
+      new Account(name: 'eu-account', accountId: '222')
+    ])
+    AWSCredentialsProvider provider = Mock(AWSCredentialsProvider)
+    AmazonClientProvider clientProvider = Mock(AmazonClientProvider)
+    AmazonEC2 euWest1Ec2 = Mock(AmazonEC2)
+    AmazonEC2 euCentral1Ec2 = Mock(AmazonEC2)
+    AmazonCredentialsParser<Account, NetflixAmazonCredentials> ci = new AmazonCredentialsParser<>(
+      provider, clientProvider, NetflixAmazonCredentials.class, config, accountsConfig)
+
+    when:
+    List<NetflixAmazonCredentials> creds = ci.load(config)
+
+    then: 'describeAvailabilityZones is called per region — describeRegions is never called'
+    1 * clientProvider.getAmazonEC2(provider, 'eu-west-1') >> euWest1Ec2
+    1 * euWest1Ec2.describeAvailabilityZones() >> new DescribeAvailabilityZonesResult(availabilityZones: [
+      new AvailabilityZone(zoneName: 'eu-west-1a'),
+      new AvailabilityZone(zoneName: 'eu-west-1b')
+    ])
+    1 * clientProvider.getAmazonEC2(provider, 'eu-central-1') >> euCentral1Ec2
+    1 * euCentral1Ec2.describeAvailabilityZones() >> new DescribeAvailabilityZonesResult(availabilityZones: [
+      new AvailabilityZone(zoneName: 'eu-central-1a')
+    ])
+    0 * euWest1Ec2.describeRegions(_)
+    0 * euCentral1Ec2.describeRegions(_)
+    creds.size() == 1
+    creds[0].regions.size() == 2
+    creds[0].regions.find { it.name == 'eu-west-1' }.availabilityZones.toSorted() == ['eu-west-1a', 'eu-west-1b']
+    creds[0].regions.find { it.name == 'eu-central-1' }.availabilityZones == ['eu-central-1a']
+  }
+
   def 'useAccountRegions=true uses first account region for findAccountId when account has regions'() {
     given: 'flag is on; account has explicit regions; accountId must be auto-discovered'
     def config = new CredentialsConfig(
@@ -438,6 +478,82 @@ class CredentialsLoaderSpec extends Specification {
     0 * clientProvider.getAmazonEC2(provider, 'us-east-1')
     creds.size() == 1
     creds[0].accountId == '333333333333'
+  }
+
+  def 'useAccountRegions=true with per-account regions and full AZs makes zero AWS calls'() {
+    given: 'flag is on; every account region has AZs — no AWS call of any kind should occur'
+    def config = new CredentialsConfig(
+      useAccountRegions: true
+      // no defaultRegions needed — accounts supply their own
+    )
+    def accountsConfig = new AccountsConfiguration(accounts: [
+      new Account(
+        name: 'prod',
+        accountId: '111122223333',
+        regions: [
+          new Region(name: 'eu-west-1', availabilityZones: ['eu-west-1a', 'eu-west-1b']),
+          new Region(name: 'eu-central-1', availabilityZones: ['eu-central-1a'])
+        ]
+      )
+    ])
+    AWSCredentialsProvider provider = Mock(AWSCredentialsProvider)
+    AmazonClientProvider clientProvider = Mock(AmazonClientProvider)
+    AmazonCredentialsParser<Account, NetflixAmazonCredentials> ci = new AmazonCredentialsParser<>(
+      provider, clientProvider, NetflixAmazonCredentials.class, config, accountsConfig)
+
+    when:
+    List<NetflixAmazonCredentials> creds = ci.load(config)
+
+    then: 'no EC2 clients are created at all'
+    0 * clientProvider.getAmazonEC2(_, _)
+    creds.size() == 1
+    creds[0].regions.size() == 2
+    creds[0].regions.find { it.name == 'eu-west-1' }.availabilityZones == ['eu-west-1a', 'eu-west-1b']
+    creds[0].regions.find { it.name == 'eu-central-1' }.availabilityZones == ['eu-central-1a']
+  }
+
+  def 'useAccountRegions=true with per-account regions missing AZs calls describeAvailabilityZones per region, no describeRegions'() {
+    given: 'flag is on; account regions have no AZs — describeAvailabilityZones should be called against each region directly'
+    def config = new CredentialsConfig(
+      useAccountRegions: true
+      // no defaultRegions — accounts supply their own
+    )
+    def accountsConfig = new AccountsConfiguration(accounts: [
+      new Account(
+        name: 'prod',
+        accountId: '111122223333',
+        regions: [
+          new Region(name: 'eu-west-1'),     // no AZs
+          new Region(name: 'eu-central-1')   // no AZs
+        ]
+      )
+    ])
+    AWSCredentialsProvider provider = Mock(AWSCredentialsProvider)
+    AmazonClientProvider clientProvider = Mock(AmazonClientProvider)
+    AmazonEC2 euWest1Ec2 = Mock(AmazonEC2)
+    AmazonEC2 euCentral1Ec2 = Mock(AmazonEC2)
+    AmazonCredentialsParser<Account, NetflixAmazonCredentials> ci = new AmazonCredentialsParser<>(
+      provider, clientProvider, NetflixAmazonCredentials.class, config, accountsConfig)
+
+    when:
+    List<NetflixAmazonCredentials> creds = ci.load(config)
+
+    then: 'describeAvailabilityZones called against each account region — no describeRegions'
+    1 * clientProvider.getAmazonEC2(provider, 'eu-west-1') >> euWest1Ec2
+    1 * euWest1Ec2.describeAvailabilityZones() >> new DescribeAvailabilityZonesResult(availabilityZones: [
+      new AvailabilityZone(zoneName: 'eu-west-1a'),
+      new AvailabilityZone(zoneName: 'eu-west-1b')
+    ])
+    1 * clientProvider.getAmazonEC2(provider, 'eu-central-1') >> euCentral1Ec2
+    1 * euCentral1Ec2.describeAvailabilityZones() >> new DescribeAvailabilityZonesResult(availabilityZones: [
+      new AvailabilityZone(zoneName: 'eu-central-1a')
+    ])
+    0 * euWest1Ec2.describeRegions(_)
+    0 * euCentral1Ec2.describeRegions(_)
+    creds.size() == 1
+    creds[0].regions.size() == 2
+    creds[0].regions.find { it.name == 'eu-west-1' }.availabilityZones.toSorted() == ['eu-west-1a', 'eu-west-1b']
+    creds[0].regions.find { it.name == 'eu-central-1' }.availabilityZones == ['eu-central-1a']
   }
 
   def 'useAccountRegions=true falls back to shared lookup for findAccountId when account has no regions'() {

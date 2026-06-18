@@ -18,6 +18,8 @@
 package com.netflix.spinnaker.clouddriver.aws.security.config;
 
 import com.amazonaws.auth.AWSCredentialsProvider;
+import com.amazonaws.services.ec2.AmazonEC2;
+import com.amazonaws.services.ec2.model.AvailabilityZone;
 import com.amazonaws.util.CollectionUtils;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -130,8 +132,21 @@ public class AmazonCredentialsParser<
    *
    * <p>- An account's region does not have availability zones defined and that region doesn't exist
    * in the region cache.
+   *
+   * <p>When {@code useAccountRegions} is true and the account has explicit regions configured, the
+   * shared default-region cache is bypassed entirely. Any missing availability zones are resolved
+   * by calling describeAvailabilityZones directly against each account region's own endpoint,
+   * without going through describeRegions first.
    */
   private List<Region> initRegions(List<Region> toInit) {
+    // Fast path: when useAccountRegions is enabled and the account has its own regions, skip the
+    // shared default-region cache entirely and resolve AZs directly per account region.
+    if (credentialsConfig.isUseAccountRegions()
+        && amazonClientProvider != null
+        && !CollectionUtils.isNullOrEmpty(toInit)) {
+      return initRegionsFromAccountConfig(toInit);
+    }
+
     // initialize regions cache if it hasn't been done already. We do this here and not in
     // toInit.isNullOrEmpty() because we need the default region values if a region in toInit list
     // has no availability zones specified.
@@ -184,6 +199,35 @@ public class AmazonCredentialsParser<
       }
     }
 
+    return result;
+  }
+
+  /**
+   * Initializes regions purely from the account's own configuration, without consulting the shared
+   * default-region cache. For regions missing availability zones, describeAvailabilityZones is
+   * called directly against each region's own endpoint — no describeRegions call is made.
+   */
+  private List<Region> initRegionsFromAccountConfig(List<Region> toInit) {
+    List<Region> result = new ArrayList<>(toInit.size());
+    for (Region region : toInit) {
+      if (!CollectionUtils.isNullOrEmpty(region.getAvailabilityZones())) {
+        // AZs fully specified — use as-is
+        result.add(region);
+      } else {
+        // AZs missing — call describeAvailabilityZones against this region's own endpoint
+        log.info(
+            "useAccountRegions: fetching availability zones for {} directly", region.getName());
+        AmazonEC2 ec2 = amazonClientProvider.getAmazonEC2(credentialsProvider, region.getName());
+        List<AvailabilityZone> azs = ec2.describeAvailabilityZones().getAvailabilityZones();
+        List<String> azNames = new ArrayList<>(azs.size());
+        for (AvailabilityZone az : azs) {
+          azNames.add(az.getZoneName());
+        }
+        Region resolved = region.copyOf();
+        resolved.setAvailabilityZones(azNames);
+        result.add(resolved);
+      }
+    }
     return result;
   }
 
