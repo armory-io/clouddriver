@@ -97,6 +97,17 @@ subprojects {
     repositories {
       mavenLocal()
     }
+  } else if ([korkVersion, fiatVersion].any { it.endsWith(".release-1.36.x") }) {
+    logger.info("Enabling Harness Registry")
+    repositories {
+      maven{
+        url "https://pkg.harness.io/pkg/NK24qb_MQ0aYFnTJmNEjiw/armory-oss-maven/maven"
+        credentials {
+          username "${harness_artifact_user}"
+          password "${harness_artifact_password}"
+        }
+      }
+    }
   }
 
   tasks.withType(JavaExec) {
