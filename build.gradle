@@ -41,7 +41,11 @@ subprojects {
 
     dependencies {
       api enforcedPlatform("io.spinnaker.kork:kork-bom:$korkVersion")
-
+      api("org.slf4j:slf4j-api"){
+        version {
+          strictly("1.7.36")
+        }
+      }
       compileOnly enforcedPlatform("io.spinnaker.kork:kork-bom:$korkVersion")
       compileOnly "org.projectlombok:lombok"
 
@@ -96,6 +100,17 @@ subprojects {
     logger.info("Enabling mavenLocal")
     repositories {
       mavenLocal()
+    }
+  } else if ([korkVersion, fiatVersion].any { it.endsWith(".release-1.36.x") }) {
+    logger.info("Enabling Harness Registry")
+    repositories {
+      maven{
+        url "https://pkg.harness.io/pkg/NK24qb_MQ0aYFnTJmNEjiw/armory-oss-maven/maven"
+        credentials {
+          username "${harness_artifact_user}"
+          password "${harness_artifact_password}"
+        }
+      }
     }
   }
 
