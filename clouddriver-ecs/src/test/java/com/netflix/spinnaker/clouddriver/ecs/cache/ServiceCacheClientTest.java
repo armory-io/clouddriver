@@ -17,19 +17,24 @@
 package com.netflix.spinnaker.clouddriver.ecs.cache;
 
 import static com.netflix.spinnaker.clouddriver.ecs.cache.Keys.Namespace.SERVICES;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.when;
 
 import com.amazonaws.services.ecs.model.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.netflix.spinnaker.cats.cache.DefaultCacheData;
+import com.netflix.spinnaker.clouddriver.ecs.EcsConfigurationProperties;
 import com.netflix.spinnaker.clouddriver.ecs.TestCredential;
 import com.netflix.spinnaker.clouddriver.ecs.cache.client.ServiceCacheClient;
 import com.netflix.spinnaker.clouddriver.ecs.cache.model.Service;
 import com.netflix.spinnaker.clouddriver.ecs.provider.agent.ServiceCachingAgent;
 import com.netflix.spinnaker.clouddriver.ecs.provider.agent.TestServiceCachingAgentFactory;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import spock.lang.Subject;
@@ -207,5 +212,57 @@ public class ServiceCacheClientTest extends CommonCacheClient {
             + loadBalancer
             + " but got "
             + ecsService.getLoadBalancers().get(0));
+  }
+
+  @Test
+  public void shouldOnlyQueryByApplicationWhenEnabledAndSupported() {
+    when(cacheView.supportsGetAllByApplication()).thenReturn(true);
+
+    assertFalse(client.canFindByApplication());
+    assertTrue(new ServiceCacheClient(cacheView, mapper, true).canFindByApplication());
+
+    when(cacheView.supportsGetAllByApplication()).thenReturn(false);
+    assertFalse(new ServiceCacheClient(cacheView, mapper, true).canFindByApplication());
+  }
+
+  @Test
+  public void shouldDefaultQueryByApplicationToOffFromProperties() {
+    when(cacheView.supportsGetAllByApplication()).thenReturn(true);
+
+    EcsConfigurationProperties properties = new EcsConfigurationProperties();
+    assertFalse(new ServiceCacheClient(cacheView, mapper, properties).canFindByApplication());
+
+    properties.getCache().setQueryByApplication(true);
+    assertTrue(new ServiceCacheClient(cacheView, mapper, properties).canFindByApplication());
+  }
+
+  @Test
+  public void shouldFindServicesByApplication() {
+    ServiceCachingAgent agent =
+        TestServiceCachingAgentFactory.create(TestCredential.named(ACCOUNT), REGION);
+    String serviceName = "test-stack-detail-v1";
+    String key = Keys.getServiceKey(ACCOUNT, REGION, serviceName);
+
+    com.amazonaws.services.ecs.model.Service service =
+        new com.amazonaws.services.ecs.model.Service();
+    service.setServiceName(serviceName);
+    service.setClusterArn("arn:aws:ecs:" + REGION + ":012345678910:cluster/test-cluster");
+    service.setDeploymentConfiguration(
+        new DeploymentConfiguration().withMinimumHealthyPercent(50).withMaximumPercent(100));
+    service.setLoadBalancers(Collections.emptyList());
+    service.setDesiredCount(1);
+    service.setCreatedAt(new Date());
+    Map<String, Object> attributes = agent.convertServiceToAttributes(service);
+    when(cacheView.getAllByApplication(SERVICES.toString(), "test"))
+        .thenReturn(
+            Map.of(
+                SERVICES.toString(),
+                List.of(new DefaultCacheData(key, attributes, Collections.emptyMap()))));
+
+    Collection<Service> services =
+        new ServiceCacheClient(cacheView, mapper, true).findByApplication("test");
+
+    assertEquals(1, services.size());
+    assertEquals(serviceName, services.iterator().next().getServiceName());
   }
 }
