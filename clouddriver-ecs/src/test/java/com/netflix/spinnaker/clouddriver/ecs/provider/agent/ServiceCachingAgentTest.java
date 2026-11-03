@@ -18,6 +18,7 @@ package com.netflix.spinnaker.clouddriver.ecs.provider.agent;
 
 import static com.netflix.spinnaker.clouddriver.ecs.cache.Keys.Namespace.ECS_CLUSTERS;
 import static com.netflix.spinnaker.clouddriver.ecs.cache.Keys.Namespace.SERVICES;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
@@ -160,6 +161,10 @@ public class ServiceCachingAgentTest extends CommonCachingAgent {
               + ". The service ARN is: "
               + cacheData.getAttributes().get("serviceArn")
               + ".");
+      assertEquals(
+          cacheData.getAttributes().get("applicationName"),
+          cacheData.getAttributes().get("application"),
+          "Expected the indexed application attribute to match applicationName");
     }
   }
 }

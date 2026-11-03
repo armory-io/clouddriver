@@ -102,6 +102,9 @@ public class ServiceCachingAgent extends AbstractEcsOnDemandAgent<Service> {
     attributes.put("account", accountName);
     attributes.put("region", region);
     attributes.put("applicationName", applicationName);
+    // Indexed by SqlCache (resource.application) so services can be queried by application,
+    // including for accounts whose moniker comes from tags rather than the service name.
+    attributes.put("application", applicationName);
     attributes.put("serviceName", service.getServiceName());
     attributes.put("serviceArn", service.getServiceArn());
     attributes.put("clusterName", clusterName);
