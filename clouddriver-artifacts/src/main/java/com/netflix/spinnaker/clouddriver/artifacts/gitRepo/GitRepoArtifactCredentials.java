@@ -154,13 +154,16 @@ public class GitRepoArtifactCredentials implements ArtifactCredentials {
         return getInputStream(repoUrl, subPath, branch, stagingPath, repoBasename, outputFile);
 
       } finally {
-        // if not deleted explicitly, clones are deleted by
-        // gitRepoFileSystem depending on retention period
-        if (!gitRepoFileSystem.canRetainClone()) {
-          log.debug("Deleting clone for {} (branch {})", repoUrl, branch);
-          FileUtils.deleteDirectory(stagingPath.toFile());
+        try {
+          // if not deleted explicitly, clones are deleted by
+          // gitRepoFileSystem depending on retention period
+          if (!gitRepoFileSystem.canRetainClone()) {
+            log.debug("Deleting clone for {} (branch {})", repoUrl, branch);
+            FileUtils.deleteDirectory(stagingPath.toFile());
+          }
+        } finally {
+          gitRepoFileSystem.unlock(repoUrl, branch);
         }
-        gitRepoFileSystem.unlock(repoUrl, branch);
       }
 
     } else {
